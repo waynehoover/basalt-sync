@@ -14,13 +14,25 @@
  * waited on for ever.
  */
 
-import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { STATE_DIR } from "./config.ts";
 
 export const lockPath = (vault: string) => join(vault, STATE_DIR, "lock");
+
+/**
+ * A seam, and a narrow one: the instant between preparing a lock and putting
+ * it at its name.
+ *
+ * Two processes contending for that instant is the whole of what this module
+ * is for, and it is too short to hit by racing. The chunk store keeps a
+ * replaceable `sync` for the same reason. It does nothing in every build; a
+ * test replaces `pause`.
+ */
+export const midPublish = { pause: async (): Promise<void> => {} };
 
 /** What the lock file says about who holds it. */
 export interface LockHolder {
@@ -29,6 +41,14 @@ export interface LockHolder {
   readonly command: string;
   /** Milliseconds since the epoch. */
   readonly since: number;
+  /**
+   * Random, and different for every acquisition.
+   *
+   * A pid is not an identity: the operating system reuses them, and a release
+   * that matched on pid and host alone could remove a lock some unrelated
+   * process on a recycled pid had taken. This is what "still ours" means.
+   */
+  readonly token: string;
 }
 
 /**
@@ -41,39 +61,46 @@ export interface LockHolder {
  */
 export async function lockVault(vault: string, command: string): Promise<() => Promise<void>> {
   const path = lockPath(vault);
-  await mkdir(join(vault, STATE_DIR), { recursive: true });
-  const mine: LockHolder = { pid: process.pid, host: hostname(), command, since: Date.now() };
+  const dir = join(vault, STATE_DIR);
+  await mkdir(dir, { recursive: true });
+  const mine: LockHolder = {
+    pid: process.pid,
+    host: hostname(),
+    command,
+    since: Date.now(),
+    token: randomBytes(16).toString("hex"),
+  };
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const handle = await open(path, "wx");
-      try {
-        await handle.writeFile(JSON.stringify(mine));
-      } finally {
-        await handle.close();
-      }
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const taken = await publish(dir, path, mine);
+    if (taken) {
       return async () => {
-        // Only if it is still ours. A stale takeover between our crash and
-        // this release would otherwise remove somebody else's lock.
+        // Only if it is still ours, by token. A pid is not an identity: it is
+        // reused, and matching on pid and host alone could remove a lock some
+        // unrelated process had taken after ours went.
         const now = await readHolder(path);
-        if (now?.pid === mine.pid && now.host === mine.host) await rm(path, { force: true });
+        if (now?.token === mine.token) await rm(path, { force: true });
       };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     }
 
     const holder = await readHolder(path);
     if (holder === undefined) {
-      // Created and removed between our attempt and our read, or unreadable
-      // as JSON. Either way it is not a holder that can be named; try once
-      // more rather than guessing.
-      await rm(path, { force: true });
+      // Not a holder that can be named. This used to mean an empty file, which
+      // was the bug: the lock was created empty and written afterwards, so a
+      // competitor arriving in between read nothing, called it corrupt and
+      // deleted a live lock. `publish` closes that by building the file
+      // complete and linking it into place, so the only ways to be here now
+      // are a file removed under us, which the retry handles, or one that is
+      // genuinely unreadable, which is debris.
+      await removeIfStill(path, undefined);
       continue;
     }
     if (holder.host === mine.host && !alive(holder.pid)) {
-      // Left behind. Taking it over is safe because the process that wrote
-      // it cannot be doing anything any more.
-      await rm(path, { force: true });
+      // Left behind by a crash or a kill. Removed only while it is still that
+      // same dead holder, and the next attempt takes the lock by linking,
+      // which is atomic: if another contender for the same stale lock links
+      // first, this one loses the link and finds a live holder to refuse for.
+      await removeIfStill(path, holder.token);
       continue;
     }
     throw new Error(
@@ -82,6 +109,52 @@ export async function lockVault(vault: string, command: string): Promise<() => P
     );
   }
   throw new Error(`could not take the lock at ${path}: something keeps recreating it`);
+}
+
+/**
+ * Puts a complete lock file at `path`, or reports that somebody else got there.
+ *
+ * The holder is written to a private name first and then `link`ed into place.
+ * `link` either creates the name or fails with EEXIST, and the file it creates
+ * already holds everything a reader needs, so there is no moment at which the
+ * lock exists and says nothing about who owns it. Creating with `wx` and
+ * writing afterwards had exactly that moment, and it was long enough for a
+ * second process to read an empty file, decide it was corrupt, delete it and
+ * take a lock somebody was holding.
+ */
+async function publish(dir: string, path: string, mine: LockHolder): Promise<boolean> {
+  const temp = join(dir, `lock.${mine.token}`);
+  await writeFile(temp, JSON.stringify(mine), { mode: 0o600 });
+  // The moment the old implementation was wrong in. There, the lock file
+  // already existed and was empty; here, nothing is at the path yet. A test
+  // stops the world here and runs a competitor, which is the only way to
+  // observe the difference: an empty lock leaves no trace once it is written.
+  await midPublish.pause();
+  try {
+    await link(temp, path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return false;
+  } finally {
+    await rm(temp, { force: true });
+  }
+}
+
+/**
+ * Removes the lock only while it still holds the token we decided about.
+ *
+ * The check and the unlink are two operations and no filesystem here offers
+ * them as one, so this narrows the window rather than closing it: a live lock
+ * taken between the re-read and the unlink could still be removed. What makes
+ * that survivable is that the caller does not then assume it holds anything.
+ * It goes back to `publish`, which is atomic, and the process that linked
+ * first keeps the lock while the other finds a live holder and refuses.
+ */
+async function removeIfStill(path: string, token: string | undefined): Promise<void> {
+  const now = await readHolder(path);
+  if (now?.token !== token) return;
+  await rm(path, { force: true });
 }
 
 async function readHolder(path: string): Promise<LockHolder | undefined> {
@@ -100,6 +173,10 @@ async function readHolder(path: string): Promise<LockHolder | undefined> {
       host: raw.host,
       command: typeof raw.command === "string" ? raw.command : "unknown command",
       since: typeof raw.since === "number" ? raw.since : 0,
+      // A lock written by an older build has none. Reported as the empty
+      // string rather than invented, so it never matches a live token and a
+      // release of somebody else's lock cannot be mistaken for our own.
+      token: typeof raw.token === "string" ? raw.token : "",
     };
   } catch {
     return undefined;

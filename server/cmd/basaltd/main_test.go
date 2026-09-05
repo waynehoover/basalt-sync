@@ -1443,3 +1443,64 @@ func TestPurgeAcceptsARealBackup(t *testing.T) {
 		t.Fatalf("the backup does not verify after the purge:\n%s", v)
 	}
 }
+
+/* ---------------------------------------------------------------- *
+ * the destination a backup is allowed to write (F06)
+ * ---------------------------------------------------------------- */
+
+// Only the source was locked, so a backup would replace the database of a
+// directory something else was using as a live store: a server serving from
+// it, a purge, or another backup. The destination now takes the same exclusive
+// data lock those hold, so all three are refused by one primitive.
+
+func TestBackupRefusesADestinationInUse(t *testing.T) {
+	dir := seeded(t)
+	dest := seeded(t) // a different store, with its own history
+
+	// What a server serving from that directory holds.
+	held, err := dirlock.Shared(dest, dirlock.Data)
+	if err != nil {
+		t.Fatalf("hold the destination: %v", err)
+	}
+	defer held.Release()
+
+	out, err := basalt(t, "backup", "-data", dir, "-to", dest)
+	if err == nil {
+		t.Fatalf("backup replaced a store that was in use:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("the refusal does not say the destination is busy: %v", err)
+	}
+	// And that store still has its own history, unreplaced.
+	if s := mustRun(t, "stats", "-data", dest); !strings.Contains(s, "6 versions") {
+		t.Fatalf("the destination was changed by a refused backup:\n%s", s)
+	}
+}
+
+func TestBackupRefusesASecondBackupIntoTheSameDirectory(t *testing.T) {
+	dir := seeded(t)
+	dest := t.TempDir()
+	// The lock a backup in progress holds.
+	held, err := dirlock.Exclusive(dest, dirlock.Data, "backup")
+	if err != nil {
+		t.Fatalf("hold the destination: %v", err)
+	}
+	defer held.Release()
+
+	out, err := basalt(t, "backup", "-data", dir, "-to", dest)
+	if err == nil {
+		t.Fatalf("two backups wrote the same directory at once:\n%s", out)
+	}
+}
+
+func TestBackupStillWorksWhenTheDestinationIsFree(t *testing.T) {
+	dir := seeded(t)
+	dest := t.TempDir()
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+	// Twice, because the second run takes the lock the first one released and
+	// sweeps the staging file the first one used.
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+	if v := mustRun(t, "verify", "-data", dest); !strings.Contains(v, "0 faults") {
+		t.Fatalf("the backup does not verify:\n%s", v)
+	}
+}

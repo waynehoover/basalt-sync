@@ -364,8 +364,10 @@ func TestAnInterruptedSnapshotLeavesThePreviousBackupIntact(t *testing.T) {
 		t.Fatalf("first backup: %v", err)
 	}
 
-	// Debris from a run that died between the snapshot and the rename.
-	tmp := filepath.Join(dir, ".basalt.db.snapshot")
+	// Debris from a run that died between the snapshot and the rename. The
+	// staging name is per-operation now, so this is one of the shapes it takes
+	// rather than the only one, and the next run sweeps every one of them.
+	tmp := filepath.Join(dir, ".basalt.db.snapshot.1234")
 	if err := os.WriteFile(tmp, []byte("half a database"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -383,6 +385,16 @@ func TestAnInterruptedSnapshotLeavesThePreviousBackupIntact(t *testing.T) {
 	}
 	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
 		t.Fatalf("the snapshot temporary file survived: %v", err)
+	}
+	// And no staging file of any name is left behind by a run that finished.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the backup: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".basalt.db.snapshot") {
+			t.Fatalf("a finished backup left staging debris: %s", e.Name())
+		}
 	}
 }
 

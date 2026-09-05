@@ -68,7 +68,7 @@ Blocking the first writer's leaf-directory fsync allowed a second `Put` of the s
 
 ### F06 — Lock and validate the backup destination
 
-- [ ] Prevent backup from replacing an active store or colliding with another backup into the same destination.
+- [x] Prevent backup from replacing an active store or colliding with another backup into the same destination.
 
 **Evidence — reproduced.** [cmdBackup](server/cmd/basaltd/main.go#L1096) locks the source; [Store.Backup](server/internal/store/backup.go#L350) does not acquire destination locks. It uses a fixed `.basalt.db.snapshot`, removes that name, and eventually replaces the destination database. The source/destination overlap guard exists, but does not protect a distinct destination in use by another server.
 
@@ -78,7 +78,7 @@ A probe held the destination's server and data locks; backup nevertheless succee
 
 ### F07 — Make CLI lock acquisition and stale-lock recovery atomic
 
-- [ ] Replace the create/write/read/unlink protocol with an ownership scheme that cannot steal a live lock.
+- [x] Replace the create/write/read/unlink protocol with an ownership scheme that cannot steal a live lock.
 
 **Evidence — reproduced.** [lockVault](client/src/cli/lock.ts#L42) creates an empty file with `wx`, then writes its holder. A competitor treats the temporarily empty file as corrupt and deletes it. Holding that initial empty file open allowed a second caller to acquire the lock. Stale-holder inspection followed by unconditional unlink has a similar replacement race; release compares PID/host without a unique acquisition token.
 

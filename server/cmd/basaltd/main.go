@@ -1197,6 +1197,40 @@ func cmdBackup(args []string, out io.Writer) error {
 	}
 	defer st.Close()
 
+	// The destination is locked too (F06).
+	//
+	// Only the source was, so a backup would happily replace the database of a
+	// directory another server was serving from, or of a vault that had
+	// nothing to do with this one: it was reproduced by holding both of a
+	// destination's locks and watching the backup overwrite it anyway. Two
+	// backups into one directory could also remove each other's staging file.
+	//
+	// Exclusive on the data lock, which is what `serve` holds shared and
+	// `purge` holds exclusive, so a served destination, a purging destination
+	// and a second backup are each refused by the same primitive rather than
+	// by three checks. Taken after `refuseOverlap` has had its say inside
+	// `Backup`, so the source's own directory is refused as a destination with
+	// the message that explains it, and taken on the resolved path so a
+	// symlinked destination cannot be locked under one name and written under
+	// another.
+	destDir, err := store.ResolveForLock(*to)
+	if err != nil {
+		return err
+	}
+	if err := store.RefuseSamePlace(destDir, *dataDir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
+		return err
+	}
+	destLock, err := dirlock.Exclusive(destDir, dirlock.Data, "backup")
+	if err != nil {
+		return locked(err, destDir, "backup",
+			"Something is using that directory as a live store: a server serving from it, a "+
+				"purge, or another backup. Backing up over it would replace its database.")
+	}
+	defer destLock.Release()
+
 	rep, err := st.Backup(*to, *deep)
 	if err != nil {
 		// The numbers so far are still worth printing: they say how far it got.

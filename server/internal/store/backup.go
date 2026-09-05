@@ -347,6 +347,10 @@ func (s *Store) ChunkRefs(fn func(vaultID, name string) error) error {
 // deep re-reads every body already in the backup as well as the ones just
 // written. The bodies just written are always checksummed; deep is for finding
 // bit rot in a backup that has been sitting on a disk for a year.
+// stagedPrefix names a snapshot being written but not yet published. Every
+// file under it in a backup directory is this operation's or a dead one's.
+const stagedPrefix = ".basalt.db.snapshot"
+
 func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	rep := BackupReport{Dir: destDir}
 
@@ -368,10 +372,45 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	// Staged, not published. The rename over dbPath is the last thing this
 	// function does, so until it succeeds the previous backup is what dbPath
 	// still names.
-	stagedDB := filepath.Join(destDir, ".basalt.db.snapshot")
+	//
+	// The staging name is this operation's own (F06). It used to be a fixed
+	// `.basalt.db.snapshot`, removed on the way in, so two backups into one
+	// directory each deleted the other's half-written snapshot and one of them
+	// published a database the other was still writing. The destination lock
+	// above makes that unreachable from this binary; the name makes it
+	// unreachable at all, and it means an interrupted backup leaves a file
+	// nothing else will pick up rather than one the next backup adopts.
+	//
+	// Anything left from a run that died is swept first. The caller holds this
+	// directory's lock, so a staging file here belongs to nobody: the process
+	// that made it is gone. Sweeping rather than reusing, because a half-written
+	// snapshot adopted as a starting point is the fault this whole staging
+	// dance exists to avoid.
+	if entries, err := os.ReadDir(destDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasPrefix(e.Name(), stagedPrefix) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(destDir, e.Name())); err != nil && !os.IsNotExist(err) {
+				return rep, err
+			}
+		}
+	}
+	staged, err := os.CreateTemp(destDir, stagedPrefix+"*")
+	if err != nil {
+		return rep, err
+	}
+	stagedDB := staged.Name()
+	if err := staged.Close(); err != nil {
+		return rep, err
+	}
+	// SnapshotInto writes its own file, so the placeholder has to go first.
 	if err := os.Remove(stagedDB); err != nil && !os.IsNotExist(err) {
 		return rep, err
 	}
+	// Whatever happens below, the staging file does not outlive this call. A
+	// no-op once the rename at the end has consumed it.
+	defer func() { _ = os.Remove(stagedDB) }()
 	if err := s.SnapshotInto(stagedDB); err != nil {
 		return rep, fmt.Errorf("snapshotting the database: %w", err)
 	}
@@ -594,6 +633,11 @@ func (s *Store) refuseOverlap(destDir string) error {
 	}
 	return nil
 }
+
+// ResolveForLock returns a path's real, absolute form, so a directory cannot be
+// locked under one name and written under another. A destination that does not
+// exist yet resolves to the place it will be.
+func ResolveForLock(path string) (string, error) { return resolvePath(path) }
 
 // RefuseSamePlace refuses a backup directory that is, contains, or is contained
 // by a data directory, following symlinks and relative paths on both sides.
