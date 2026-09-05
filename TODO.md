@@ -42,7 +42,7 @@ Failing the device proof after saving credentials left the plugin with a working
 
 ### F03 — Make recovery-key rotation recoverable across an uncertain outcome
 
-- [ ] Give rotation a prepare/commit/recovery flow that preserves the candidate key before the server can commit.
+- [x] Give rotation a prepare/commit/recovery flow that preserves the candidate key before the server can commit.
 
 **Evidence — reproduced for CLI JSON mode; plugin crash window identified by inspection.** [cmdRotate](client/src/cli/cli.ts#L990) only emits the candidate before rotation in text mode. If rotation commits, its reply is lost, and the follow-up probe cannot connect, JSON output contains an error telling the user to keep both keys but never supplies the new one. The candidate is not saved. [Plugin.rotate](client/src/plugin/main.ts#L1322) also keeps the candidate only in memory until the operation returns.
 

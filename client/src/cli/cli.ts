@@ -1013,10 +1013,16 @@ async function cmdRotate(args: Args, io: Console): Promise<number> {
   // longer anywhere on a device to stage a root: not holding one is the point.
   // So the durable copy is the one on the person's paper, and it goes there
   // first.
-  if (!args.json) {
-    io.err("The vault is about to get this recovery key. Write it down before pressing on:");
-    io.err(`  ${recoveryKey}`);
-  }
+  //
+  // Under `--json` as well, and that was F03: the guard here used to be
+  // `if (!args.json)`, so machine mode printed the candidate nowhere. A
+  // rotation that then committed with its reply lost, and whose probe could
+  // not connect, produced an error telling the operator to keep both keys
+  // while never having shown them one of the two. It goes to stderr, which
+  // is where the failure paths below already write and is not the one object
+  // stdout carries.
+  io.err("The vault is about to get this recovery key. Write it down before pressing on:");
+  io.err(`  ${recoveryKey}`);
 
   const registrar = await Registrar.open({
     url: config.url,

@@ -1323,7 +1323,10 @@ export default class BasaltPlugin extends Plugin {
    * lost the only durable copy of the new key is the one somebody wrote down.
    * `settled` says whether the server was heard from.
    */
-  async rotate(recoveryKey: string): Promise<{ recoveryKey: string; settled: boolean }> {
+  async rotate(
+    recoveryKey: string,
+    onKey?: (key: string) => void,
+  ): Promise<{ recoveryKey: string; settled: boolean }> {
     const config = this.config;
     if (!config) throw new Error("this vault is not paired yet.");
     if (this.pairing) throw new Error("a pairing is already in progress");
@@ -1338,6 +1341,14 @@ export default class BasaltPlugin extends Plugin {
 
     const secret = generateSecret();
     const fresh = formatPairing({ url: config.url, vaultId: config.vaultId, secret });
+    // On screen before the request goes out (F03). The server commits, closes
+    // every other registrar and only then replies, so a socket that drops in
+    // between leaves a vault whose new root exists nowhere but in this
+    // process; there is no longer anywhere on a device to stage a root,
+    // because not holding one is the point. The durable copy is the one on
+    // the person's paper, so it goes there first and everything after it is
+    // allowed to fail.
+    onKey?.(fresh);
     const registrar = await Registrar.open({
       url: config.url,
       vaultId: config.vaultId,
@@ -2338,11 +2349,14 @@ class BasaltPanel {
             return;
           }
           try {
-            const { recoveryKey, settled } = await this.plugin.rotate(given);
-            // Shown in the panel rather than in a notice, and not dismissed
-            // by anything but saying it has been written down: at this
-            // moment it is the only thing that opens the vault.
-            this.freshRecoveryKey = recoveryKey;
+            // Rendered before the request rather than after it returns: a
+            // rotation that commits and loses its reply has already changed
+            // the vault, and a key that only exists in a resolved promise is
+            // one a crash takes with it.
+            const { settled } = await this.plugin.rotate(given, (key) => {
+              this.freshRecoveryKey = key;
+              this.render();
+            });
             new Notice(
               settled
                 ? "The vault has a new secret. Write down the new recovery key shown in the panel. " +

@@ -124,6 +124,34 @@ async function started(name = "a"): Promise<{ dir: string; key: string }> {
   return { dir, key: init.json()["recoveryKey"] as string };
 }
 
+/**
+ * F03. The candidate key has to be out before the request that commits it.
+ *
+ * The server commits a rotation, closes every other registrar and only then
+ * replies, so a socket that drops in between leaves a vault whose new root
+ * exists nowhere but in this process. The text path printed the candidate
+ * first for exactly that reason; the JSON path printed it nowhere, and then
+ * told the operator to keep both keys.
+ */
+describe("what rotate prints before it commits (F03)", () => {
+  it("shows the candidate key in JSON mode too, before the request", async () => {
+    const { dir, key } = await started("j");
+    const r = await cli("rotate", key, "--dir", dir, "--json");
+    expect(r.code, r.all).toBe(0);
+
+    // stdout stays one parseable object, so whatever reads it is unharmed.
+    const out = r.json();
+    expect(out["ok"]).toBe(true);
+    const fresh = out["recoveryKey"] as string;
+
+    // And the same key was on stderr before the request went out, which is
+    // the copy that survives a lost reply.
+    const warned = r.err.join("\n");
+    expect(warned, `the candidate was never shown: ${r.all}`).toContain(fresh);
+    expect(warned).toMatch(/Write it down before pressing on/);
+  }, 300_000);
+});
+
 describe("a rotation whose reply never came back", () => {
   /**
    * Committed, reply lost. The CLI cannot tell that from a rotation that never
