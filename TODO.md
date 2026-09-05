@@ -32,7 +32,7 @@ A fake server delivered version 2 while a user edit was injected during its fetc
 
 ### F02 — Preserve the initial recovery key until the user can retain it
 
-- [ ] Separate creating/registering the first device from retiring the only durable copy of its recovery key.
+- [x] Separate creating/registering the first device from retiring the only durable copy of its recovery key.
 
 **Evidence — reproduced for the plugin; CLI crash window identified by inspection.** [registerAsDevice](client/src/core/client.ts#L1263) replaces the root-bearing config with the device credential, then proves that the device connects. [Plugin.pairFirst](client/src/plugin/main.ts#L902) only returns the recovery key after this succeeds. Its catch path omits the key when the disk already holds a device credential. The panel receives the key only on successful completion. [CLI init](client/src/cli/cli.ts#L317) also prints the key after registration.
 

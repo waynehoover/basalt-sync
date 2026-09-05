@@ -898,8 +898,18 @@ export default class BasaltPlugin extends Plugin {
    * The recovery key is returned for the panel to show once, and this is the
    * only moment it exists anywhere: a paired device does not keep the root, on
    * purpose, and nothing here can print it again.
+   *
+   * `onKey` is how it gets out before anything can lose it (F02). Returning
+   * it only at the end meant every failure after the registration threw it
+   * away: the save that records this device's credential replaces the root on
+   * disk, and the connection that proves the credential comes after, so a
+   * proof that failed left a working device, no root, and an error with no
+   * key in it. A crash in the same window did the same thing with no error at
+   * all. So the key is handed over while the root is still what is on disk
+   * and before the first byte goes out, and everything after it is allowed to
+   * fail.
    */
-  async pairFirst(setup: string, device: string): Promise<string> {
+  async pairFirst(setup: string, device: string, onKey?: (key: string) => void): Promise<string> {
     return this.onePairing(async () => {
       const { url, token } = parseSetup(setup);
       const secret = generateSecret();
@@ -908,6 +918,9 @@ export default class BasaltPlugin extends Plugin {
       await this.saveVerified(starting);
       this.config = starting;
       const recoveryKey = formatPairing({ url, vaultId: "default", secret });
+      // On screen now, while the root above is still the only thing on disk
+      // and nothing has been sent. Every later step is allowed to fail.
+      onKey?.(recoveryKey);
 
       const mine = this.generation;
       let registered = false;
@@ -939,9 +952,13 @@ export default class BasaltPlugin extends Plugin {
         // same counsellor the pairing form above uses, because a phone sent
         // straight back to pairing registers a second row and spends another
         // of the vault's eight slots.
+        // The key, either way, and most of all when the credential landed.
+        // That is the case where the root is gone from disk, so the copy the
+        // panel is holding is the only one left in the world; saying nothing
+        // there was the whole of F02.
         const writeItDown =
           remains.kind === "credential"
-            ? ""
+            ? `Write down the recovery key on the panel now: it is no longer on this device. ${recoveryKey}. `
             : "Write the recovery key shown in the Basalt panel down now. ";
         throw new Error(
           `the vault was started but this device could not register itself with it: ` +
@@ -2440,11 +2457,17 @@ class BasaltPanel {
     new Setting(contentEl).addButton((b) =>
       b.setButtonText("Start a new vault").onClick(async () => {
         try {
-          const key = await this.plugin.pairFirst(setupField?.getValue() ?? "", device());
-          // Shown once, in this panel, until it is closed. Not a notice,
-          // which goes away on its own, and not stored anywhere it could
-          // be shown again by accident.
-          this.freshRecoveryKey = key;
+          // Rendered the moment the key exists, which is before the vault is
+          // claimed and long before the registration replaces the root on
+          // disk (F02). Waiting for the call to return meant a failure or a
+          // crash anywhere after the registration took the only copy with
+          // it. Shown once, in this panel, until it is closed: not a notice,
+          // which goes away on its own, and not stored anywhere it could be
+          // shown again by accident.
+          await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), (key) => {
+            this.freshRecoveryKey = key;
+            this.render();
+          });
           new Notice(
             "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
           );

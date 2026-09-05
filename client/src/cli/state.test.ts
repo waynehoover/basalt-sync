@@ -142,6 +142,43 @@ const exited = (child: ChildProcess) =>
     else child.once("exit", (code) => r(code ?? -1));
   });
 
+/**
+ * F02, the CLI half. The key has to be printed before the step that erases it.
+ *
+ * `init` writes the root, claims the vault, registers this device, and the
+ * registration replaces the root on disk with a device credential. Printing
+ * the key after all that meant the window between the replacement and the
+ * print held the only copy of it in a local variable, and a kill there left a
+ * working device on a vault nobody could ever recover.
+ */
+describe("what init prints, and when (F02)", () => {
+  it("prints the recovery key before it registers the device", async () => {
+    server = new TestServer();
+    await server.start();
+    const dir = await vaultDir("initorder");
+    // The order the lines were produced in, which is the whole property: the
+    // key has to be out before the config on disk stops holding the root.
+    const init = await cli("init", server.setup, "--dir", dir, "--device", "a");
+    expect(init.code, init.all).toBe(0);
+
+    const printed = init.out.join("\n");
+    const key = printed.match(/basalt3_[A-Za-z0-9_-]+/)?.[0];
+    expect(key, `no recovery key was printed at all: ${init.all}`).toBeDefined();
+    const keyAt = printed.indexOf(key!);
+    const startedAt = printed.indexOf("Started the vault");
+    expect(startedAt, "init never reported success").toBeGreaterThan(-1);
+    expect(
+      keyAt,
+      "the key was printed after the registration that had already erased it from disk",
+    ).toBeLessThan(startedAt);
+
+    // And the disk is in the state that makes revoking mean something.
+    const held = await loadConfig(dir);
+    expect(held?.deviceId).toBeDefined();
+    expect(held?.secret, "a paired device kept the vault's root").toBeUndefined();
+  }, 300_000);
+});
+
 describe("the vault lock (C12)", () => {
   it("refuses a second holder and names the first", async () => {
     const dir = await vaultDir("lock");

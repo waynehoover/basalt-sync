@@ -1462,6 +1462,48 @@ describe("a vault that was started and never joined (P16)", () => {
     expect(again.plugin.savedData).not.toBe(null);
   }, 300_000);
 
+  /**
+   * F02. The recovery key has to leave this device before anything that can
+   * lose it.
+   *
+   * The registration replaces the root on disk with this device's own
+   * credential, and the connection that proves that credential comes after
+   * the replacement. So every failure from the registration onwards used to
+   * end with a working device, no root anywhere, and an error with no key in
+   * it; a crash in the same window did it silently. Returning the key at the
+   * end cannot fix that, because the end is the part that does not happen.
+   */
+  it("hands the recovery key over while the root is still the thing on disk", async () => {
+    await fresh();
+    const { plugin } = await load();
+
+    const seen: { key: string; rootOnDisk: boolean; sent: number }[] = [];
+    let sent = 0;
+    const realSave = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data) => {
+      sent++;
+      return realSave(data);
+    };
+
+    const key = await plugin.pairFirst(server.setup, "laptop", (k) => {
+      const held = plugin.savedData as Record<string, unknown> | null;
+      seen.push({ key: k, rootOnDisk: held?.["secret"] !== undefined, sent });
+    });
+
+    expect(seen, "the key was never handed over before the call returned").toHaveLength(1);
+    expect(seen[0]!.key, "a different key was handed over").toBe(key);
+    expect(
+      seen[0]!.rootOnDisk,
+      "the key was handed over after the root had already left the disk",
+    ).toBe(true);
+    // And the vault ends up in the state it always did: the credential on
+    // disk, the root gone, which is what makes revoking this device mean
+    // something.
+    const held = plugin.savedData as Record<string, unknown>;
+    expect(held["deviceId"]).toBeDefined();
+    expect(held["secret"], "a paired device kept the vault's root").toBeUndefined();
+  }, 300_000);
+
   it("keeps the root when the claim went through and the credential could not be saved", async () => {
     // The save that records this device's credential is the one that cannot be
     // taken on trust: it lands between a registration the server has committed

@@ -336,6 +336,32 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // vault that nothing will ever open again: the secret in it is the only copy
   // on this machine. Every command from here on refuses it and prints the key
   // back out, which is what "pair again with it" needs to be possible.
+  // Out before the registration, not after it (F02).
+  //
+  // The registration replaces the root on this disk with this device's own
+  // credential, and printing the key afterwards meant the window between the
+  // replacement and the print had no copy of it anywhere: a crash there left
+  // a working device and a vault nobody can ever recover. The catch below
+  // already prints it, which covers a failure and not a kill.
+  //
+  // On stderr under --json, because stdout is one object and a second thing
+  // written there is a parse error for whatever is reading it. That is where
+  // the failure path has always printed it.
+  const sayKey = (): void => {
+    const say = args.json ? io.err.bind(io) : io.out.bind(io);
+    say("This is the vault's recovery key. Write it down and keep it offline:");
+    say("");
+    say(`  ${recoveryKey}`);
+    say("");
+    say("It is shown once and this device does not keep it: what is on disk here is this");
+    say("device's own credential, which can be revoked on its own. Adding a device does not");
+    say("need it, basalt invite does that; the recovery key replaces the vault's secret and is");
+    say("the only way back if every device is lost. Anyone who has it has the vault, and the");
+    say("server has never seen it.");
+    say("");
+  };
+  sayKey();
+
   let registered = false;
   try {
     await joinVault(
@@ -367,16 +393,6 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
     io.out(JSON.stringify({ ok: true, paired: args.dir, device, recoveryKey }));
   } else {
     io.out(`Started the vault. ${args.dir} is paired as "${device}".`);
-    io.out("");
-    io.out("This is the vault's recovery key. Write it down and keep it offline:");
-    io.out("");
-    io.out(`  ${recoveryKey}`);
-    io.out("");
-    io.out("It is shown once and this device does not keep it: what is on disk here is this");
-    io.out("device's own credential, which can be revoked on its own. Adding a device does not");
-    io.out("need it, basalt invite does that; the recovery key replaces the vault's secret and is");
-    io.out("the only way back if every device is lost. Anyone who has it has the vault, and the");
-    io.out("server has never seen it.");
   }
   return 0;
 }
