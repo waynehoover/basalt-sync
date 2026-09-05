@@ -432,6 +432,13 @@ published from CI over OIDC with no stored token.
   file is valid JSON, and Obsidian drops the edge silently on the next save.
   Telling it from one the ancestor already had would need the validity check to
   see both sides and the ancestor. Pinned as a test.
+- A write landing between the check and the write it guards. A pass decides
+  from a scan, fetches, and then checks the file is still the one it decided
+  about before overwriting or deleting it; an edit inside *that* gap is still
+  lost. Closing it needs a compare-and-swap the adapters do not have, and
+  Obsidian's has no locking at all. What the check buys is the size of the
+  window: from the length of a fetch, where an edit is ordinary, to the length
+  of one stat.
 - The whole-file fallback on mobile. The 64 MiB default came off a desktop
   memory curve, so an older phone syncing a large attachment may be killed
   mid-pass: no note is lost, the file never syncs, and the symptom is a dead

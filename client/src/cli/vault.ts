@@ -14,6 +14,7 @@ import {
   access,
   cp,
   link,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -708,6 +709,32 @@ export class NodeVault implements Vault {
 
   async read(path: string): Promise<Uint8Array> {
     return new Uint8Array(await readFile(await this.absolute(path)));
+  }
+
+  /**
+   * One path's stat, for the check the engine makes before destroying bytes.
+   *
+   * `lstat`, not `stat`, and deliberately: the question is whether this path
+   * still holds the file the pass decided about, and a symlink that appeared
+   * where a note was is a different answer, not the same one seen through.
+   * Anything unreadable is reported as absent, which makes the engine keep
+   * both copies rather than assume the file is unchanged.
+   */
+  async stat(path: string): Promise<FileStat | undefined> {
+    try {
+      const st = await lstat(await this.absolute(path));
+      if (st.isDirectory()) return { path, folder: true, mtime: 0, ctime: 0, size: 0 };
+      if (!st.isFile()) return undefined;
+      return {
+        path,
+        folder: false,
+        mtime: st.mtimeMs,
+        ctime: st.birthtimeMs || st.ctimeMs,
+        size: st.size,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   /**

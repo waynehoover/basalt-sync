@@ -89,6 +89,21 @@ export interface Vault {
   ambiguous?(): readonly Ambiguous[];
   read(path: string): Promise<Uint8Array>;
   /**
+   * One path's stat, or undefined when nothing is there.
+   *
+   * Not a convenience over `list`. A pass decides what to do from a scan,
+   * then goes to the network, then writes, and the editor is in use for the
+   * whole of that gap. This is what the engine calls immediately before a
+   * write or a removal that would destroy local bytes, to check the file is
+   * still the one the decision was taken about.
+   *
+   * Required, not optional, because a vault that cannot answer would make the
+   * check silently do nothing and the note it was protecting disappear
+   * exactly as before. A vault that genuinely cannot stat one path should
+   * answer from its own listing rather than say nothing.
+   */
+  stat(path: string): Promise<FileStat | undefined>;
+  /**
    * Makes durable whatever the writes so far have left un-durable.
    *
    * Optional, because a vault whose writes are already durable when they return
@@ -336,6 +351,13 @@ export class MemoryVault implements Vault {
     return f.bytes;
   }
 
+  async stat(path: string): Promise<FileStat | undefined> {
+    const f = this.files.get(path);
+    if (f) return { path, folder: false, mtime: f.mtime, ctime: f.ctime, size: f.bytes.length };
+    if (this.folders.has(path)) return { path, folder: true, mtime: 0, ctime: 0, size: 0 };
+    return undefined;
+  }
+
   async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     this.files.set(path, { bytes: bytes.slice(), mtime: times.mtime, ctime: times.ctime });
     for (const parent of parents(path)) this.folders.add(parent);
@@ -352,7 +374,18 @@ export class MemoryVault implements Vault {
    */
   failRemoveOnce: string | undefined;
 
+  /**
+   * Runs just before a removal, which is where an editor's write would land.
+   *
+   * The sibling of the fetch callback the download races use. A deletion
+   * carries no body, so there is no network round trip to hide an edit
+   * inside, and this is the only way to produce one at the moment that
+   * matters.
+   */
+  beforeRemove: ((path: string) => Promise<void> | void) | undefined;
+
   async remove(path: string): Promise<void> {
+    await this.beforeRemove?.(path);
     if (this.failRemoveOnce === path) {
       this.failRemoveOnce = undefined;
       throw new Error(`refusing to remove ${path}, as a locked file would`);

@@ -28,7 +28,7 @@ import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
 import { TEST_DATA_KEY, otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
 import { ProtocolError, Transport, type WireEntry } from "./transport.ts";
 import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
-import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
+import { MemoryIndexStore, MemoryVault, type FileStat, type Times } from "./vault.ts";
 import { firstFreeName, ignoredHereError, neverSync } from "./paths.ts";
 import type { IndexEntry } from "./index-state.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
@@ -140,6 +140,28 @@ class GatedVault extends MemoryVault {
   override async read(path: string): Promise<Uint8Array> {
     if (path === this.gatePath) await this.gate;
     return super.read(path);
+  }
+}
+
+/**
+ * A vault that is edited the instant the engine finishes looking at a path.
+ *
+ * `stat` answers with the shape it found and *then* writes, so the caller
+ * gets a true reading of the file as it was and the file is different by the
+ * time the caller acts on it. That is the F01 window made deterministic: no
+ * timing, no sleeps, and exactly the ordering a person saving in the editor
+ * produces while the other side of a merge is on the wire.
+ */
+class EditsAfterLooking extends MemoryVault {
+  armed = "";
+  text_ = "";
+  override async stat(path: string): Promise<FileStat | undefined> {
+    const was = await super.stat(path);
+    if (this.armed !== "" && path === this.armed) {
+      this.armed = "";
+      await this.write(path, new TextEncoder().encode(this.text_), { mtime: 99_000, ctime: 1000 });
+    }
+    return was;
   }
 }
 
@@ -1246,6 +1268,50 @@ describe("a conflict copy whose name is taken in the gap", () => {
  * in practice: `basaltd purge` keeps the newest version of each path, and a
  * device that was away holds a base the server has since let go of.
  */
+/**
+ * F01, on the merge path.
+ *
+ * A merge reads the local file, then fetches the other side, then writes the
+ * result. The fetch is a network round trip and the editor is in use through
+ * it, so the text being written can be a merge of a version that is no longer
+ * on this disk. Writing it drops whatever replaced it, with `merged 1` in the
+ * report.
+ */
+describe("a note edited while the other side of its merge is in flight (F01)", () => {
+  it("keeps both rather than writing a merge of a version that is gone", async () => {
+    await fresh();
+    const a = await device("a");
+    const racy = new EditsAfterLooking();
+    const b = await device("b", undefined, racy);
+
+    const base = "# Note\n\nFirst paragraph.\n\nSecond paragraph.\n";
+    await a.vault.edit("note.md", base);
+    await convergeBoth(a, b);
+    expect(b.vault.text("note.md")).toBe(base);
+
+    // Both sides edit a different paragraph, which is an ordinary clean merge.
+    await a.vault.edit("note.md", base.replace("First paragraph.", "First, from a."));
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+    await b.vault.edit("note.md", base.replace("Second paragraph.", "Second, from b."));
+
+    // And the editor saves again the moment the merge has read the file.
+    racy.text_ = base.replace("Second paragraph.", "Third, typed during the merge.");
+    racy.armed = "note.md";
+
+    const report = await b.engine.sync();
+
+    expect(
+      b.vault.text("note.md"),
+      "the merge overwrote an edit made while the other side was on the wire",
+    ).toContain("Third, typed during the merge.");
+    expect(report.merged, "a merge that was not written was counted as one").toBe(0);
+    expect(report.conflicted).toBe(1);
+    // And a's paragraph is not lost either: it is beside the note.
+    expect(everywhere(b)).toContain("First, from a.");
+  }, 240_000);
+});
+
 describe("a merge against an ancestor that has been purged (C7)", () => {
   it("keeps both and says why, rather than blaming the encoding", async () => {
     await fresh();

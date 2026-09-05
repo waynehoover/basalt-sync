@@ -619,6 +619,23 @@ export class ObsidianVault implements Vault {
     return new Uint8Array(await this.adapter.readBinary(this.resolve(path)));
   }
 
+  /**
+   * One path's stat, for the check the engine makes before destroying bytes.
+   *
+   * Obsidian's adapter answers `null` for a path it has nothing at, and this
+   * turns anything it cannot describe as a file or a folder into the same
+   * `undefined`. That reads as "not the file the pass decided about", which
+   * makes the engine keep both copies: the safe direction for a question
+   * whose wrong answer is somebody's unsaved paragraph.
+   */
+  async stat(path: string): Promise<FileStat | undefined> {
+    const st = await this.adapter.stat(this.resolve(path));
+    if (st === null) return undefined;
+    if (st.type === "folder") return { path, folder: true, mtime: 0, ctime: 0, size: 0 };
+    if (st.type !== "file") return undefined;
+    return { path, folder: false, mtime: st.mtime, ctime: st.ctime, size: st.size };
+  }
+
   async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     const normalized = this.resolve(path);
     await this.ensureParents(normalized);

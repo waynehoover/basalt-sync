@@ -90,7 +90,7 @@ import {
   isNeverSynced,
   spellOut,
 } from "./paths.ts";
-import { parents, type IndexStore, type Times, type Vault } from "./vault.ts";
+import { parents, type FileStat, type IndexStore, type Times, type Vault } from "./vault.ts";
 
 /**
  * An index entry with its derivable fields left out.
@@ -1505,7 +1505,7 @@ export class Engine {
       case "download":
       case "restoreLocal": {
         if (!remote) return;
-        await this.receive(path, entry, remote, action.kind, action.why, report);
+        await this.receive(path, entry, remote, action.kind, action.why, report, local);
         return;
       }
 
@@ -1546,7 +1546,7 @@ export class Engine {
         // bytes the pass was about to write back, so the file came over
         // the wire instead. Deferring costs nothing and means there is
         // never a moment where neither name holds the note.
-        this.pendingDeletes.push({ path, why: action.why });
+        this.pendingDeletes.push({ path, why: action.why, based: local });
         return;
 
       case "deleteRemote": {
@@ -1976,11 +1976,12 @@ export class Engine {
     kind: "download" | "restoreLocal",
     why: string,
     report: SyncReport,
+    based: LocalState | undefined,
   ): Promise<void> {
     const chunks = chunkNamesOf(remote.hash);
     this.checkChunkCount(remote.uid, chunks.length);
 
-    this.inbox.push({ path, entry, remote, chunks, kind, why });
+    this.inbox.push({ path, entry, remote, chunks, kind, why, based });
     this.inboxBytes += remote.size;
     if (this.inbox.length >= MAX_BATCH_ENTRIES || this.inboxBytes >= INBOX_BYTES) {
       await this.fill(report);
@@ -2052,13 +2053,17 @@ export class Engine {
           this.log(d.kind, d.path, `${d.why}, from ${from} without asking`);
           continue;
         }
-        if (from !== undefined) {
-          // The local copy did not prove out, so ask for it after all.
-          // Rare, and it costs one extra round trip rather than a file.
-          await this.land(d, await this.fetchFor(d));
-        } else {
-          await this.land(d, held);
-        }
+        const wrote =
+          from !== undefined
+            ? // The local copy did not prove out, so ask for it after all.
+              // Rare, and it costs one extra round trip rather than a file.
+              await this.land(d, await this.fetchFor(d), report)
+            : await this.land(d, held, report);
+        // Counted only when it happened. A conflict copy is not a download,
+        // and reporting one is the kind of true-sounding status rule 7 is
+        // about: the incoming version is on this disk either way, but under
+        // a different name and with the local file untouched.
+        if (!wrote) continue;
         if (d.kind === "download") report.downloaded++;
         else report.restored++;
         this.log(d.kind, d.path, d.why);
@@ -2142,7 +2147,7 @@ export class Engine {
    * produced is refused. Rule 3 in its smallest form: not "the path is
    * different" but "the file is a different file".
    */
-  private pendingDeletes: { path: string; why: string }[] = [];
+  private pendingDeletes: { path: string; why: string; based: LocalState | undefined }[] = [];
   private wroteThisPass: string[] = [];
 
   /**
@@ -2175,7 +2180,7 @@ export class Engine {
   private async applyDeletes(report: SyncReport): Promise<void> {
     const deletes = this.pendingDeletes;
     this.pendingDeletes = [];
-    for (const { path, why } of deletes) {
+    for (const { path, why, based } of deletes) {
       try {
         const same = await this.wouldUndoAWrite(path);
         if (same !== undefined) {
@@ -2206,6 +2211,19 @@ export class Engine {
             path,
             `deleting it might remove ${same.wrote}, and this vault cannot say whether they are one file`,
           );
+          continue;
+        }
+        // An incoming deletion removes bytes, so it asks the same question
+        // the landing paths do (F01). A file edited since the pass decided
+        // to delete it holds work the server has never seen, and the
+        // deletion is about the version that is gone, not about this one.
+        if (!(await this.unchangedSince(path, based))) {
+          report.waiting++;
+          this.again = true;
+          this.log("kept", path, {
+            why: "it changed after the pass decided to delete it",
+            deletion: why,
+          });
           continue;
         }
         await this.opts.vault.remove(path);
@@ -2304,6 +2322,11 @@ export class Engine {
     const names = (await sealChunks(this.keys, parts)).map((c) => c.name);
     if (contentId(names) !== contentId(d.chunks)) return false;
 
+    // The same check as `land`, for the same reason: this writes over
+    // `d.path` too, and finding the bytes on this disk rather than on the
+    // wire does not make the destination any less somebody's open note.
+    if (!(await this.unchangedSince(d.path, d.based))) return false;
+
     await this.opts.vault.write(d.path, bytes, { mtime: d.remote.mtime, ctime: d.remote.mtime });
     this.landed(d.path);
     observe(d.entry, {
@@ -2319,8 +2342,90 @@ export class Engine {
     return true;
   }
 
-  /** Writes one queued version from bodies already in hand. */
-  private async land(d: Incoming, held: Map<string, Uint8Array>): Promise<void> {
+  /**
+   * Whether this path still holds the file the pass decided about (F01).
+   *
+   * A pass scans, decides, fetches, and only then writes. The fetch is the
+   * whole of a slow link and the editor is in use throughout it, so by the
+   * time the bytes arrive the note underneath may be somebody's unsaved
+   * paragraph. Overwriting it loses work no other device has ever seen,
+   * which is rule 1, and a report that says "downloaded 1" while it happens
+   * is rule 7 as well.
+   *
+   * Compared against `LocalState`, whose mtime and size came from the scan
+   * that informed the decision, so `Math.ceil` is applied here to match what
+   * `observe` stored. Absent means absent on both sides: a note created
+   * under the path during the fetch is a change, not an empty slot.
+   *
+   * **What this does not close.** A write landing between this stat and the
+   * write below is still undetected; no adapter here offers a
+   * compare-and-swap, and Obsidian's offers no locking at all. The window
+   * goes from the length of a fetch to the length of one stat, which is the
+   * difference between "happens on a slow link" and "happens if you hit a
+   * microsecond". docs/design.md, "What is not claimed", says so.
+   */
+  private async unchangedSince(path: string, based: LocalState | undefined): Promise<boolean> {
+    let now: FileStat | undefined;
+    try {
+      now = await this.opts.vault.stat(path);
+    } catch {
+      // A vault that cannot answer is a vault that cannot promise the file is
+      // untouched, so this reads as changed and both copies are kept.
+      return false;
+    }
+    if (based === undefined) {
+      if (now === undefined) return true;
+      // Something is at a path the scan did not list under this name. On a
+      // case-folding disk that is routinely this pass's own rename: the scan
+      // listed `Note.md`, the server asked for `NOTE.md`, and a stat for the
+      // second finds the first because they are one file. Writing over it is
+      // the rename, not a stranger's edit, and the old name's deletion at the
+      // end of the pass is what completes it.
+      //
+      // Anything else at an unlisted path is a file that appeared during the
+      // fetch, which is the case this guard is for.
+      const known = this.localByIdentity.get(this.identity(path));
+      return known !== undefined && this.deletingThisPass.has(known);
+    }
+    if (now === undefined) return false;
+    if (now.folder !== based.folder) return false;
+    if (now.folder) return true;
+    return now.size === based.size && Math.ceil(now.mtime) === based.mtime;
+  }
+
+  /**
+   * Keeps both when the file changed under a decision already taken (F01).
+   *
+   * The incoming version goes beside the note rather than over it, which is
+   * what `conflict` already does for a divergence the scan saw. This is the
+   * same divergence, noticed later.
+   */
+  private async landedOnAChangedFile(
+    d: Incoming,
+    content: Uint8Array,
+    report: SyncReport,
+  ): Promise<void> {
+    this.log("kept the local copy", d.path, {
+      why: "it changed while its next version was being fetched",
+      version: d.remote.uid,
+    });
+    // The entry is re-read from disk on the next pass, and must not claim the
+    // scan's stale shape in the meantime.
+    const entry = this.entryFor(d.path);
+    await this.conflict(d.path, entry, d.remote, report, "changed during the fetch", content);
+  }
+
+  /**
+   * Writes one queued version from bodies already in hand.
+   *
+   * False when it wrote nothing because the file changed under the decision,
+   * so the caller counts a conflict rather than a download it did not do.
+   */
+  private async land(
+    d: Incoming,
+    held: Map<string, Uint8Array>,
+    report: SyncReport,
+  ): Promise<boolean> {
     const bodies = d.chunks.map((name) => {
       const body = held.get(name);
       if (!body) throw new Error(`the server did not send ${name}, which ${d.path} is made of`);
@@ -2337,6 +2442,12 @@ export class Engine {
       );
     }
 
+    // The last thing before the bytes go down (F01).
+    if (!(await this.unchangedSince(d.path, d.based))) {
+      await this.landedOnAChangedFile(d, content, report);
+      return false;
+    }
+
     await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
     this.landed(d.path);
     observe(d.entry, {
@@ -2351,6 +2462,7 @@ export class Engine {
     d.entry.hash = contentId(d.chunks);
     d.entry.size = content.length;
     synced(d.entry, d.entry.hash, d.entry.chunks, d.remote.uid, this.now());
+    return true;
   }
 
   /**
@@ -2510,6 +2622,18 @@ export class Engine {
       return;
     }
     const mineBytes = await this.opts.vault.read(path);
+    // What this file was when its bytes were read, for the check before the
+    // merged text is written back (F01). Between here and that write is a
+    // fetch for the other side, which is a network round trip, and a merge
+    // computed from a version the editor has already replaced would write
+    // over the replacement with text nobody has.
+    const read = await this.opts.vault.stat(path);
+    const mineAt: LocalState | undefined = read && {
+      folder: read.folder,
+      mtime: Math.ceil(read.mtime),
+      size: read.size,
+      hash: "",
+    };
     const theirsBytes = await this.contentOf(remote.uid, remote.hash, remote.size);
 
     const dec = new TextDecoder("utf-8", { fatal: true });
@@ -2555,6 +2679,15 @@ export class Engine {
 
     const text = outcome.text;
     if (text !== mine) {
+      if (!(await this.unchangedSince(path, mineAt))) {
+        // The merge is of a version that is no longer here, so writing it
+        // would drop whatever replaced it. Both sides are kept instead, which
+        // is what a divergence this pass cannot resolve has always meant.
+        const why = "it changed while the other side of the merge was being fetched";
+        this.log("merge refused", path, why);
+        await this.conflict(path, entry, remote, report, why, theirsBytes);
+        return;
+      }
       await this.opts.vault.write(path, new TextEncoder().encode(text), {
         mtime: this.now(),
         ctime: entry.ctime,
@@ -2611,9 +2744,18 @@ export class Engine {
     remote: RemoteState | undefined,
     report: SyncReport,
     why: string,
+    /**
+     * The incoming plaintext, when the caller already holds it.
+     *
+     * The landing paths do: they have just assembled it, and asking the
+     * server for the same version again would be a second round trip for
+     * bytes in hand, on the one path where the reason for the conflict is
+     * that everything took too long already.
+     */
+    inHand?: Uint8Array,
   ): Promise<void> {
     if (!remote) return;
-    const incoming = await this.contentOf(remote.uid, remote.hash, remote.size);
+    const incoming = inHand ?? (await this.contentOf(remote.uid, remote.hash, remote.size));
     const copyPath = await placeBeside(
       () => this.freeConflictPath(path),
       incoming,
@@ -3112,6 +3254,14 @@ interface Incoming {
   readonly chunks: readonly string[];
   readonly kind: "download" | "restoreLocal";
   readonly why: string;
+  /**
+   * What this path held locally when the pass decided to write over it, or
+   * undefined when it held nothing.
+   *
+   * Checked again immediately before the write. Between the decision and the
+   * write is a fetch, and the person using the vault is typing through it.
+   */
+  readonly based: LocalState | undefined;
 }
 
 /** One write waiting for company in the outbox. */

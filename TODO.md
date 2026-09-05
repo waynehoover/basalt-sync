@@ -22,7 +22,7 @@ There are **28 fix items: 13 P1 and 15 P2**. Twenty were reproduced. Each checkb
 
 ### F01 — Recheck local content before applying an incoming change
 
-- [ ] Make download, merge, and deletion landing conditional on the local version used to make the sync decision.
+- [x] Make download, merge, and deletion landing conditional on the local version used to make the sync decision.
 
 **Evidence — reproduced.** [Engine.reconcile](client/src/core/engine.ts#L1274) decides from an earlier scan; [land](client/src/core/engine.ts#L2323) overwrites after awaiting the fetch. The same pattern appears in [merge](client/src/core/engine.ts#L2557), [landFromLocal](client/src/core/engine.ts#L2307), and [applyDeletes](client/src/core/engine.ts#L2175).
 
