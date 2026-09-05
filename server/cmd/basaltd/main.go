@@ -944,7 +944,7 @@ func cmdPurge(args []string, out io.Writer) error {
 	// with a new date.
 	var covered int64
 	if !*noBackupCheck {
-		if covered, err = backupCovers(*backup, *vault, st); err != nil {
+		if covered, err = backupCovers(*backup, *vault, *dataDir, st); err != nil {
 			return err
 		}
 	}
@@ -1058,9 +1058,35 @@ func cmdPurge(args []string, out io.Writer) error {
 	return nil
 }
 
-// backupCovers opens the backup at dir and checks that its copy of the vault is
-// at least as new as the source's, returning the backup's latest uid.
-func backupCovers(dir, vault string, source *store.Store) (int64, error) {
+// backupCovers checks that the backup at dir independently holds every version
+// of the vault this purge could destroy, and returns the backup's latest uid.
+//
+// This authorises an irreversible deletion, so what it used to check was not
+// enough by a wide margin: it compared two maximum uids. A store satisfies that
+// by being the source itself, by being an unrelated vault of the same name that
+// happens to have counted higher, or by holding every entry and none of the
+// bodies. All three were reproduced, and the first one printed that the history
+// it had just destroyed was safely held by the directory it destroyed it in.
+//
+// Four questions now, in the order that fails cheapest first:
+//
+//  1. Is it somewhere else? A directory that is, contains, or is contained by
+//     the data directory is not a backup of it, aliases and symlinks included.
+//  2. Is it this vault? Compared by walking entries rather than by name: names
+//     are chosen by whoever ran the server, and uids restart with the store.
+//  3. Does it hold every version this store holds? Every uid, with an
+//     identical MAC, which is the client's own authentication of that entry
+//     and is not something a coincidence reproduces.
+//  4. Can it actually give them back? Every chunk of every entry with a body
+//     has to be a file in the backup's own chunk tree. A database with no
+//     bodies restores to a history of empty notes.
+//
+// It walks the whole history, which is O(versions) on a rare administrative
+// command that is about to delete data for good. That is the right trade.
+func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error) {
+	if err := store.RefuseSamePlace(dir, dataDir); err != nil {
+		return 0, err
+	}
 	if _, err := os.Stat(filepath.Join(dir, "basalt.db")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, fmt.Errorf("there is no backup at %s: no basalt.db in it; nothing was purged", dir)
@@ -1085,6 +1111,52 @@ func backupCovers(dir, vault string, source *store.Store) (int64, error) {
 			"the backup at %s holds %q up to uid %d and this store is at uid %d, so it is missing "+
 				"versions this purge would drop for good; nothing was purged.\n"+
 				"Take a fresh one first: basaltd backup -to %s", dir, vault, backupLatest, sourceLatest, dir)
+	}
+
+	// Every version this store holds, present in the backup and the same one.
+	// The MAC is the client's authentication of the entry's content and
+	// metadata; two stores agreeing on it for every uid are holding the same
+	// history, and a store that merely counted as high is not.
+	seen := 0
+	bodies := 0
+	if err := source.EachEntry(vault, func(e store.Entry) error {
+		held, ok, err := bk.EntryByUID(vault, e.UID)
+		if err != nil {
+			return fmt.Errorf("reading the backup at %s: %w", dir, err)
+		}
+		if !ok {
+			return fmt.Errorf(
+				"the backup at %s is missing version %d of %q, which this purge could drop for "+
+					"good; nothing was purged.\nTake a fresh one first: basaltd backup -to %s",
+				dir, e.UID, vault, dir)
+		}
+		if held.Mac != e.Mac {
+			return fmt.Errorf(
+				"the backup at %s holds a different version %d of %q than this store does, so it "+
+					"is a backup of some other vault that reused the name; nothing was purged",
+				dir, e.UID, vault)
+		}
+		seen++
+		if !e.HasBody() {
+			return nil
+		}
+		for _, name := range e.Chunks {
+			if !bk.Chunks().Has(vault, name) {
+				return fmt.Errorf(
+					"the backup at %s has the record of version %d of %q but not its contents "+
+						"(chunk %s is not in its chunk tree), so restoring from it would give back "+
+						"an empty note; nothing was purged.\nTake a fresh one first: "+
+						"basaltd backup -to %s", dir, e.UID, vault, name, dir)
+			}
+			bodies++
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	if seen == 0 && sourceLatest > 0 {
+		return 0, fmt.Errorf(
+			"the backup at %s holds no versions of %q at all; nothing was purged", dir, vault)
 	}
 	return backupLatest, nil
 }

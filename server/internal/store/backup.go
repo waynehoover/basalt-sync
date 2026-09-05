@@ -595,6 +595,38 @@ func (s *Store) refuseOverlap(destDir string) error {
 	return nil
 }
 
+// RefuseSamePlace refuses a backup directory that is, contains, or is contained
+// by a data directory, following symlinks and relative paths on both sides.
+//
+// `refuseOverlap` above answers this for a backup being written. The same
+// question has to be asked of a backup being *read* as proof that a purge is
+// safe, and it was not: `basaltd purge -backup` accepted the store's own data
+// directory, compared its maximum uid against itself, found it equal, and
+// reported that the history it had just destroyed was safely held by the
+// directory it had destroyed it in. Aliases do it too, so this resolves rather
+// than compares strings.
+func RefuseSamePlace(backupDir, dataDir string) error {
+	backup, err := resolvePath(backupDir)
+	if err != nil {
+		return err
+	}
+	data, err := resolvePath(dataDir)
+	if err != nil {
+		return err
+	}
+	if backup == data {
+		return fmt.Errorf(
+			"the backup at %s is this store's own data directory, so it is not a backup of "+
+				"anything; nothing was purged", backupDir)
+	}
+	if overlaps(backup, data) {
+		return fmt.Errorf(
+			"the backup at %s and the data directory %s contain one another, so one is not an "+
+				"independent copy of the other; nothing was purged", backupDir, dataDir)
+	}
+	return nil
+}
+
 // overlaps reports whether either path is the other or contains it.
 func overlaps(a, b string) bool {
 	return a == b || isUnder(a, b) || isUnder(b, a)

@@ -50,7 +50,7 @@ Failing the device proof after saving credentials left the plugin with a working
 
 ### F04 — Require an independent, verified backup before purge
 
-- [ ] Replace UID-only backup coverage with verification that the history being removed exists in an independent usable backup.
+- [x] Replace UID-only backup coverage with verification that the history being removed exists in an independent usable backup.
 
 **Evidence — reproduced.** [backupCovers](server/cmd/basaltd/main.go#L1063) checks for `basalt.db` and compares maximum UIDs. A temporary two-version store accepted its own directory as `-backup`, removed one version, and printed that this same “backup” held the removed history. Another vault incarnation with the same name and a sufficiently large UID, or a backup missing chunk bodies, can also satisfy the current check.
 
@@ -58,7 +58,7 @@ Failing the device proof after saving credentials left the plugin with a working
 
 ### F05 — Hide newly published chunks until their publication is durable
 
-- [ ] Make every deduplication and metadata-commit path wait for chunk durability, including chunks being written by another session.
+- [x] Make every deduplication and metadata-commit path wait for chunk durability, including chunks being written by another session.
 
 **Evidence — reproduced.** [chunks.place](server/internal/chunks/chunks.go#L305) renames a body into its final name before [Put](server/internal/chunks/chunks.go#L265) or the batch writer flushes the directory. Its early `Has` return treats visibility as completion. `Missing`/`Size` and [AppendEntry](server/internal/store/store.go#L670) can also observe the published body during this window.
 

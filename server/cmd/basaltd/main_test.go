@@ -1330,3 +1330,116 @@ func TestBackupNeverPrintsANegativeBodyCount(t *testing.T) {
 		t.Fatalf("backup says bodies were not copied when it holds more than the source:\n%s", out)
 	}
 }
+
+/* ---------------------------------------------------------------- *
+ * the backup a purge is allowed to trust (F04)
+ * ---------------------------------------------------------------- */
+
+// Purge is the one command that destroys something no device holds a copy of,
+// and -backup is what authorises it. The check used to compare two maximum
+// uids, which is satisfied by the store itself, by an unrelated vault of the
+// same name that counted higher, and by a database with none of its bodies.
+// Each of those printed that the history it had just destroyed was safely
+// held somewhere.
+
+func TestPurgeRefusesItsOwnDirectoryAsABackup(t *testing.T) {
+	dir := seeded(t)
+	out, err := basalt(t, "purge", "-data", dir, "-backup", dir, "-confirm", "default")
+	if err == nil {
+		t.Fatalf("purge accepted its own data directory as a backup:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "own data directory") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+	// And nothing was destroyed on the way to refusing.
+	if v := mustRun(t, "verify", "-data", dir); !strings.Contains(v, "0 faults") {
+		t.Fatalf("the store was changed by a refused purge:\n%s", v)
+	}
+	if s := mustRun(t, "stats", "-data", dir); !strings.Contains(s, "6 versions") {
+		t.Fatalf("versions went missing during a refused purge:\n%s", s)
+	}
+}
+
+func TestPurgeRefusesABackupThatIsAnAliasOfTheSourceDirectory(t *testing.T) {
+	dir := seeded(t)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Skipf("this filesystem will not make a symlink: %v", err)
+	}
+	out, err := basalt(t, "purge", "-data", dir, "-backup", alias, "-confirm", "default")
+	if err == nil {
+		t.Fatalf("purge accepted a symlink to its own data directory:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "own data directory") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+func TestPurgeRefusesAnUnrelatedVaultThatCountedHigher(t *testing.T) {
+	dir := seeded(t)
+	// A different vault that happens to share the name and to have counted
+	// higher. Same name, more versions, none of them the same versions: this
+	// is what a second server, or a data directory that was started again,
+	// leaves behind, and its uids satisfy every comparison the old check made.
+	other := t.TempDir()
+	st, err := store.Open(filepath.Join(other, "basalt.db"), filepath.Join(other, "chunks"))
+	if err != nil {
+		t.Fatalf("open other: %v", err)
+	}
+	if err := st.EnsureVault("default", 1); err != nil {
+		t.Fatalf("ensure vault: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := st.AppendEntry("default", store.Entry{
+			Path: "elsewhere.md", MTime: 30, Device: "other", Mac: strings.Repeat("b", 64),
+		}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close other: %v", err)
+	}
+
+	out, err := basalt(t, "purge", "-data", dir, "-backup", other, "-confirm", "default")
+	if err == nil {
+		t.Fatalf("purge accepted an unrelated vault as a backup:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "some other vault") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+func TestPurgeRefusesABackupWithNoChunkBodies(t *testing.T) {
+	dir := seeded(t)
+	backup := t.TempDir()
+	mustRun(t, "backup", "-data", dir, "-to", backup)
+	// The database, and none of the contents. This is what a copy that got
+	// part way, or a retention policy that swept the bodies, leaves behind:
+	// every version recorded and nothing to restore.
+	if err := os.RemoveAll(filepath.Join(backup, "chunks")); err != nil {
+		t.Fatalf("remove bodies: %v", err)
+	}
+
+	out, err := basalt(t, "purge", "-data", dir, "-backup", backup, "-confirm", "default")
+	if err == nil {
+		t.Fatalf("purge accepted a backup holding no bodies:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "not its contents") {
+		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+func TestPurgeAcceptsARealBackup(t *testing.T) {
+	dir := seeded(t)
+	backup := t.TempDir()
+	mustRun(t, "backup", "-data", dir, "-to", backup)
+
+	out := mustRun(t, "purge", "-data", dir, "-confirm", "default", "-backup", backup)
+	if !strings.Contains(out, "gone for good") {
+		t.Fatalf("a purge against a real backup removed nothing:\n%s", out)
+	}
+	// And the backup still verifies with the history the source no longer has.
+	if v := mustRun(t, "verify", "-data", backup); !strings.Contains(v, "0 faults") {
+		t.Fatalf("the backup does not verify after the purge:\n%s", v)
+	}
+}

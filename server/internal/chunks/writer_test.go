@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // A batch is worth having only if it stores exactly what one-at-a-time storing
@@ -256,5 +258,113 @@ func TestACorruptBodyStopsCountingAsHeld(t *testing.T) {
 	got, err := s.Get("v1", name)
 	if err != nil || string(got) != string(body) {
 		t.Fatalf("get after healing = %q, %v", got, err)
+	}
+}
+
+// A chunk is *visible* when it is renamed into place and *durable* when the
+// directory it landed in is flushed, and those are two different moments (F05).
+//
+// `place` short-circuits on `Has`, which answers from visibility. A second
+// writer of the same chunk arriving in that window found it there, wrote
+// nothing, flushed nothing, and returned success. The version it then committed
+// referenced a chunk whose directory entry was not durable, which is the one
+// server-side fault a client cannot detect: it was told the chunk arrived and
+// will never send it again.
+func TestASecondPutOfTheSameChunkWaitsForTheFirstToBeDurable(t *testing.T) {
+	s := newTestStore(t)
+	body := []byte("the body both writers have")
+	name := Name(body)
+
+	// The first writer is held inside its directory flush, which is the exact
+	// window: the body is renamed into place and its name is not yet durable.
+	// The leaf directory only. `mkdirAll` flushes the directories on the way
+	// down before the body is written, and holding one of those would stop the
+	// story before the part that matters.
+	leaf := filepath.Dir(s.path("v1", name))
+	inFlush := make(chan struct{})
+	release := make(chan struct{})
+	realSync := s.sync
+	var held int32
+	s.sync = func(dir string) error {
+		if dir == leaf && atomic.AddInt32(&held, 1) == 1 {
+			close(inFlush)
+			<-release
+		}
+		return realSync(dir)
+	}
+
+	first := make(chan error, 1)
+	go func() { first <- s.Put("v1", name, body) }()
+	<-inFlush
+
+	// The chunk is visible now, and that is the whole trap.
+	if !s.Has("v1", name) {
+		t.Fatal("the body was not renamed into place before its flush, so this proves nothing")
+	}
+
+	second := make(chan error, 1)
+	go func() { second <- s.Put("v1", name, body) }()
+
+	select {
+	case err := <-second:
+		t.Fatalf("the second put returned %v while the first had not flushed the name", err)
+	case <-time.After(150 * time.Millisecond):
+		// Waiting, which is the point.
+	}
+
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first put: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second put: %v", err)
+	}
+	if got, err := s.Get("v1", name); err != nil || string(got) != string(body) {
+		t.Fatalf("the chunk came back as %q, %v", got, err)
+	}
+}
+
+// The same window, one level up: a batch publishes on `place` and flushes at
+// Close, so the gap between visible and durable is the whole of the batch.
+func TestAPutWaitsForABatchStillPublishingTheSameChunk(t *testing.T) {
+	s := newTestStore(t)
+	body := []byte("shared between a batch and a put")
+	name := Name(body)
+
+	leaf := filepath.Dir(s.path("v1", name))
+	inFlush := make(chan struct{})
+	release := make(chan struct{})
+	realSync := s.sync
+	var held int32
+	s.sync = func(dir string) error {
+		if dir == leaf && atomic.AddInt32(&held, 1) == 1 {
+			close(inFlush)
+			<-release
+		}
+		return realSync(dir)
+	}
+
+	w := s.NewWriter("v1")
+	if err := w.Add(name, body); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- w.Close() }()
+	<-inFlush
+
+	put := make(chan error, 1)
+	go func() { put <- s.Put("v1", name, body) }()
+	select {
+	case err := <-put:
+		t.Fatalf("a put returned %v while the batch holding that chunk had not flushed", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := <-put; err != nil {
+		t.Fatalf("put: %v", err)
 	}
 }

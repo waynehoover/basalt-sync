@@ -92,6 +92,14 @@ type Store struct {
 	// mkdirAll for the race it closes.
 	mkdirMu sync.Mutex
 
+	// pending is the chunk names some caller is part way through publishing:
+	// renamed into place, not yet flushed. Visible and not durable are two
+	// different states and `Has` cannot tell them apart, so a second writer of
+	// the same name waits here rather than acking on the first one's rename.
+	// See beginPublish.
+	pendingMu sync.Mutex
+	pending   map[string]chan struct{}
+
 	// sync flushes one directory and is fsync.Dir in every non-test build. A
 	// test replaces it to see which directories were flushed, because the one
 	// fault this package guards against, a name that is not durable, leaves
@@ -262,6 +270,47 @@ func (s *Store) Missing(vaultID string, names []string) ([]string, map[string]in
 //
 // Put returns once the body is durable. Nothing above it may acknowledge a push
 // before that; the entry commit that follows is what makes the ack truthful.
+// beginPublish reserves a chunk name until this caller has made it durable,
+// and waits for whoever holds it first (F05).
+//
+// A body becomes *visible* when it is renamed into place and *durable* when
+// the directory it landed in is flushed, and those are two different moments.
+// `place` short-circuits on `Has`, which answers from visibility, so a second
+// writer of the same chunk arriving in that window found it there, wrote
+// nothing, flushed nothing, and returned success. The version it then
+// committed referenced a chunk whose directory entry was not durable: the one
+// server-side fault a client cannot detect, because it was told the chunk
+// arrived and will never send it again.
+//
+// So publication is serialised per name. The second writer waits for the
+// first, and then finds a chunk that really is durable, or finds it gone
+// because the first failed and gets to write it itself. Per name rather than
+// per store, so unrelated chunks still land in parallel; the existing
+// concurrent-directory test covers those and never closed this.
+func (s *Store) beginPublish(vaultID, name string) func() {
+	key := vaultID + "/" + name
+	for {
+		s.pendingMu.Lock()
+		if s.pending == nil {
+			s.pending = map[string]chan struct{}{}
+		}
+		waitOn, busy := s.pending[key]
+		if !busy {
+			mine := make(chan struct{})
+			s.pending[key] = mine
+			s.pendingMu.Unlock()
+			return func() {
+				s.pendingMu.Lock()
+				delete(s.pending, key)
+				s.pendingMu.Unlock()
+				close(mine)
+			}
+		}
+		s.pendingMu.Unlock()
+		<-waitOn
+	}
+}
+
 func (s *Store) Put(vaultID, name string, body []byte) error {
 	if !ValidName(name) {
 		return fmt.Errorf("%w: %q", ErrBadName, name)
@@ -269,6 +318,10 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 	if int64(len(body)) > s.max {
 		return fmt.Errorf("%w: %d > %d", ErrTooLarge, len(body), s.max)
 	}
+	// Held across the write *and* the flush below, which is what makes the
+	// `Has` inside `place` mean "durable" rather than "renamed" (F05).
+	defer s.beginPublish(vaultID, name)()
+
 	// The name-against-body check is place's, so that it happens on whichever
 	// goroutine is about to do the write. Storing a body under a claimed name
 	// would corrupt the vault invisibly, and storing it under the computed name
@@ -441,6 +494,11 @@ type Writer struct {
 	mu   sync.Mutex
 	dirs map[string]struct{}
 	err  error
+	// One per body placed, called by Close once its directory is flushed.
+	release []func()
+	// The names this batch has already claimed, so a repeated body does not
+	// wait for a release only Close can make. See run.
+	claimed map[string]struct{}
 }
 
 type writeJob struct {
@@ -459,8 +517,9 @@ func (s *Store) newWriterWidth(vaultID string, width int) *Writer {
 		vaultID: vaultID,
 		// Bounded, so a fast reader cannot queue the whole upload in memory
 		// while the disk is still on the first few chunks.
-		work: make(chan writeJob, width),
-		dirs: map[string]struct{}{},
+		work:    make(chan writeJob, width),
+		dirs:    map[string]struct{}{},
+		claimed: map[string]struct{}{},
 	}
 	for i := 0; i < width; i++ {
 		w.wg.Add(1)
@@ -478,8 +537,31 @@ func (w *Writer) run() {
 			// this channel and would block on a closed pool for ever.
 			continue
 		}
+		// One claim per name per batch, and this check has to come first.
+		//
+		// Two bodies in one batch can share a name: a chunk name is a hash of
+		// its bytes, so the same content twice is the same name twice. Letting
+		// both workers claim it deadlocks the batch, because the second waits
+		// for a release that Close makes and Close waits for every worker. The
+		// first claim covers the second, whose bytes are identical by
+		// definition and which has nothing left to write.
+		w.mu.Lock()
+		_, already := w.claimed[job.name]
+		if !already {
+			w.claimed[job.name] = struct{}{}
+		}
+		w.mu.Unlock()
+		if already {
+			continue
+		}
+
+		// Claimed before the write and released by Close, after the flush:
+		// a batch publishes on `place` and becomes durable pages later, so
+		// the window this closes is the widest one in the store (F05).
+		release := w.store.beginPublish(w.vaultID, job.name)
 		dirs, err := w.store.place(w.vaultID, job.name, job.body)
 		w.mu.Lock()
+		w.release = append(w.release, release)
 		if err != nil && w.err == nil {
 			w.err = err
 		}
@@ -531,6 +613,18 @@ func (w *Writer) Add(name string, body []byte) error {
 func (w *Writer) Close() error {
 	close(w.work)
 	w.wg.Wait()
+	// After the flushes below, whatever they do: a name this batch reserved
+	// and then failed on has to be released, or the next writer of that chunk
+	// waits for a batch that has already gone.
+	defer func() {
+		w.mu.Lock()
+		releases := w.release
+		w.release = nil
+		w.mu.Unlock()
+		for _, release := range releases {
+			release()
+		}
+	}()
 	if w.err != nil {
 		return w.err
 	}

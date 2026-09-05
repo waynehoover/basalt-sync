@@ -2406,6 +2406,70 @@ func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64
 	return hash, wrapped, rotations, err
 }
 
+// EachEntry calls fn for every entry of a vault, oldest first, with its chunks.
+//
+// For comparing one store against another. A purge's backup check used to
+// compare two maximum uids, which is satisfied by any store that happens to
+// have counted as high: another vault of the same name, or the same vault
+// restored and moved on. Walking the entries is what turns "a store with a
+// big number in it" into "a store holding these exact versions".
+//
+// A callback rather than a slice because a vault's whole history can be large
+// and the caller only needs one entry at a time.
+func (s *Store) EachEntry(vaultID string, fn func(Entry) error) error {
+	rows, err := s.db.Query(
+		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? ORDER BY uid`, vaultID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var entries []Entry
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &e.Folder,
+			&e.Deleted, &e.Device, &e.Prev, &e.Mac, &e.Parent); err != nil {
+			return err
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// The chunk lists after the entry rows, because the first query's rows are
+	// still open until the loop above finishes.
+	byUID := make(map[int64]int, len(entries))
+	for i := range entries {
+		entries[i].Chunks = []string{}
+		byUID[entries[i].UID] = i
+	}
+	chunkRows, err := s.db.Query(
+		`SELECT uid, name FROM entry_chunks WHERE vault_id = ? ORDER BY uid ASC, ord ASC`, vaultID)
+	if err != nil {
+		return err
+	}
+	defer chunkRows.Close()
+	for chunkRows.Next() {
+		var uid int64
+		var name string
+		if err := chunkRows.Scan(&uid, &name); err != nil {
+			return err
+		}
+		if i, ok := byUID[uid]; ok {
+			entries[i].Chunks = append(entries[i].Chunks, name)
+		}
+	}
+	if err := chunkRows.Err(); err != nil {
+		return err
+	}
+
+	for _, e := range entries {
+		if err := fn(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Rotations is the vault's rotation generation on its own: how many times the
 // secret has been replaced. Zero for a vault with no row, which is also where a
 // vault starts.
