@@ -88,7 +88,7 @@ Desktop and Android are in daily use. Not yet: iOS, which should work and has ne
 - **It cannot write, either.** Every version is signed under a key the server has never seen, so it cannot forge one, alter one, or move a file's contents onto another.
 - **Lose a device, revoke a device.** Each holds a credential of its own, never the recovery key. Leak that and `basalt rotate` replaces it without losing history or disconnecting anything.
 
-A server can still go quiet and show a device nothing. Nothing is altered, and two devices disagreeing is how you notice. Stated rather than solved: [the design doc](docs/design.md) says why.
+A server can still go quiet, and it can hand back an old version of a note under a new number, which reverts it to something it really did say once. It cannot invent, alter or mix up a version. Two devices disagreeing is how you notice. Stated rather than solved: [the design doc](docs/design.md) has both, and what would close the second.
 
 ## Speed
 

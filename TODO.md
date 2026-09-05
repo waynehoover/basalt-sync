@@ -106,7 +106,7 @@ The probe saved cursors 1 and 2, appended a malformed tail, reopened successfull
 
 ### F10 — Bind recovery history to the requested path and page
 
-- [ ] Validate history response identity, entry paths, UID bounds/order, and pagination progress before presenting or restoring versions.
+- [x] Validate history response identity, entry paths, UID bounds/order, and pagination progress before presenting or restoring versions.
 
 **Evidence — reproduced.** [Transport.history](client/src/core/transport.ts#L1514) checks entry shape, but not the response/entry path against the request. [Client.history](client/src/core/client.ts#L430) verifies each entry's MAC and then relabels it with the caller's requested plaintext path. A valid signed entry from `other.md` was returned as a version of `requested.md`. Matching its signed chunk list later does not repair this path substitution.
 
@@ -116,7 +116,7 @@ The probe saved cursors 1 and 2, appended a malformed tail, reopened successfull
 
 ### F11 — Detect replay of signed old versions, and correct the threat-model claim
 
-- [ ] Design authenticated version freshness/ancestry and state the current limitation accurately until it is implemented.
+- [x] Design authenticated version freshness/ancestry and state the current limitation accurately until it is implemented.
 
 **Evidence — reproduced.** [EntryFacts/canonical](client/src/core/crypto.ts#L809) authenticate content metadata and parent, but not the server-assigned UID. [Engine.acceptBatch](client/src/core/engine.ts#L910) accepts a valid old entry with a new UID without establishing that it is a new authorized version. Replaying signed version 1 as UID 3 after version 2 reverted a synchronized note to its old contents.
 

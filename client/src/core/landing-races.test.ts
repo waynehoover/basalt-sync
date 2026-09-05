@@ -245,3 +245,91 @@ describe("a client connected only to look (F08)", () => {
     await client.close();
   });
 });
+
+/**
+ * Replay of a signed old version, which the server can do and nothing here
+ * detects (F11).
+ *
+ * The entry authenticator covers the content, the metadata and the version
+ * this one was written on top of. It does not cover the uid, because the
+ * server assigns uids and ordering the log is its job. So a server can take a
+ * version a device really did write, hand it back under a newer uid, and the
+ * receiving device applies it: the note reverts to contents it genuinely had
+ * once, with a valid signature on the entry that did it.
+ *
+ * These are pinned rather than fixed. docs/design.md says so under what the
+ * server can do, and describes the ancestry check that would close it. If a
+ * later change makes one of them fail, that is the fix landing, and the test
+ * should become an assertion of the new behaviour rather than be deleted.
+ */
+describe("a server that replays a signed old version (F11, pinned)", () => {
+  it("reverts a note, because nothing binds a version to its place in the log", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    const one = await entryFor(keys, 1, "note.md", "the first version", bodies);
+    socket.raw({ op: "batch", from: 1, to: 1, entries: [one] });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const two = await entryFor(keys, 2, "note.md", "the second version", bodies, { mtime: 2000 });
+    socket.raw({ op: "batch", from: 2, to: 2, entries: [two] });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("note.md")).toBe("the second version");
+
+    // The same entry the device accepted as version one, handed back with a
+    // uid that makes it look like the newest thing on the server. Its MAC is
+    // the original and verifies, because it is the original.
+    socket.raw({ op: "batch", from: 3, to: 3, entries: [{ ...one, uid: 3 }] });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    expect(
+      vault.text("note.md"),
+      "the replay was detected, which is a fix: update this test to assert it",
+    ).toBe("the first version");
+  });
+
+  /**
+   * The tombstone case, which turns out to be covered already, and by the
+   * ordinary divergence rules rather than by anything about replay: the note
+   * has been written here since the deletion, so an incoming deletion is not
+   * a continuation of what this device holds and the local copy wins. Kept as
+   * the boundary of the gap above, so that a change which widens it fails
+   * here.
+   */
+  it("does not delete a note written since, even when the tombstone is replayed", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "gone.md", "here for now", bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const tomb = await entryFor(keys, 2, "gone.md", "", bodies, { deleted: true, mtime: 2000 });
+    socket.raw({ op: "batch", from: 2, to: 2, entries: [tomb] });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("gone.md")).toBeUndefined();
+
+    // Written again on this device, and then the old tombstone comes back.
+    await vault.edit("gone.md", "typed again after the deletion", 6000);
+    await engine.sync({ coalesceWrites: false });
+    socket.raw({ op: "batch", from: 3, to: 3, entries: [{ ...tomb, uid: 4 }] });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    expect(
+      vault.text("gone.md"),
+      "a replayed tombstone removed a note this device had written since",
+    ).toBe("typed again after the deletion");
+  });
+});

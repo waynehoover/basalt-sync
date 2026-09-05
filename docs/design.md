@@ -205,11 +205,39 @@ log, with the offset and the note that ordering is unaffected.
 
 **What it can still do is withhold.** A server can advance a client past
 versions it never shows it, because an empty batch over a covered range is also
-how a device sees its own write. Nothing detects that. It is a liveness attack
-rather than a corruption: no note is altered, and a person notices when two
-devices disagree. Detecting it needs a hash chain over the whole log, which was
-measured and rejected because a global chain forces concurrent writers to
+how a device sees its own write. Nothing detects that. A person notices when
+two devices disagree. Detecting it needs a hash chain over the whole log, which
+was measured and rejected because a global chain forces concurrent writers to
 serialise, one round trip per collision.
+
+**And it can replay.** This used to say withholding was the whole of it, and
+that no note is altered. That is not true and the difference matters. The
+entry's authenticator covers the content, the metadata and the version this one
+was written on top of; it does not cover the uid, because the server assigns
+uids and ordering the log is the server's job. So a server can take a version a
+device really did write, hand it back under a newer uid, and the receiving
+device applies it. The note reverts to contents it genuinely had once, and the
+entry that did it verifies, because it is a real entry.
+
+What bounds it: the server cannot invent a version, alter one, or move one
+file's chunks onto another, so what it can show is some version of that note
+that a device once wrote. A note written on this device since is not reverted,
+because the incoming version is then not a continuation of what this device
+holds and the ordinary divergence rules keep both. Both are pinned in
+`core/landing-races.test.ts`.
+
+What would close it is authenticated ancestry rather than a signed uid.
+Signing the server-assigned uid does not work: the server would still choose
+which signed entry to present, and a fresh device has nothing to compare
+against. The mechanism that does is already half built. Every entry carries a
+signed `parent`, the hash of the content its writer built on, and the receiving
+device stores nothing with it. Checking that an incoming version's `parent` is
+the ancestor this device holds turns a replay into a divergence, which is a
+conflict copy rather than a silent revert. It is not implemented, and it is not
+complete when it is: a device that has just paired has no ancestor for any
+path, so it takes what it is given. Closing that needs a retained checkpoint a
+device carries across pairings, which is a protocol change and is not designed
+here.
 
 ### What a stranger on the port learns
 

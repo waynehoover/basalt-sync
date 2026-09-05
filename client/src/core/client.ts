@@ -462,7 +462,55 @@ export class Client {
     const sealed = await sealPath(this.keys, path);
     const entries = await this.serial(() => this.transport.history(sealed, opts));
     await this.recoveryIsOurs(entries);
+    this.recoveryIsAboutThisPath(entries, sealed, path, opts.before);
     return entries.map((e) => this.asVersion(e, path));
+  }
+
+  /**
+   * Refuses a history answer that is not about the note that was asked for
+   * (F10).
+   *
+   * The signature check above says this vault's key wrote every entry. It
+   * does not say they are entries of *this* note, and the answer was then
+   * relabelled with the path the caller asked for: a valid signed entry for
+   * `other.md` came back as a version of `requested.md`, and restoring it
+   * wrote one note's contents over another's name. Nothing later catches
+   * that. The chunk list matches its own entry perfectly, because it is a
+   * real entry; it is simply somebody else's.
+   *
+   * Path sealing is deterministic, so the comparison is exact: one note has
+   * one sealed name, and an entry that does not carry it is not a version of
+   * it. Ordering and the `before` bound are checked here too, because a
+   * caller paging backwards trusts both and neither was ever tested.
+   */
+  private recoveryIsAboutThisPath(
+    entries: readonly WireEntry[],
+    sealed: string,
+    path: string,
+    before: number | undefined,
+  ): void {
+    let last: number | undefined;
+    for (const e of entries) {
+      if (e.path !== sealed) {
+        throw new Error(
+          `the server answered a history request for ${path} with a version of some other ` +
+            "note, and it is not shown",
+        );
+      }
+      if (before !== undefined && e.uid >= before) {
+        throw new Error(
+          `the server answered a history request for versions of ${path} older than ${before} ` +
+            `with version ${e.uid}, and it is not shown`,
+        );
+      }
+      if (last !== undefined && e.uid >= last) {
+        throw new Error(
+          `the server answered a history request for ${path} with versions out of order ` +
+            `(${e.uid} after ${last}), and it is not shown`,
+        );
+      }
+      last = e.uid;
+    }
   }
 
   /**
@@ -611,7 +659,20 @@ export class Client {
       const found = page.find(match);
       if (found) return found;
       if (page.length < pageSize) return undefined;
-      before = page[page.length - 1]!.uid;
+      const next = page[page.length - 1]!.uid;
+      // Each page has to reach further back than the last (F10). `history`
+      // refuses a page that is out of order or ignores `before`, which leaves
+      // one shape it cannot see from inside a single answer: a server that
+      // returns a well-formed page and then the same well-formed page again,
+      // for ever. Paging is the only loop here that a server controls the
+      // number of turns of.
+      if (before !== undefined && next >= before) {
+        throw new Error(
+          `the server is not paging back through the versions of ${path}: it answered a ` +
+            `request for versions older than ${before} with a page ending at ${next}`,
+        );
+      }
+      before = next;
     }
   }
 

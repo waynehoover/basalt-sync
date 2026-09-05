@@ -233,10 +233,16 @@ The uid is not covered. The server assigns uids and ordering the log is its
 job.
 
 `parent` is a digest of the content id of the version the writer built on, or
-empty for a file it had never synced. It tells a new version from an old one
-replayed. It is per path rather than global, which keeps concurrent writers
-from serialising. The cost is that a server withholding a version is
-undetectable.
+empty for a file it had never synced. It is per path rather than global, which
+keeps concurrent writers from serialising, and the cost of that is that a
+server withholding a version is undetectable.
+
+It is what would tell a new version from an old one replayed, and no client
+checks it yet. Until one does, a server can hand back a version a device
+really wrote under a newer uid and the receiving device applies it, which
+reverts the note. The field is signed and carried so that the check can be
+added without a protocol change; docs/design.md, under what the server can do,
+says what is bounded and what a fresh device still cannot see.
 
 ## Reading a file
 

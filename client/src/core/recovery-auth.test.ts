@@ -219,6 +219,71 @@ describe("recovery against a server that answers with the right names (C-D4, C-D
     expect(vault.paths()).toEqual([]);
   });
 
+  /**
+   * F10. A signature says who wrote an entry, not which note it belongs to.
+   *
+   * `history` sealed the path on the way out, checked the answer's signatures
+   * on the way back, and then relabelled every entry with the path the caller
+   * had asked for. So a real, correctly signed version of one note came back
+   * as a version of another, and restoring it wrote one note's contents under
+   * the other's name. Nothing later catches it: the chunk list matches its
+   * entry perfectly, because it is a genuine entry, just somebody else's.
+   */
+  it("refuses a signed version of a different note", async () => {
+    const { socket, keys, client } = await rig();
+    const elsewhere = await version(keys, 11, "other.md", "another note entirely");
+    const asking = client.history("requested.md");
+    await sent(socket, "history");
+    // Even the echoed path is the one that was asked for, which is what makes
+    // this worth refusing: everything on the outside of the answer is right.
+    socket.reply({
+      res: "history",
+      path: await sealPath(keys, "requested.md"),
+      entries: [elsewhere.entry],
+    });
+    await expect(asking).rejects.toThrow(/a version of some other note/);
+  });
+
+  it("refuses a page that ignores the version it was asked to go back from", async () => {
+    const { socket, keys, client } = await rig();
+    const newer = await version(keys, 20, "note.md", "the newer one");
+    const asking = client.history("note.md", { before: 10 });
+    await sent(socket, "history");
+    socket.reply({ res: "history", path: newer.entry.path, entries: [newer.entry] });
+    await expect(asking).rejects.toThrow(/older than 10 with version 20/);
+  });
+
+  it("refuses a page whose versions are not newest first", async () => {
+    const { socket, keys, client } = await rig();
+    const older = await version(keys, 3, "note.md", "older");
+    const newer = await version(keys, 9, "note.md", "newer");
+    const asking = client.history("note.md");
+    await sent(socket, "history");
+    socket.reply({ res: "history", path: older.entry.path, entries: [older.entry, newer.entry] });
+    await expect(asking).rejects.toThrow(/out of order/);
+  });
+
+  /**
+   * The one shape a single answer cannot show: every page is well formed and
+   * the pages never advance, so `findVersion` walks backwards for ever.
+   */
+  it("gives up on a server that keeps answering with the same page", async () => {
+    const { socket, keys, client } = await rig();
+    const page = [await version(keys, 4, "note.md", "a"), await version(keys, 3, "note.md", "b")];
+    socket.autoReply = (frame, sock) => {
+      if (frame["op"] === "history") {
+        sock.reply({
+          res: "history",
+          path: page[0]!.entry.path,
+          entries: page.map((v) => v.entry),
+        });
+      }
+    };
+    await expect(client.findVersion("note.md", () => false, 2)).rejects.toThrow(
+      /not paging back through the versions|older than 3 with version 4/,
+    );
+  });
+
   it("refuses a signed history entry that declares bytes and names no chunks", async () => {
     const { socket, keys, client } = await rig();
     const facts = {
