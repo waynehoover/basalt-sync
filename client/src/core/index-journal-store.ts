@@ -294,6 +294,21 @@ export class JournalIndexStore implements IndexStore {
     }
 
     this.settle(out.state, out.seq, out.applied);
+    // After `settle`, which clears the flag, and that ordering is the whole
+    // of it (F09).
+    //
+    // Appending after a record replay stops at buries every save made from
+    // here on: the tail is written, `save` returns, and the next load stops at
+    // the same bad record and reports the same older state. The vault goes on
+    // working perfectly and forgetting everything, for ever, with no error on
+    // any pass. Reproduced as save 1, save 2, damage, load at 2, save 3, load
+    // at 2 again.
+    //
+    // A snapshot is complete on its own, so it cannot be a delta over a prefix
+    // nobody can read, and truncating the log is what retires the damage. The
+    // two fall-backs above set the same flag for the same reason, and set it
+    // after their own `settle` calls for this same reason.
+    if (out.stopped.why !== "end") this.mustSnapshot = true;
     return out.state;
   }
 

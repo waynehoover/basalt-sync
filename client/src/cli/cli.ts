@@ -609,7 +609,7 @@ async function pairWithInvite(invite: Invite, args: Args, io: Console): Promise<
  */
 async function cmdInvite(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io, { waitForBacklog: false });
+  const client = await open(config, args, io, { waitForBacklog: false, inspect: true });
   let issued: { invite: string; expiresAt: number };
   try {
     issued = await client.invite(args.ttlMs);
@@ -845,7 +845,7 @@ async function openRevoker(
     };
   }
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io, { waitForBacklog: false });
+  const client = await open(config, args, io, { waitForBacklog: false, inspect: true });
   return {
     revoke: (id, opts) => client.revoke(id, opts),
     uninvite: (invite) => client.uninvite(invite),
@@ -883,7 +883,7 @@ async function openDeviceList(
     }
   }
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io, { waitForBacklog: false });
+  const client = await open(config, args, io, { waitForBacklog: false, inspect: true });
   try {
     return {
       ...(await client.devices()),
@@ -1275,7 +1275,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // The handshake and nothing after it. What is printed below is the
     // server's own cursor out of `ready`, and waiting for the backlog first
     // meant a device weeks behind unsealed all of it before saying a word.
-    const client = await open(config, args, io, { waitForBacklog: false });
+    const client = await open(config, args, io, { waitForBacklog: false, inspect: true });
     // Signed, not clamped. Clamping at zero made a server behind its own
     // clients, which is a restored backup or the wrong vault, read exactly
     // like being up to date.
@@ -1356,7 +1356,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
  */
 async function cmdDeleted(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io);
+  const client = await open(config, args, io, { inspect: true });
   try {
     // Only a limit somebody typed. The default of 20 is history's, and
     // passing it here silently cut the deleted list to twenty while the
@@ -1412,7 +1412,7 @@ async function cmdHistory(args: Args, io: Console): Promise<number> {
   const path = args.rest[0];
   if (!path) throw new Error("history needs the path of a note");
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io);
+  const client = await open(config, args, io, { inspect: true });
   try {
     // Capped here rather than left to the server, which answers a limit over
     // its maximum with its *default* page of a hundred and no indication.
@@ -1581,9 +1581,12 @@ async function open(
   config: Config,
   args: Args,
   io?: Console,
-  opts: ConnectHow = {},
+  opts: ConnectHow & { inspect?: boolean } = {},
 ): Promise<Client> {
-  const client = new Client(await clientOptions(config, args, io));
+  const client = new Client({
+    ...(await clientOptions(config, args, io)),
+    ...(opts.inspect === true ? { inspect: true } : {}),
+  });
   try {
     await client.connect(opts);
   } catch (err) {

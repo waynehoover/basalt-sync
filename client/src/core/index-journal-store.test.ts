@@ -208,6 +208,39 @@ describe("a log that cannot be trusted", () => {
     expect(said.join(" "), "a discarded record was not reported").toMatch(/journal stops/);
   });
 
+  /**
+   * F09. Everything saved after damaged tail was found has to be readable.
+   *
+   * Replay stopping early was reported and then forgotten: the next save
+   * appended after the record replay stops at, so it was written, `save`
+   * returned, and the next load stopped at the same bad record and reported
+   * the same older state. The vault went on working perfectly and forgetting
+   * everything, for ever, with no error on any pass. This is the review's own
+   * sequence: save 1, save 2, damage, load at 2, save 3, load at 2.
+   */
+  it("makes the first save after the damage readable, and the next one too", async () => {
+    const files = new FakeFiles();
+    const store = new JournalIndexStore(files);
+    await store.load();
+    await store.save(state({ cursor: 1 }));
+    await store.save(state({ cursor: 2 }));
+    files.log = (files.log ?? "") + '2 deadbeef {"cursor":99}\n';
+
+    const reopened = new JournalIndexStore(files, { log: () => undefined });
+    expect((await reopened.load())!.cursor).toBe(2);
+    await reopened.save(state({ cursor: 3 }));
+    expect(
+      (await new JournalIndexStore(files).load())!.cursor,
+      "a save made after a damaged tail was not readable afterwards",
+    ).toBe(3);
+
+    // And the one after it, so the repair is not a single lucky snapshot.
+    const third = new JournalIndexStore(files);
+    await third.load();
+    await third.save(state({ cursor: 4 }));
+    expect((await new JournalIndexStore(files).load())!.cursor).toBe(4);
+  });
+
   it("falls back to the snapshot when the whole log is rubbish", async () => {
     const files = new FakeFiles();
     const store = new JournalIndexStore(files);

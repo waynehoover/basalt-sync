@@ -86,7 +86,7 @@ A probe held the destination's server and data locks; backup nevertheless succee
 
 ### F08 — Keep inspection and device administration from starting sync writes
 
-- [ ] Add an explicit connection mode that receives/query-validates server state without scheduling filesystem synchronization; use it for CLI inspection and administration.
+- [x] Add an explicit connection mode that receives/query-validates server state without scheduling filesystem synchronization; use it for CLI inspection and administration.
 
 **Evidence — reproduced at the shared Client boundary.** [CLI dispatch](client/src/cli/cli.ts#L159) omits the vault lock for `history`, `deleted`, device-list/administration operations, and `status`. These paths can construct the normal [Client](client/src/core/client.ts#L123), whose batch handler schedules [soon → sync](client/src/core/client.ts#L380). `waitForBacklog: false` changes waiting, not this behavior.
 
@@ -96,7 +96,7 @@ A client that only connected received a batch, downloaded a note, and saved its 
 
 ### F09 — Repair a damaged journal tail before appending new state
 
-- [ ] Force a safe snapshot/replacement, or truncate to the verified prefix, after partial journal replay.
+- [x] Force a safe snapshot/replacement, or truncate to the verified prefix, after partial journal replay.
 
 **Evidence — reproduced.** [JournalIndexStore.load](client/src/core/index-journal-store.ts#L274) logs a stopped replay, then calls `settle` without retaining `mustSnapshot`. [save](client/src/core/index-journal-store.ts#L300) can append after the bad record. Every subsequent restart stops at that same record, hiding later acknowledged saves.
 

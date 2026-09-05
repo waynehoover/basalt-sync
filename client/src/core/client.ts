@@ -97,6 +97,23 @@ export interface ClientOptions {
    */
   readonly onPass?: (report: SyncReport) => void;
   /** Injectable for tests, and for a platform whose WebSocket is not global. */
+  /**
+   * Connect to read, and never to write (F08).
+   *
+   * `history`, `deleted`, `devices` and `status` ask the server a question and
+   * print the answer. They construct this client, and this client used to
+   * schedule a sync the moment a batch arrived, so a command that was only
+   * meant to look downloaded notes and saved an index behind whatever else was
+   * running: those commands do not take the vault lock, precisely because
+   * looking is not writing, and that stopped being true here.
+   *
+   * With this set nothing schedules a pass and `sync` refuses, so the only way
+   * to write is for a caller to have said so with a command that locks the
+   * vault. Batches are still accepted, because the answers to those questions
+   * come off the same connection and a client that ignored them would report a
+   * stale cursor.
+   */
+  readonly inspect?: boolean;
   readonly socketFactory?: (url: string) => SocketLike;
 }
 
@@ -135,7 +152,12 @@ export class Client {
         //
         // An empty batch is this device's own write coming back, and
         // there is nothing to fetch for it.
-        if (batch.entries.length > 0) this.soon();
+        //
+        // Not at all when this client is only here to look (F08). Nothing
+        // below the engine distinguishes a pass somebody asked for from one an
+        // arrival scheduled, so an inspection command that happened to be
+        // connected while a note arrived wrote it to disk.
+        if (batch.entries.length > 0 && opts.inspect !== true) this.soon();
       },
       onCaughtUp: () => {
         this.caughtUp = true;
@@ -394,6 +416,15 @@ export class Client {
    * handler and there is nothing useful for it to do with an exception.
    */
   async sync(opts: SyncOptions = {}): Promise<SyncReport | undefined> {
+    // Refused rather than ignored. A caller that asks an inspection client to
+    // sync has made a mistake about which client it is holding, and doing
+    // nothing quietly would leave it reporting an empty pass as a real one.
+    if (this.opts.inspect === true) {
+      throw new Error(
+        "this client is connected to read, not to sync: an inspection command cannot write to " +
+          "the vault, because it does not hold the lock that makes writing safe",
+      );
+    }
     try {
       return await this.pass(opts);
     } catch (err) {

@@ -180,3 +180,68 @@ describe("a note edited while an incoming deletion is in flight (F01)", () => {
     ).toBe("still writing this");
   });
 });
+
+/**
+ * A client that connected to look wrote to the vault anyway (F08).
+ *
+ * `history`, `deleted`, `devices`, `invite` and `status` do not take the
+ * vault's lock, and that is deliberate: looking is not writing, and holding
+ * the lock would make `status` refuse exactly while a watcher is running,
+ * which is when somebody asks. But the client they built scheduled a sync
+ * the moment a batch arrived, so an inspection command that stayed connected
+ * long enough downloaded notes and saved an index with no lock held and
+ * nobody having asked it to.
+ */
+describe("a client connected only to look (F08)", () => {
+  it("takes a batch and neither downloads it nor saves an index", async () => {
+    const { Client } = await import("./client.ts");
+    const { MemoryIndexStore } = await import("./vault.ts");
+    const { TEST_DATA_KEY, testKeys } = await import("./test-keys.ts");
+    const { FakeSocket, ready, RIG_SECRET } = await import("./fake-socket.ts");
+
+    const socket = new FakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    const keys = await testKeys(RIG_SECRET);
+    const looking = new MemoryVault();
+    const store = new MemoryIndexStore();
+    const client = new Client({
+      vault: looking,
+      store,
+      dataKey: TEST_DATA_KEY,
+      url: "ws://test",
+      deviceId: "inspector",
+      token: "t",
+      vaultId: "v",
+      device: "d",
+      inspect: true,
+      socketFactory: () => socket,
+    });
+
+    const connecting = client.connect({ waitForBacklog: false });
+    socket.open();
+    await settle();
+    socket.reply(ready({ cursor: 0 }));
+    await connecting;
+
+    // A note arrives while this command is still printing its answer, which
+    // is all it takes: catch-up delivers batches to whoever is connected.
+    servingWith(socket, bodies);
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "arrived.md", "not asked for", bodies)],
+    });
+    // Well past the arrival delay a syncing client would have fired on.
+    await new Promise((r) => setTimeout(r, 400));
+
+    expect(looking.paths(), "a command that only looks downloaded a note into the vault").toEqual(
+      [],
+    );
+    expect(await store.load(), "a command that only looks saved an index").toBeUndefined();
+
+    // And asking it to sync is a mistake it names rather than performs.
+    await expect(client.sync()).rejects.toThrow(/connected to read, not to sync/);
+    await client.close();
+  });
+});
