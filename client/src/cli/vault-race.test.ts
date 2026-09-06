@@ -481,3 +481,53 @@ describe("creating a file across a mount boundary", () => {
     expect(await readFile(join(root, "restored.md"), "utf8")).toBe("brought back");
   });
 });
+
+/**
+ * A scan's concurrency is bounded however deep the vault goes (I06).
+ *
+ * A stat per file was `Promise.all` per directory and the recursion was
+ * another, so in-flight work multiplied with depth rather than adding up: a
+ * wide deep tree meant thousands of concurrent operations, and on a network
+ * filesystem or under a low descriptor limit that is an EMFILE with nothing
+ * useful attached to it.
+ *
+ * The gate is on the stats and not on the recursion. Stats are leaves, so a
+ * slot is held for one syscall; a directory holding a slot while its children
+ * waited for one would deadlock as soon as the tree was deeper than the limit.
+ */
+describe("how much a scan does at once", () => {
+  it("keeps outstanding stats under a ceiling, and still finds everything", async () => {
+    // Wide and deep, which is the shape that punished the old code.
+    let expected = 0;
+    for (let a = 0; a < 6; a++) {
+      for (let b = 0; b < 6; b++) {
+        await mkdir(join(root, `d${a}`, `e${b}`), { recursive: true });
+        for (let f = 0; f < 8; f++) {
+          await writeFile(join(root, `d${a}`, `e${b}`, `n${f}.md`), "x");
+          expected++;
+        }
+      }
+    }
+
+    let inFlight = 0;
+    let peak = 0;
+    const real = vi.mocked(stat).getMockImplementation()!;
+    vi.mocked(stat).mockImplementation(async (...args: Parameters<typeof stat>) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      try {
+        return await real(...args);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    const listed = await new NodeVault(root).list();
+    expect(listed.filter((f) => !f.folder)).toHaveLength(expected);
+    // The ceiling is 64 inside the vault. Asserted with room, because the
+    // number is an implementation choice and the property is that there is
+    // one at all: unbounded on this tree is 288 stats at once.
+    expect(peak, `a scan had ${peak} stats outstanding at once`).toBeLessThanOrEqual(80);
+    expect(peak, "the gate serialised the scan, which is the other failure").toBeGreaterThan(1);
+  });
+});

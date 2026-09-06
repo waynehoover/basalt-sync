@@ -609,6 +609,9 @@ export class NodeVault implements Vault {
     this.diskName.clear();
     this.spellingsKnown.clear();
     this.ambiguousPaths = [];
+    // One gate for the whole scan, not one per directory, which is what makes
+    // the bound hold however deep the tree goes (I06).
+    const gate = limiter(SCAN_CONCURRENCY);
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
       let items;
       try {
@@ -709,13 +712,31 @@ export class NodeVault implements Vault {
       // `disk` rather than `item.name` from here on: the entry may have just
       // been renamed into its normal form, and statting the name it no longer
       // has would report a note that is right there as gone.
+      // Every stat in the whole scan passes through one gate (I06).
+      //
+      // This was `Promise.all` per directory, and the recursion was another,
+      // so in-flight work multiplied with depth rather than adding up: a wide
+      // deep tree meant thousands of concurrent operations, and on a network
+      // filesystem or under a low descriptor limit that is an EMFILE with
+      // nothing useful attached to it.
+      //
+      // The gate is on the stats and not on the recursion, and that is the
+      // whole design. Stats are leaves, so a slot is held for one syscall and
+      // released; a directory that held a slot while its children waited for
+      // one would deadlock the moment the tree was deeper than the limit.
+      // Bounding the recursion instead, by walking subdirectories one at a
+      // time, was measured and cost nearly three times the wall clock on 2,880
+      // files: correct, and not worth it when the descriptors were never the
+      // recursion's to exhaust.
       const stats = await Promise.all(
         kept.map(({ item, disk }) =>
           item.isFile()
-            ? stat(join(dir, disk)).catch((err: NodeJS.ErrnoException) => {
-                if (err.code === "ENOENT") return undefined;
-                throw err;
-              })
+            ? gate(() =>
+                stat(join(dir, disk)).catch((err: NodeJS.ErrnoException) => {
+                  if (err.code === "ENOENT") return undefined;
+                  throw err;
+                }),
+              )
             : undefined,
         ),
       );
@@ -1658,6 +1679,43 @@ export async function writeAll(
     }
     at += bytesWritten;
   }
+}
+
+/**
+ * How many file stats a scan may have outstanding at once (I06).
+ *
+ * High enough that an ordinary vault on a local disk sees no difference, since
+ * the cost of a scan there is the syscalls rather than the waiting. Low enough
+ * that a network filesystem, or a shell with a small descriptor limit, does
+ * not meet a wall of concurrent work with no useful error on it. Internal,
+ * because a number nobody has needed to change is not a setting.
+ */
+const SCAN_CONCURRENCY = 64;
+
+/**
+ * A counting gate: at most `limit` calls are inside `fn` at once.
+ *
+ * Waiters are a queue rather than a poll, so nothing spins and the order they
+ * were asked in is the order they run in. A rejection releases the slot the
+ * same as a return does, which matters because the caller here lets the first
+ * failure end the scan and the rest of the workers have to be able to finish.
+ */
+function limiter(limit: number): <R>(fn: () => Promise<R>) => Promise<R> {
+  let running = 0;
+  const waiting: (() => void)[] = [];
+  const release = (): void => {
+    running--;
+    waiting.shift()?.();
+  };
+  return async <R>(fn: () => Promise<R>): Promise<R> => {
+    if (running >= limit) await new Promise<void>((go) => waiting.push(go));
+    running++;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
 }
 
 /** Makes a directory's own entries durable. */
