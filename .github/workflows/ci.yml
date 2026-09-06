@@ -105,6 +105,12 @@ jobs:
       - name: the image release promotes in order
         run: scripts/release-order.test.sh
 
+      # And that the workflow which publishes a release can be started at all.
+      # A draft fires no release event, so one listening for `created` sat
+      # there with nothing running, on the documented flow.
+      - name: the attestation can be started
+        run: scripts/attest-trigger.test.sh
+
       # And that no workflow reaches for a mutable tag, here included. A tag is
       # a name somebody else can repoint, and these files are what builds,
       # signs and publishes the project.

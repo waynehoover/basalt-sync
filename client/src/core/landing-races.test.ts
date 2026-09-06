@@ -541,6 +541,135 @@ describe("an edit a stat cannot tell apart", () => {
     ).toContain(after);
   });
 
+  /**
+   * The same edit, under the landing that never goes to the network (R19).
+   *
+   * Chunk names are hashes of ciphertext, so a version whose content this
+   * device already holds somewhere else is written from that copy rather than
+   * fetched. That is the path a move takes, and it writes over the
+   * destination exactly as a download does.
+   *
+   * The first fix routed it through the preserving write and then reported
+   * "could not use the local copy", so the pass fetched the same bytes and
+   * wrote them again, over the version it had just landed: two conflict
+   * copies, the second one holding the server's own text, from one edit.
+   */
+  it("keeps the edit when the version is rebuilt from a copy this device has", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    const shared = "the version both notes end up holding\n";
+    const before = "the original line\n";
+    const after = "the ORIGINAL line\n";
+    expect(after.length, "the two versions must be the same length or this proves nothing").toBe(
+      before.length,
+    );
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 2,
+      entries: [
+        await entryFor(keys, 1, "held.md", shared, bodies),
+        await entryFor(keys, 2, "note.md", before, bodies),
+      ],
+    });
+    await accepted(engine, 2);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("note.md")).toBe(before);
+    const stamped = await vault.stat("note.md");
+
+    // The gap this is about is between the baseline digest, taken as the
+    // version is queued, and the write at the end of the batch. There is no
+    // fetch for the reused path, so the batch is given a second note that does
+    // need one: that fetch is the pause, and the editor types during it.
+    servingWith(socket, bodies, async () => {
+      await vault.write("note.md", enc.encode(after), {
+        mtime: stamped!.mtime,
+        ctime: stamped!.ctime,
+      });
+    });
+
+    // And now the server says `note.md` holds what `held.md` already does,
+    // which is the content this device can rebuild without a fetch.
+    socket.raw({
+      op: "batch",
+      from: 3,
+      to: 4,
+      entries: [
+        await entryFor(keys, 3, "note.md", shared, bodies, { mtime: 9000 }),
+        await entryFor(keys, 4, "fetched.md", "something only the server has\n", bodies, {
+          mtime: 9000,
+        }),
+      ],
+    });
+    await accepted(engine, 2);
+    await engine.sync({ coalesceWrites: false });
+
+    const held = vault.paths().map((p) => [p, vault.text(p)] as const);
+    expect(
+      held.map(([, t]) => t).filter((t) => t === after),
+      `the local edit should be kept exactly once. The vault holds: ${JSON.stringify(vault.paths())}`,
+    ).toHaveLength(1);
+    // And exactly the two notes that should hold the shared version: the one
+    // it came from and the one it landed at. A third is the pass writing it
+    // twice and calling the second one a conflict.
+    expect(
+      held.filter(([, t]) => t === shared).map(([p]) => p),
+      "the server's own version was kept as a conflict copy of itself",
+    ).toEqual(["held.md", "note.md"]);
+  });
+
+  /**
+   * And the other outcome of the same instant: the write itself loses.
+   *
+   * The adapters reserve the destination with an exclusive create, so a file
+   * that appears in the moment the name is free keeps it, and the incoming
+   * version has nowhere to go. Dropping it would be a version the server holds
+   * and this device silently does not, with the index recording it as landed.
+   */
+  it("keeps the incoming version beside the note when the name is taken", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "note.md", "the original line\n", bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    // Somebody takes the name in the instant it is free, which the real
+    // adapters find out about from an exclusive create and this one is told.
+    servingWith(socket, bodies, () => {
+      vault.nameTakenOnce = enc.encode("a note somebody made under that name\n");
+    });
+    socket.raw({
+      op: "batch",
+      from: 2,
+      to: 2,
+      entries: [
+        await entryFor(keys, 2, "note.md", "the server's own version\n", bodies, { mtime: 9000 }),
+      ],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const texts = vault.paths().map((p) => vault.text(p));
+    expect(
+      texts,
+      `the incoming version was dropped. The vault holds: ${JSON.stringify(vault.paths())}`,
+    ).toContain("the server's own version\n");
+    // And the file that took the name is still the file at the name.
+    expect(vault.text("note.md")).toBe("a note somebody made under that name\n");
+    // As is the version that was there before it.
+    expect(texts).toContain("the original line\n");
+  });
+
   it("survives a deletion that lands on it, same length and same timestamp", async () => {
     const { engine, socket, vault, keys } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();

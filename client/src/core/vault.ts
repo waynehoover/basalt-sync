@@ -491,6 +491,19 @@ export class MemoryVault implements Vault {
   midReplace: ((path: string) => Promise<void> | void) | undefined;
 
   /**
+   * The bytes somebody else puts at the path in the instant it is free, once.
+   *
+   * The real adapters reserve the destination with an exclusive create and
+   * lose it when a file appears there first, which leaves the incoming version
+   * with nowhere to go. That is a whole branch in the engine, and in memory
+   * there is no way to reach it: a map assignment cannot fail. So it is asked
+   * for, and asked for with the interloper's content, because "the write did
+   * not land" and "the path is empty" are not the same vault and only the
+   * first one is what an adapter reports.
+   */
+  nameTakenOnce: Uint8Array | undefined;
+
+  /**
    * Writes over a file, keeping what was there when it is not what the caller
    * expected (R01).
    *
@@ -518,16 +531,19 @@ export class MemoryVault implements Vault {
     // there: the caller is told where, not handed a buffer (R18).
     this.files.set(keepAt, was);
     this.files.delete(path);
-    await this.write(path, bytes, times);
+    const taken = this.nameTakenOnce;
+    this.nameTakenOnce = undefined;
+    await this.write(path, taken ?? bytes, times);
+    const landed = taken === undefined;
     const id = await expect.idOf(was.bytes);
-    if (id === expect.contentId) {
+    if (id === expect.contentId && landed) {
       // A duplicate of what the server already has.
       this.files.delete(keepAt);
       this.notify(keepAt);
-      return { landed: true };
+      return { landed };
     }
     this.notify(keepAt);
-    return { keptAt: keepAt, landed: true };
+    return { keptAt: keepAt, landed };
   }
 
   /** The deletion half, and the same reasoning. */
@@ -549,7 +565,14 @@ export class MemoryVault implements Vault {
     return { keptAt: keepAt, landed: true };
   }
 
-  /** Hashes without holding the file, which in memory is the same thing. */
+  /**
+   * Hashes without holding the file, which in memory is the same thing.
+   *
+   * The import is deferred because this module has no others: it is the
+   * interface every vault implements, and the plugin, the CLI and the engine
+   * all reach it. Pulling `crypto.ts` in at the top would put the whole cipher
+   * suite into any bundle that only wanted the type.
+   */
   contentDigest = async (path: string): Promise<string | undefined> => {
     const f = this.files.get(path);
     if (f === undefined) return undefined;

@@ -25,17 +25,19 @@ import {
   readdir,
   rename,
   rm,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { NodeVault, midRespell, retireName } from "./vault.ts";
+import { NodeVault, STALE_TEMP_MS, midRespell, retireName } from "./vault.ts";
 
 const dirs: string[] = [];
 afterEach(async () => {
   midRespell.pause = async () => {};
+  midRespell.beforeGivingBack = async () => {};
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -115,6 +117,63 @@ describe("taking away a name whose file has a second one", () => {
       (await readdir(staging).catch(() => [])).length,
       "the retired name was left behind in staging",
     ).toBe(0);
+  });
+
+  /**
+   * Two saves and one name, which is where the first R21 fix stopped short.
+   *
+   * The file that came out of the rename is not ours and cannot go back,
+   * because a third version now holds the name. It used to be left in staging
+   * and called done. Staging is what the scan's reaper empties, it empties by
+   * age, and a rename carries the file's own timestamp: the preserved version
+   * was older than the cutoff the moment it landed. So a note somebody typed
+   * was deleted an hour later as write debris, and nothing said so.
+   */
+  it("puts a version it cannot give back beside the note, where no sweep takes it", async () => {
+    const dir = await vault();
+    const from = join(dir, "old-name.md");
+    const to = join(dir, "new-name.md");
+    const staging = join(dir, ".basalt", "tmp");
+    await writeFile(from, "the synced contents\n");
+    const source = await lstat(from);
+    await hardLink(from, to);
+
+    // One editor saves over the name before the scan moves it aside...
+    midRespell.pause = async (at) => {
+      midRespell.pause = async () => {};
+      await writeFile(`${at}.editor`, "the unsent edit\n");
+      await rename(`${at}.editor`, at);
+    };
+    // ...and another takes the name in the instant it is free, so the first
+    // one cannot be put back. This is the window, and the hook sits in it.
+    midRespell.beforeGivingBack = async (at) => {
+      midRespell.beforeGivingBack = async () => {};
+      await writeFile(`${at}.second`, "and a second unsent edit\n");
+      await rename(`${at}.second`, at);
+    };
+
+    await retireName(staging, from, { dev: source.dev, ino: source.ino });
+
+    // Beside the note, under a name somebody will see.
+    const beside = (await readdir(dir)).filter((n) => !n.startsWith("."));
+    expect(
+      beside.find((n) => n.includes("(kept")),
+      `nothing was kept beside the note. Found: ${JSON.stringify(beside)}`,
+    ).toBeDefined();
+
+    // And an ordinary scan, an hour later, leaves it alone. Staging would not
+    // have: the reaper deletes by age and the file arrived older than the
+    // cutoff.
+    const kept = join(
+      dir,
+      beside.find((n) => n.includes("(kept"))!,
+    );
+    const long = (Date.now() - STALE_TEMP_MS - 60_000) / 1000;
+    await utimes(kept, long, long);
+    await new NodeVault(dir).list();
+    expect(await readFile(kept, "utf8"), "a preserved version was swept away as write debris").toBe(
+      "the unsent edit\n",
+    );
   });
 
   it("does nothing when the old name has already gone", async () => {

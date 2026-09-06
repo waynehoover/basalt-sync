@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -179,25 +178,12 @@ func (s *Store) CheckHealth(ctx context.Context) (h Health) {
 	// That is the same mistake the database side made with `SELECT 1`, one
 	// directory over, and the field is still called CanPersist.
 	//
-	// A file created and removed, which is what an upload does and costs one
-	// inode for the length of this call. Named so that anything that survives
-	// a crash here is obviously this and obviously disposable, and it lives at
-	// the chunk root rather than in a vault's shard so it can never be mistaken
-	// for a body.
-	probe := filepath.Join(dir, ".basalt-health-probe")
-	f, openErr := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if openErr != nil {
-		h.CanPersist = false
-		h.Why = HealthUnwritable
-		return h
-	}
-	chunkWriteErr := func() error {
-		defer func() { _ = f.Close() }()
-		_, failed := f.Write([]byte("ok"))
-		return failed
-	}()
-	_ = os.Remove(probe)
-	if chunkWriteErr != nil {
+	// Asked of the chunk store, which owns the name the probe takes: it goes
+	// under the prefix a half-written body carries, so every walk over the
+	// tree already skips it. A name of its own would have been counted as a
+	// body by `CountBodies` for as long as it existed, and a backup comparing
+	// its count with the source's would report that file as a discrepancy.
+	if err := s.chunks.CheckWritable(); err != nil {
 		h.CanPersist = false
 		h.Why = HealthUnwritable
 	}

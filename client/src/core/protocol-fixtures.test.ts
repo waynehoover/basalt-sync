@@ -18,11 +18,13 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { checkEntryShape } from "./engine.ts";
+import { LOCAL_MAX_BATCH_BYTES, LOCAL_MAX_FETCH_BYTES } from "./transport.ts";
 import type { WireEntry } from "./transport.ts";
 
 interface Fixture {
   goodMac: string;
   goodChunk: string;
+  ceilings: { maxBatchBytes: number; maxFetchBytes: number };
   cases: { name: string; valid: boolean; why?: string; entry: Record<string, unknown> }[];
 }
 
@@ -61,4 +63,20 @@ describe("the entry shape both languages enforce", () => {
       }
     });
   }
+});
+
+/**
+ * The other thing both languages write down separately (R26).
+ *
+ * The client caps what a handshake may raise its own memory limits to, and it
+ * needs those numbers before the handshake has told it anything, so it cannot
+ * read them off the wire. Two copies of a constant drift, and this pair drifts
+ * into a client that ends the connection over a batch the server was entitled
+ * to send: an outage that neither side reports as a version mismatch.
+ */
+describe("the ceilings both languages hard-code", () => {
+  it("match the fixtures the server also reads", () => {
+    expect(fixtures.ceilings.maxBatchBytes).toBe(LOCAL_MAX_BATCH_BYTES);
+    expect(fixtures.ceilings.maxFetchBytes).toBe(LOCAL_MAX_FETCH_BYTES);
+  });
 });

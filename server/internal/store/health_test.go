@@ -2,10 +2,11 @@ package store
 
 import (
 	"context"
-	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 )
 
 /*

@@ -158,7 +158,18 @@ export interface NodeVaultOptions {
  * meant to be a read-only scan. Too short to hit by racing, so a test stops
  * the world in it. It does nothing in every build.
  */
-export const midRespell = { pause: async (_path: string): Promise<void> => {} };
+export const midRespell = {
+  pause: async (_path: string): Promise<void> => {},
+  /**
+   * The instant after the old name has been moved aside and before what came
+   * out is put back under it (R21).
+   *
+   * The other window, and the one the first fix missed: the name is free here,
+   * and a save that takes it leaves this scan holding a version with nowhere
+   * to return it to.
+   */
+  beforeGivingBack: async (_path: string): Promise<void> => {},
+};
 
 /**
  * The instant between a trash copy being made durable and the original being
@@ -182,6 +193,14 @@ export const midTrash = {
    * place it can prove anything.
    */
   afterCompare: async (_path: string): Promise<void> => {},
+  /**
+   * The instant a note being removed is parked under a temporary name, before
+   * anything has been decided about it (R22).
+   *
+   * Where a crash leaves the vault, which is why the name it is parked under
+   * matters: a visible one is a note, and this pass would upload it.
+   */
+  parked: async (_path: string): Promise<void> => {},
 };
 
 /**
@@ -197,9 +216,8 @@ export const midTrash = {
  * out whole, and only then is it identified. Our own inode is a second name
  * for a file that is safely at its new one, so it is dropped. Anything else is
  * a save that landed in the instant between the link and here, and it goes
- * back; if the name has been taken again in the meantime the file stays in
- * staging, which `list` reports and reaps only when it is old, so it is
- * recoverable rather than gone.
+ * back; if the name has been taken again in the meantime it goes beside the
+ * note instead, because staging is swept and a note is not debris (R21).
  *
  * Module-level so it can be driven directly. Through `list` it is reachable
  * only on a filesystem that keeps two Unicode spellings apart, which macOS
@@ -227,6 +245,7 @@ export async function retireName(
     return;
   }
   // Not ours. Put it back under the name it was saved at.
+  await midRespell.beforeGivingBack(from);
   try {
     await link(spare, from);
     await rm(spare, { force: true });
@@ -247,13 +266,21 @@ export async function retireName(
   try {
     await link(spare, kept);
   } catch {
-    // Nothing left to try that does not risk the file. Leaving it in staging
-    // is worse than saying so, so this throws and the caller reports it: the
-    // bytes are still at `spare` and the message names it.
-    throw new Error(
-      `two versions of ${from} were saved at once and neither could be put beside the other; ` +
-        `the one this scan moved is at ${spare}`,
-    );
+    // `link` cannot cross a filesystem, and staging is `<root>/.basalt/tmp`,
+    // which is a separate mount on any vault assembled out of several. The
+    // copy is verified and refuses an occupied name, so it keeps both halves
+    // of what `link` was chosen for.
+    await copyVerifiedThenRemove(spare, kept).catch(async (err: unknown) => {
+      // Out of options that do not risk the file, so the file wins. It is
+      // renamed to something the reaper will not take, because `respell.` is
+      // a name this code gives its own debris and the sweep believes it.
+      const held = join(staging, `preserved.${randomBytes(8).toString("hex")}`);
+      await rename(spare, held).catch(() => undefined);
+      throw new Error(
+        `two versions of ${from} were saved at once and the one this scan moved could not be ` +
+          `put beside the other (${(err as Error).message}); it is at ${held}`,
+      );
+    });
   }
   await rm(spare, { force: true });
 }
@@ -773,8 +800,8 @@ export class NodeVault implements Vault {
    * second name for a file that is safely at its new one, so it is dropped.
    * Anything else is a save that landed in the instant between the link and
    * here, and it is put back; if the name has been taken again in the
-   * meantime the file stays in staging rather than being thrown away, and the
-   * next scan finds it there.
+   * meantime it goes beside the note under a name a person will see, because
+   * staging is swept by age and a note somebody typed is not debris (R21).
    */
   private async retireOldSpelling(
     from: string,
@@ -1250,7 +1277,6 @@ export class NodeVault implements Vault {
     const kept = await this.absolute(keepAt);
     await this.insideForReal(kept);
     const staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
-    let stagedGone = false;
     try {
       // Durable before anything is moved: a crash after the rename below must
       // not leave the path empty and the new content only in memory.
@@ -1306,12 +1332,12 @@ export class NodeVault implements Vault {
       this.unflushed.add(dirname(kept));
       return { keptAt: keepAt, landed };
     } finally {
-      // Only the staged copy, and only ever the staged copy. The preserved
+      // Only the staged copy, and only ever the staged copy. `link` leaves it
+      // behind by design, so there is always one to remove. The preserved
       // version is a note now and is not this function's to remove; deleting
       // recovery data in a `finally` is how a failure anywhere above used to
       // take the original with it (R18).
-      if (!stagedGone) await rm(staged, { force: true });
-      stagedGone = true;
+      await rm(staged, { force: true });
     }
   }
 
@@ -1328,9 +1354,12 @@ export class NodeVault implements Vault {
   async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
-    if ((await this.contentDigest(path)) === undefined) {
-      // Nothing readable there. Two devices deleting one file produces this
-      // routinely; `remove` says the same by doing nothing.
+    if ((await lstat(full).catch(() => undefined)) === undefined) {
+      // Nothing there. Two devices deleting one file produces this routinely;
+      // `remove` says the same by doing nothing. Asked with `lstat` and not by
+      // hashing: hashing to find out whether a file exists reads a 256 MiB
+      // attachment to learn what one syscall knows, and calls a file that
+      // cannot be read a file that is gone.
       await this.remove(path);
       return { landed: true };
     }
@@ -1342,26 +1371,37 @@ export class NodeVault implements Vault {
     // the two deleted a version nothing had ever seen. A rename takes the
     // exact bytes that were there, atomically, and then they can be looked at
     // at leisure.
-    const kept = await this.absolute(keepAt);
-    await this.insideForReal(kept);
-    await mkdir(dirname(kept), { recursive: true });
+    //
+    // Under a temporary name beside it rather than at `keepAt`, because most
+    // of the time this is an ordinary deletion and the file is going to the
+    // trash. Parked at the conflict-copy path it reached the trash *called* a
+    // conflict copy, which is a name nobody searches for and a claim that
+    // something was in conflict when nothing was.
+    const aside = `${full}.${TEMP_MARK}${randomBytes(4).toString("hex")}`;
     try {
-      await rename(full, kept);
+      await rename(full, aside);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      return { landed: true }; // gone between the read and here
+      return { landed: true }; // gone between the lstat and here
     }
     this.unflushed.add(dirname(full));
+    await midTrash.parked(aside);
 
-    const digest = await this.contentDigest(keepAt);
+    const digest = await digestOf(aside).catch(() => undefined);
     if (digest !== undefined && digest === expect.contentId) {
       // The version the pass decided to delete. It goes where a deletion goes,
-      // which is the trash, so it is recoverable exactly as before.
-      await this.remove(keepAt);
+      // which is the trash, under the name it had.
+      await this.intoTrash(path, aside);
       return { landed: true };
     }
-    // Something else. It stays, under a name a person will find.
-    this.dirty(kept, await this.deepestExisting(kept));
+    // Something else, so it is not deleted at all. It comes back out under a
+    // name a person will find, and the engine says so.
+    const kept = await this.absolute(keepAt);
+    await this.insideForReal(kept);
+    const had = await this.deepestExisting(kept);
+    await mkdir(dirname(kept), { recursive: true });
+    await rename(aside, kept);
+    this.dirty(kept, had);
     this.unflushed.add(dirname(kept));
     return { keptAt: keepAt, landed: true };
   }
@@ -1374,23 +1414,8 @@ export class NodeVault implements Vault {
    * the copy. Here the hash consumes each block and keeps none of them, so a
    * 256 MiB attachment costs one pass and a few kilobytes.
    */
-  contentDigest = async (path: string): Promise<string | undefined> => {
-    try {
-      const full = await this.absolute(path);
-      const handle = await open(full, "r");
-      const hash = createHash("sha256");
-      try {
-        for await (const block of handle.createReadStream({ autoClose: false })) {
-          hash.update(block as Buffer);
-        }
-      } finally {
-        await handle.close();
-      }
-      return hash.digest("hex");
-    } catch {
-      return undefined;
-    }
-  };
+  contentDigest = async (path: string): Promise<string | undefined> =>
+    digestOf(await this.absolute(path)).catch(() => undefined);
 
   async remove(path: string): Promise<void> {
     const full = await this.absolute(path);
@@ -1405,6 +1430,18 @@ export class NodeVault implements Vault {
       throw err;
     }
 
+    await this.intoTrash(path, full);
+  }
+
+  /**
+   * Moves `from` into the trash under the name `path` had.
+   *
+   * The two are separate because `removeExpecting` disposes of a note that is
+   * sitting under a temporary name by then, and the trash entry has to carry
+   * the note's own name rather than the one it was parked under. A person
+   * looking for the note they deleted searches for `doomed.md`.
+   */
+  private async intoTrash(path: string, from: string): Promise<void> {
     const target = await this.freeTrashPath(path);
     // The destination is checked too (F24).
     //
@@ -1417,8 +1454,8 @@ export class NodeVault implements Vault {
     const had = await this.deepestExisting(target);
     await mkdir(dirname(target), { recursive: true });
     try {
-      await rename(full, target);
-      this.unflushed.add(dirname(full));
+      await rename(from, target);
+      this.unflushed.add(dirname(from));
       this.dirty(target, had);
       return;
     } catch (err) {
@@ -1426,8 +1463,8 @@ export class NodeVault implements Vault {
     }
     // The trash is on another filesystem, which happens when a vault spans
     // mounts. Copied, checked byte for byte, and only then removed.
-    await copyVerifiedThenRemove(full, target);
-    this.unflushed.add(dirname(full));
+    await copyVerifiedThenRemove(from, target);
+    this.unflushed.add(dirname(from));
     this.dirty(target, had);
   }
 
@@ -1868,6 +1905,15 @@ export const TEMP_MARK = ".basalt-tmp-";
  * something this project has not thought about, and either way it stays.
  */
 const DISPOSABLE_PREFIXES = ["replace.", "respell.", "keep."];
+
+/**
+ * `keep.` is here for what an older version of this code left behind: it
+ * staged displaced note versions under that prefix, and those are duplicates
+ * of what the server holds. Nothing writes one now. `preserved.` is
+ * deliberately absent, and is what a version that could not be put beside its
+ * note is renamed to, so that the one case this file cannot resolve is the one
+ * case the sweep will not touch.
+ */
 
 function disposableTemp(name: string): boolean {
   // `openTemp` builds `<basename><TEMP_MARK><counter>`, so the mark is inside

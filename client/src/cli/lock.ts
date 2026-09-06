@@ -205,9 +205,8 @@ export const midEvict = { pause: async (): Promise<void> => {} };
  * anything else, somebody got there first and this does nothing at all.
  *
  * A marker outlives its evictor only if the process dies inside these few
- * operations, against a lock that is held for a whole command; when that
- * happens the marker is a lock like any other and is recovered the same way,
- * by its own holder's liveness.
+ * operations. Nothing goes looking at who held it: it stops being anybody's
+ * exclusion when its window passes, and the sweep takes it then (R20).
  */
 async function evicting(
   dir: string,
@@ -216,7 +215,8 @@ async function evicting(
   mine: LockHolder,
   remove: (at: LockState) => boolean,
 ): Promise<void> {
-  const marker = `${path}.evicting.${who}.${evictionEpoch()}`;
+  const epoch = evictionEpoch();
+  const marker = `${path}.evicting.${who}.${epoch}`;
   if (!(await publish(dir, marker, mine))) {
     // Somebody else is evicting this holder in this window. This attempt does
     // nothing and the loop looks again.
@@ -232,6 +232,12 @@ async function evicting(
     // that a second one cannot get in front of it.
     const still = await lockState(path);
     await midEvict.pause();
+    // Still this window's. An eviction that has run past the boundary no
+    // longer has the name to itself: the next window is a different name and
+    // `link` will hand it to somebody else. Checked rather than assumed, so
+    // straddling one costs an abandoned attempt and not an exclusion two
+    // processes both believe they hold.
+    if (evictionEpoch() !== epoch) return;
     if (remove(still)) await rm(path, { force: true });
   } finally {
     await rm(marker, { force: true });
@@ -257,11 +263,18 @@ async function evicting(
  * is using now, so deleting it cannot take anybody's exclusion away: it is
  * debris by construction rather than by judgement.
  *
- * Eviction is a handful of filesystem calls and the window is a minute, so
- * losing exclusivity by straddling a boundary needs an eviction to take a
- * minute; the re-read under the marker still stands behind that. This is one
- * machine's clock compared only with itself, and takeover is already
- * host-scoped: a holder on another host is believed and never evicted.
+ * Straddling a boundary is the residual, and it is worth naming rather than
+ * waving at: an eviction that starts just before one and finishes after it
+ * shared its right with the next window's evictor. So the window is checked
+ * again immediately before the unlink and a straddling attempt gives up,
+ * which leaves the gap between that check and the unlink: a couple of
+ * syscalls that also have to land across a one-minute boundary. That is not
+ * zero. It is a hard zero only with `flock`, which Node does not offer
+ * portably (docs/compared.md), and it is several orders below the read-then-
+ * unlink this replaced.
+ *
+ * This is one machine's clock compared only with itself, and takeover is
+ * already host-scoped: a holder on another host is believed and never evicted.
  */
 const EVICTION_WINDOW_MS = 60_000;
 

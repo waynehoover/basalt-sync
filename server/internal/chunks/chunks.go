@@ -739,6 +739,43 @@ const corruptSuffix = ".corrupt"
 // tmpPrefix marks in-progress writes so the sweep leaves them alone.
 const tmpPrefix = ".tmp-"
 
+// probeName is the file CheckWritable makes and removes.
+//
+// Under tmpPrefix on purpose: every walk in this file already skips that, so
+// the probe cannot be counted as a body or swept as one, and the debris of a
+// crash inside CheckWritable is debris the store already knows how to describe.
+const probeName = tmpPrefix + "health"
+
+// CheckWritable says whether a body could be stored here right now (R28).
+//
+// `statfs` says the volume is mounted and has room. It says nothing about
+// whether this process may write to it: a chunk root whose permissions have
+// gone, or one on a mount the kernel turned read-only after an I/O error,
+// answers `statfs` perfectly and refuses every upload. The only way to know is
+// the thing an upload does.
+//
+// One file created, written and removed, which is one inode for the length of
+// the call. The root is not created if it is missing: a health check that
+// makes the store it is describing would report a mounted volume where there
+// is none.
+func (s *Store) CheckWritable() error {
+	probe := filepath.Join(s.dir, probeName)
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write([]byte("ok"))
+	closeErr := f.Close()
+	// Whatever happened above. A probe left behind would be counted by nothing
+	// and swept by nothing, but it would still be a file this created and did
+	// not clean up.
+	_ = os.Remove(probe)
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
 // Get returns a chunk body, verified against its name.
 //
 // Verifying on every read costs one SHA-256 over data that was just read from

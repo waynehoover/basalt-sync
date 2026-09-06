@@ -2294,12 +2294,18 @@ export class Engine {
     for (const d of batch) {
       try {
         const from = local.get(d);
-        if (from !== undefined && (await this.landFromLocal(d, from, report))) {
+        const reused = from === undefined ? "ask" : await this.landFromLocal(d, from, report);
+        if (reused === "landed") {
           if (d.kind === "download") report.downloaded++;
           else report.restored++;
           this.log(d.kind, d.path, `${d.why}, from ${from} without asking`);
           continue;
         }
+        // Written, over somebody's edit, and that edit is beside the note.
+        // Counted by `writePreserving` as a conflict and not as a download,
+        // and finished: asking the server for bytes already on the disk
+        // would only displace them again.
+        if (reused === "kept") continue;
         const wrote =
           from !== undefined
             ? // The local copy did not prove out, so ask for it after all.
@@ -2582,27 +2588,37 @@ export class Engine {
    * A false negative costs one round trip, which is what the old code did
    * every time. A false positive would write the wrong bytes into somebody's
    * note, so there is no version of this worth guessing at.
+   *
+   * Three answers, not two. "ask" is the false negative above, and the caller
+   * fetches. "kept" is the write having happened and having displaced
+   * somebody's edit, which is finished business: reading it as "ask" sent the
+   * pass round again to write the same bytes over the version it had just
+   * put there, and made a second conflict copy holding the server's own text.
    */
-  private async landFromLocal(d: Incoming, from: string, report: SyncReport): Promise<boolean> {
+  private async landFromLocal(
+    d: Incoming,
+    from: string,
+    report: SyncReport,
+  ): Promise<"landed" | "kept" | "ask"> {
     let bytes: Uint8Array;
     try {
       bytes = await this.opts.vault.read(from);
     } catch {
-      return false;
+      return "ask";
     }
-    if (bytes.length !== d.remote.size) return false;
+    if (bytes.length !== d.remote.size) return "ask";
 
     const isText = this.mergeable(from);
     const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map(
       (c) => c.bytes,
     );
     const names = (await sealChunks(this.keys, parts)).map((c) => c.name);
-    if (contentId(names) !== contentId(d.chunks)) return false;
+    if (contentId(names) !== contentId(d.chunks)) return "ask";
 
     // The same check as `land`, for the same reason: this writes over
     // `d.path` too, and finding the bytes on this disk rather than on the
     // wire does not make the destination any less somebody's open note.
-    if (!(await this.unchangedSince(d.path, d.based))) return false;
+    if (!(await this.unchangedSince(d.path, d.based))) return "ask";
 
     // And the same preserving write (R19). This path used to call
     // `vault.write` straight after the stat, so a version rebuilt from chunks
@@ -2617,7 +2633,7 @@ export class Engine {
         report,
       )
     ) {
-      return false;
+      return "kept";
     }
     this.landed(d.path);
     observe(d.entry, {
@@ -2630,7 +2646,7 @@ export class Engine {
     d.entry.hash = contentId(d.chunks);
     d.entry.size = bytes.length;
     synced(d.entry, d.entry.hash, d.entry.chunks, d.remote.uid, this.now());
-    return true;
+    return "landed";
   }
 
   /**

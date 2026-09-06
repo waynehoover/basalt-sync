@@ -510,9 +510,15 @@ const MAX_UNAGREED_FETCH_BYTES = 1 << 20;
  * Set at the protocol's own defaults, so an ordinary server is unaffected and
  * one asking for more than the protocol describes is held to it. A server that
  * advertises *less* still gets its way: the smaller of the two wins.
+ *
+ * Written down twice, once here and once in `wire`, because this side needs
+ * them before the handshake has said anything. Both sides check them against
+ * `protocol-fixtures.json`, so raising the server's without raising these
+ * fails a test rather than producing a client that hangs up on a batch the
+ * server was entitled to send.
  */
-const LOCAL_MAX_BATCH_BYTES = 16 << 20;
-const LOCAL_MAX_FETCH_BYTES = 64 << 20;
+export const LOCAL_MAX_BATCH_BYTES = 16 << 20;
+export const LOCAL_MAX_FETCH_BYTES = 64 << 20;
 
 export class Transport {
   private socket: SocketLike | undefined;

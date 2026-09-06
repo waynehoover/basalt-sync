@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { NodeVault, STALE_TEMP_MS, TEMP_MARK } from "./vault.ts";
+import { NodeVault, STALE_TEMP_MS, TEMP_MARK, midTrash } from "./vault.ts";
 import { plainDigest } from "../core/crypto.ts";
 
 const dirs: string[] = [];
@@ -107,6 +107,84 @@ describe("a write that displaces something unexpected", () => {
     expect(found.join("|"), `the only copy is gone. Found: ${JSON.stringify(found)}`).toContain(
       "the only copy\n",
     );
+  });
+});
+
+/**
+ * A deletion that arrives over the wire is an ordinary deletion, and the trash
+ * has to say so.
+ *
+ * Identifying a file before disposing of it means moving it out of the way
+ * first, because `rm` takes whatever is at a name and not what was hashed a
+ * moment earlier. The obvious place to park it is the conflict path the caller
+ * already supplied, and that is wrong: both trashes take their entry's name
+ * from the file they are handed, so the note reached the trash called a
+ * conflict copy. Nothing was in conflict, and `doomed.md` is what somebody
+ * looks for.
+ */
+describe("a deletion the pass decided about", () => {
+  it("reaches the trash under the name the note had", async () => {
+    const { dir, v } = await vault();
+    const was = "here for now\n";
+    await writeFile(join(dir, "doomed.md"), was);
+
+    const out = await v.removeExpecting(
+      "doomed.md",
+      expecting(await plainDigest(enc.encode(was))),
+      "doomed (conflict from laptop 2026-09-06 11-47).md",
+    );
+
+    expect(out.keptAt, "an agreed deletion kept a copy").toBeUndefined();
+    expect(await readdir(join(dir, ".trash"))).toEqual(["doomed.md"]);
+    expect(await readFile(join(dir, ".trash", "doomed.md"), "utf8")).toBe(was);
+    // And nothing of the move is left beside the note.
+    expect(await readdir(dir)).toEqual([".trash"]);
+  });
+
+  /**
+   * The parked name is not a name. A crash between the move and the disposal
+   * leaves the note wherever it was put, and if that is a name the scan lists,
+   * this pass uploads it: a plain deletion turns into a conflict copy on every
+   * device, from a file nobody ever wrote.
+   */
+  it("parks it under a name no scan will list", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "doomed.md"), "here for now\n");
+
+    let visible: string[] | undefined;
+    midTrash.parked = async () => {
+      visible = (await new NodeVault(dir).list()).map((e) => e.path);
+    };
+    try {
+      await v.removeExpecting(
+        "doomed.md",
+        expecting(await plainDigest(enc.encode("here for now\n"))),
+        "doomed (conflict from laptop 2026-09-06 11-47).md",
+      );
+    } finally {
+      midTrash.parked = async () => {};
+    }
+
+    expect(visible, "the seam never ran, so this proved nothing").toBeDefined();
+    expect(visible, "a crash here would have left a note for the next pass to upload").toEqual([]);
+  });
+
+  it("keeps a version it did not decide about, and trashes nothing", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "doomed.md"), "typed after the pass listed it\n");
+
+    const out = await v.removeExpecting(
+      "doomed.md",
+      expecting("a digest of something else entirely"),
+      "doomed (kept).md",
+    );
+
+    expect(out.keptAt).toBe("doomed (kept).md");
+    expect(await readFile(join(dir, "doomed (kept).md"), "utf8")).toBe(
+      "typed after the pass listed it\n",
+    );
+    expect(await readdir(join(dir, ".trash")).catch(() => [])).toEqual([]);
+    expect(await readdir(dir)).toEqual(["doomed (kept).md"]);
   });
 });
 

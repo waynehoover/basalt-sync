@@ -68,6 +68,7 @@ import {
   type Vault as ObsidianVaultApi,
 } from "obsidian";
 
+import { plainDigest } from "../core/crypto.ts";
 import {
   configFolderName,
   firstFreeName,
@@ -818,9 +819,7 @@ export class ObsidianVault implements Vault {
    */
   contentDigest = async (path: string): Promise<string | undefined> => {
     const bytes = await this.readIfThere(path);
-    if (bytes === undefined) return undefined;
-    const { plainDigest } = await import("../core/crypto.ts");
-    return plainDigest(bytes);
+    return bytes === undefined ? undefined : plainDigest(bytes);
   };
 
   /** The bytes at a path, or undefined when there is nothing there to read. */

@@ -18,10 +18,20 @@
     "The client is the side that matters most for the invalid cases. A server",
     "is not obliged to be honest, so every shape the server refuses to store is",
     "a shape a hostile one can still send, and the client has to refuse it on",
-    "the way in rather than trust that it was never written."
+    "the way in rather than trust that it was never written.",
+    "",
+    "`ceilings` is the second thing both sides write down separately (R26). The",
+    "client caps what a handshake may raise its own memory limits to, and it has",
+    "to have those numbers in hand before the handshake, so it cannot read them",
+    "off the wire. Two copies of a constant drift, and this one drifts into a",
+    "client that kills a connection over a batch the server was entitled to send."
   ],
   "goodMac": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "goodChunk": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "ceilings": {
+    "maxBatchBytes": 16777216,
+    "maxFetchBytes": 67108864
+  },
   "cases": [
     {
       "name": "a file with content and the chunks to back it",
@@ -38,7 +48,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -130,7 +142,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -149,7 +163,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -168,7 +184,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -206,7 +224,9 @@
         "prev": "",
         "mac": "",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -263,7 +283,9 @@
         "prev": "",
         "mac": "not a digest",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -282,7 +304,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "halfway",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -301,7 +325,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     },
     {
@@ -320,7 +346,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["../../etc/passwd"]
+        "chunks": [
+          "../../etc/passwd"
+        ]
       }
     },
     {
@@ -339,7 +367,9 @@
         "prev": "",
         "mac": "$mac",
         "parent": "",
-        "chunks": ["$chunk"]
+        "chunks": [
+          "$chunk"
+        ]
       }
     }
   ]

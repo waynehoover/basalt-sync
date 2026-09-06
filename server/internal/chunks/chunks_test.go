@@ -736,3 +736,46 @@ func TestSweepCountsTheSpaceItWalkedPastAndCannotReclaim(t *testing.T) {
 		t.Fatalf("the sweep deleted %d files it was meant to walk past", rep.Deleted)
 	}
 }
+
+// The health probe is a body to nothing (R28).
+//
+// Health runs every few seconds, and it now writes a file into the chunk root
+// to find out whether a body could be stored there: `statfs` says a volume is
+// mounted and has room and says nothing about whether this process may write
+// to it. That file must be invisible to everything that counts or sweeps, or a
+// backup comparing its own body count with the source's reports a discrepancy
+// that is the probe.
+//
+// Asserted on the name itself, left in place as a crash inside the probe would
+// leave it, because the real one exists for microseconds and nothing can
+// reliably observe it.
+func TestTheHealthProbeIsNotABody(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, 1<<20)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	body := []byte("a real body")
+	if err := s.Put("v1", Name(body), body); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Root(), probeName), []byte("ok"), 0o600); err != nil {
+		t.Fatalf("write the probe: %v", err)
+	}
+
+	n, err := s.CountBodies()
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("CountBodies = %d, want 1: the health probe was counted as a body", n)
+	}
+
+	// And it comes and goes without leaving one.
+	if err := s.CheckWritable(); err != nil {
+		t.Fatalf("the store reported itself unwritable: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Root(), probeName)); err == nil {
+		t.Error("CheckWritable left its probe behind")
+	}
+}
