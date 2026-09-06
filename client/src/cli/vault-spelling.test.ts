@@ -523,3 +523,50 @@ describe("basalt restore into a vault whose disk spells a name its own way", () 
     expect(await onDisk()).toContain(NAME);
   }, 120_000);
 });
+
+/**
+ * F12. Normalising a name must not replace a file that appeared since the scan.
+ *
+ * `list` decides the normalised name is free from the directory listing, and
+ * a listing is a moment ago. The rename that followed replaced whatever was
+ * at that name, so a note created by an editor in between was destroyed by
+ * what is meant to be a read-only scan, silently, with the old file taking
+ * its place.
+ */
+describe("normalising a name onto one that appeared since the listing", () => {
+  it("leaves both files rather than replacing the new one", async () => {
+    const nfd = "cafe\u0301.md";
+    const nfc = "caf\u00e9.md";
+    await writeFile(join(root, nfd), "the old spelling");
+
+    const vault = new NodeVault(root);
+    // The destination appears between the listing and the rename, which is
+    // the window: injected by creating it during the scan's own stat.
+    const realList = vault.list.bind(vault);
+    let armed = true;
+    vault.list = async () => {
+      if (armed) {
+        armed = false;
+        await writeFile(join(root, nfc), "typed while the scan was running");
+      }
+      return realList();
+    };
+    await vault.list();
+
+    const names = await onDisk();
+    if (names.length === 1) {
+      // A folding disk files both spellings as one name, so there was never a
+      // second file to lose and the only thing to check is that the name came
+      // out normalised. This is the branch a Mac takes. On the ext4 runner CI
+      // uses the two spellings are two files, and the assertions below are
+      // what catch a rename that replaces one with the other.
+      expect(names[0]).toBe(nfc);
+      return;
+    }
+    expect(names.length, `both spellings should survive: ${names.join(", ")}`).toBe(2);
+    expect(
+      await readFile(join(root, nfc), "utf8"),
+      "the file created during the scan was replaced by the one being normalised",
+    ).toBe("typed while the scan was running");
+  });
+});

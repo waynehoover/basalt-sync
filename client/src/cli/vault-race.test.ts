@@ -29,6 +29,8 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     access: vi.fn(actual.access),
     readdir: vi.fn(actual.readdir),
     cp: vi.fn(actual.cp),
+    // F13 watches the order of flushes against the removal of the source.
+    rm: vi.fn(actual.rm),
   };
 });
 
@@ -345,6 +347,57 @@ describe("moving a note across filesystems", () => {
       await expect(stat(join(root, "dst"))).rejects.toThrow();
     });
   }
+
+  /**
+   * F13. The copy has to be durable before the original goes.
+   *
+   * Reading the copy back proves the bytes reached the page cache and no more,
+   * so a power cut after the removal could leave the source deleted and the
+   * copy short or absent. Rule 3 says nothing is destroyed until a verified
+   * copy exists elsewhere, and a copy that is only in memory is not elsewhere
+   * yet.
+   *
+   * Counted rather than power-cut: what is checked is that every copied file
+   * and the directories holding them were flushed, and that they were flushed
+   * before the source was removed.
+   */
+  it("flushes every copied file and directory before removing the source", async () => {
+    await mkdir(join(root, "src", "deep"), { recursive: true });
+    await writeFile(join(root, "src", "a.md"), "alpha");
+    await writeFile(join(root, "src", "deep", "b.md"), "beta");
+
+    const order: string[] = [];
+    const realOpen = vi.mocked(open).getMockImplementation()!;
+    vi.mocked(open).mockImplementation(async (...args: Parameters<typeof open>) => {
+      const handle = await realOpen(...args);
+      const path = String(args[0]);
+      const realSync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        if (path.includes("dst")) order.push(`sync ${path.slice(root.length + 1)}`);
+        return realSync();
+      };
+      return handle;
+    });
+    const realRm = vi.mocked(rm).getMockImplementation()!;
+    vi.mocked(rm).mockImplementation(async (...args: Parameters<typeof rm>) => {
+      const path = String(args[0]);
+      if (path.endsWith("src")) order.push("remove the source");
+      return realRm(...args);
+    });
+
+    await copyVerifiedThenRemove(join(root, "src"), join(root, "dst"));
+
+    const removedAt = order.indexOf("remove the source");
+    expect(removedAt, `the source was never removed: ${order.join(", ")}`).toBeGreaterThan(-1);
+    const flushed = order.slice(0, removedAt);
+    for (const wanted of ["dst/a.md", "dst/deep/b.md", "dst/deep", "dst"]) {
+      expect(
+        flushed,
+        `${wanted} was not made durable before the original was removed: ${order.join(", ")}`,
+      ).toContain(`sync ${wanted}`);
+    }
+    await expect(stat(join(root, "src"))).rejects.toThrow();
+  });
 
   it("refuses a destination something else took first", async () => {
     await mkdir(join(root, "src"));

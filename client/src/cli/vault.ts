@@ -485,7 +485,52 @@ export class NodeVault implements Vault {
   ): Promise<void> {
     if (this.normalized.has(path)) return;
     try {
-      await rename(join(dir, entry.disk), join(dir, entry.name));
+      // `link` decides whether the name is free; `rename` is what re-spells
+      // it (F12).
+      //
+      // Renaming straight over the target was the fault. The decision that the
+      // normalised name is free came from the directory listing, and a listing
+      // is a moment ago, so an editor that created that exact name in between
+      // had its file silently replaced by this one during what is meant to be
+      // a read-only scan.
+      //
+      // `link` cannot replace anything: it creates the name or fails with
+      // EEXIST. Two of the three answers are then easy. What EEXIST does not
+      // distinguish on its own is the case this rule exists for: APFS stores
+      // one name for `café.md` in either normal form, so the two spellings are
+      // one inode, and the destination "already existing" is the source. That
+      // one is re-spelled with `rename`, which is safe precisely because there
+      // is only one file to lose. A different inode is a real collision and is
+      // left alone for the alias machinery to report as two spellings of one
+      // name, which is what it is for.
+      //
+      // A folder takes the second path from the start: `link` refuses a
+      // directory, and there is no atomic no-clobber rename for one. It is
+      // checked and then renamed, which narrows the window rather than
+      // closing it, and a folder appearing under a normalised name during a
+      // scan is not a thing an editor does.
+      const from = join(dir, entry.disk);
+      const to = join(dir, entry.name);
+      const source = await lstat(from);
+      const sameFileAt = async (): Promise<boolean> => {
+        const there = await lstat(to).catch(() => undefined);
+        if (there === undefined) return true;
+        return there.dev === source.dev && there.ino === source.ino;
+      };
+
+      if (source.isDirectory()) {
+        if (!(await sameFileAt())) return;
+        await rename(from, to);
+      } else {
+        try {
+          await link(from, to);
+          await rm(from, { force: true });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+          if (!(await sameFileAt())) throw err;
+          await rename(from, to);
+        }
+      }
       // Remembered on success, not on the attempt. A rename that succeeded
       // and left the name where it was is a filesystem storing its own normal
       // form, and asking it again will get the same answer for ever. A rename
@@ -497,6 +542,9 @@ export class NodeVault implements Vault {
       this.unflushed.add(dir);
     } catch {
       // Kept under the spelling the disk has, which is what the map is for.
+      // A destination that appeared since the listing lands here too, and
+      // leaving both is the point: the alias machinery reports two spellings
+      // of one name, and replacing one with the other would report nothing.
     }
   }
 
@@ -1468,7 +1516,58 @@ export async function copyVerifiedThenRemove(source: string, target: string): Pr
       `refusing to remove ${source}: its copy at ${target} does not match: ${(err as Error).message}`,
     );
   }
+  // Durable before the original goes (F13).
+  //
+  // Reading the copy back proves the bytes reached the page cache and nothing
+  // more, so a power cut after the `rm` below could leave the source deleted
+  // and the copy short or absent: rule 3 says nothing is destroyed until a
+  // verified copy exists elsewhere, and a copy that is only in memory is not
+  // elsewhere yet. Every copied file is flushed, and then every directory
+  // holding one, because a file whose bytes are durable under a name that is
+  // not is the same loss with a different shape.
+  //
+  // A failure here leaves both copies. That is the safe direction: the worst
+  // case is a note in the trash and in the vault, which somebody can see and
+  // sort out, rather than neither.
+  try {
+    await flushTree(target);
+  } catch (err) {
+    throw new Error(
+      `refusing to remove ${source}: its copy at ${target} could not be made durable: ` +
+        `${(err as Error).message}`,
+    );
+  }
   await rm(source, { recursive: true, force: true });
+}
+
+/** Flushes every file under a path, then every directory holding one. */
+async function flushTree(path: string): Promise<void> {
+  const dirs = new Set<string>();
+  const walk = async (at: string): Promise<void> => {
+    const info = await stat(at);
+    if (info.isDirectory()) {
+      dirs.add(at);
+      for (const name of await readdir(at)) await walk(join(at, name));
+      return;
+    }
+    if (!info.isFile()) return;
+    const handle = await open(at, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    dirs.add(dirname(at));
+  };
+  await walk(path);
+  // The parent too: the copy's own name lives in it, and a name that is not
+  // durable is a body nothing can find.
+  dirs.add(dirname(path));
+  // Deepest first, so a directory's entries are durable before the directory
+  // that names it is flushed.
+  for (const dir of [...dirs].sort((a, b) => b.length - a.length)) {
+    await syncDirectory(dir);
+  }
 }
 
 async function sameTree(source: string, target: string): Promise<void> {

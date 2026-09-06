@@ -126,7 +126,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F12 — Do not overwrite a file created during filename normalization
 
-- [ ] Give normalization and case correction a no-clobber destination operation.
+- [x] Give normalization and case correction a no-clobber destination operation.
 
 **Evidence — reproduced with an injected enumeration/rename interleaving.** [NodeVault.list](client/src/cli/vault.ts#L650) uses a directory listing to decide the normalized target is free, then [normalizeName](client/src/cli/vault.ts#L480) uses replacing `rename`. A new destination created after enumeration was overwritten by the old file. [matchCase](client/src/cli/vault.ts#L791) needs the same race audit.
 
@@ -134,7 +134,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F13 — Flush a cross-filesystem trash copy before removing its source
 
-- [ ] Make the copy/verify/delete fallback durable, including directory trees, before deleting the original.
+- [x] Make the copy/verify/delete fallback durable, including directory trees, before deleting the original.
 
 **Evidence — inspection.** [NodeVault.remove](client/src/cli/vault.ts#L829) falls back on `EXDEV` to [copyVerifiedThenRemove](client/src/cli/vault.ts#L1429). This copies and reads the result to verify it, then deletes the source without fsyncing the copied files and destination directory hierarchy. Subsequent directory-only flushes cannot establish that file contents were durable before source deletion.
 
