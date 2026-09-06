@@ -132,6 +132,184 @@ jobs:
         working-directory: server
         run: go test -tags rehearsal -run TestRestoreRehearsal -count=1 ./cmd/basaltd/
 
+  # The same client suite on a case-folding filesystem (I18).
+  #
+  # A dozen tests ask the disk whether it folds case and skip when it does not,
+  # which is honest and which meant they only ever ran on a maintainer's laptop.
+  # Every runner above is Linux, so the behaviour that F01 was about (a stat for
+  # "NOTE.md" finding "Note.md", and a delete of one taking the other) was
+  # checked in CI exactly never. macOS runners are APFS, which folds case by
+  # default, so this is the same suite against the other kind of disk.
+  #
+  # Its own job rather than a matrix on `client`, because the Linux one carries
+  # the format check, the typecheck and the compression golden, and running
+  # those twice buys nothing. What this adds is the filesystem.
+  # systemd's opinion of the unit `basaltd service` writes (I20).
+  #
+  # `TestService` checks the unit's text against what this project meant to
+  # write, which is a test of this repository agreeing with itself. Whether
+  # systemd accepts it is a different question and has never been asked: no
+  # runner ran systemd and `scripts/check.sh` runs on macOS, where there is
+  # none. A directive misspelled, or one that a newer systemd refuses, produces
+  # a unit that fails on first start and every five seconds after that under
+  # Restart=always, at whatever hour somebody installed it.
+  #
+  # `systemd-analyze verify` is what systemd itself says. It is stricter than
+  # loading the unit and it needs no root and no running service.
+  systemd:
+    name: the systemd unit is one systemd accepts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: systemd accepts the unit
+        run: |
+          set -euo pipefail
+          systemd-analyze --version | head -1
+
+          go build -C server -o /tmp/basaltd ./cmd/basaltd
+          # The flags somebody would actually use, including the ceiling,
+          # because that is the one a person adds by hand and the one most
+          # likely to be written into the unit wrongly.
+          /tmp/basaltd service \
+            -data /var/lib/basalt -addr 0.0.0.0:3003 -vault default \
+            -user basalt -binary /usr/local/bin/basaltd -max-file 134217728 \
+            > /tmp/basalt.service
+          cat /tmp/basalt.service
+
+          # Copied into a directory systemd looks in, because verify resolves a
+          # unit by name and reports "not found" for a bare path in some
+          # versions, which passes for the wrong reason.
+          sudo mkdir -p /etc/systemd/system
+          sudo cp /tmp/basalt.service /etc/systemd/system/basalt.service
+
+          # Warnings about a user or a binary that does not exist on a runner
+          # are expected and are not what this is looking for. Everything else
+          # is: a directive systemd does not know, a value it cannot parse, a
+          # dependency that cannot be resolved.
+          out=$(systemd-analyze verify /etc/systemd/system/basalt.service 2>&1 || true)
+          echo "$out"
+          # Grep out the two classes that are about this runner rather than
+          # about the unit.
+          real=$(printf '%s\n' "$out" \
+            | grep -v -e "Unit configuration has fatal error" \
+            | grep -v -e "basalt.service: Failed to create" \
+            | grep -vi -e "user or group" -e "does not exist" -e "Cannot find user" \
+            | grep -v -e "^$" || true)
+          if [ -n "$real" ]; then
+            echo "systemd objects to the unit basaltd writes:" >&2
+            printf '%s\n' "$real" >&2
+            exit 1
+          fi
+          echo "systemd accepts it"
+
+  # The client suite with its vaults on a filesystem of its own (I20).
+  #
+  # Every test makes its vault under `tmpdir()`, which on a runner is the root
+  # filesystem, and that is the only kind of disk this project has ever been
+  # tested against. The matrix in docs/server.md had "a vault on a mounted
+  # subdirectory: never", and that is the case somebody actually has: a NAS
+  # mount, an external drive, a separate partition for notes.
+  #
+  # A loopback ext4 image is a real filesystem with its own superblock, its own
+  # free space and its own mount options, reached through a mount point. Setting
+  # TMPDIR is what puts the vaults on it, with no change to a single test: every
+  # one of them already asks the OS where temporary files go.
+  #
+  # Not a substitute for testing a network filesystem, which is the case the
+  # matrix is honest about not covering. It is the difference between "one
+  # filesystem, the runner's" and "a filesystem, mounted".
+  client-mounted:
+    name: client, with vaults on a mounted filesystem
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.1
+
+      - name: a filesystem of its own, mounted
+        run: |
+          set -euo pipefail
+          # 4 GiB, which is room for the stress suite's attachments with a wide
+          # margin. A vault that filled the image would fail as a disk-full
+          # error and read as a bug in this project.
+          dd if=/dev/zero of=/tmp/basalt.img bs=1M count=4096 status=none
+          mkfs.ext4 -q /tmp/basalt.img
+          sudo mkdir -p /mnt/basalt
+          sudo mount -o loop /tmp/basalt.img /mnt/basalt
+          sudo mkdir -p /mnt/basalt/tmp
+          sudo chown -R "$(id -u):$(id -g)" /mnt/basalt
+          # Asserted, not assumed. A mount that silently did not happen would
+          # leave TMPDIR pointing at the root filesystem and this job would go
+          # on passing while testing nothing new, which is the shape of failure
+          # the case-folding job also guards against.
+          mountpoint -q /mnt/basalt
+          df -h /mnt/basalt
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: test
+        working-directory: client
+        env:
+          TMPDIR: /mnt/basalt/tmp
+        run: |
+          set -euo pipefail
+          # The vaults land wherever the OS says temporary files go, so this is
+          # the whole of the change.
+          test "$(node -p 'require("node:os").tmpdir()')" = /mnt/basalt/tmp
+          bun run test
+
+  client-case-folding:
+    name: client, on a case-folding filesystem
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Both toolchains, because the client's tests build cmd/basaltd and talk
+      # to it over a real socket.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.1
+
+      # The runner's filesystem is asserted rather than assumed. If GitHub ever
+      # moves macOS runners to a case-sensitive volume this job would go on
+      # passing while quietly skipping the only thing it is here for, which is
+      # the exact failure the job exists to end.
+      - name: this runner folds case
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          printf 'probe' > "$d/CaseProbe.tmp"
+          if [ ! -f "$d/caseprobe.tmp" ]; then
+            echo "This runner's filesystem is case-sensitive, so the tests this" >&2
+            echo "job exists for would all skip. Nothing here would say so." >&2
+            exit 1
+          fi
+          echo "case-folding, as expected"
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: test
+        working-directory: client
+        run: bun run test
+
   client:
     name: client
     runs-on: ubuntu-latest

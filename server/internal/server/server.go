@@ -19,6 +19,7 @@ import (
 
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
+	"sync/atomic"
 )
 
 const (
@@ -301,11 +302,17 @@ type Server struct {
 	// enqueued under the lock rather than written afterwards.
 	afterFlush func()
 
-	// beforePing runs just before keepalive sends a ping, and is nil in every
+	// beforePing runs just before keepalive sends a ping, and is unset in every
 	// non-test build. A test uses it to check what the queue held at that
 	// moment, because the symptom of pinging behind queued data depends on how
 	// much the kernel buffers, which differs by platform.
-	beforePing func()
+	//
+	// Atomic because the test that sets it cannot set it before the session
+	// exists: the hook closes over the peer, and the peer is the thing dialling
+	// creates. So the write lands while a keepalive goroutine is already
+	// reading the field, and `-race` caught it, intermittently, which is how a
+	// test-only race reaches CI and stays.
+	beforePing atomic.Pointer[func()]
 
 	// beforeEvict runs at the top of each eviction a rotation causes, and is
 	// nil in every non-test build. A test uses it to see that the evictions
@@ -436,6 +443,22 @@ func (s *Server) registrarsOn(vaultID string, except *Session) []*Session {
 }
 
 // Sessions is how many connections are being handled, joined or not.
+// Health is what /health answers with (I17).
+//
+// Shutting down is reported as unable to persist, deliberately. A server
+// draining its sessions will refuse new work in a moment, and a checker that
+// keeps calling it healthy is one that keeps sending devices to it: the whole
+// use of a health check during a restart is to stop that.
+func (s *Server) Health(ctx context.Context) store.Health {
+	s.sessMu.Lock()
+	closing := s.closing
+	s.sessMu.Unlock()
+	if closing {
+		return store.Health{CanPersist: false, Why: store.HealthClosing}
+	}
+	return s.st.CheckHealth(ctx)
+}
+
 func (s *Server) Sessions() int {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()

@@ -178,6 +178,27 @@ Unlinking and pairing again works too and is worse: it resets the merge base, so
 every note comes back as a version with no ancestor and the next edit made on
 two devices at once makes conflict copies instead of merging. Use Rejoin.
 
+## Sending back what the server has lost
+
+A note can stop downloading and never finish. That usually means the server no
+longer has the file behind a version: a disk rotted it and the server set it
+aside, or a restore brought back a database and a chunk tree of slightly
+different ages. Every row is intact, so nothing looks broken, and the download
+retries for ever.
+
+Nothing fixes that on its own, and the reason is worth knowing. A device whose
+copy of the note has not changed is *right* to consider it synced: the version
+is committed and the hashes agree. It is holding the missing bytes and has no
+reason to send them, and making it send them used to mean editing the note,
+which writes a version nobody typed into a vault that is already damaged.
+
+*Manage this vault* has a **Send back what the server has lost** row. It offers
+the server everything this device holds, the server takes only what it is
+actually missing, and no new version is written. Do it on every device: each one
+can only offer the versions it holds, and history a device never had is not
+visible from it. `basaltd verify` on the server is what knows whether anything
+is still missing.
+
 ## Devices, and revoking one
 
 *Devices* is under *Manage this vault*. It asks the server who may reach this

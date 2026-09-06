@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"encoding/binary"
+	"errors"
 	"github.com/waynehoover/basalt-sync/server/internal/fsync"
+	"io"
 )
 
 // BackupReport says what a backup copied.
@@ -92,6 +95,13 @@ const BackupMetaFormat = 2
 type BackupMeta struct {
 	// Format is 2. A script checks it before trusting the field names.
 	// Format 1 had no Database stamp.
+	//
+	// Still 2 after `Database.Change` was added, deliberately. The field is
+	// additive: an older build ignores it and reads everything else correctly,
+	// and a newer build treats its absence as "not recorded" rather than as a
+	// mismatch. Bumping would make every older basaltd refuse a backup it can
+	// read perfectly well, which is a worse failure than the one it would
+	// announce.
 	Format int `json:"format"`
 	// TakenAt is when the snapshot was taken, RFC 3339 in UTC.
 	TakenAt string `json:"takenAt"`
@@ -100,17 +110,57 @@ type BackupMeta struct {
 	Vaults   []VaultCoverage `json:"vaults"`
 }
 
-// Snapshot is how backup.json names the database it describes: the size and
-// modification time of basalt.db at the moment the file was written.
+// Snapshot is how backup.json names the database it describes.
 //
-// Size is what ReadBackupMeta checks, because it survives a plain `cp -r` of
-// the whole directory and a copy is a thing people legitimately do to a backup.
-// ModifiedAt is recorded beside it for a script looking at a directory nobody
-// has copied, where it is the stronger of the two, and is not checked here
-// because a copy moves it and a moved mtime is not a stale file.
+// Size survives a plain `cp -r` of the whole directory, which is a thing people
+// legitimately do to a backup, and that is why it is here. It is a weak
+// identifier on its own: two different databases of the same size are not
+// unlikely at all, because a snapshot taken an hour later is usually the same
+// number of pages. So a second database could be republished into a directory
+// and the coverage beside it would go on looking plausible while describing a
+// snapshot that no longer exists (I16).
+//
+// Change is what makes the binding real: SQLite's file change counter, four
+// bytes at offset 24 of the header, incremented on every transaction that
+// modifies the database. Two snapshots of one store differ in it even when they
+// are byte-identical in length, and it survives a copy exactly as the size
+// does, because it is inside the file.
+//
+// ModifiedAt is recorded for a script looking at a directory nobody has copied,
+// where it is stronger than either, and is not checked here because a copy
+// moves it and a moved mtime is not a stale file.
 type Snapshot struct {
-	Bytes      int64  `json:"bytes"`
+	Bytes int64 `json:"bytes"`
+	// Change is SQLite's file change counter. Zero in a Format 2 file, which is
+	// why reading one is not an error: it means "not recorded", not "zero".
+	Change     int64  `json:"change"`
 	ModifiedAt string `json:"modifiedAt"`
+}
+
+// sqliteChangeCounter reads the file change counter out of a SQLite header.
+//
+// Four bytes, big-endian, at offset 24. Read from the file rather than asked of
+// a connection, because the point is to identify the bytes on disk: opening the
+// database to ask would recover its write-ahead log and change the very thing
+// being identified.
+//
+// A file too short to have a header is not an error here. This is used to stamp
+// and to compare, and both callers have better things to say about a database
+// that is not one than this function does.
+func sqliteChangeCounter(path string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	var head [28]byte
+	if _, err := io.ReadFull(f, head[:]); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint32(head[24:28])), nil
 }
 
 // DatabaseStamp describes the database in a backup directory, for writing into
@@ -121,8 +171,13 @@ func DatabaseStamp(dir string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	change, err := sqliteChangeCounter(dbPath)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	return Snapshot{
 		Bytes:      info.Size(),
+		Change:     change,
 		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339Nano),
 	}, nil
 }
@@ -240,6 +295,19 @@ func ReadBackupMeta(dir string) (BackupMeta, error) {
 				"this snapshot: something republished the database without rewriting the coverage. "+
 				"Run `basaltd backup` into this directory again, or read the database itself",
 			BackupMetaFile, meta.Database.Bytes, stamp.Bytes)
+	}
+	// The change counter, which is what catches a replacement of the same size
+	// (I16). Skipped when the file records zero, which is every Format 2 file
+	// and every file written before this was stamped: "not recorded" is not
+	// "zero", and treating it as a mismatch would fail every backup taken
+	// before the upgrade.
+	if meta.Database.Change != 0 && stamp.Change != meta.Database.Change {
+		return meta, fmt.Errorf(
+			"%s describes a database at change %d and the one beside it is at change %d. They are the same "+
+				"size, so this is a different snapshot of the same store rather than a truncated file: "+
+				"something republished the database without rewriting the coverage. "+
+				"Run `basaltd backup` into this directory again, or read the database itself",
+			BackupMetaFile, meta.Database.Change, stamp.Change)
 	}
 	return meta, nil
 }

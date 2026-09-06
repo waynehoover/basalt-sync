@@ -194,6 +194,13 @@ type In struct {
 	// two devices may share one.
 	Name string `json:"name,omitempty"`
 
+	// resend: Chunks names bodies this device believes it can supply, for a
+	// server that has lost or quarantined them (I14).
+	//
+	// The same field `fetch` uses, and deliberately: both are "these chunk
+	// names", in opposite directions, and a second field meaning the same thing
+	// is a second place for a validation to be forgotten.
+
 	// revoke: AllowLast is the caller saying out loud that it means to leave
 	// the vault with no devices at all, reachable only by the recovery key.
 	// Refused without it, because that is a thing to want after a house fire
@@ -497,6 +504,22 @@ type Want struct {
 	Res    string   `json:"res"` // "want"
 	ID     int64    `json:"id,omitempty"`
 	Chunks []string `json:"chunks"`
+}
+
+// Resent answers a `resend`: how many bodies this device supplied, and how many
+// the server is still without (I14).
+//
+// Both numbers, because they answer different questions and a caller needs
+// both. Stored is what this device could produce and the server now has.
+// Missing is what it still lacks after that: chunks belonging to versions this
+// device never had, or has since edited away. Those are not this device's to
+// fix, and reporting only the good news would have somebody run repair on every
+// machine they own and never find out that a body is gone for good.
+type Resent struct {
+	Res     string `json:"res"` // "resent"
+	ID      int64  `json:"id,omitempty"`
+	Stored  int    `json:"stored"`
+	Missing int    `json:"missing"`
 }
 
 // Have means every chunk was already held, so nothing was uploaded and the

@@ -518,6 +518,12 @@ any, with their bytes, because both are space the purge did not reclaim:
 quarantined bodies, which stay until a device resends the real chunk, and
 unfinished uploads, which no grace collects at all.
 
+`basalt repair` on a device that still holds those notes is what resends them.
+It offers everything that device has, the server takes only what it is missing,
+and no new version is written. Run it on each device: one can only offer the
+versions it holds. Anything `basaltd verify` still reports afterwards is history
+no device has, and `basaltd purge` drops versions nothing can serve.
+
 If the sweep cannot finish, no chunk figures are printed. It stops at the first
 thing in the tree it does not recognise, so its counts would describe how far
 it got rather than what the vault holds. The versions line stays, because that
@@ -600,12 +606,13 @@ that field before the others, and run `basaltd verify` when it is false.
 
 ## What to alert on
 
-There is no dashboard, on purpose. Seven things are worth a check from a cron
+There is no dashboard, on purpose. Eight things are worth a check from a cron
 job or whatever watches your machines, all readable without a key.
 
 | Signal | How to read it | What it means |
 |---|---|---|
-| Health failing | `basaltd health` exits non-zero | The server is down or not answering. systemd restarts it, and after five failures in five minutes gives up and marks the unit `failed`; `journalctl -u basalt` has the reason. |
+| Health failing | `basaltd health` exits non-zero | It names which kind. `store-unreadable`, `disk-full` and `chunks-unreachable` mean the server is running and cannot take a note, which is the case that used to look identical to health; `shutting-down` is a restart in progress. No answer at all means it is down, and systemd restarts it, giving up after five failures in five minutes and marking the unit `failed`. `journalctl -u basalt` has the reason either way, and `basaltd stats` has the numbers. |
+| A note that never finishes downloading | `basaltd verify` reports a fault, or a device reports a path retrying for days | The server has lost the body behind a version. Run `basalt repair` on a device that still holds those notes, and on each of your other devices: one can only offer versions it holds. Anything `basaltd verify` still reports afterwards is history no device has. |
 | Cursor stuck | `latestUid` from `stats -json` unchanged for days while you have been writing | Devices are not reaching the server, or one device's `basalt status` shows a server cursor ahead of its own and nothing arriving. Check the device before the server. |
 | Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, expected after restoring an older backup. `basalt rebase --backup-taken` on the headless client, or *Rejoin this server* in the plugin panel, rejoins without losing what only that device holds. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
@@ -706,6 +713,41 @@ would admit it:
 journalctl -u basalt | grep 'accept refused'
 basaltd serve -allow-origin capacitor://localhost
 ```
+
+## What has actually been run where
+
+Not a compatibility promise. It is a list of what a machine has executed, kept
+because the alternative is a reader assuming that anything unmentioned works,
+and because the honest entries here are the ones worth acting on.
+
+Three different guarantees are in play and a filesystem can offer one without
+the others. **Atomic visibility** is a rename either happening or not, never
+half. **Readback** is being able to open what was written and get the same
+bytes. **Persistence** is those bytes surviving a power cut, which is the one
+that needs `fsync` and the one most likely to be missing.
+
+| | exercised | by what |
+|---|---|---|
+| Linux, ext4/overlay | every push | the whole suite, on every CI job but one |
+| macOS, APFS, case-folding | every push | the client suite, `client-case-folding` |
+| Linux and macOS, case-sensitive | every push | the same suite, where the case tests skip themselves |
+| linux/amd64 container | every push | built, started, and asked its version |
+| linux/arm64 container | every release | the same, under emulation, before any tag moves |
+| Obsidian desktop | by hand | no runner has Obsidian on it; the panel's states are captured as structure, not pixels |
+| Obsidian mobile | by hand, rarely | the mobile origins in the server have never been checked against a device |
+| Network filesystems (NFS, SMB, sshfs) | never | see below |
+| A vault on a mounted subdirectory | never | |
+| Windows | never | and not supported: the CLI is not built or tested for it |
+
+The one to be careful about is a vault, or a data directory, on a network
+filesystem. Nothing here has been run on one, and the parts most likely to
+behave differently are the parts that exist to stop a note being lost: `fsync`
+on a directory is a no-op or an error on several of them, rename is not always
+atomic across all of them, and file locking is where they differ most. Basalt
+notices some of that and says so rather than guessing: a directory flush that
+the filesystem cannot do is treated as nothing to do, and one that *fails* is
+reported, because those are different and used to be the same silence. That is
+detection, not support. Keep the data directory on a local disk.
 
 ## Reference
 
@@ -815,6 +857,44 @@ next to their reasoning in the source; these are the numbers.
 
 `health` does a GET on `/health`. It exists so the container has a healthcheck
 without a shell or curl in the image.
+
+`/health` answers whether this server could take a note, not whether the
+process replied. It used to answer `ok` without touching anything, so a full
+disk, a database gone read-only, and a chunk directory whose volume had
+unmounted all looked exactly like a healthy server until somebody tried to save
+something. Now it does one indexed read and one `statfs`, and answers:
+
+| | |
+|---|---|
+| `200 ok` | a note arriving now would be stored |
+| `503 store-unreadable` | the database is not answering |
+| `503 disk-full` | less than 64 MiB free, which is not enough for a commit to work in |
+| `503 chunks-unreachable` | the body directory is gone, usually an unmounted volume |
+| `503 shutting-down` | draining, so stop sending devices here |
+
+Both checks are cheap enough for a probe every few seconds. The deep one is
+`basaltd verify`, which is asked for rather than run on a timer.
+
+`basaltd stats` prints the numbers behind the word, including how much room is
+left. They are not on the endpoint: it needs no credential, and behind a tunnel
+the port is on the internet.
+
+### Stopping it
+
+A stop drains in two halves of five seconds each. First the listener and its
+ordinary requests; then the sessions, where a put that has already stored its
+bodies is allowed to reach its commit and its acknowledgement rather than being
+cut off to make the stop look quick. Then the store closes.
+
+Whatever runs the server imposes its own deadline on top of that, and it has to
+outlast the sum. The unit `basaltd service` writes sets `TimeoutStopSec=30`.
+Under compose, `stop_grace_period: 30s` is in the file here for the same
+reason: Docker's default is ten seconds, which is both halves and nothing at
+all for closing the store. A stop killed partway through loses no note, because
+an unacked put is retried and the write-ahead log recovers, but it does mean
+nothing can tell a clean stop from a killed one.
+
+If you run it some other way, give it at least fifteen seconds.
 
 ### version
 

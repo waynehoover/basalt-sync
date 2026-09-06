@@ -451,8 +451,8 @@ func (s *Session) keepalive() {
 			if !s.reading.Load() || s.inflight.Load() > 0 {
 				continue
 			}
-			if s.srv.beforePing != nil {
-				s.srv.beforePing()
+			if hook := s.srv.beforePing.Load(); hook != nil {
+				(*hook)()
 			}
 			ctx, cancel := context.WithTimeout(s.ctx, s.srv.pongWait)
 			err := s.conn.Ping(ctx)
@@ -652,6 +652,10 @@ func (s *Session) run() error {
 var deviceOps = map[string]bool{
 	"put": true, "putmany": true, "get": true, "fetch": true,
 	"history": true, "deleted": true, "invite": true,
+	// resend writes bodies the vault already refers to and nothing else: no
+	// entry, no uid, no authenticator. A device is the only thing that can
+	// have them, so it is the only thing that can repair them (I14).
+	"resend": true,
 }
 
 // dispatch routes one request. frameLen is the encoded size of the frame it
@@ -720,6 +724,8 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handlePut(m)
 	case "putmany":
 		return s.handlePutMany(m, frameLen)
+	case "resend":
+		return s.handleResend(m)
 	case "get":
 		return s.handleGet(m)
 	case "fetch":
@@ -1929,6 +1935,99 @@ func nonNil[T any](entries []T) []T {
 		return []T{}
 	}
 	return entries
+}
+
+// handleResend takes bodies for chunks this vault refers to and has lost (I14).
+//
+// A body can go missing without a single row changing: a disk rots one and
+// `verify` quarantines it, or a restore brings back a database whose chunk tree
+// is not quite the same age. Every version that names it then downloads
+// forever, which presents as a sync that never finishes.
+//
+// Nothing in ordinary reconciliation fixes that. A device whose copy of the
+// note has not changed considers it synced, because it is: the entry is
+// committed and the hashes agree. It has the bytes and no reason to send them,
+// and the only way to make it send them was to edit the note, which puts a
+// version nobody wrote into the history of a vault that is already damaged.
+//
+// So: a put with no entry. The client names chunks, the server says which of
+// them it wants, and the bodies arrive and are stored. No uid is allocated, no
+// entry is written, no authenticator is touched, and the vault afterwards is
+// exactly the vault the backup should have been.
+//
+// Two things make it safe to let a device write bodies with no entry:
+//
+//   - a body is content-addressed, so `chunks.Put` hashes what arrives and
+//     refuses anything that is not the body its name claims. A device cannot
+//     put the wrong bytes under a name however much it would like to.
+//   - a name no committed entry refers to is refused outright. Correct bytes
+//     under an unreferenced name are still a paired device writing into the
+//     store for ever, and repair is for bodies the vault is missing.
+func (s *Session) handleResend(m wire.In) error {
+	if len(m.Chunks) == 0 {
+		return s.reject(wire.CodeBadChunk, errors.New("resend named no chunks"))
+	}
+	if len(m.Chunks) > store.MaxChunksPerEntry {
+		return s.reject(wire.CodeToolarge,
+			fmt.Errorf("%d chunks, limit is %d; ask in smaller sets",
+				len(m.Chunks), store.MaxChunksPerEntry))
+	}
+	for _, n := range m.Chunks {
+		if !chunks.ValidName(n) {
+			return s.reject(wire.CodeBadChunk, fmt.Errorf("%q is not a chunk name", n))
+		}
+	}
+
+	referenced, err := s.srv.st.ReferencedChunks(s.vaultID, m.Chunks)
+	if err != nil {
+		return s.reject(wire.CodeInternal, err)
+	}
+	// Named rather than silently dropped. A device offering a body for a name
+	// this vault does not use has an index that disagrees with the server, and
+	// telling it so is how that gets found; accepting it quietly would be the
+	// server storing something nothing will read.
+	for _, n := range m.Chunks {
+		if _, ok := referenced[n]; !ok {
+			return s.reject(wire.CodeNoChunk, fmt.Errorf(
+				"no entry in this vault refers to %s, so there is nothing here for it to repair", n))
+		}
+	}
+
+	missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, m.Chunks)
+	if err != nil {
+		return s.reject(wire.CodeInternal, err)
+	}
+	_ = sizes
+	if len(missing) == 0 {
+		// Nothing to do, said plainly. A device runs repair without knowing
+		// whether anything is wrong, and "the server already had all of them"
+		// is the answer it is usually hoping for.
+		return s.writeJSON(wire.Resent{Res: "resent", ID: s.reqID, Stored: 0, Missing: 0})
+	}
+
+	if err := s.writeJSON(wire.Want{Res: "want", ID: s.reqID, Chunks: missing}); err != nil {
+		return err
+	}
+	// The same body reader a put uses, so the size ceiling, the framing rules
+	// and the hash check are one implementation rather than two. The allowance
+	// is what these bodies are permitted to occupy, computed the way a put's is.
+	if err := s.readBodies(missing, s.srv.perFileMax*int64(len(missing))); err != nil {
+		return err
+	}
+
+	// Asked again rather than assumed. readBodies returning is not the same
+	// statement as "the store now holds them", and rule 4 is that the outcome
+	// is what gets checked. It is also how `Missing` in the reply is honest:
+	// anything still absent after this is a body the store would not take.
+	stillMissing, _, err := s.srv.st.Chunks().Missing(s.vaultID, m.Chunks)
+	if err != nil {
+		return s.reject(wire.CodeInternal, err)
+	}
+	return s.writeJSON(wire.Resent{
+		Res: "resent", ID: s.reqID,
+		Stored:  len(missing) - len(stillMissing),
+		Missing: len(stillMissing),
+	})
 }
 
 func (s *Session) handleGet(m wire.In) error {

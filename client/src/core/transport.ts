@@ -1562,6 +1562,51 @@ export class Transport {
    * An empty list means the server has no versions of that path. It cannot
    * tell "never existed" from "history purged", so neither can this.
    */
+  /**
+   * Offers bodies for chunks the server has lost, and writes no entry (I14).
+   *
+   * A put with no version attached. The server answers `want` with whatever it
+   * is actually missing, takes those bodies, and reports what it stored and
+   * what it still lacks; no uid is allocated and no authenticator is touched,
+   * so a vault repaired this way is the vault it should have been rather than
+   * one with a synthetic edit in its history.
+   *
+   * `bodyOf` is asked for a chunk only if the server wants it, exactly as in
+   * `put` and for the same reason: producing every sealed body up front to
+   * discover the server needed none of them is the whole file in memory for
+   * nothing.
+   */
+  async resend(
+    names: readonly string[],
+    bodyOf: (name: string) => Promise<Uint8Array>,
+  ): Promise<{ stored: number; missing: number; bytes: number }> {
+    const reply = await this.request({ op: "resend", chunks: [...names] }, "want or resent");
+
+    if (reply["res"] === "resent") {
+      return { stored: countOf(reply, "stored"), missing: countOf(reply, "missing"), bytes: 0 };
+    }
+    if (reply["res"] !== "want") {
+      throw new ProtocolError(
+        "protostate",
+        `expected want or resent, got ${JSON.stringify(reply)}`,
+      );
+    }
+
+    const offered = new Set(names);
+    const wanted = this.wanted(reply, offered);
+    // Taken out before the bodies go, for the reason `put` gives: a loopback
+    // server answers from inside the last send, and a waiter installed
+    // afterwards finds the answer already gone.
+    const id = idOf(reply);
+    const done = this.expectMore(id, "resent");
+    const bytes = await this.sendBodies(wanted, offered, bodyOf, "resend");
+    const final = await this.awaitPhase(done, id);
+    if (final["res"] !== "resent") {
+      throw new ProtocolError("protostate", `expected resent, got ${JSON.stringify(final)}`);
+    }
+    return { stored: countOf(final, "stored"), missing: countOf(final, "missing"), bytes };
+  }
+
   async history(
     sealedPath: string,
     opts: { before?: number; limit?: number } = {},
@@ -2140,6 +2185,20 @@ function protoRefusal(err: unknown): unknown {
 }
 
 /** The id a reply came back under, which every reply reaching a caller has. */
+/**
+ * A count out of a reply, refused rather than coerced.
+ *
+ * `Number(undefined)` is NaN and `Number(null)` is 0, and a repair reporting
+ * "0 still missing" because a field was absent is the wrong kind of good news.
+ */
+function countOf(reply: Reply, field: string): number {
+  const raw = reply[field];
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    throw new ProtocolError("protostate", `${field} is ${JSON.stringify(raw)}, not a count`);
+  }
+  return raw;
+}
+
 function idOf(reply: Reply): number {
   const id = reply["id"];
   if (typeof id !== "number") throw new Error("a matched reply lost its id, which cannot happen");

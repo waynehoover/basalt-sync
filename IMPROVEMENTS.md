@@ -18,7 +18,27 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 
 ### I01 — Split large modules along existing responsibilities
 
-- [ ] **Medium; incremental.** Extract code when touching its behavior rather than doing a broad rewrite first.
+- [x] **Medium; incremental.** Extract code when touching its behavior rather than doing a broad rewrite first.
+
+Done as the item asks, which is to say not as a rewrite. The success measure it
+sets is that "a change to one credential or transfer rule has one main
+implementation site and focused tests", and that is what the extractions were
+for: `core/rotation.ts` is the whole of replacing a vault's secret and both
+shells call it (I02), `core/outcome.ts` is the whole of what a pass came to and
+four different readings became one (I04), `protocol-fixtures.json` is the whole
+of what a well-formed entry is and both languages are held to it (I03), and the
+repair path added since is one place in the engine, one in the transport and one
+in the session (I14). Each was extracted while its behaviour was being changed,
+and each is where the divergence it was hiding actually was.
+
+The large files are still large, and that is a decision rather than an omission.
+`engine.ts` is the reconciliation, and the comments in it are the incidents that
+shaped each rule; a split along the seams this item suggests would move those
+comments away from the code they explain, and the value of this project's tests
+is that a fix without a test that failed first is not finished, which is harder
+to hold across a boundary than within one. The rule stands: extract when
+touching, and the next credential or transfer change is where the next
+extraction comes from.
 
 [engine.ts](client/src/core/engine.ts) combines reconciliation, hashing, transfer planning, conflict handling, recovery, retries, and persistence. [transport.ts](client/src/core/transport.ts) combines connection lifecycle, request matching, notifications, validation, transfer flow control, and administration. [plugin/main.ts](client/src/plugin/main.ts) mixes lifecycle, credentials, UI construction, and recovery. The Go [session](server/internal/server/session.go), [store](server/internal/store/store.go), and [CLI entrypoint](server/cmd/basaltd/main.go) have similar concentrations.
 
@@ -166,7 +186,28 @@ Use executable examples for default and non-default names, including spaces wher
 
 ### I14 — Add an explicit repair path for quarantined/missing server bodies
 
-- [ ] **Medium to large; after durability fixes.** Define how an operator can repopulate damaged server chunks from a healthy device without manufacturing arbitrary note edits.
+- [x] **Medium to large; after durability fixes.** Define how an operator can repopulate damaged server chunks from a healthy device without manufacturing arbitrary note edits.
+
+`resend` is a put with no entry: the client names chunks, the server says which
+of them it actually lacks, the bodies arrive, and no uid is allocated, no entry
+is written and no authenticator is touched. `basalt repair` drives it from
+whatever this device holds. The alternative, which is what the purge output used
+to be waiting for, was to edit a note so reconciliation would upload it, which
+writes a version nobody typed into the history of a vault that is already
+damaged.
+
+Two rules make it safe to let a device write bodies with no entry behind them: a
+body is content-addressed, so the server refuses anything that is not the body
+its name claims, and a name no committed entry refers to is refused outright,
+because correct bytes under an unreferenced name are a paired device filling the
+disk.
+
+The honest part is what it does not claim. A body belonging to a version this
+device never had is not on its disk and not in its index, so nothing here could
+notice it is gone; a count of "history I could not reach" would be a number that
+reads like assurance and means nothing. So repair reports what it did, and both
+shells point at `basaltd verify` on the server for what remains. The test for
+that case asserts exactly that: a clean run, and a server that still knows.
 
 [Chunk integrity checks](server/internal/chunks/chunks.go) can detect/quarantine bad content, and [purge output](server/cmd/basaltd/main.go#L1009) says it is waiting for devices to resend. Ordinary reconciliation may consider an unchanged local note already synchronized and never upload its missing body.
 
@@ -174,7 +215,23 @@ A repair operation could inventory required chunk names, verify matching local c
 
 ### I15 — Separate read-only inspection from database creation and migration
 
-- [ ] **Medium.** Add explicit create/open-existing/read-only modes and a supported schema-version check.
+- [x] **Medium.** Add explicit create/open-existing/read-only modes and a supported schema-version check.
+
+Nothing recorded a schema version at all, and that is the half that could lose a
+note: `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists,
+so an older basaltd opened a newer database without a word, read the columns it
+happened to know and wrote rows missing the rest. `PRAGMA user_version` now
+carries it, a database from the future is refused in every mode including
+read-only, and the refusal names both numbers. Zero is accepted, because every
+database written so far has one and refusing them would mean an upgrade that
+cannot open the store it is upgrading.
+
+`Create`, `Existing` and `ReadOnly` say what opening a store may do to it.
+`verify` and `stats` take the read-only path, where SQLite refuses the write
+rather than this package remembering not to make one; `backup` does not, because
+`VACUUM INTO` is a write statement whatever its effect on the source, and
+`purge` writes by definition. Both exceptions are written down where somebody
+would otherwise 'fix' them.
 
 [Store.OpenWithSync](server/internal/store/store.go#L509) creates directories, runs migrations, and executes schema setup. Administrative inspection and backup coverage currently use that general opening path. A diagnostic command should have a clear contract about whether it can alter the store it is inspecting.
 
@@ -182,7 +239,29 @@ Refuse a future incompatible schema instead of allowing an older binary to proce
 
 ### I16 — Strengthen backup identity, retention, and restore verification
 
-- [ ] **Medium; alongside F04/F06.** Bind backup metadata to a specific database generation and make retention preserve usable database-and-body sets.
+- [x] **Medium; alongside F04/F06.** Bind backup metadata to a specific database generation and make retention preserve usable database-and-body sets.
+
+The sidecar was stamped with the database's size, which survives a `cp -r` and
+is why it was chosen, and which two snapshots of one store share about as often
+as not: an hour's worth of notes is usually the same number of pages. So a
+database republished into a backup directory left coverage that went on looking
+plausible while describing a snapshot that no longer existed. SQLite's file
+change counter, four bytes at offset 24 of the header, moves on every
+transaction that modifies the database and is inside the file, so it survives a
+copy exactly as the size does. Recorded and checked; zero means "not recorded"
+rather than "zero", so every backup taken before this still reads.
+
+The rehearsal now goes all the way. `rehearsal_test.go` executes the runbook and
+proves the server serves what the backup held, and that is as far as it can get:
+the server holds no key and has never seen a plaintext, so "every body came
+back" is its whole vocabulary. Whether any of it decrypts to the note somebody
+wrote is a question only a client can answer, and that is the gap a backup
+exists to close. `client/src/restore-rehearsal.test.ts` writes notes whose
+plaintext hashes are known, backs up, destroys the live directory, starts a
+server on the backup, pairs a device that has never existed using the recovery
+key alone, and compares every note by hash. A second case does the same from a
+backup taken before a purge, and reads the history the purge would have dropped,
+which is the argument for keeping one and had never been executed.
 
 [Backup metadata](server/internal/store/backup.go) is useful operational context; file size alone does not establish that a sidecar belongs to a database. A changed database of the same size can leave plausible stale coverage information. Record/check a durable generation identifier or equivalent binding, and distinguish successful completion from a partially staged attempt.
 
@@ -190,7 +269,26 @@ The existing [restore rehearsal](server/cmd/basaltd/rehearsal_test.go) validates
 
 ### I17 — Make operational health and shutdown limits observable
 
-- [ ] **Small to medium.** Build on existing `health`, stats, and alert guidance with machine-readable reasons and bounded operational behavior.
+- [x] **Small to medium.** Build on existing `health`, stats, and alert guidance with machine-readable reasons and bounded operational behavior.
+
+`/health` wrote `ok` from a handler that touched nothing, so a full disk, a
+database gone read-only and a chunk directory whose volume had unmounted all
+looked exactly like a healthy server until somebody tried to save a note. It
+now does one indexed read and one `statfs`, and answers 200 or 503 with one
+word from a fixed vocabulary: `store-unreadable`, `disk-full`,
+`chunks-unreachable`, `shutting-down`. No path, no vault name, no number, no
+version, because the endpoint needs no credential and behind a tunnel the port
+is on the internet; the figures are in `basaltd stats`, run on the machine.
+Draining reports 503 deliberately, because the use of a health check during a
+restart is to stop devices being sent to a server that is about to refuse them.
+
+The shutdown budget is two halves of five seconds plus closing the store, and
+the deadlines that can kill the process now all outlast it. `TimeoutStopSec=30`
+was already in the systemd unit; compose had nothing, so Docker's ten-second
+default applied, which is both halves and nothing at all for the store close.
+`TestEveryStopDeadlineOutlastsTheShutdownBudget` keeps the three numbers in
+step, since they live in three files in two languages and the easiest one to
+change is the one in Go.
 
 Distinguish process responsiveness from ability to persist a note, disk exhaustion, slow fsync/SQLite operations, and a failed last backup. Do not put expensive deep verification on every health probe. Record sync refusal counts, queue saturation, and storage failure counts without high-cardinality filenames or secrets.
 
@@ -198,7 +296,25 @@ Distinguish process responsiveness from ability to persist a note, disk exhausti
 
 ### I18 — Document filesystem and device support as an explicit matrix
 
-- [ ] **Small documentation work; medium validation.** State which guarantees have been exercised on macOS/Linux, case-sensitive/insensitive volumes, mounted subdirectories, network filesystems, Obsidian desktop, and mobile adapters.
+- [x] **Small documentation work; medium validation.** State which guarantees have been exercised on macOS/Linux, case-sensitive/insensitive volumes, mounted subdirectories, network filesystems, Obsidian desktop, and mobile adapters.
+
+The table is in [docs/server.md](docs/server.md), and it says what a machine has
+actually executed rather than what is expected to work, which made one entry
+embarrassing enough to fix on the spot: a dozen tests ask the disk whether it
+folds case and skip when it does not, every runner was Linux, so the behaviour
+F01 was about had been checked in CI exactly never. There is a macOS job now,
+and it asserts the runner really does fold case before running, because a job
+that silently skips the only thing it exists for is the failure it was added to
+end. `scripts/check.sh` says which kind of disk it just ran on, for the same
+reason.
+
+The blanket `catch` on the directory flush after a removal is gone. A filesystem
+with no directory fsync and a disk returning EIO were the same silence, and the
+second one means an unlink may not survive a power cut: the config comes back,
+and with it a vault that reads as paired to a server it was told to forget,
+which is exactly what C38 added the flush to prevent. It is now reported rather
+than thrown, because by the time it runs the pairing is already gone and only
+its durability is in question.
 
 [CLI durability helpers](client/src/cli/vault.ts), [Obsidian adapter](client/src/plugin/vault.ts), and [server fsync](server/internal/fsync/fsync.go) depend on different filesystem capabilities. Distinguish atomic visibility, readback verification, and persistence across power loss. Review blanket directory-sync error suppression in [config removal](client/src/cli/config.ts#L102): an unsupported operation and an actual I/O failure should not become the same success.
 
@@ -216,7 +332,34 @@ Assert properties: every acknowledged version is readable after restart; a newer
 
 ### I20 — Add representative real-runtime and filesystem coverage
 
-- [ ] **Medium.** Keep fast stub tests, and supplement them with a small acceptance matrix using actual supported environments.
+- [x] **Medium.** Keep fast stub tests, and supplement them with a small acceptance matrix using actual supported environments.
+
+Four of the six named here are now jobs. The packaged CLI is installed from its
+own tarball and run under node, which is the runtime it claims and the one
+nothing else used (I21). The client suite runs on a case-folding filesystem, so
+the dozen tests that ask the disk and skip stop only ever running on a
+maintainer's laptop (I18). It also runs with its vaults on a loopback ext4
+image, reached through a mount point, which is the "mounted subdirectory" the
+matrix said had never been tried; `TMPDIR` is the whole of the change, because
+every test already asks the OS where temporary files go. And systemd is finally
+asked what it thinks of the unit `basaltd service` writes: `TestService` checks
+that text against what this project meant to write, which is the repository
+agreeing with itself, and a directive systemd refuses produces a unit that fails
+five seconds after somebody installs it.
+
+Both new filesystem jobs assert their own premise before running, because a
+mount that silently did not happen, or a runner that stopped folding case, is a
+job that passes while testing nothing and says so to nobody.
+
+`scripts/check.sh` grew a third category for this. A skip is a check that could
+have run here and did not, and it makes the run amber; systemd on macOS is a
+check that never can, and counting it as a skip would leave the script amber for
+ever on the machine it is mostly run on, which is a signal nobody reads. Those
+are listed as "only in CI" and do not change the exit code.
+
+What is left is Obsidian itself, desktop and mobile, and it is left because no
+runner has Obsidian on it. docs/server.md says so in the matrix rather than
+leaving a reader to assume otherwise.
 
 [Plugin tests](client/src/plugin/main.test.ts) explicitly use an Obsidian runtime stub. Panel rendering tests cannot establish actual adapter semantics, event order, unload timing, mobile suspension, or editor-save interaction. [The check script](scripts/check.sh) also cannot execute systemd validation on a macOS host.
 

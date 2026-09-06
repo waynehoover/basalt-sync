@@ -22,6 +22,7 @@ import {
   contentId,
   mustBeOurs,
   placeBeside,
+  type RepairReport,
   type SyncOptions,
   type SyncReport,
 } from "./engine.ts";
@@ -599,6 +600,23 @@ export class Client {
    * remember what it was called, which is why the paths are unsealed here
    * rather than left for the caller.
    */
+  /**
+   * Sends the server bodies it has lost, writing no version (I14).
+   *
+   * What `basaltd verify` finds and nothing could previously fix: a chunk the
+   * disk rotted and the server quarantined, or one a restore left behind. Every
+   * device that wants that version downloads for ever, and no ordinary pass
+   * repairs it, because a device whose copy has not changed is correct to
+   * consider it synced.
+   *
+   * Serialised with the passes, like every other request here, so a repair
+   * cannot run inside a sync and offer bodies for an index the pass is halfway
+   * through rewriting.
+   */
+  async repair(): Promise<RepairReport> {
+    return this.serial(() => this.engine.repair());
+  }
+
   async deleted(limit?: number, before?: number): Promise<DeletedList> {
     const answer = await this.serial(() => this.transport.deleted(limit, before));
     await this.recoveryIsOurs(answer.entries);

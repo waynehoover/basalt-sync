@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"encoding/json"
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 )
 
@@ -517,5 +518,131 @@ func TestBackupCountsIgnoreInProgressWrites(t *testing.T) {
 	}
 	if rep.DestBodies != 1 {
 		t.Fatalf("DestBodies = %d, want 1", rep.DestBodies)
+	}
+}
+
+// A different snapshot of the same size is caught (I16).
+//
+// The stamp was the database's size, which survives a copy and is why it was
+// chosen, and which two snapshots of one store share about as often as not: an
+// hour's worth of notes is usually the same number of pages. So a database
+// republished into a backup directory by anything that does not rewrite
+// backup.json left coverage that went on looking plausible while describing a
+// snapshot that no longer existed, for ever, because nothing corrects it.
+//
+// SQLite's file change counter is four bytes at offset 24 of the header and
+// moves on every transaction that modifies the database. It is inside the file,
+// so it survives `cp -r` exactly as the size does.
+func TestCoverageCatchesADifferentDatabaseOfTheSameSize(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(dir, "backup")
+	if _, err := st.Backup(dest, false); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if _, err := ReadBackupMeta(dest); err != nil {
+		t.Fatalf("the backup this just took does not read: %v", err)
+	}
+
+	// A second snapshot of the same store, published over the first without
+	// its coverage being rewritten. Same schema, same rows, same size.
+	destDB, _ := DataDir(dest)
+	before, err := os.Stat(destDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One more transaction, so the change counter moves and the page count does
+	// not. Writing a vault row into an existing table adds no page.
+	if err := st.SawDevice("default", "nobody", 2000); err != nil {
+		// Not every build has a device to see; the point is a transaction.
+		if err := st.EnsureVault("default", 2000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second := filepath.Join(dir, "second.db")
+	if err := st.SnapshotInto(second); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destDB, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(destDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Size() != after.Size() {
+		t.Skipf("the two snapshots differ in size (%d then %d), so the size check "+
+			"catches this one and the change counter is not what is under test here",
+			before.Size(), after.Size())
+	}
+
+	_, err = ReadBackupMeta(dest)
+	if err == nil {
+		t.Fatal("coverage describing a database that was replaced read as valid")
+	}
+	if !strings.Contains(err.Error(), "change") {
+		t.Fatalf("refused, but not for the reason it should be: %v", err)
+	}
+}
+
+// Every backup taken before the change counter was stamped records zero, and
+// zero means "not recorded" rather than "the counter is zero". Treating it as a
+// mismatch would fail every backup anybody already has.
+func TestCoverageWithNoChangeCounterStillReads(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "backup")
+	if _, err := st.Backup(dest, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the sidecar as an older build would have: everything else the
+	// same, no change counter.
+	path := filepath.Join(dest, BackupMetaFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta BackupMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Database.Change == 0 {
+		t.Fatal("the backup just taken recorded no change counter, so this proves nothing")
+	}
+	meta.Database.Change = 0
+	out, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ReadBackupMeta(dest); err != nil {
+		t.Fatalf("a backup from before the counter was stamped was refused: %v", err)
 	}
 }

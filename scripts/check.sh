@@ -12,10 +12,18 @@
 # script does not know about. The two cannot drift, because drifting is itself
 # a failure.
 #
-# Exit 0 means every check CI runs passed here. Nothing else means that. A
-# check that could not run locally is a failure too, not a footnote, because
-# the whole lesson is that a partial pass reads exactly like a complete one.
-# Pass --skip-docker to accept that one deliberately.
+# Exit 0 means every check CI runs and this machine can run passed here.
+# Nothing else means that. A check that could have run here and did not is a
+# failure, not a footnote, because the whole lesson is that a partial pass
+# reads exactly like a complete one. Pass --skip-docker to accept that one
+# deliberately.
+#
+# The one exception is a check this platform cannot run at all, of which there
+# is currently one: systemd's opinion of the unit, on a machine with no systemd.
+# Those are listed at the end under "only in CI" and do not change the exit
+# code, because a script that is amber for ever on the machine it is mostly run
+# on is a script nobody reads the colour of. See `only_in_ci` below for the line
+# between that and a skip.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,9 +31,10 @@ root=$(pwd)
 skip_docker=0
 [ "${1:-}" = "--skip-docker" ] && skip_docker=1
 
-pass=0 fail=0 skipped=0
+pass=0 fail=0 skipped=0 elsewhere=0
 failed_names=()
 skipped_names=()
+elsewhere_names=()
 
 # Each entry is a CI step name, so the guard can compare against the workflow.
 run() { # run <ci step name> <working dir> <command...>
@@ -43,6 +52,23 @@ skip() { # skip <ci step name> <why>
   skipped=$((skipped + 1)); skipped_names+=("$1")
 }
 
+# only_in_ci is for a check this machine cannot run and never will (I20).
+#
+# Different from `skip`, and the difference is the point. A skip is a check that
+# could have run here: no docker daemon today, one tomorrow, and the run is
+# amber until it does. A macOS machine will not grow systemd, so counting that
+# as a skip would make this script exit 2 for ever on the machine it is mostly
+# run on, and a signal that is always amber is a signal nobody reads. That is
+# the failure this whole script exists to prevent, arriving by another door.
+#
+# So it is reported, listed at the end, and does not change the exit code. What
+# it must never be used for is a check that is merely inconvenient here: the
+# test is whether this platform can run it at all.
+only_in_ci() { # only_in_ci <ci step name> <why>
+  printf '\n\033[1m==> %s\033[0m ONLY IN CI: %s\n' "$1" "$2"
+  elsewhere=$((elsewhere + 1)); elsewhere_names+=("$1")
+}
+
 gofmt_clean() {
   local out; out=$(gofmt -l .)
   [ -z "$out" ] || { echo "not gofmt'd:"; echo "$out"; return 1; }
@@ -53,6 +79,36 @@ run "gofmt" server gofmt_clean
 run "vet" server go vet ./...
 run "test" server go test -race ./...
 run "the systemd unit verifies" server go test -race -run 'TestService' ./cmd/basaltd/
+
+# ---- systemd's own opinion of that unit -------------------------------------
+#
+# The test above checks the unit against what this project meant to write, which
+# is this repository agreeing with itself. Whether systemd accepts it is a
+# different question, and on a machine with no systemd it cannot be asked (I20).
+# Skipped rather than passed, for the reason the whole script exists: "could not
+# run" and "passed" are different sentences, and exit 2 says which.
+systemd_accepts() {
+  local unit; unit=$(mktemp)
+  go -C "$root/server" build -o "$(dirname "$unit")/basaltd" ./cmd/basaltd
+  "$(dirname "$unit")/basaltd" service -data /var/lib/basalt -addr 0.0.0.0:3003 \
+    -vault default -user basalt -binary /usr/local/bin/basaltd -max-file 134217728 > "$unit"
+  systemd-analyze verify "$unit"
+}
+if command -v systemd-analyze >/dev/null 2>&1; then
+  run "systemd accepts the unit" "" systemd_accepts
+else
+  only_in_ci "systemd accepts the unit" "there is no systemd on this machine"
+fi
+
+# ---- the client suite on a filesystem of its own ----------------------------
+#
+# CI builds a loopback ext4 image, mounts it, and points TMPDIR at it, so every
+# vault the suite makes lands on a filesystem that is not the runner's root
+# (I20). That needs a mount and therefore root, and a check script that sudos is
+# a check script nobody runs. So it is named here and executed only in CI, which
+# is the honest version of both facts.
+only_in_ci "a filesystem of its own, mounted" \
+  "it needs a loopback mount, and this script does not ask for root"
 
 # ---- the compose pin -------------------------------------------------------
 run "the pinned image is not behind the newest server release" "" \
@@ -77,6 +133,26 @@ run "the backup restores, verifies and serves what it held" server \
   go test -tags rehearsal -run TestRestoreRehearsal -count=1 ./cmd/basaltd/
 
 # ---- client ----------------------------------------------------------------
+# ---- the filesystem this is running on --------------------------------------
+#
+# CI runs the client suite twice, on Linux and on macOS, because a dozen tests
+# ask the disk whether it folds case and skip when it does not (I18). Here it
+# runs once, on whatever this machine is, and says which kind that was: a green
+# run on a case-sensitive box has skipped the case-folding half, and a green run
+# on a case-folding one has skipped the other, and neither says so by itself.
+folds_case() {
+  local d; d=$(mktemp -d)
+  printf 'probe' > "$d/CaseProbe.tmp"
+  if [ -f "$d/caseprobe.tmp" ]; then
+    echo "this filesystem folds case, so the case-folding tests ran here"
+  else
+    echo "this filesystem is case-sensitive, so the case-folding tests skipped here."
+    echo "CI runs them on macOS; see the client-case-folding job."
+  fi
+  rm -rf "$d"
+}
+run "this runner folds case" "" folds_case
+
 run "install" client bun install --frozen-lockfile
 run "format" client bun run format:check
 run "typecheck" client bun run typecheck
@@ -140,6 +216,12 @@ fi
 
 # ---- what actually happened ------------------------------------------------
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
+# One per line. These names have commas in them, so a comma-joined list reads
+# as more entries than there are.
+if [ ${#elsewhere_names[@]} -gt 0 ]; then
+  printf 'only in CI:\n'
+  printf '  %s\n' "${elsewhere_names[@]}"
+fi
 [ ${#failed_names[@]} -eq 0 ] || printf 'failed:  %s\n' "$(IFS=', '; echo "${failed_names[*]}")"
 [ ${#skipped_names[@]} -eq 0 ] || printf 'skipped: %s\n' "$(IFS=', '; echo "${skipped_names[*]}")"
 

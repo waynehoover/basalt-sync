@@ -127,12 +127,13 @@ func TestS1NoPingIsSentWhileFramesAreStillQueued(t *testing.T) {
 	peer := r.onlyPeer()
 
 	var pings, pingsBehindData atomic.Int64
-	r.srv.beforePing = func() {
+	hook := func() {
 		pings.Add(1)
 		if peer.inflight.Load() > 0 {
 			pingsBehindData.Add(1)
 		}
 	}
+	r.srv.beforePing.Store(&hook)
 
 	cl.sendJSON(wire.In{Op: "fetch", Chunks: names})
 	// 60 ms per body: the last eight are queued for half a second after the

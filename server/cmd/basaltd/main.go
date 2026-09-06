@@ -158,6 +158,26 @@ func openExisting(dataDir, verb string) (*store.Store, error) {
 	return openStore(dataDir)
 }
 
+// openForInspection is openExisting for the commands that only ask questions
+// (I15).
+//
+// `verify` and `stats` read and report, and used the same opening path as
+// `serve`: it migrates, and it writes the schema. So inspecting a store written
+// by an older build changed it, which is a diagnostic modifying the thing it
+// was asked to look at, and the person running it had no way to know.
+//
+// Not every read-only-sounding command belongs here. `backup` reads the source
+// and issues `VACUUM INTO`, which is a statement SQLite refuses on a read-only
+// connection however harmless its effect on the source; `purge` writes by
+// definition. Both keep the writable path, and this comment is why.
+func openForInspection(dataDir, verb string) (*store.Store, error) {
+	if err := requireDataDir(dataDir, verb); err != nil {
+		return nil, err
+	}
+	dbPath, chunkDir := store.DataDir(dataDir)
+	return store.OpenForInspection(dbPath, chunkDir)
+}
+
 // requireDataDir refuses a path that is not already a data directory.
 //
 // Called before the lock rather than after, because taking a lock creates the
@@ -864,7 +884,7 @@ func cmdVerify(args []string, out io.Writer) error {
 	}
 	defer lock.Release()
 
-	st, err := openExisting(*dataDir, "verify")
+	st, err := openForInspection(*dataDir, "verify")
 	if err != nil {
 		return err
 	}
@@ -1041,7 +1061,13 @@ func cmdPurge(args []string, out io.Writer) error {
 	// purging for space came for, and a count with no bytes beside it does not
 	// answer that (rule 8).
 	if rep.ChunksQuarantined > 0 {
-		fmt.Fprintf(out, "%d quarantined bodies (%s) left in place, waiting for a device to resend them\n",
+		// Naming the command, because for a long time this line asked for
+		// something no device could do (I14). A device whose copy of the note
+		// has not changed is right to consider it synced and has no reason to
+		// send anything, so "waiting for a device to resend them" was a wait
+		// with nothing at the end of it.
+		fmt.Fprintf(out, "%d quarantined bodies (%s) left in place. Run `basalt repair` on a device "+
+			"that still has those notes; they are replaced when the real body arrives\n",
 			rep.ChunksQuarantined, humanBytes(rep.BytesQuarantined))
 	}
 	if rep.ChunksTemp > 0 {

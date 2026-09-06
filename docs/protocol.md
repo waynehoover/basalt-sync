@@ -269,6 +269,49 @@ A `get` for a missing uid is `nouid`. One for a folder or a deletion is
 A deletion is an entry with `deleted: true`, not the absence of one. The record
 is what makes the file recoverable.
 
+## Repairing a body the server has lost
+
+A chunk can go missing while every row stays exactly as it was: a disk rots one
+and the server quarantines it, or a restore brings back a database and a chunk
+tree of slightly different ages. Every device that wants that version then
+downloads it for ever, which looks like a sync that never finishes rather than
+an error anybody can act on.
+
+Nothing in ordinary reconciliation fixes it, and that is the point of a separate
+op. A device whose copy of the note has not changed is right to consider it
+synced: the entry is committed, the hashes agree, and a pass has nothing to do.
+It is holding the missing bytes and has no reason to send them. The only way to
+make it send them used to be to edit the note, which writes a version nobody
+typed into the history of a vault that is already damaged.
+
+So `resend` is a put with no entry:
+
+```
+-> {"op":"resend","id":9,"chunks":["<name>", ...]}
+<- {"res":"want","id":9,"chunks":["<name>"]}       the ones it actually lacks
+-> <binary frame per wanted chunk, in order>
+<- {"res":"resent","id":9,"stored":1,"missing":0}
+```
+
+No uid is allocated, no entry is written, no authenticator is touched. A vault
+repaired this way is the vault it should have been.
+
+Two rules make it safe to let a device write bodies with no entry behind them:
+
+- a body is content-addressed, so the server hashes what arrives and refuses
+  anything that is not the body its name claims. A device cannot put the wrong
+  bytes under a name however much it would like to.
+- a name no committed entry in the vault refers to is refused outright, with
+  `nochunk`. Correct bytes under an unreferenced name are still a paired device
+  writing into the store for ever, and repair is for bodies the vault is
+  missing.
+
+`missing` in the reply counts bodies the server asked for, was sent, and still
+does not have, which is a full disk rather than a normal outcome. What the reply
+cannot say is how much of the vault's *history* is gone, because the client
+never named those chunks: a device can only offer what it holds. `basaltd
+verify` on the server is what knows, and `basalt repair` says so.
+
 ## Recovery
 
 Two read-only operations:

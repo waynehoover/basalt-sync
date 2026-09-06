@@ -61,7 +61,7 @@ import {
   type Version,
 } from "../core/client.ts";
 import { generateSecret } from "../core/crypto.ts";
-import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
+import { REJOIN_ADVICE, type RepairReport, type SyncReport } from "../core/engine.ts";
 import {
   decodeConfig,
   deviceCredential,
@@ -635,6 +635,26 @@ export default class BasaltPlugin extends Plugin {
         }
       });
     }, 400);
+  }
+
+  /**
+   * Offers the server every body this device holds, for the ones it has lost
+   * (I14).
+   *
+   * The same operation as `basalt repair`, and it is here for the reason
+   * `rejoin` is: the documented alternative for a plugin device was nothing at
+   * all. A phone can perfectly well be the last machine holding a body the
+   * server no longer has, and it has no shell to run the CLI in.
+   *
+   * Writes no version, so there is no generation dance around it: a repair
+   * changes nothing about this vault's state and cannot leave a stale result
+   * speaking for a vault that has since been unlinked. The panel disables the
+   * button while it runs, which is the whole of the concurrency here.
+   */
+  async repair(): Promise<RepairReport> {
+    const client = this.client;
+    if (!client) throw new Error(this.whyNoClient());
+    return client.repair();
   }
 
   /** Syncs on demand, and says so, because a command with no feedback is a guess. */
@@ -2079,6 +2099,49 @@ class BasaltPanel {
     // warning, and behind two presses, because it is the one action here that
     // retires the key somebody wrote down.
     this.renderRotate(manage);
+
+    // Beside the device list rather than under recovery, because it is a thing
+    // done to the server and not to this vault, and it is here at all for the
+    // reason rejoin is: the documented alternative for a plugin device was
+    // nothing. A phone may hold the only remaining copy of a body the server
+    // has lost, and it has no shell to run `basalt repair` in (I14).
+    row(
+      manage,
+      "Send back what the server has lost",
+      "If a note will not download and never finishes, the server may have lost the file " +
+        "behind it. This offers everything this device holds. It writes no new versions.",
+    ).addButton((b) =>
+      b.setButtonText("Send").onClick(async () => {
+        b.setDisabled(true).setButtonText("Sending");
+        try {
+          const out = await this.plugin.repair();
+          // Both halves of the answer, always. "Sent 3" without "and this
+          // device cannot reach the rest" is the comfortable half of a story
+          // whose other half decides whether to go and find another machine.
+          const parts: string[] = [];
+          parts.push(
+            out.stored > 0
+              ? `Sent ${out.stored} back.`
+              : "The server already had everything this device can offer.",
+          );
+          if (out.stillMissing > 0) {
+            parts.push(`${out.stillMissing} would not store; check the server's disk.`);
+          }
+          if (out.failed.length > 0) {
+            parts.push(`${out.failed.length} could not be read here.`);
+          }
+          parts.push(
+            "Do this on your other devices too. Anything still missing is history this " +
+              "device never had.",
+          );
+          new Notice(`Basalt: ${parts.join(" ")}`, 15_000);
+        } catch (err) {
+          new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+        } finally {
+          b.setDisabled(false).setButtonText("Send");
+        }
+      }),
+    );
 
     row(
       manage,

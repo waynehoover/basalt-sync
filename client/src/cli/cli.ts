@@ -110,6 +110,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt deleted                            notes the server still has and you do not
   basalt history PATH                       every version the server holds of one note
   basalt restore PATH                       put a note back, newest version first
+  basalt repair                             resend bodies the server has lost, from this device
   basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
   basalt rebase --backup-taken              rejoin a server restored from an older backup
   basalt unlink                             forget the pairing, keep the notes
@@ -187,6 +188,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await locked(args, () => cmdSync(args, io));
       case "status":
         return await cmdStatus(args, io);
+      case "repair":
+        return await cmdRepair(args, io);
       case "deleted":
         return await cmdDeleted(args, io);
       case "history":
@@ -1111,7 +1114,13 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
     );
   }
 
-  await removeIndex(args.dir);
+  // Same as unlink: a flush that failed is reported and does not stop the
+  // rebase, because the index is already gone and starting again from the
+  // server's cursor is what was asked for (I18).
+  const notDurable = await removeIndex(args.dir);
+  if (notDurable !== undefined && !args.json) {
+    io.err(`The index was removed, but flushing that removal failed: ${notDurable}`);
+  }
   const client = await open(config, args, io);
   try {
     const report = await client.settle({ coalesceWrites: false });
@@ -1488,6 +1497,72 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
  * The whole point of keeping every version is that this list exists. Until it
  * did, a deleted note was safe and unreachable, which is only half a promise.
  */
+/**
+ * Sends the server bodies it has lost, without writing a version (I14).
+ *
+ * `basaltd verify` finds a chunk the disk rotted or the server quarantined, and
+ * says it is waiting for a device to resend it. Nothing did. A device whose copy
+ * of the note has not changed is correct to consider it synced: the entry is
+ * committed, the hashes agree, and a pass has nothing to do. It is holding the
+ * bytes and has no reason to send them, and the only way to make it was to edit
+ * the note, which writes a version nobody typed into a damaged vault's history.
+ *
+ * Exits non-zero when anything is still missing afterwards, because that is the
+ * case that needs a person: another device may hold it, and if none does, the
+ * version is gone and the vault should be told the truth about that.
+ */
+async function cmdRepair(args: Args, io: Console): Promise<number> {
+  const config = await mustLoad(args.dir);
+  const client = await open(config, args, io);
+  try {
+    const out = await client.repair();
+    const wrong = out.failed.length > 0 || out.stillMissing > 0;
+    if (args.json) {
+      io.out(JSON.stringify({ ok: !wrong, ...out }));
+      return wrong ? 1 : 0;
+    }
+
+    if (out.stored > 0) {
+      io.out(`Sent ${out.stored} ${out.stored === 1 ? "body" : "bodies"} the server was missing.`);
+    } else {
+      io.out(
+        `The server has every body this device can offer, from ${out.scanned} ` +
+          `${out.scanned === 1 ? "note" : "notes"}.`,
+      );
+    }
+    for (const f of out.failed) io.err(`${f.path}: ${f.why}`);
+    if (out.stillMissing > 0) {
+      io.err(
+        `${out.stillMissing} ${out.stillMissing === 1 ? "body was" : "bodies were"} asked for, ` +
+          "sent, and the server still does not have them. Check its disk.",
+      );
+    }
+    if (out.couldNotOffer > 0) {
+      io.out(
+        `${out.couldNotOffer} ${out.couldNotOffer === 1 ? "chunk belongs" : "chunks belong"} to ` +
+          "notes this device has edited since they were last synced, so it cannot supply them.",
+      );
+    }
+
+    // What this command does not know, said rather than left to be inferred.
+    //
+    // A device can only see the bodies of the versions it holds. History it
+    // never had is not in its index, so a clean run here is not a statement
+    // that the vault is whole, and reading it as one is exactly the mistake
+    // this project keeps finding: a green result that answers a narrower
+    // question than the one somebody asked.
+    io.out("");
+    io.out(
+      "This repairs what this device holds. Run it on your other devices too, then " +
+        "`basaltd verify` on the server for what is still missing: history this device " +
+        "never had is not visible from here.",
+    );
+    return wrong ? 1 : 0;
+  } finally {
+    client.close();
+  }
+}
+
 async function cmdDeleted(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
   const client = await open(config, args, io, { inspect: true });
@@ -1670,19 +1745,37 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
  */
 async function cmdUnlink(args: Args, io: Console): Promise<number> {
   const config = await loadConfig(args.dir).catch(() => undefined);
-  await removeState(args.dir);
+  // `notDurable` is set when the removal happened and could not be made
+  // durable: the disk failed while it was being flushed, rather than a
+  // filesystem that has no directory fsync, which says nothing (I18).
+  //
+  // Not an error. The files are unlinked and the pairing is forgotten, which
+  // is what was asked for; what is uncertain is whether a power cut in the
+  // next moment brings the config back. Saying so is the whole of the fix:
+  // this used to be swallowed, so a vault could come back paired to a server
+  // it had been told to forget with nothing anywhere having mentioned it.
+  const notDurable = await removeState(args.dir);
   if (args.json) {
     io.out(
       JSON.stringify({
         ok: true,
         unlinked: args.dir,
         wasPaired: config !== undefined,
+        ...(notDurable !== undefined ? { notDurable } : {}),
         ...(config?.deviceId !== undefined ? { deviceId: config.deviceId } : {}),
       }),
     );
     return 0;
   }
   io.out(`Forgot the pairing for ${args.dir}. Every note is where it was.`);
+  if (notDurable !== undefined) {
+    io.out("");
+    io.out(`The pairing is gone from this disk, but flushing that removal failed: ${notDurable}`);
+    io.out(
+      "If the machine loses power before the filesystem catches up, the pairing may come back. " +
+        "Check the disk, and run `basalt unlink` again if it does.",
+    );
+  }
   io.out("Nothing was removed from the server.");
   if (config?.deviceId !== undefined) {
     io.out("");

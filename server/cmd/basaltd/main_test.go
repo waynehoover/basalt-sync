@@ -29,6 +29,8 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 )
 
 // A mac of the right shape, standing in for a real writer's. The server holds no
@@ -1554,5 +1556,100 @@ func TestThePortAnswersBeforeTheStartupSummaryRuns(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the server never reached the point where the port is open")
+	}
+}
+
+// Every deadline that can kill this process outlasts its own shutdown (I17).
+//
+// A stop drains in two halves of shutdownTimeout each and then closes the
+// store. Two managers impose their own deadline on top of that and neither
+// knows the arithmetic: systemd's TimeoutStopSec, written by `basaltd service`,
+// and Docker's stop grace, which defaults to ten seconds if compose does not
+// say otherwise. Ten seconds is exactly the two halves with nothing left for
+// closing the store, so a busy shutdown under compose was killed partway
+// through one.
+//
+// Nothing is lost when that happens: an unacked put is retried and the
+// write-ahead log recovers. What is lost is the ability to tell a clean stop
+// from a killed one, and a margin that is exactly zero is not a margin.
+//
+// Asserted rather than written down because the number lives in three files in
+// two languages, and the one that is easiest to change is the one in Go.
+func TestEveryStopDeadlineOutlastsTheShutdownBudget(t *testing.T) {
+	// Both halves, plus room to close the store. The store close is not
+	// budgeted anywhere, so this asks for at least as long again as one half,
+	// which is the smallest honest way to say "and then some".
+	budget := 2*shutdownTimeout + shutdownTimeout
+
+	written := unit(unitArgs{
+		Binary: "/usr/local/bin/basaltd", Data: "/var/lib/basalt", User: "basalt",
+		Addr: ":3003", Vault: "default",
+	})
+	var systemdStop time.Duration
+	for _, line := range strings.Split(written, "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "TimeoutStopSec="); ok {
+			secs, err := strconv.Atoi(after)
+			if err != nil {
+				t.Fatalf("TimeoutStopSec is %q, which is not a number of seconds", after)
+			}
+			systemdStop = time.Duration(secs) * time.Second
+		}
+	}
+	if systemdStop == 0 {
+		t.Fatal("the systemd unit sets no TimeoutStopSec, so systemd's own default decides")
+	}
+	if systemdStop < budget {
+		t.Errorf("TimeoutStopSec is %s and a stop can take %s", systemdStop, budget)
+	}
+
+	// And compose, which is the one with a default that used to be too short.
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose, err := os.ReadFile(filepath.Join(root, "compose.yaml"))
+	if err != nil {
+		t.Fatalf("reading compose.yaml: %v", err)
+	}
+	grace := ""
+	for _, line := range strings.Split(string(compose), "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "stop_grace_period:"); ok {
+			grace = strings.TrimSpace(after)
+		}
+	}
+	if grace == "" {
+		t.Fatal("compose.yaml sets no stop_grace_period, so Docker's ten-second default decides, " +
+			"which is both halves of a stop and nothing for closing the store")
+	}
+	d, err := time.ParseDuration(grace)
+	if err != nil {
+		t.Fatalf("stop_grace_period is %q, which is not a duration: %v", grace, err)
+	}
+	if d < budget {
+		t.Errorf("stop_grace_period is %s and a stop can take %s", d, budget)
+	}
+}
+
+// `basaltd health` says which kind of unwell (I17).
+//
+// /health answers one word naming its case, and reporting only "503 Service
+// Unavailable" would collapse "the disk is full" and "we are shutting down"
+// into a sentence that says neither. That is rule 7 in the place an operator
+// reads: this command is what the container healthcheck runs and what somebody
+// types when a device says it cannot sync.
+func TestHealthCommandSaysWhyNotJustThatItFailed(t *testing.T) {
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("disk-full\n"))
+	}))
+	defer hs.Close()
+
+	var out bytes.Buffer
+	err := cmdHealth([]string{"-addr", strings.TrimPrefix(hs.URL, "http://")}, &out)
+	if err == nil {
+		t.Fatal("a 503 was reported as healthy")
+	}
+	if !strings.Contains(err.Error(), "disk-full") {
+		t.Errorf("the failure said %q, which does not say which kind of unwell", err)
 	}
 }

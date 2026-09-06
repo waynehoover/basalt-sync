@@ -16,8 +16,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -506,33 +504,21 @@ func Open(dbPath, chunkDir string) (*Store, error) {
 	return OpenWithSync(dbPath, chunkDir, SyncFull)
 }
 
+// OpenWithSync is Open with a chosen durability mode. Both create what is not
+// there and migrate what is; see OpenMode in open.go for the other contracts
+// and for why there are any.
 func OpenWithSync(dbPath, chunkDir string, mode SyncMode) (*Store, error) {
-	if mode != SyncFull && mode != SyncNormal {
-		return nil, fmt.Errorf("invalid sync mode %q", mode)
-	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
-		return nil, err
-	}
-	cs, err := chunks.New(chunkDir, ChunkMax)
-	if err != nil {
-		return nil, err
-	}
-	dsn := dbPath + "?_pragma=busy_timeout(5000)" +
-		"&_pragma=synchronous(" + string(mode) + ")" +
-		"&_pragma=foreign_keys(1)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	if err := migrate(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrating: %w", err)
-	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema: %w", err)
-	}
-	return &Store{db: db, chunks: cs, dbPath: dbPath}, nil
+	return OpenMode(dbPath, chunkDir, Create, mode)
+}
+
+// OpenForInspection opens a store to be looked at and not changed (I15).
+//
+// What `verify`, `stats` and a backup's coverage report want. It refuses a
+// directory that is not already a store rather than creating one, does not
+// migrate, and the handle itself is read-only, so "this command does not modify
+// what it inspects" is enforced by SQLite rather than remembered by the caller.
+func OpenForInspection(dbPath, chunkDir string) (*Store, error) {
+	return OpenMode(dbPath, chunkDir, ReadOnly, SyncFull)
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -1124,6 +1110,64 @@ func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 
 // LatestUID is the newest uid in the vault, or 0 if it holds nothing. This is
 // the server's cursor in the handshake.
+// ReferencedChunks reports which of the given names some committed entry in
+// this vault refers to (I14).
+//
+// The gate on `resend`. A body is content-addressed, so a device cannot put the
+// wrong bytes under a name: `chunks.Put` hashes what arrives and refuses it
+// otherwise. What it could do without this is put *correct* bytes under names
+// nothing refers to, for ever, which is a paired device filling the disk with
+// data no vault will ever read and no purge will ever collect until the grace
+// window passes. Repair is for bodies the vault is missing, and a name no entry
+// mentions is not one of those.
+//
+// Returned as a set rather than checked one at a time, because repair asks
+// about every chunk of every note it holds and a query per name would be one
+// round trip through SQLite per body in the vault.
+func (s *Store) ReferencedChunks(vaultID string, names []string) (map[string]struct{}, error) {
+	found := make(map[string]struct{}, len(names))
+	if len(names) == 0 {
+		return found, nil
+	}
+	// In batches, because SQLite has a limit on how many parameters one
+	// statement may bind and a vault has more chunks than that.
+	const batch = 400
+	for start := 0; start < len(names); start += batch {
+		end := min(start+batch, len(names))
+		chunk := names[start:end]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, vaultID)
+		holes := make([]byte, 0, len(chunk)*2)
+		for i, n := range chunk {
+			if i > 0 {
+				holes = append(holes, ',')
+			}
+			holes = append(holes, '?')
+			args = append(args, n)
+		}
+		rows, err := s.db.Query(
+			`SELECT DISTINCT name FROM entry_chunks WHERE vault_id = ? AND name IN (`+
+				string(holes)+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			found[name] = struct{}{}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return found, nil
+}
+
 func (s *Store) LatestUID(vaultID string) (int64, error) {
 	var uid sql.NullInt64
 	if err := s.db.QueryRow(

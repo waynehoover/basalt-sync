@@ -12,13 +12,22 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const synced: string[] = [];
+
+/**
+ * The seam is `syncDirectoryIfSupported`, not `syncDirectory`.
+ *
+ * That is what the removals call, and a call from inside vault.ts to its own
+ * `syncDirectory` does not go through a mock of it: these two tests passed for
+ * a while against a wrapper they had stopped exercising. What each errno means
+ * is tested against the real function in durable-removal.test.ts.
+ */
 vi.mock("./vault.ts", async (importOriginal) => {
   const real = await importOriginal<typeof import("./vault.ts")>();
   return {
     ...real,
-    syncDirectory: async (dir: string) => {
+    syncDirectoryIfSupported: async (dir: string) => {
       synced.push(dir);
-      return real.syncDirectory(dir);
+      return real.syncDirectoryIfSupported(dir);
     },
   };
 });

@@ -50,6 +50,17 @@ func cmdHealth(args []string, out io.Writer) error {
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		// The reason, not just the code. /health answers one word saying which
+		// of its cases this is, and reporting only "503 Service Unavailable"
+		// would collapse "the disk is full" and "we are shutting down" into one
+		// sentence that says neither (rule 7).
+		//
+		// Bounded, because this is a body from the network and nothing here
+		// needs more than a word of it.
+		why, _ := io.ReadAll(io.LimitReader(res.Body, 256))
+		if word := strings.TrimSpace(string(why)); word != "" {
+			return fmt.Errorf("%s answered %s: %s", target, res.Status, word)
+		}
 		return fmt.Errorf("%s answered %s", target, res.Status)
 	}
 	fmt.Fprintf(out, "ok\n")
@@ -85,7 +96,7 @@ func cmdStats(args []string, out io.Writer) error {
 	}
 	defer lock.Release()
 
-	st, err := openExisting(*dataDir, "report on")
+	st, err := openForInspection(*dataDir, "report on")
 	if err != nil {
 		return err
 	}
@@ -104,6 +115,10 @@ func cmdStats(args []string, out io.Writer) error {
 	}
 	if len(vaults) == 0 {
 		fmt.Fprintln(out, "no vaults yet")
+		// Still printed. Whether this machine can take a note is a fact about
+		// the store and not about what is in it, and the moment somebody most
+		// wants it is when a fresh server is refusing the first one.
+		writeHealth(out, healthOf(st))
 		return nil
 	}
 
@@ -133,8 +148,30 @@ func cmdStats(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "  newest uid %d\n", s.LatestUID)
 	}
 	fmt.Fprintf(out, "%d chunk bodies on disk\n", bodies)
+	writeHealth(out, healthOf(st))
 	fmt.Fprintf(out, "purge spares bodies newer than %s unless -grace says otherwise\n", chunks.DefaultGrace)
 	return nil
+}
+
+// writeHealth prints what /health answers and the numbers behind it (I17).
+//
+// Printed whether or not anything is wrong. "There is room" is an answer, and
+// a line that appears only in trouble is one nobody knows to miss; the same
+// reasoning as the reclaimable line above it.
+func writeHealth(out io.Writer, h healthJSON) {
+	if h.CanPersist {
+		fmt.Fprintf(out, "can take a note: yes, %s free of %s\n",
+			humanBytes(h.FreeBytes), humanBytes(h.TotalBytes))
+		return
+	}
+	// The reason first, because it is the sentence somebody acts on, and the
+	// same word /health puts on the wire so the two cannot be read as
+	// different problems.
+	fmt.Fprintf(out, "CANNOT TAKE A NOTE: %s\n", h.Reason)
+	if h.TotalBytes > 0 {
+		fmt.Fprintf(out, "  %s free of %s, and a commit needs %s to work in\n",
+			humanBytes(h.FreeBytes), humanBytes(h.TotalBytes), humanBytes(h.LowSpaceBytes))
+	}
 }
 
 // writeReclaimable prints what says whether a purge is worth the ceremony: the
@@ -196,8 +233,44 @@ type statsJSON struct {
 	Vaults  []vaultStats `json:"vaults"`
 	// Bodies is chunk files on disk across every vault, and GraceMs the window
 	// a default purge spares.
-	Bodies  int   `json:"bodies"`
-	GraceMs int64 `json:"graceMs"`
+	Bodies  int        `json:"bodies"`
+	GraceMs int64      `json:"graceMs"`
+	Health  healthJSON `json:"health"`
+}
+
+// healthJSON is what /health decides from, spelled out (I17).
+//
+// The endpoint answers a status code and one word, because it needs no
+// credential and behind a tunnel the port is on the internet. The numbers
+// behind that word belong here, where the command is run on the machine by
+// somebody who already has the data directory.
+type healthJSON struct {
+	// CanPersist is what /health returns 200 or 503 for.
+	CanPersist bool   `json:"canPersist"`
+	Reason     string `json:"reason,omitempty"`
+	// FreeBytes and TotalBytes are the filesystem the bodies are on, and
+	// LowSpaceBytes the point below which CanPersist goes false. Three numbers
+	// rather than a percentage: the threshold is absolute, because what a
+	// commit needs is room for a journal and not a share of the disk.
+	FreeBytes     int64 `json:"freeBytes"`
+	TotalBytes    int64 `json:"totalBytes"`
+	LowSpaceBytes int64 `json:"lowSpaceBytes"`
+	// CheckMs is how long the check took. A store whose fsync has gone slow
+	// answers correctly and slowly, and that is its own kind of unwell: it is
+	// what turns a health probe into a timeout somewhere else.
+	CheckMs int64 `json:"checkMs"`
+}
+
+func healthOf(st *store.Store) healthJSON {
+	h := st.CheckHealth(context.Background())
+	return healthJSON{
+		CanPersist:    h.CanPersist,
+		Reason:        string(h.Why),
+		FreeBytes:     h.FreeBytes,
+		TotalBytes:    h.TotalBytes,
+		LowSpaceBytes: store.LowSpaceBytes(),
+		CheckMs:       h.Took.Milliseconds(),
+	}
 }
 
 type vaultStats struct {
@@ -244,6 +317,7 @@ func writeStatsJSON(out io.Writer, st *store.Store, vaults []string, bodies int)
 		Vaults:  []vaultStats{},
 		Bodies:  bodies,
 		GraceMs: chunks.DefaultGrace.Milliseconds(),
+		Health:  healthOf(st),
 	}
 	now := time.Now().UnixMilli()
 	for _, v := range vaults {

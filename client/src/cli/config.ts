@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 import { indexLogPath } from "../core/index-journal-store.ts";
 import { decodeConfig, encodeConfig, type DeviceConfig } from "../core/pairing.ts";
-import { syncDirectory, writeDurably } from "./vault.ts";
+import { syncDirectory, syncDirectoryIfSupported, writeDurably } from "./vault.ts";
 
 /** The folder inside a vault that holds this client's state. */
 export const STATE_DIR = ".basalt";
@@ -99,14 +99,21 @@ export async function saveConfig(vault: string, config: Config): Promise<void> {
  * server that had never seen this device. An index removal that fails must
  * leave the vault paired, which is the state that refuses to pair again.
  */
-export async function removeState(vault: string): Promise<void> {
-  await removeIndex(vault);
+export async function removeState(vault: string): Promise<string | undefined> {
+  const first = await removeIndex(vault);
   await rm(configPath(vault), { force: true });
   await mustBeGone(configPath(vault), "the config");
   // Synced, so the removal is as durable as the writes were (C38). Without
   // this a power cut after unlink could bring the config back, and with it
   // a vault that reads as paired to a server it was told to forget.
-  await syncDirectory(join(vault, STATE_DIR)).catch(() => undefined);
+  //
+  // Returned rather than thrown or swallowed (I18). By the time this runs the
+  // files are unlinked and the pairing is forgotten; what is uncertain is
+  // whether that survives a power cut. A filesystem that cannot fsync a
+  // directory is not a problem and says nothing. A disk that failed is, and
+  // the caller says so.
+  const done = await syncDirectoryIfSupported(join(vault, STATE_DIR));
+  return first ?? (done.synced ? undefined : done.why);
 }
 
 /**
@@ -116,7 +123,7 @@ export async function removeState(vault: string): Promise<void> {
  * half of `removeState`. Kept apart so a rebase cannot remove the config by
  * taking the wrong function.
  */
-export async function removeIndex(vault: string): Promise<void> {
+export async function removeIndex(vault: string): Promise<string | undefined> {
   // The journal first, and this order is the only safe one. A crash between
   // the two leaves a snapshot with no journal, which is exactly what an index
   // looked like before the journal existed and loads without a word. The other
@@ -126,7 +133,8 @@ export async function removeIndex(vault: string): Promise<void> {
   await mustBeGone(indexLog(vault), "the index journal");
   await rm(indexPath(vault), { force: true });
   await mustBeGone(indexPath(vault), "the index");
-  await syncDirectory(join(vault, STATE_DIR)).catch(() => undefined);
+  const done = await syncDirectoryIfSupported(join(vault, STATE_DIR));
+  return done.synced ? undefined : done.why;
 }
 
 /**

@@ -1727,3 +1727,49 @@ export async function syncDirectory(dir: string): Promise<void> {
     await handle.close();
   }
 }
+
+/**
+ * Errors from a directory fsync that mean "not here" or "not on this
+ * filesystem", as opposed to "the disk said no" (I18).
+ *
+ * `ENOENT` is the directory already being gone, which is the ordinary result of
+ * removing the last thing in it and is nothing to report. The rest are
+ * filesystems that do not implement fsync on a directory handle at all: some
+ * network mounts, some FUSE layers, and Windows through a compatibility layer.
+ * On those there is nothing to do and nothing to say.
+ *
+ * Everything else is `EIO`, `ENOSPC`, `ENXIO` and their relatives, which is a
+ * disk that has failed at the exact moment something was being made durable.
+ */
+const FSYNC_NOT_APPLICABLE = new Set(["ENOENT", "ENOTSUP", "EOPNOTSUPP", "EINVAL", "EPERM"]);
+
+/**
+ * A directory fsync that tolerates a filesystem which cannot do one, and
+ * nothing else (I18).
+ *
+ * `syncDirectory(...).catch(() => undefined)` was how removals made themselves
+ * durable, and it is two different outcomes wearing one face. A filesystem with
+ * no directory fsync is fine and there is nothing to be done about it. A disk
+ * returning EIO while a pairing is being forgotten is the opposite: the unlink
+ * may not survive a power cut, so the config can come back, and with it a vault
+ * that reads as paired to a server it was told to forget. Both used to be
+ * silence.
+ *
+ * Returns what happened rather than throwing, because the caller has already
+ * unlinked the files by the time this runs: the pairing *is* forgotten, and
+ * only its durability is in question. Throwing would report a failure for
+ * something that largely worked, and swallowing reports a success that was not
+ * one. Rule 7: say which.
+ */
+export async function syncDirectoryIfSupported(
+  dir: string,
+): Promise<{ readonly synced: boolean; readonly why?: string }> {
+  try {
+    await syncDirectory(dir);
+    return { synced: true };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "";
+    if (FSYNC_NOT_APPLICABLE.has(code)) return { synced: true };
+    return { synced: false, why: `${code || "the filesystem"}: ${(err as Error).message}` };
+  }
+}

@@ -66,6 +66,7 @@ basalt status                             what this device thinks the state is
 basalt deleted                            notes the server has and this vault does not
 basalt history PATH                       every version of one note, newest first
 basalt restore PATH                       put a note back
+basalt repair                             resend bodies the server has lost
 basalt unlink                             forget the pairing, keep the notes
 basalt --version                          which release this is
 ```
@@ -304,6 +305,35 @@ basalt restore "Q.md" --to old/Q.md       somewhere else
 
 Restoring never overwrites. If the path is occupied the copy lands beside it as
 `Q (restored 42).md`. The restored note is sent to the server right away.
+
+### When a note will not download
+
+```bash
+basalt repair                             offer the server everything this device holds
+```
+
+A note that never finishes downloading usually means the server has lost the
+file behind a version: a disk rotted it and the server set it aside, or a
+restore brought back a database and a chunk tree of slightly different ages.
+Every row is intact, so nothing reads as broken.
+
+Ordinary syncing cannot fix that, and the reason is the interesting part. This
+device is *right* to consider the note synced: the version is committed and the
+hashes agree, so a pass has nothing to do. It is holding the missing bytes and
+has no reason to send them. The only way to make it send them used to be to edit
+the note, which writes a version nobody typed into a vault that is already
+damaged.
+
+`basalt repair` offers the chunk names of everything this device holds, the
+server asks for the ones it is actually missing, and those bytes go up. No
+version is written, no version number is allocated, nothing about any note
+changes.
+
+Run it on every device. Each one can only offer versions it holds, so history a
+device never had is invisible from it, and a clean run here is not a statement
+that the vault is whole. `basaltd verify` on the server is what knows. If no
+device can supply a body, that version cannot be restored; `basalt history` will
+still list it, and `basaltd purge` drops versions nothing can serve.
 
 **Renames become deletions here.** A filesystem scan cannot tell a rename from
 a delete plus a create, so the old path is recorded as deleted and appears in

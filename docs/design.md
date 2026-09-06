@@ -245,7 +245,7 @@ Behind `tailscale serve` the port is private. Behind Caddy it is on the
 internet, and an unauthenticated request can reach exactly three things: `GET
 /health`, one hello frame before the server decides whether to keep talking,
 and the `426` that every other path and method gets, which says `basalt speaks
-websocket only`. None of them names the release: `/health` answers `ok`, the
+websocket only`. None of them names the release: `/health` answers one word, the
 `426` sends no `Server` header, and a hello refused for its protocol or crypto
 names the range the server speaks and not its version. The version is in
 `ready`, which only a device holding the vault's auth key receives, and in
@@ -259,7 +259,12 @@ headers included, is checked for it.
 What a stranger can still learn is that a Basalt server is here and which
 protocol it speaks, because the refusal has to name the numbers for an old
 client to know which end to upgrade, and that the port is up, because a
-healthcheck has to say so.
+healthcheck has to say so. Since the healthcheck answers whether the server
+could take a note rather than whether the process replied, it can also say one
+word about why it could not: `store-unreadable`, `disk-full`,
+`chunks-unreachable`, `shutting-down`. That vocabulary is fixed and carries no
+path, no vault name and no number, for the same reason as everything else here,
+and the figures behind it are in `basaltd stats` on the machine.
 
 ### Why the other pre-auth codes stay distinct
 

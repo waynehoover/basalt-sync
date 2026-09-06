@@ -434,6 +434,45 @@ export interface SyncOptions {
  * docs/design.md is that a status which cannot distinguish the cases it
  * collapses is not a status. "12 files synced" hides whether anything conflicted.
  */
+/**
+ * What one `repair` run did, and what it knows it did not do (I14).
+ *
+ * The counts are deliberately about this device and nothing else, because that
+ * is the whole of what a device can see. A body belonging to a version this
+ * device never had is not on this disk and is not in this index: there is
+ * nothing here that could notice it is gone, let alone supply it. The
+ * authoritative list of what a vault is still missing comes from `basaltd
+ * verify` on the server, and both shells say so rather than implying that a
+ * clean repair means a whole vault.
+ */
+export interface RepairReport {
+  /** Notes this device holds and examined. */
+  scanned: number;
+  /** Chunk names offered to the server across all of them. */
+  offered: number;
+  /** Bodies the server was missing and now has. */
+  stored: number;
+  /**
+   * Chunks of notes this device could not offer, because its copy has moved on
+   * from the version the server acknowledged.
+   *
+   * Those bytes were this device's and are not any more. Counted because it is
+   * the one kind of "cannot help" this device can actually see, and because a
+   * repair run that examined a note and skipped it should say so.
+   */
+  couldNotOffer: number;
+  /**
+   * Bodies the server asked for, was sent, and still does not have.
+   *
+   * Always zero in a healthy run, and never a normal outcome: the server asked
+   * for these, so it wants them, and it refused what arrived. A full disk is
+   * the likely reason.
+   */
+  stillMissing: number;
+  /** Paths that could not be read or sent, with why. One does not stop the rest. */
+  failed: Array<{ readonly path: string; readonly why: string }>;
+}
+
 export interface SyncReport {
   uploaded: number;
   downloaded: number;
@@ -1982,6 +2021,87 @@ export class Engine {
    * Below the threshold nothing is dropped, because almost every file is a
    * note and re-sealing a note to save a few kilobytes is a worse trade.
    */
+  /**
+   * Sends the server bodies it has lost, without writing a version (I14).
+   *
+   * A body can go missing while every row stays exactly as it was: a disk rots
+   * one and `basaltd verify` quarantines it, or a restore brings back a
+   * database and a chunk tree of slightly different ages. Every device that
+   * wants that version then downloads for ever, which presents as a sync that
+   * never finishes rather than as an error anybody can act on.
+   *
+   * Ordinary reconciliation cannot fix it, and that is the point of this
+   * method. A device whose copy of the note has not changed considers it
+   * synced, because it is: the entry is committed, the hashes agree, and there
+   * is nothing for a pass to do. It is holding the missing bytes and has no
+   * reason to send them. The only way to make it send them used to be to edit
+   * the note, which writes a version nobody typed into the history of a vault
+   * that is already damaged.
+   *
+   * So this offers the server the chunk names of everything this device holds,
+   * lets the server say which of them it actually lacks, and produces only
+   * those, from the files on this disk. Nothing about any entry changes.
+   *
+   * What this cannot see is said out loud rather than implied away. A body
+   * belonging to a version this device never had is not on this disk and is not
+   * in this index: nothing here could notice it is gone. `couldNotOffer` is the
+   * one kind of "cannot help" a device can see for itself, a note whose local
+   * copy has moved on from what the server acknowledged. The authoritative list
+   * of what a vault still lacks is `basaltd verify` on the server, and both
+   * shells say so, because a clean repair here is not the same claim as a whole
+   * vault and reporting it as one would be the comfortable lie.
+   */
+  async repair(): Promise<RepairReport> {
+    const report: RepairReport = {
+      scanned: 0,
+      offered: 0,
+      stored: 0,
+      couldNotOffer: 0,
+      stillMissing: 0,
+      failed: [],
+    };
+
+    // One path at a time. The names could be offered all at once, and then a
+    // wanted body would have to be traced back to the file that can make it;
+    // per path the answer is already in hand, and a file that has changed under
+    // us costs one path rather than the run.
+    for (const [path, entry] of [...this.entries]) {
+      if (entry.folder || entry.chunks.length === 0) continue;
+      report.scanned++;
+
+      // Only what this device can prove it holds. `synchash` is the content the
+      // server acknowledged; if the local file has moved on, its chunks are not
+      // the ones the server is missing, and offering them would be an offer
+      // this device cannot keep.
+      const names = entry.chunks;
+      if (entry.hash !== entry.synchash) {
+        report.couldNotOffer += names.length;
+        continue;
+      }
+
+      try {
+        const plan = await this.planUpload(entry, path);
+        // The scan has to agree with the index, or the file changed since the
+        // last sync and these are not the bodies the server wants.
+        if (plan.names.length !== names.length || plan.names.some((n, i) => n !== names[i])) {
+          report.couldNotOffer += names.length;
+          continue;
+        }
+        report.offered += names.length;
+        const out = await this.opts.transport.resend(names, plan.bodyOf);
+        report.stored += out.stored;
+        report.stillMissing += out.missing;
+      } catch (err) {
+        // One path's failure is one path. A repair run is somebody acting on a
+        // vault that is already damaged, and stopping at the first file it
+        // could not read would leave the rest unrepaired with no list of what
+        // was skipped.
+        report.failed.push({ path, why: (err as Error).message });
+      }
+    }
+    return report;
+  }
+
   private async planUpload(entry: IndexEntry, path: string, fresh?: Scanned): Promise<UploadPlan> {
     // The scan that decided this file changed already read it, cut it and
     // sealed it. Doing that again was the single largest cost of sending a

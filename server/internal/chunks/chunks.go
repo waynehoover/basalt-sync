@@ -147,6 +147,13 @@ func writeAll(f *os.File, body []byte) error {
 // Max is the largest body this store accepts, for the handshake to advertise.
 func (s *Store) Max() int64 { return s.max }
 
+// Root is the directory every vault's bodies live under.
+//
+// Exposed so the health check can stat the filesystem the bodies are on, which
+// is the one that runs out of room and the one that goes away when a volume
+// unmounts.
+func (s *Store) Root() string { return s.dir }
+
 // vaultKey derives a fixed-width directory name from a vault id.
 //
 // Unlike chunk names, a vault id is an arbitrary client-supplied string, so it
