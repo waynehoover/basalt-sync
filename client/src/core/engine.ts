@@ -298,15 +298,56 @@ export async function mustBeOurs(
  * reason the size and chunk-count limits exist.
  */
 export function checkEntryShape(e: WireEntry): void {
+  // The same list the server's `store.Entry.Validate` enforces, and
+  // `protocol-fixtures.json` is what keeps the two lists the same (I03).
+  //
+  // This used to check two of the server's rules and the server checked seven.
+  // That asymmetry is the wrong way round: a server is not obliged to be
+  // honest, so every shape it refuses to *store* is a shape a hostile one can
+  // still *send*, and the client is the side that has to refuse it on the way
+  // in. Checking less here than the server does meant trusting that nobody
+  // would ever write the difference.
+  if (e.path === "") {
+    throw new Error(`version ${e.uid} has an empty path, and no file is called nothing`);
+  }
+  if (e.folder && e.deleted) {
+    throw new Error(`version ${e.uid} is both a folder and a deletion`);
+  }
+  if (e.size < 0) {
+    throw new Error(`version ${e.uid} declares ${e.size} bytes, and there is no such file`);
+  }
+  if (!isDigest(e.mac)) {
+    throw new Error(
+      `version ${e.uid} carries no authenticator of the right shape, so nothing can check it`,
+    );
+  }
+  // `parent` is always sent and an absent one arrives as undefined rather than
+  // as the empty string, which is a real value meaning a first version.
+  if (e.parent !== undefined && e.parent !== "" && !isDigest(e.parent)) {
+    throw new Error(`version ${e.uid} names a parent that is neither empty nor a digest`);
+  }
+  for (const name of e.chunks) {
+    if (!isDigest(name)) {
+      throw new Error(`version ${e.uid} names ${JSON.stringify(name)}, which is not a chunk name`);
+    }
+  }
   if (!e.folder && !e.deleted && e.size > 0 && e.chunks.length === 0) {
     throw new Error(
       `version ${e.uid} declares ${e.size} bytes and names no chunks, which cannot both be true`,
     );
   }
+  if (!e.folder && !e.deleted && e.size === 0 && e.chunks.length > 0) {
+    throw new Error(`version ${e.uid} is a zero-byte file naming ${e.chunks.length} chunks`);
+  }
   if (e.chunks.length > 0 && (e.folder || e.deleted)) {
     const what = e.folder ? "a folder" : "a deletion";
     throw new Error(`version ${e.uid} is ${what} and names ${e.chunks.length} chunks`);
   }
+}
+
+/** Lowercase hex SHA-256, which is the shape of a MAC, a parent and a chunk name. */
+function isDigest(s: string): boolean {
+  return /^[0-9a-f]{64}$/.test(s);
 }
 
 /**

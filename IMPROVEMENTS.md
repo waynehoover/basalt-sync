@@ -36,7 +36,7 @@ Return outcomes such as prepared, committed, definitely refused, and unknown, wi
 
 ### I03 — Make protocol contracts executable across TypeScript and Go
 
-- [ ] **Medium.** Establish one documented field contract and shared valid/invalid wire fixtures.
+- [x] **Medium.** Establish one documented field contract and shared valid/invalid wire fixtures.
 
 [TypeScript transport](client/src/core/transport.ts) and [Go wire types](server/internal/wire/wire.go) represent the same protocol separately. Define required fields, canonical encodings, safe numeric ranges, reply identity, authentication coverage, per-message byte limits, and valid state transitions. Keep the deliberate policy that device clocks are not trusted for ordering.
 
