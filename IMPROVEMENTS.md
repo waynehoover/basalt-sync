@@ -44,7 +44,7 @@ Start with golden JSON fixtures consumed by both suites; schema generation is op
 
 ### I04 — Use one failure/outcome vocabulary from core to UI and automation
 
-- [ ] **Medium; high value during F15/F16/F26/F27.** Define connection failure, whole-pass failure, retrying path, permanent refusal, conflict preserved, and fully synchronized as distinct outcomes.
+- [x] **Medium; high value during F15/F16/F26/F27.** Define connection failure, whole-pass failure, retrying path, permanent refusal, conflict preserved, and fully synchronized as distinct outcomes.
 
 [SyncReport](client/src/core/engine.ts), [Client.sync](client/src/core/client.ts#L396), [CLI renderReport](client/src/cli/cli.ts#L1611), and [plugin announcements](client/src/plugin/main.ts#L685) currently expose different slices of the result. Prefer structured causes/codes and path context over consumers parsing prose or treating “resolved promise” as “all work succeeded.”
 
@@ -170,7 +170,7 @@ This can begin as a short tested/untested/unsupported table with exact test comm
 
 ### I19 — Turn the review probes into an invariant-focused failure suite
 
-- [ ] **Medium; incremental with each TODO fix.** Prefer tests at durability and ownership boundaries over tests that merely mirror implementation branches.
+- [x] **Medium; incremental with each TODO fix.** Prefer tests at durability and ownership boundaries over tests that merely mirror implementation branches.
 
 The suite already has fake sockets, adapters, race tests, stress/fuzz cases, and server rehearsals. Extend those helpers with named pause/failure points: before/after durable publication, after a config save, before an editor-overwriting write, during journal repair, and during uncertain remote commits.
 

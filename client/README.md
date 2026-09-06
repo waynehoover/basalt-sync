@@ -87,11 +87,29 @@ basalt --version                          which release this is
 | `--` | everything after it is a word rather than an option, for a device id that begins with `-` |
 | `-v`, `--verbose` | engine logging |
 
-**Exit codes.** 0 worked. 1 failed, could not reach the server, finished with
-files that can never sync, or is blocked by a name that is a file here and a
-folder elsewhere. 2 the command line was wrong. A sync that gave up on a file
-exits non-zero on purpose, so a broken vault in cron is heard about. Files this
-device ignores are reported as ignored and exit 0.
+**Exit codes.** 0 worked. 1 something did not. 2 the command line was wrong.
+
+Two values and not one per outcome, because a script asks "did this finish"
+and a code per outcome would make every caller enumerate them to answer it.
+What happened is in `--json` under `outcome`, which is the same conclusion the
+exit code is derived from and the same one the plugin's panel shows:
+
+| `outcome.kind` | exit | what it means |
+|---|---|---|
+| `synced` | 0 | everything this device knows about is where it should be |
+| `conflicted` | 0 | both versions are on this disk, waiting to be looked at |
+| `retrying` | 1 | named paths this device will try again on its own |
+| `refused` | 1 | named paths that need a person: a name that is a file here and a folder elsewhere, a file the server refused |
+| `passFailed` | 1 | the pass itself did not finish, so nothing per-path is known |
+| `offline` | 1 | no connection, so nothing about the vault is known |
+
+`retrying` and `refused` carry the paths, because a count is not something
+anybody can act on. A conflict exits 0 on purpose: keeping both versions is
+the engine working, and a cron job that treated it as a failure would alert on
+ordinary use of two devices. A sync that gave up on a file exits non-zero, also
+on purpose, so a broken vault in cron is heard about. Files this device ignores
+are reported as ignored and exit 0, because refusing them is the configuration
+doing what it was told.
 
 `basalt devices` lists every device that may reach this vault: its id, its
 name, when it was added and when it was last seen. The name is not an identity

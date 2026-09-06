@@ -71,6 +71,7 @@ import {
 } from "./config.ts";
 import { lockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
+import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
 import { validateStoredState } from "../core/stored-state.ts";
 import type { StoredState } from "../core/vault.ts";
 
@@ -1211,7 +1212,11 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
  * instead.
  */
 export function exitCodeFor(report: SyncReport): number {
-  return report.skipped > 0 || report.retrying > 0 || report.blocked > 0 ? 1 : 0;
+  // Through the shared vocabulary, so the exit code, the panel's glyph and
+  // the JSON all draw the same conclusion from one pass (I04). This counted
+  // three fields directly, the panel counted two others, and the two answers
+  // were not always the same pass's.
+  return exitCodeOf(outcomeOf(report));
 }
 
 /**
@@ -1749,8 +1754,13 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
 }
 
 export function renderReport(r: SyncReport, args: Args, io: Console, serverCursor: number): void {
+  const outcome = outcomeOf(r);
   if (args.json) {
-    io.out(JSON.stringify({ ok: true, ...r, serverCursor }));
+    // `ok` and `outcome` come from the same conclusion, so a script keying on
+    // either gets the same answer as the exit code (I04). `ok: true` beside a
+    // non-zero exit was a real divergence, and one field being derived from
+    // counters while another was hardcoded is how it happened.
+    io.out(JSON.stringify({ ok: exitCodeOf(outcome) === 0, outcome, ...r, serverCursor }));
     return;
   }
 
@@ -1786,6 +1796,11 @@ export function renderReport(r: SyncReport, args: Args, io: Console, serverCurso
     io.out("Nothing to do. Everything here matches the server.");
   } else {
     for (const line of lines) io.out(line);
+    // The conclusion, once, in the same words the panel and the JSON use
+    // (I04). The counted lines above say what happened; this says what it
+    // adds up to, which is the part a person acts on and the part that used
+    // to be left to them to work out from three separate numbers.
+    if (outcome.kind !== "synced") io.out(`         ${describeOutcome(outcome)}`);
   }
 
   // Named, because a count is not something anybody can act on, and some of
