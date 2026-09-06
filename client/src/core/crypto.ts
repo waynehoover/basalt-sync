@@ -605,6 +605,24 @@ export async function sealChunks(
   );
 }
 
+/**
+ * The most a single chunk may inflate to (F28).
+ *
+ * A chunk is cut to at most `BINARY_SIZES.max`, one mebibyte, before it is
+ * compressed and sealed, so nothing this client wrote can exceed that. The
+ * ceiling here is generous against that because compression is not the only
+ * thing that decides a chunk's plaintext size and a future chunker may raise
+ * it; what it rules out is the shape where a small authenticated body expands
+ * to whatever the writer chose.
+ *
+ * Producing such a body needs the data key, so this is not a keyless server's
+ * attack: it is a bound on what one compromised or buggy writer can make every
+ * other device allocate, and on a phone that is the difference between a note
+ * and a dead app. `inflateSync` has no output limit of its own, so the check
+ * has to be here.
+ */
+export const MAX_CHUNK_PLAINTEXT = 16 * 1024 * 1024;
+
 export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uint8Array> {
   const framed = await open(keys.content, sealed);
   if (framed.length === 0) {
@@ -615,8 +633,16 @@ export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uin
   if (marker === CHUNK_RAW) return payload;
   if (marker === CHUNK_DEFLATE) {
     try {
-      return inflateSync(payload);
+      const out = inflateSync(payload);
+      if (out.length > MAX_CHUNK_PLAINTEXT) {
+        throw new Error(
+          `sealed chunk inflates to ${out.length} bytes, over the ${MAX_CHUNK_PLAINTEXT} a chunk ` +
+            "may hold, so it is refused rather than kept",
+        );
+      }
+      return out;
     } catch (cause) {
+      if (cause instanceof Error && cause.message.includes("over the")) throw cause;
       // Authenticated, so the bytes are what was sealed, which means the
       // writer produced something this reader cannot inflate. Never
       // recovered from: returning anything here would write a truncated

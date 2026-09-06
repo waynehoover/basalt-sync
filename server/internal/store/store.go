@@ -908,7 +908,22 @@ type Deletion struct {
 // there is no intervening incarnation of the path between the rename and the
 // deletion. That holds for both orders of the two halves, and stops holding as
 // soon as the path is reused.
-func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Deletion, bool, error) {
+// beforeUID pages: zero starts at the newest, and any other value asks for
+// deletions older than that uid (F21).
+//
+// The list was capped at DeletedMax with no way past it, and the two clients
+// both tried to get past it anyway: the panel doubled the limit it asked for
+// and the CLI told people to raise `--limit`, both of which stop working at
+// the cap and neither of which said so. The uid is the cursor because that is
+// what the rows are ordered by, so a page is stable even while deletions are
+// still arriving: a newer one changes what the first page holds and never
+// what comes after a given uid.
+func (s *Store) Deleted(
+	vaultID string,
+	suppressRenames bool,
+	limit int,
+	beforeUID int64,
+) ([]Deletion, bool, error) {
 	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path, e.mac, e.parent,
 	             COALESCE((SELECT MAX(r.uid) FROM entries r
 	                        WHERE r.vault_id = e.vault_id AND r.path = e.path
@@ -917,6 +932,11 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Dele
 	        JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
 	          ON e.path = latest.path AND e.uid = latest.uid
 	       WHERE e.vault_id = ? AND e.deleted = 1`
+	args := []any{vaultID, vaultID}
+	if beforeUID > 0 {
+		q += ` AND e.uid < ?`
+		args = append(args, beforeUID)
+	}
 	if suppressRenames {
 		q += ` AND NOT EXISTS (
 		         SELECT 1 FROM entries r
@@ -940,7 +960,7 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Dele
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(q, vaultID, vaultID, limit+1)
+	rows, err := tx.Query(q, append(args, limit+1)...)
 	if err != nil {
 		return nil, false, err
 	}

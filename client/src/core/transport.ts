@@ -837,10 +837,44 @@ export class Transport {
    * that were never received. Obsidian serialises them through a `notifyQueue`
    * for the same reason.
    */
+  /**
+   * The most notifications that may be waiting to run at once (F28).
+   *
+   * Batches and caught-up frames are chained onto one promise so they are
+   * applied in order, and the chain had no bound: a server that sends faster
+   * than the engine applies grows it without limit, and each link holds its
+   * frame's entries alive. Catch-up on a large vault is legitimately hundreds
+   * deep, so this is well above anything an honest server produces and well
+   * below the point where a phone dies.
+   */
+  private static readonly MAX_BACKLOG = 1024;
+
+  private backlog = 0;
+
   private queueNotification(work: () => void | Promise<void>): void {
-    this.notifying = this.notifying.then(work).catch((err: unknown) => {
-      this.die(err instanceof Error ? err : new Error(String(err)));
-    });
+    if (this.backlog >= Transport.MAX_BACKLOG) {
+      // Ended rather than dropped. Dropping a batch would advance nothing and
+      // leave a hole this device never asks about again, which is the silent
+      // half of the failure; ending the session means the next connection
+      // starts from the cursor that was actually applied.
+      this.die(
+        new ProtocolError(
+          "protostate",
+          `server sent more than ${Transport.MAX_BACKLOG} notifications faster than this device ` +
+            "could apply them",
+        ),
+      );
+      return;
+    }
+    this.backlog++;
+    this.notifying = this.notifying
+      .then(work)
+      .catch((err: unknown) => {
+        this.die(err instanceof Error ? err : new Error(String(err)));
+      })
+      .finally(() => {
+        this.backlog--;
+      });
   }
 
   private async onBatchFrame(frame: Reply): Promise<void> {
@@ -1554,9 +1588,17 @@ export class Transport {
    * a deletion behind at the old path, and a recovery list that is mostly
    * phantom deletions of files that still exist is one nobody reads.
    */
-  async deleted(limit?: number): Promise<{ entries: WireDeletion[]; more: boolean }> {
+  async deleted(
+    limit?: number,
+    before?: number,
+  ): Promise<{ entries: WireDeletion[]; more: boolean }> {
     const reply = await this.request(
-      { op: "deleted", ...(limit !== undefined ? { limit } : {}) },
+      {
+        op: "deleted",
+        ...(limit !== undefined ? { limit } : {}),
+        // The oldest uid already held, to ask for the page before it (F21).
+        ...(before !== undefined && before > 0 ? { before } : {}),
+      },
       "deleted",
     );
     if (reply["res"] !== "deleted") {

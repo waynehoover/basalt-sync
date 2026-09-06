@@ -1022,10 +1022,10 @@ export default class BasaltPlugin extends Plugin {
    * is nothing to recover" and "I could not ask" are different answers, and
    * confusing them in a recovery tool is the worst place to do it.
    */
-  async deletedNotes(limit?: number): Promise<DeletedList> {
+  async deletedNotes(limit?: number, before?: number): Promise<DeletedList> {
     if (!this.client)
       throw new Error(`${this.whyNoClient()} There is no way to ask what the server has.`);
-    return this.client.deleted(limit);
+    return this.client.deleted(limit, before);
   }
 
   /**
@@ -1916,6 +1916,15 @@ function say(el: HTMLElement, text: string): void {
   el.toggle(text !== "");
 }
 
+/**
+ * How many deletions a page of the recovery list holds.
+ *
+ * Small enough to read and large enough that paging is rare. The server caps
+ * what it will return whatever this says; the point of a fixed size is that
+ * the cursor does the walking rather than an ever-growing request (F21).
+ */
+const PAGE_SIZE = 50;
+
 /** A link out to `DOCS`, which is the panel's answer to "but why". */
 function docsLink(el: HTMLElement, text: string): void {
   el.createEl("a", { text }).setAttribute("href", DOCS);
@@ -2652,7 +2661,8 @@ class BasaltSettingTab extends PluginSettingTab {
  */
 class RecoverModal extends Modal {
   /** How many to ask for; undefined is the server's default. */
-  private limit: number | undefined;
+  /** The oldest uid of the page before this one, or undefined for the newest. */
+  private before: number | undefined;
 
   constructor(private readonly plugin: BasaltPlugin) {
     super(plugin.app);
@@ -2673,7 +2683,7 @@ class RecoverModal extends Modal {
 
     let deleted: DeletedList;
     try {
-      deleted = await this.plugin.deletedNotes(this.limit);
+      deleted = await this.plugin.deletedNotes(PAGE_SIZE, this.before);
     } catch (err) {
       // Not an empty list. "There is nothing to recover" and "I could not
       // ask" are different answers and this is the worst place to confuse
@@ -2688,13 +2698,27 @@ class RecoverModal extends Modal {
     }
 
     contentEl.createEl("p", { text: describeDeleted(deleted) });
-    if (deleted.more) {
-      // Never a short list that looks complete, and never a pointer at a
-      // command line this plugin's users may not have.
+    if (this.before !== undefined) {
+      // Somewhere to go back to. Paging forward without a way back is a list
+      // somebody can walk off the end of.
+      row(contentEl, "Back to the newest", "This is a page further back.").addButton((b) =>
+        b.setButtonText("Newest").onClick(async () => {
+          this.before = undefined;
+          await this.render();
+        }),
+      );
+    }
+    if (deleted.more && deleted.oldest !== undefined) {
+      // A page, not a bigger ask (F21). This doubled the limit it requested,
+      // which stops working at the server's cap: at a thousand deletions the
+      // button fetched the same capped page for ever and said nothing. The
+      // cursor is the oldest uid on this page, so the next one starts below
+      // it however many there are.
+      const next = deleted.oldest;
       row(contentEl, "Show older", "The server has more deletions than are listed here.").addButton(
         (b) =>
           b.setButtonText("Show older").onClick(async () => {
-            this.limit = deleted.notes.length * 2;
+            this.before = next;
             await this.render();
           }),
       );

@@ -213,7 +213,7 @@ func TestEntriesLeaveTheStoreWithAnArrayNotNull(t *testing.T) {
 		}
 		check(fmt.Sprintf("uid %d", uid), e)
 	}
-	del, _, err := h.Deleted("v1", false, 0)
+	del, _, err := h.Deleted("v1", false, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}

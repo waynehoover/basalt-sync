@@ -16,7 +16,8 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { chunkName } from "./crypto.ts";
-import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
+import { FakeSocket, RIG_SECRET, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
+import { testKeys } from "./test-keys.ts";
 import { Backoff, ConnectionError, ProtocolError, Transport, type Batch } from "./transport.ts";
 
 /** A connected transport and the socket behind it. */
@@ -1856,5 +1857,55 @@ describe("a corrupt body early in a fetch", () => {
     await settle();
     socket.bodies(new Uint8Array([8, 8, 8]));
     await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
+  });
+});
+
+/**
+ * Work a server can make this device queue, and memory it can make it hold
+ * (F28).
+ *
+ * Batches and caught-up frames are chained onto one promise so they apply in
+ * order, and the chain had no bound: a server that sends faster than the
+ * engine applies grows it without limit, each link holding its frame's
+ * entries alive. Ending the session is the answer rather than dropping a
+ * frame, because a dropped batch advances nothing and leaves a hole this
+ * device never asks about again.
+ */
+describe("a server that sends faster than this device can apply", () => {
+  it("ends the session rather than queueing without limit", async () => {
+    const { t, socket } = await helloed(0);
+    // Nothing drains while this runs: the frames are all delivered inside one
+    // synchronous burst, so the chain cannot make progress between them.
+    for (let i = 0; i < 2000 && !t.isClosed; i++) {
+      socket.raw({ op: "batch", from: i + 1, to: i + 1, entries: [] });
+    }
+    await settle();
+    expect(t.isClosed, "the backlog grew without any bound at all").toBe(true);
+  });
+});
+
+/**
+ * A chunk that inflates to whatever the writer chose (F28).
+ *
+ * `inflateSync` has no output limit, and the engine checked the assembled size
+ * only after every chunk had been expanded, so a small authenticated body
+ * could make a device allocate as much as its writer liked. Producing one
+ * needs the data key, so this bounds a compromised or buggy writer rather than
+ * a keyless server, and on a phone that is the difference between a note and a
+ * dead app.
+ */
+describe("a chunk that inflates far beyond a chunk", () => {
+  it("is refused rather than held", async () => {
+    const { MAX_CHUNK_PLAINTEXT, openChunk, sealChunk } = await import("./crypto.ts");
+    const keys = await testKeys(RIG_SECRET);
+
+    // Sealed the way a writer seals one, so this is the real path and not a
+    // hand-built frame: zeroes compress to almost nothing and expand past the
+    // ceiling.
+    const huge = new Uint8Array(MAX_CHUNK_PLAINTEXT + 1024);
+    const sealed = await sealChunk(keys, huge);
+    expect(sealed.length, "the body has to be small to be worth refusing").toBeLessThan(100_000);
+
+    await expect(openChunk(keys, sealed)).rejects.toThrow(/over the .* a chunk may hold/);
   });
 });

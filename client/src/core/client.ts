@@ -556,11 +556,28 @@ export class Client {
    * remember what it was called, which is why the paths are unsealed here
    * rather than left for the caller.
    */
-  async deleted(limit?: number): Promise<DeletedList> {
-    const answer = await this.serial(() => this.transport.deleted(limit));
+  async deleted(limit?: number, before?: number): Promise<DeletedList> {
+    const answer = await this.serial(() => this.transport.deleted(limit, before));
     await this.recoveryIsOurs(answer.entries);
     const notes: Deletion[] = [];
+    let last: number | undefined;
     for (const e of answer.entries) {
+      // The same ordering check history makes, for the same reason: a caller
+      // paging backwards trusts it, and a page that does not respect `before`
+      // is a loop that never advances (F21, F10).
+      if (before !== undefined && before > 0 && e.uid >= before) {
+        throw new Error(
+          `the server answered a request for deletions older than ${before} with version ` +
+            `${e.uid}, and it is not shown`,
+        );
+      }
+      if (last !== undefined && e.uid >= last) {
+        throw new Error(
+          `the server answered with deletions out of order (${e.uid} after ${last}), and they ` +
+            "are not shown",
+        );
+      }
+      last = e.uid;
       notes.push({
         ...this.asVersion(e, await openPath(this.keys, e.path)),
         // Zero means purge has taken every version that had content.
@@ -568,7 +585,9 @@ export class Client {
         restorable: e.restorable ?? 0,
       });
     }
-    return { notes, more: answer.more };
+    // The cursor for the next page: the oldest uid this one holds. Undefined
+    // when the list is empty, because there is nothing to page from.
+    return { notes, more: answer.more, ...(last !== undefined ? { oldest: last } : {}) };
   }
 
   /**
@@ -850,6 +869,16 @@ export class Client {
 export interface DeletedList {
   readonly notes: Deletion[];
   readonly more: boolean;
+  /**
+   * The oldest uid on this page, to ask for the one before it (F21).
+   *
+   * Undefined for an empty page, because there is nothing to page from. The
+   * list was capped with no way past the cap, and both clients tried to get
+   * past it anyway: the panel doubled the limit it asked for and the CLI told
+   * people to raise `--limit`. Both stop working at the cap, and neither said
+   * so.
+   */
+  readonly oldest?: number;
 }
 
 /**

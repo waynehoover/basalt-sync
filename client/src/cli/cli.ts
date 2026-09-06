@@ -126,6 +126,7 @@ Options
   --uid N          restore one exact version, from basalt history
   --to PATH        restore somewhere other than where it came from
   --limit N        how many versions history or deleted shows (default: 20, or all deletions)
+  --before UID     for deleted: the page before this version, to walk further back
   --config-dir DIR Obsidian's config folder, if it is not .obsidian
   --ignore NAME    a folder or file name never to sync, at any depth, repeatable; local to this
                    device. A path another device syncs and this one ignores is reported as
@@ -1464,7 +1465,10 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
     // passing it here silently cut the deleted list to twenty while the
     // "older deletions" hint below stayed quiet, because the server had not
     // been asked for more.
-    const gone = await client.deleted(args.limitGiven ? args.limit : undefined);
+    const gone = await client.deleted(
+      args.limitGiven ? args.limit : undefined,
+      args.before > 0 ? args.before : undefined,
+    );
     if (args.json) {
       io.out(JSON.stringify({ ok: true, deleted: gone.notes, more: gone.more }));
       return 0;
@@ -1494,7 +1498,16 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
     }
     // Never a short list that looks complete. Somebody reading one and not
     // finding their note concludes it is gone.
-    if (gone.more) io.out("There are older deletions than these. --limit N shows more.");
+    // A cursor, not a bigger ask (F21). This said `--limit N shows more`,
+    // which stops being true at the server's cap: past a thousand deletions
+    // every larger limit returned the same page. The uid is what walks past
+    // it, and it is the same flag `history` pages with.
+    if (gone.more && gone.oldest !== undefined) {
+      io.out(
+        `There are older deletions than these. basalt deleted --before ${gone.oldest} ` +
+          "shows the page before this one.",
+      );
+    }
     return 0;
   } finally {
     await client.close();
@@ -1811,6 +1824,14 @@ interface Args {
   limit: number;
   /** Whether --limit was typed, since the default only suits history. */
   limitGiven: boolean;
+  /**
+   * The oldest uid already seen, to ask for the page before it (F21).
+   *
+   * Zero means the newest page. Used by `deleted`, which had no way past the
+   * server's cap and told people to raise `--limit`, which stops working at
+   * exactly the point somebody needs it.
+   */
+  before: number;
   verbose: boolean;
   help: boolean;
   version: boolean;
@@ -1852,6 +1873,7 @@ export function parseArgs(argv: readonly string[]): Args {
     watch: false,
     limit: 20,
     limitGiven: false,
+    before: 0,
     verbose: false,
     help: false,
     version: false,
@@ -1872,6 +1894,7 @@ export function parseArgs(argv: readonly string[]): Args {
     "--uid",
     "--to",
     "--limit",
+    "--before",
     "--config-dir",
     "--ignore",
     "--ttl",
@@ -1967,6 +1990,13 @@ export function parseArgs(argv: readonly string[]): Args {
           throw new Error(`--limit wants a count, not ${value}`);
         args.limit = limit;
         args.limitGiven = true;
+        break;
+      }
+      case "--before": {
+        const before = Number(value);
+        if (!Number.isInteger(before) || before <= 0)
+          throw new Error(`--before wants a version number, not ${value}`);
+        args.before = before;
         break;
       }
       case "--backup-taken":

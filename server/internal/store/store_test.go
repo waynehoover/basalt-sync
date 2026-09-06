@@ -516,7 +516,7 @@ func TestAVaultOfDeletedFilesIsNotAnEmptyVault(t *testing.T) {
 	if st.Versions != 6 {
 		t.Fatalf("Versions = %d, want 6: deletions are entries", st.Versions)
 	}
-	del, _, err := h.Deleted("v1", true, 0)
+	del, _, err := h.Deleted("v1", true, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -540,7 +540,7 @@ func TestRenameDeletionIsSuppressedInTheDeletedList(t *testing.T) {
 		t.Fatalf("append new: %v", err)
 	}
 
-	suppressed, _, err := h.Deleted("v1", true, 0)
+	suppressed, _, err := h.Deleted("v1", true, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -548,7 +548,7 @@ func TestRenameDeletionIsSuppressedInTheDeletedList(t *testing.T) {
 		t.Fatalf("rename shows as %d deletions: %v", len(suppressed), suppressed[0].Path)
 	}
 	// Unsuppressed it is still visible, because the record itself is real.
-	raw, _, err := h.Deleted("v1", false, 0)
+	raw, _, err := h.Deleted("v1", false, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -1175,7 +1175,7 @@ func TestRenameDeletionIsSuppressedWhenTheNewPathIsPublishedFirst(t *testing.T) 
 		t.Fatalf("delete old: %v", err)
 	}
 
-	got, _, err := h.Deleted("v1", true, 0)
+	got, _, err := h.Deleted("v1", true, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -1205,7 +1205,7 @@ func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
 		t.Fatalf("delete the reused path: %v", err)
 	}
 
-	got, _, err := h.Deleted("v1", true, 0)
+	got, _, err := h.Deleted("v1", true, 0, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -1397,5 +1397,60 @@ func TestVerifyNoticesAnEntryWithNoAuthenticator(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("verify did not notice an entry with no authenticator: %v", rep.Faults)
+	}
+}
+
+// F21. Walking past the cap on the deleted list.
+//
+// The list was bounded at DeletedMax with no cursor, and both clients tried to
+// get past it anyway: the panel doubled the limit it asked for and the CLI told
+// people to raise `--limit`. Both stop working at exactly the point somebody
+// needs them, and neither said so. The uid is the cursor because that is what
+// the rows are ordered by, so a page is stable while deletions are still
+// arriving: a new one changes the first page and never what follows a uid.
+func TestDeletedPagesBackwardsPastItsLimit(t *testing.T) {
+	h := newTestStore(t)
+	for i := 0; i < 12; i++ {
+		path := fmt.Sprintf("note-%02d.md", i)
+		h.file(t, path, "content")
+		if _, err := h.AppendEntry("v1", Entry{
+			Path: path, Deleted: true, MTime: int64(1000 + i), Device: "test",
+			Mac: strings.Repeat("d", 64),
+		}); err != nil {
+			t.Fatalf("delete %s: %v", path, err)
+		}
+	}
+
+	seen := map[string]bool{}
+	var before int64
+	for page := 0; page < 10; page++ {
+		got, more, err := h.Deleted("v1", true, 5, before)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if len(got) == 0 {
+			t.Fatalf("page %d came back empty with more=%v", page, more)
+		}
+		for _, d := range got {
+			if seen[d.Path] {
+				t.Fatalf("%s was listed on two pages", d.Path)
+			}
+			seen[d.Path] = true
+			if before > 0 && d.UID >= before {
+				t.Fatalf("a page asked for versions before %d returned %d", before, d.UID)
+			}
+		}
+		// Strictly decreasing, which is what makes the walk terminate.
+		next := got[len(got)-1].UID
+		if before > 0 && next >= before {
+			t.Fatalf("the page did not advance: %d then %d", before, next)
+		}
+		before = next
+		if !more {
+			break
+		}
+	}
+	if len(seen) != 12 {
+		t.Fatalf("walked %d deletions of 12: %v", len(seen), seen)
 	}
 }

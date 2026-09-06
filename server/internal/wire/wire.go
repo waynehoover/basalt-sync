@@ -230,10 +230,14 @@ type In struct {
 	// get
 	UID int64 `json:"uid"`
 
-	// history
+	// history and deleted
 	//
 	// Before paginates: the oldest uid already held, to ask for the page before
 	// it. Zero starts at the newest. Limit is advisory and the server bounds it.
+	//
+	// Shared by both listings on purpose. They are ordered the same way, by uid
+	// descending, so the cursor means the same thing in both and a client that
+	// can page one can page the other (F21).
 	Before int64 `json:"before"`
 	Limit  int   `json:"limit"`
 

@@ -200,7 +200,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F21 — Add real pagination for deleted notes
 
-- [ ] Add a stable deletion-page cursor through store, protocol, shared client, CLI, and plugin.
+- [x] Add a stable deletion-page cursor through store, protocol, shared client, CLI, and plugin.
 
 **Evidence — inspection.** [Store.Deleted](server/internal/store/store.go#L905) caps results at `DeletedMax` (1,000) and has no page cursor. [Plugin “Show older”](client/src/plugin/main.ts#L2592) doubles the returned count; at 1,000 it repeatedly requests the same capped set. [CLI guidance](client/src/cli/cli.ts#L1373) says increasing `--limit` reveals older entries, which stops being true at that cap.
 
@@ -256,7 +256,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F28 — Enforce receive and decompression limits before allocating work
 
-- [ ] Bound incoming notification backlog, frame/body bytes, response entries/chunk lists, and decompressed output before retaining or expanding them.
+- [x] Bound incoming notification backlog, frame/body bytes, response entries/chunk lists, and decompressed output before retaining or expanding them.
 
 **Evidence — inspection.** [onFrame](client/src/core/transport.ts#L679) accepts received body buffers without a byte budget; [queueNotification](client/src/core/transport.ts#L823) chains work without a backlog bound. [openChunk](client/src/core/crypto.ts#L608) calls unbounded `inflateSync` before the engine checks assembled size. Server [NextBatch](server/internal/store/store.go#L770) and history are count-bounded, but maximum chunk lists can make a permitted response much larger than the nominal queue budget.
 
