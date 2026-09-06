@@ -43,7 +43,6 @@ import {
 
 import {
   Client,
-  Registrar,
   adviseAfterRegistering,
   attentionLines,
   needsAttention,
@@ -75,6 +74,7 @@ import {
   type DeviceConfig,
   type Invite,
 } from "../core/pairing.ts";
+import { rotateVault } from "../core/rotation.ts";
 import { ProtocolError } from "../core/transport.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
@@ -1396,79 +1396,43 @@ export default class BasaltPlugin extends Plugin {
     if (!config) throw new Error("this vault is not paired yet.");
     if (this.pairing) throw new Error("a pairing is already in progress");
     const { dataKey } = deviceCredential(config);
-    const old = parsePairing(recoveryKey);
-    if (old.vaultId !== config.vaultId) {
-      throw new Error(
-        `that recovery key is for vault "${old.vaultId}" and this one is paired with ` +
-          `"${config.vaultId}", so it would replace the secret of a vault this device is not on`,
-      );
-    }
 
-    const secret = generateSecret();
-    const fresh = formatPairing({ url: config.url, vaultId: config.vaultId, secret });
-    // On screen before the request goes out (F03). The server commits, closes
-    // every other registrar and only then replies, so a socket that drops in
-    // between leaves a vault whose new root exists nowhere but in this
-    // process; there is no longer anywhere on a device to stage a root,
-    // because not holding one is the point. The durable copy is the one on
-    // the person's paper, so it goes there first and everything after it is
-    // allowed to fail.
-    onKey?.(fresh);
-    const registrar = await Registrar.open({
-      url: config.url,
-      vaultId: config.vaultId,
-      device: config.device,
-      secret: old.secret,
-    });
-    try {
-      await registrar.rotate(secret, dataKey);
-    } catch (err) {
-      registrar.close();
-      if (err instanceof ProtocolError && err.code === "rotated") {
-        // Answered, and refused: somebody rotated first, so nothing committed
-        // and this key is not the vault's. Putting a key that opens nothing in
-        // front of somebody to write down is worse than saying so.
+    // The same state machine the CLI runs (I02). What differs between the two
+    // surfaces is how the candidate is put in front of somebody, which is the
+    // callback, and how the four outcomes are worded, which is below. Deciding
+    // what happened is not something either surface should be doing on its
+    // own: it is exactly where the two drifted, and F03 is what that cost.
+    const rotation = await rotateVault(
+      {
+        url: config.url,
+        vaultId: config.vaultId,
+        device: config.device,
+        recoveryKey,
+        dataKey,
+      },
+      (candidate: string) => onKey?.(candidate),
+    );
+
+    switch (rotation.kind) {
+      case "committed":
+        return { recoveryKey: rotation.recoveryKey, settled: true };
+      case "refused":
         throw new Error(
           "the vault's secret was replaced by somebody else first, so this was refused and no " +
             "new key was made. The recovery key you used has been retired too.",
         );
-      }
-      // No reply, and nothing here can tell a rotation that committed from one
-      // that did not. So ask: the new root opens a registrar session if and
-      // only if the server took it.
-      const committed = await this.didRotate(config, secret).catch(() => undefined);
-      if (committed === false) {
+      case "notCommitted":
         throw new Error(
-          `the vault's secret was not replaced: ${(err as Error).message}. ` +
-            `It still has the recovery key you used.`,
+          `the vault's secret was not replaced: ${rotation.why}. It still has the recovery key ` +
+            `you used.`,
         );
-      }
-      // Committed, or unknown. Either way the new key may be the vault's, and
-      // it is returned so it can be written down; `settled` says which.
-      return { recoveryKey: fresh, settled: committed === true };
+      case "unknown":
+        // The new key may be the vault's, so it goes back to be written down.
+        // `settled` is what says the server never confirmed it.
+        return { recoveryKey: rotation.recoveryKey, settled: false };
     }
-    registrar.close();
-    return { recoveryKey: fresh, settled: true };
-  }
-
-  /** Whether a root secret opens this vault, which is whether a rotation to it committed. */
-  private async didRotate(config: DeviceConfig, secret: Uint8Array): Promise<boolean> {
-    try {
-      const probe = await Registrar.open({
-        url: config.url,
-        vaultId: config.vaultId,
-        device: config.device,
-        secret,
-      });
-      probe.close();
-      return true;
-    } catch (err) {
-      // Only `auth` says "this is not the vault's credential". Anything else is
-      // the network or the server, and answering "it did not commit" to those
-      // would have somebody cross out the key that opens their vault.
-      if (err instanceof ProtocolError && err.code === "auth") return false;
-      throw err;
-    }
+    // Named rather than left implicit, so a fifth outcome fails loudly here.
+    throw new Error(`unhandled rotation outcome ${JSON.stringify(rotation)}`);
   }
 
   /**

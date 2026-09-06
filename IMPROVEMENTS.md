@@ -28,7 +28,7 @@ Useful boundaries are credential operations, protocol decoding, a sync-pass plan
 
 ### I02 — Share credential-operation state machines between CLI and plugin
 
-- [ ] **Medium; high value during F02/F03/F23.** Model initial claim, registration, invitation redemption, rotation, and unlink as explicit stages with typed outcomes.
+- [x] **Medium; high value during F02/F03/F23.** Model initial claim, registration, invitation redemption, rotation, and unlink as explicit stages with typed outcomes.
 
 [core/client.ts](client/src/core/client.ts#L1005) already shares low-level registration, but [CLI](client/src/cli/cli.ts#L972) and [plugin](client/src/plugin/main.ts#L1309) independently handle persistence, uncertain outcomes, and recovery messages. That duplication is where the reviewed key-handoff and lifecycle behaviors diverge.
 

@@ -72,6 +72,7 @@ import {
 import { lockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
+import { rotateVault } from "../core/rotation.ts";
 import { validateStoredState } from "../core/stored-state.ts";
 import type { StoredState } from "../core/vault.ts";
 
@@ -997,103 +998,54 @@ async function cmdRotate(args: Args, io: Console): Promise<number> {
         "basalt rotate basalt3_...",
     );
   }
-  const old = parsePairing(given);
   const config = await mustLoad(args.dir);
   const { dataKey } = deviceCredential(config);
-  if (old.vaultId !== config.vaultId) {
-    throw new Error(
-      `that recovery key is for vault "${old.vaultId}" and this one is paired with ` +
-        `"${config.vaultId}", so it would rotate a vault this device is not on`,
-    );
-  }
 
-  const secret = generateSecret();
-  const recoveryKey = formatPairing({ url: config.url, vaultId: config.vaultId, secret });
-  // Printed before the request goes out, and this is the whole of the
-  // durability. Rotation used to stage its new secret in this device's config
-  // and promote it afterwards, because the server commits, closes every other
-  // registrar and only then replies, so a socket that drops in between leaves
-  // a vault whose new root exists nowhere but in this process. There is no
-  // longer anywhere on a device to stage a root: not holding one is the point.
-  // So the durable copy is the one on the person's paper, and it goes there
-  // first.
-  //
-  // Under `--json` as well, and that was F03: the guard here used to be
-  // `if (!args.json)`, so machine mode printed the candidate nowhere. A
-  // rotation that then committed with its reply lost, and whose probe could
-  // not connect, produced an error telling the operator to keep both keys
-  // while never having shown them one of the two. It goes to stderr, which
-  // is where the failure paths below already write and is not the one object
-  // stdout carries.
-  io.err("The vault is about to get this recovery key. Write it down before pressing on:");
-  io.err(`  ${recoveryKey}`);
-
-  const registrar = await Registrar.open({
-    url: config.url,
-    vaultId: config.vaultId,
-    device: config.device,
-    secret: old.secret,
-    timeoutMs: args.timeout,
-  });
-  try {
-    await registrar.rotate(secret, dataKey);
-  } catch (err) {
-    registrar.close();
-    if (err instanceof ProtocolError && err.code === "rotated") {
-      // Answered, and refused: somebody rotated first, so nothing committed
-      // and the key printed above is not the vault's. Said plainly, because a
-      // key that opens nothing written down in place of one that does is worse
-      // than either.
-      throw new Error(
-        "the vault was rotated by somebody else first, so this rotation was refused and the key " +
-          "above is not the vault's. Cross it out. The recovery key you used has been retired too.",
-      );
-    }
-    // No reply, and nothing here can tell a rotation that committed from one
-    // that did not. So ask: the new root opens a registrar session if and only
-    // if the server took it.
-    const committed = await didRotate(config, secret, args).catch(() => undefined);
-    if (committed === true) {
-      io.err(
-        "basalt: the reply was lost, but the rotation did commit. The key above is the vault's.",
-      );
-      return finishRotate(recoveryKey, args, io);
-    }
-    if (committed === false) {
-      throw new Error(
-        `the rotation was not answered and did not commit: ${(err as Error).message}. ` +
-          `The vault still has its old recovery key; cross out the one above.`,
-      );
-    }
-    throw new Error(
-      `the rotation was not answered and the server could not be reached to find out whether it ` +
-        `committed: ${(err as Error).message}. Keep both keys and run basalt rotate again with ` +
-        `whichever one the server accepts.`,
-    );
-  }
-  registrar.close();
-  return finishRotate(recoveryKey, args, io);
-}
-
-/** Whether a root secret opens this vault, which is whether a rotation to it committed. */
-async function didRotate(config: Config, secret: Uint8Array, args: Args): Promise<boolean> {
-  try {
-    const probe = await Registrar.open({
+  const rotation = await rotateVault(
+    {
       url: config.url,
       vaultId: config.vaultId,
       device: config.device,
-      secret,
+      recoveryKey: given,
+      dataKey,
       timeoutMs: args.timeout,
-    });
-    probe.close();
-    return true;
-  } catch (err) {
-    // Only `auth` says "this is not the vault's credential". Anything else is
-    // the network or the server, and answering "it did not commit" to those
-    // would have somebody cross out the key that opens their vault.
-    if (err instanceof ProtocolError && err.code === "auth") return false;
-    throw err;
+    },
+    // Out before the request, and on stderr whatever the output format: stdout
+    // is one object under `--json` and a second thing written there is a parse
+    // error for whatever is reading it (F03). The shared machine awaits this,
+    // so the bytes are gone before the vault can change.
+    (candidate: string) => {
+      io.err("The vault is about to get this recovery key. Write it down before pressing on:");
+      io.err(`  ${candidate}`);
+    },
+  );
+
+  switch (rotation.kind) {
+    case "committed":
+      if (rotation.confirmedBy === "probe") {
+        // The command looked like it failed and did not. Said before the
+        // success block below, because somebody watching a timeout needs to
+        // know the key they were shown is the live one.
+        io.err(
+          "basalt: the reply was lost, but the rotation did commit. The key above is the vault's.",
+        );
+      }
+      return finishRotate(rotation.recoveryKey, args, io);
+    case "refused":
+      throw new Error(rotation.why);
+    case "notCommitted":
+      throw new Error(
+        `${rotation.why}. The vault still has its old recovery key; cross out the one above.`,
+      );
+    case "unknown":
+      throw new Error(
+        `${rotation.why}. Keep both keys and run basalt rotate again with whichever one the ` +
+          `server accepts.`,
+      );
   }
+  // Every arm above returns or throws. Named rather than left implicit,
+  // because a fifth outcome added to the union should fail here loudly.
+  throw new Error(`unhandled rotation outcome ${JSON.stringify(rotation)}`);
 }
 
 function finishRotate(recoveryKey: string, args: Args, io: Console): number {
