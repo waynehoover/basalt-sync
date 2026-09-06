@@ -111,6 +111,34 @@ The protocol version is what decides whether two releases can talk. Every
 plugin release needs Obsidian 1.7.2 or newer (`versions.json`). `basaltd
 version` prints the server's release, and the plugin's is in its manifest.
 
+### A vault that is not called `default`
+
+One server serves one vault, named by `-vault`, and every hello route enforces
+it. The name only has to be chosen in two places and they are not the same
+place, which is worth saying plainly because the onboarding does not express
+it (I13):
+
+- **`basalt init --vault-id work`** starts it. The headless client is the only
+  thing that can, because the setup line the server prints carries an address
+  and a token and not a name, and the plugin has nowhere to ask for one: there
+  is no settings screen, on purpose.
+- **Every other device joins with the recovery key**, which does carry the
+  name, so the plugin is a perfectly ordinary second device on a vault called
+  anything. Invites carry it too.
+
+So the constraint is exact: a vault whose name is not `default` has to be
+started from the command line, once. Nothing else changes. The alternative
+was putting the name in the setup line, which is a format change to the one
+string a person types by hand, for a case that happens once per server.
+
+```bash
+basaltd serve -data /var/lib/basalt -vault work
+basalt init 'homelab:3003#K7M2...' --vault-id work --dir ~/vault
+basalt invite --dir ~/vault          # every device after the first
+```
+
+A name with a space in it works and needs quoting in both places.
+
 ## TLS
 
 None in the binary, on purpose. No key material lives here. Bind to localhost

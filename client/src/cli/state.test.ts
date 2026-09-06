@@ -198,6 +198,64 @@ describe("what status knows about this device (F27)", () => {
   }, 300_000);
 });
 
+/**
+ * Secrets that never touch the command line (I12).
+ *
+ * A recovery key typed as an argument is in the shell's history and in
+ * `/proc` for every process on the machine while the command runs. Fine for a
+ * one-off on a laptop you own, wrong for a script or a shared box. The
+ * argument still works, because taking it away would make the common case
+ * worse for no gain.
+ */
+describe("where a secret can come from (I12)", () => {
+  it("reads the recovery key from a file, and writes a new one to a file only you can read", async () => {
+    server = new TestServer();
+    await server.start();
+    const dir = await vaultDir("keyfile");
+    const out = join(await vaultDir("keyout"), "key.txt");
+
+    // The setup string from a file, and the generated key to one.
+    const setupFile = join(dir, "setup.txt");
+    await writeFile(setupFile, `${server.setup}\n`);
+    const init = await cli("init", "--key-file", setupFile, "--key-out", out, "--dir", dir);
+    expect(init.code, init.all).toBe(0);
+
+    const written = (await readFile(out, "utf8")).trim();
+    expect(written, "the key file holds no key").toMatch(/^basalt3_/);
+    // And it is the key the command printed, not some other one.
+    expect(init.all).toContain(written);
+    // Readable by nobody else.
+    expect((await stat(out)).mode & 0o077, "the key file is readable by others").toBe(0);
+
+    // That key, back in from a file, to rotate with.
+    const rotated = await cli("rotate", "--key-file", out, "--dir", dir, "--json");
+    expect(rotated.code, rotated.all).toBe(0);
+    expect(rotated.json()["recoveryKey"]).not.toBe(written);
+  }, 300_000);
+
+  it("refuses an empty key file rather than treating it as no key at all", async () => {
+    server = new TestServer();
+    await server.start();
+    const dir = await vaultDir("emptykey");
+    const empty = join(dir, "empty.txt");
+    await writeFile(empty, "   \n");
+    const r = await cli("init", "--key-file", empty, "--dir", dir);
+    expect(r.code).not.toBe(0);
+    expect(r.all).toMatch(/is empty/);
+  }, 300_000);
+
+  it("will not take the same secret twice, from a file and an argument", async () => {
+    server = new TestServer();
+    await server.start();
+    const dir = await vaultDir("bothkeys");
+    const f = join(dir, "setup.txt");
+    await writeFile(f, `${server.setup}\n`);
+    const r = await cli("init", server.setup, "--key-file", f, "--dir", dir);
+    expect(r.code).not.toBe(0);
+    expect(r.all).toMatch(/not both/);
+  }, 300_000);
+});
+
 describe("what a rebase exits with (F26)", () => {
   it("gives JSON and text the same status when a path cannot be replayed", async () => {
     // A server that refuses anything over a few bytes, so the replay after

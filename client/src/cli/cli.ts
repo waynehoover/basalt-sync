@@ -21,6 +21,7 @@
  * never sync is not a successful run.
  */
 
+import { open as openFile, readFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 
@@ -129,6 +130,8 @@ Options
   --to PATH        restore somewhere other than where it came from
   --limit N        how many versions history or deleted shows (default: 20, or all deletions)
   --before UID     for deleted: the page before this version, to walk further back
+  --key-file PATH  read the recovery key, invite or setup string from a file
+  --key-out PATH   also write a newly generated recovery key here, readable only by you
   --config-dir DIR Obsidian's config folder, if it is not .obsidian
   --ignore NAME    a folder or file name never to sync, at any depth, repeatable; local to this
                    device. A path another device syncs and this one ignores is reported as
@@ -299,10 +302,11 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // flags are kept for anyone who split it by hand when that was the only way.
   let server = args.server;
   let token = args.token;
-  if (args.rest[0] !== undefined) {
+  const setup = await secretFrom(args.rest[0], args, "the setup string");
+  if (setup !== undefined) {
     if (server !== undefined || token !== undefined)
       throw new Error("init takes the server's line or --server and --token, not both");
-    ({ url: server, token } = parseSetup(args.rest[0]));
+    ({ url: server, token } = parseSetup(setup));
   }
   if (!server || !token)
     throw new Error(
@@ -366,6 +370,10 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
     say("");
   };
   sayKey();
+  // Also to a file, when asked, so a script has somewhere to keep it that is
+  // not a terminal. Before the registration for the same reason the printing
+  // is: everything after this is allowed to fail (F02, I12).
+  if (args.keyOut !== undefined) await writeKeyOut(args.keyOut, recoveryKey);
 
   let registered = false;
   try {
@@ -493,7 +501,7 @@ async function refuseIfPaired(dir: string): Promise<void> {
  * also take their words from.
  */
 async function cmdPair(args: Args, io: Console): Promise<number> {
-  const given = args.rest[0];
+  const given = await secretFrom(args.rest[0], args, "the invite or recovery key");
   if (!given) throw new Error("pair needs the invite or recovery key another device printed");
   await refuseIfPaired(args.dir);
   if (isInvite(given)) return await pairWithInvite(parseInvite(given), args, io);
@@ -795,7 +803,7 @@ async function cmdDevices(args: Args, io: Console): Promise<number> {
  * lost".
  */
 async function cmdUninvite(args: Args, io: Console): Promise<number> {
-  const invite = args.rest[0];
+  const invite = await secretFrom(args.rest[0], args, "the invite");
   if (!invite) throw new Error("uninvite needs an invite id, from basalt devices");
   const canceller = await openRevoker(args, io);
   try {
@@ -991,7 +999,7 @@ async function cmdRevoke(args: Args, io: Console): Promise<number> {
  * current, and there is nothing to fetch before rewrapping it.
  */
 async function cmdRotate(args: Args, io: Console): Promise<number> {
-  const given = args.rest[0];
+  const given = await secretFrom(args.rest[0], args, "the recovery key");
   if (!given) {
     throw new Error(
       "rotate needs the vault's current recovery key, which no device holds: " +
@@ -1014,9 +1022,12 @@ async function cmdRotate(args: Args, io: Console): Promise<number> {
     // is one object under `--json` and a second thing written there is a parse
     // error for whatever is reading it (F03). The shared machine awaits this,
     // so the bytes are gone before the vault can change.
-    (candidate: string) => {
+    async (candidate: string) => {
       io.err("The vault is about to get this recovery key. Write it down before pressing on:");
       io.err(`  ${candidate}`);
+      // Awaited by the state machine, so a script's copy is on disk before
+      // the vault can change under it (I02, I12).
+      if (args.keyOut !== undefined) await writeKeyOut(args.keyOut, candidate);
     },
   );
 
@@ -1163,6 +1174,69 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
  * about a decision its owner made on purpose. It is printed on every run
  * instead.
  */
+/**
+ * A secret from somewhere other than the command line (I12).
+ *
+ * A recovery key, an invite or a setup string typed as an argument is in the
+ * shell's history file and in `/proc` for every process on the machine while
+ * the command runs. That is fine for a one-off on a laptop you own and wrong
+ * for a script, a shared box, or anything a person will paste twice.
+ *
+ * Three ways in, and the argument is still one of them because taking it away
+ * would make the common case worse for no gain:
+ *
+ *   basalt pair basalt3i_...        the argument, as before
+ *   basalt pair -                   standard input, for a pipe
+ *   basalt pair --key-file ./k      a file, which is what a script should use
+ *
+ * `-` reads to end of input and trims, so `printf %s "$KEY" | basalt pair -`
+ * and a here-doc both work. A file is read whole and trimmed for the same
+ * reason. Neither is logged, and neither is echoed back.
+ */
+async function secretFrom(
+  given: string | undefined,
+  args: Args,
+  what: string,
+): Promise<string | undefined> {
+  if (args.keyFile !== undefined) {
+    if (given !== undefined && given !== "-") {
+      throw new Error(`give ${what} as an argument or with --key-file, not both`);
+    }
+    const text = await readFile(args.keyFile, "utf8");
+    const trimmed = text.trim();
+    if (trimmed === "") throw new Error(`${args.keyFile} is empty, so it holds no ${what}`);
+    return trimmed;
+  }
+  if (given === "-") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    const trimmed = Buffer.concat(chunks).toString("utf8").trim();
+    if (trimmed === "")
+      throw new Error(`nothing arrived on standard input, so there is no ${what}`);
+    return trimmed;
+  }
+  return given;
+}
+
+/**
+ * Writes a newly generated recovery key somewhere only its owner can read.
+ *
+ * The alternative to a key on a terminal, for a script that has to keep one.
+ * Created with `wx` so it cannot land on an existing file, and 0600 so it is
+ * not readable by anything else on the machine. The key still goes to the
+ * usual place as well: a file somebody forgot to look at is not a backup, and
+ * this is an addition rather than a redirection.
+ */
+async function writeKeyOut(path: string, recoveryKey: string): Promise<void> {
+  const handle = await openFile(path, "wx", 0o600);
+  try {
+    await handle.writeFile(`${recoveryKey}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export function exitCodeFor(report: SyncReport): number {
   // Through the shared vocabulary, so the exit code, the panel's glyph and
   // the JSON all draw the same conclusion from one pass (I04). This counted
@@ -1799,6 +1873,10 @@ interface Args {
    * exactly the point somebody needs it.
    */
   before: number;
+  /** A file holding the recovery key, invite or setup string (I12). */
+  keyFile: string | undefined;
+  /** Where to write a newly generated recovery key, at 0600 (I12). */
+  keyOut: string | undefined;
   verbose: boolean;
   help: boolean;
   version: boolean;
@@ -1841,6 +1919,8 @@ export function parseArgs(argv: readonly string[]): Args {
     limit: 20,
     limitGiven: false,
     before: 0,
+    keyFile: undefined,
+    keyOut: undefined,
     verbose: false,
     help: false,
     version: false,
@@ -1862,6 +1942,8 @@ export function parseArgs(argv: readonly string[]): Args {
     "--to",
     "--limit",
     "--before",
+    "--key-file",
+    "--key-out",
     "--config-dir",
     "--ignore",
     "--ttl",
@@ -1959,6 +2041,12 @@ export function parseArgs(argv: readonly string[]): Args {
         args.limitGiven = true;
         break;
       }
+      case "--key-file":
+        args.keyFile = value!;
+        break;
+      case "--key-out":
+        args.keyOut = value!;
+        break;
       case "--before": {
         const before = Number(value);
         if (!Number.isInteger(before) || before <= 0)

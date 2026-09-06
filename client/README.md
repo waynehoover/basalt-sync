@@ -74,7 +74,7 @@ basalt --version                          which release this is
 |---|---|
 | `--dir DIR` | the vault (default: the current directory) |
 | `--device NAME` | this device's name (default: the hostname plus four random characters, chosen once at pairing) |
-| `--vault-id ID` | which vault on the server (default `default`) |
+| `--vault-id ID` | which vault on the server, for `init` only (default `default`) |
 | `--json` | machine-readable output, on every command |
 | `--timeout MS` | how long to wait on the server (default 30000) |
 | `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |

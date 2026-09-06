@@ -156,10 +156,12 @@ func cmdService(args []string, out io.Writer) error {
 #   %s backup -data %s -to /somewhere/else
 #
 # Purge does need it stopped, because it deletes chunk bodies, and it wants the
-# vault's name again and the backup that holds what it is about to drop:
+# vault's name twice and the backup that holds what it is about to drop. Twice
+# because -vault says which one and -confirm is the typing-it-out that a
+# command destroying history should ask for (I13):
 #
-#   systemctl stop basalt && %s purge -data %s -confirm %s -backup /somewhere/else && systemctl start basalt
-`, qExe, qData, qExe, qData, shellQuote(*vault))
+#   systemctl stop basalt && %s purge -data %s -vault %s -confirm %s -backup /somewhere/else && systemctl start basalt
+`, qExe, qData, qExe, qData, shellQuote(*vault), shellQuote(*vault))
 	return nil
 }
 

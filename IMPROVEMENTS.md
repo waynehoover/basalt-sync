@@ -132,13 +132,13 @@ about.
 
 ### I12 — Support secret input without shell history or process arguments
 
-- [ ] **Small.** Offer explicit stdin/file input for recovery and invite material in [CLI argument handling](client/src/cli/cli.ts#L1739), with documented restrictive file permissions.
+- [x] **Small.** Offer explicit stdin/file input for recovery and invite material in [CLI argument handling](client/src/cli/cli.ts#L1739), with documented restrictive file permissions.
 
 Current positional-key workflows are convenient but expose secrets to command history and process inspection. Keep existing interactive convenience if appropriate, and offer a deliberate secure export destination for newly generated recovery keys. Never silently send a secret to a log stream, pager, or diagnostic export. Test JSON output and piping so errors do not accidentally discard the only generated key.
 
 ### I13 — Align custom-vault setup and command examples
 
-- [ ] **Small.** Either make the non-default vault flow complete across server, setup payload, CLI, plugin, and generated service instructions, or clearly constrain the POC UI to `default`.
+- [x] **Small.** Either make the non-default vault flow complete across server, setup payload, CLI, plugin, and generated service instructions, or clearly constrain the POC UI to `default`.
 
 The server accepts `-vault`; [plugin first pairing](client/src/plugin/main.ts#L907) hardcodes `default`, while the setup string carries address/token rather than the selected vault. [Generated service purge guidance](server/cmd/basaltd/service.go#L161) includes `-confirm` but omits the custom `-vault`. Review argument handling too: reject unsupported command flags/extra positional arguments rather than silently ignoring meaningful input.
 
