@@ -31,10 +31,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     cp: vi.fn(actual.cp),
     // F13 watches the order of flushes against the removal of the source.
     rm: vi.fn(actual.rm),
+    // F25 injects the EXDEV a mounted subdirectory produces.
+    link: vi.fn(actual.link),
   };
 });
 
-import { access, cp, open, readdir, rename, stat, utimes } from "node:fs/promises";
+import { access, cp, link, open, readdir, rename, stat, utimes } from "node:fs/promises";
 import { JsonIndexStore, TEMP_MARK, copyVerifiedThenRemove, writeDurably } from "./vault.ts";
 import { loadConfig, saveConfig } from "./config.ts";
 
@@ -442,5 +444,40 @@ describe("temporary files, ours and not", () => {
     await v.list();
     expect(v.reaped).toBe(1);
     expect(await readdir(staging)).toEqual([`new.md${TEMP_MARK}yy`]);
+  });
+});
+
+/**
+ * F25. A restore into a mounted subdirectory has to land.
+ *
+ * `create` stages under the vault's own `.basalt/tmp` and hard-links the
+ * result into place, which is what makes it exclusive: a link creates the
+ * name or fails, so it cannot replace a note that appeared since. Its
+ * fallback covered the filesystems that have no hard links and not the case
+ * where the two paths are on different mounts, which is a different error for
+ * a reason that has nothing to do with link support. Restores and conflict
+ * copies into such a directory failed outright.
+ */
+describe("creating a file across a mount boundary", () => {
+  it("still lands, and still refuses to replace what is already there", async () => {
+    const vault = new NodeVault(root);
+    // What a staging directory on one mount and a destination on another
+    // produces, and nothing else here can.
+    vi.mocked(link).mockImplementation(async () => {
+      const err = new Error("EXDEV: cross-device link") as NodeJS.ErrnoException;
+      err.code = "EXDEV";
+      throw err;
+    });
+
+    const times = { mtime: 1_700_000_000_000, ctime: 1_700_000_000_000 };
+    const made = await vault.create("restored.md", enc.encode("brought back"), times);
+    expect(made, "a restore into a mounted subdirectory was refused").toBe(true);
+    expect(await readFile(join(root, "restored.md"), "utf8")).toBe("brought back");
+
+    // And the no-overwrite promise survives the fallback: the second attempt
+    // finds the name taken and says so rather than replacing it.
+    const again = await vault.create("restored.md", enc.encode("a second copy"), times);
+    expect(again, "the fallback replaced a file that was already there").toBe(false);
+    expect(await readFile(join(root, "restored.md"), "utf8")).toBe("brought back");
   });
 });

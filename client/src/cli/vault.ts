@@ -841,6 +841,7 @@ export class NodeVault implements Vault {
     const had = await this.deepestExisting(full);
     await mkdir(dirname(full), { recursive: true });
     await this.matchCase(full);
+    await this.checkStaging();
     await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
     this.dirty(full, had);
   }
@@ -848,6 +849,24 @@ export class NodeVault implements Vault {
   /** Where this vault's temporary files live: under its own state folder, never beside a note. */
   private get staging(): string {
     return join(this.root, ".basalt", "tmp");
+  }
+
+  /**
+   * The staging directory, checked once per process for leaving the vault
+   * (F24).
+   *
+   * Note destinations were validated and the internal directories were not,
+   * so a `.basalt` that is a link somewhere else staged every note this
+   * device wrote outside the vault, in plaintext, on the way in. Checked once
+   * and remembered: it is the same path for the life of the process, and
+   * asking `realpath` per write would be a syscall on the hot path for an
+   * answer that cannot change without somebody moving the directory under a
+   * running client.
+   */
+  private stagingChecked: Promise<void> | undefined;
+
+  private checkStaging(): Promise<void> {
+    return (this.stagingChecked ??= this.insideForReal(join(this.staging, "x")));
   }
 
   /**
@@ -915,6 +934,14 @@ export class NodeVault implements Vault {
     }
 
     const target = await this.freeTrashPath(path);
+    // The destination is checked too (F24).
+    //
+    // The source's parents were validated and the trash path was then built
+    // and used without the same question being asked of it. A `.trash` that
+    // is a symlink out of the vault therefore moved notes outside it, which
+    // is the deletion path quietly becoming an export. `.basalt` and the
+    // staging directory get the same treatment where they are made.
+    await this.insideForReal(target);
     const had = await this.deepestExisting(target);
     await mkdir(dirname(target), { recursive: true });
     try {
@@ -1061,8 +1088,20 @@ export class NodeVault implements Vault {
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code === "EEXIST") return false;
-        if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") throw err;
-        // No hard links here. Exclusive open, then the bytes again.
+        // `EXDEV` belongs with the rest (F25). The staging directory is at
+        // the vault root and the destination may be on a different mount, in
+        // which case a hard link between them is refused for a reason that
+        // has nothing to do with the filesystem's support for links. An
+        // ordinary write has had a cross-device fallback for a while;
+        // restores and conflict copies into a mounted subdirectory failed
+        // outright without this, which is the one place a file arriving is
+        // the whole point.
+        if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EXDEV") {
+          throw err;
+        }
+        // No link across this boundary. Exclusive open, then the bytes again,
+        // which keeps the no-overwrite promise: `wx` fails if anything is
+        // there, including something that appeared since the link was tried.
         let exclusive;
         try {
           exclusive = await open(full, "wx");

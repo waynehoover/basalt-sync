@@ -216,7 +216,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F23 — Prevent pairing/admin completion from reviving an unloaded plugin
 
-- [ ] Track and cancel lifecycle-sensitive operations, and guard their saves and restarts with the generation that began them.
+- [x] Track and cancel lifecycle-sensitive operations, and guard their saves and restarts with the generation that began them.
 
 **Evidence — reproduced for invite pairing.** [pairWithInvite](client/src/plugin/main.ts#L860) awaits redemption then directly saves and starts. Unlike the root registration save path, it does not use `saveDuringRun`. [onunload](client/src/plugin/main.ts#L328) retires sync clients but not that operation. Completing redemption after unload still invoked a config save and restart in the probe. First-pairing error paths and rotation also need the same lifecycle audit.
 
@@ -224,7 +224,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F24 — Validate trash and staging directories as well as note destinations
 
-- [ ] Enforce filesystem containment/ownership for `.trash`, `.basalt`, and temporary-file directories.
+- [x] Enforce filesystem containment/ownership for `.trash`, `.basalt`, and temporary-file directories.
 
 **Evidence — reproduced for trash.** [NodeVault.remove](client/src/cli/vault.ts#L829) validates the source's parents, then constructs a trash destination without the same check. A pre-existing `.trash` symlink caused a note to be moved outside the vault. [staging](client/src/cli/vault.ts#L774) and [config saving](client/src/cli/config.ts#L78) likewise use internal directories without equivalent containment validation.
 
@@ -232,7 +232,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F25 — Support exclusive creation across mounted subdirectories
 
-- [ ] Handle `EXDEV` when publishing a new file from the root staging directory, while preserving no-overwrite semantics.
+- [x] Handle `EXDEV` when publishing a new file from the root staging directory, while preserving no-overwrite semantics.
 
 **Evidence — inspection.** [NodeVault.create](client/src/cli/vault.ts#L970) stages under `.basalt/tmp` then hard-links into the destination. Its fallback covers `EPERM`, `ENOTSUP`, and `EOPNOTSUPP`, but not `EXDEV`. Restores/conflict copies into a mounted subdirectory therefore fail even where ordinary write has a cross-device fallback.
 
@@ -248,7 +248,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F27 — Distinguish server catch-up from unsynchronized local edits in status
 
-- [ ] Scan local changes without writing, or explicitly label local-change knowledge as stale/unexamined.
+- [x] Scan local changes without writing, or explicitly label local-change knowledge as stale/unexamined.
 
 **Evidence — inspection.** [cmdStatus](client/src/cli/cli.ts#L1210) reads the persisted index and server cursor. When the cursors match and the stored pending set is empty, it prints “up to date with the server” without checking files added, edited, or removed since the last pass.
 

@@ -2718,6 +2718,38 @@ describe("adding a device from the panel", () => {
     expect(listed.devices).toHaveLength(2);
   }, 300_000);
 
+  /**
+   * F23. A pairing that completes after the plugin is unloaded must not
+   * revive it.
+   *
+   * Redeeming an invite is a round trip, and Obsidian can disable a plugin
+   * while one is in flight. This wrote its config and started a sync loop
+   * unconditionally when it came back, so a redemption that finished after
+   * `onunload` left a save, a client and a ticker belonging to a plugin that
+   * had been retired. The root registration path next door has used the
+   * generation guard since it was written; this one reached straight for the
+   * raw save.
+   */
+  it("does not save or start when an invite is redeemed after unload", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+    const invite = (await first.plugin.createInvite()).invite;
+
+    const second = await load();
+    // Unloaded while the redemption is on the wire, which is the window.
+    const pairing = second.plugin.pair(invite, "phone");
+    second.plugin.onunload();
+    await second.plugin.closing;
+
+    await expect(pairing, "a pairing completed into a plugin that was gone").rejects.toThrow(
+      /no longer paired|unlinked while the invite/,
+    );
+    expect(second.plugin.savedData, "a retired plugin saved a pairing").toBe(null);
+    expect(second.plugin.paired).toBe(false);
+  }, 300_000);
+
   it("adds one with the recovery key, and neither device keeps it", async () => {
     await fresh();
     const first = await load();

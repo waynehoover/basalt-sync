@@ -72,6 +72,7 @@ import {
 import { lockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { validateStoredState } from "../core/stored-state.ts";
+import type { StoredState } from "../core/vault.ts";
 
 /**
  * The client's release, written in by the build.
@@ -1274,6 +1275,53 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
   return 0;
 }
 
+/**
+ * How many notes have changed here since the index was written (F27).
+ *
+ * A read and nothing else: `status` does not hold the vault's lock, on
+ * purpose, so it must not write notes or an index (F08). Listing and
+ * comparing stats does neither, and it is the same comparison the engine's
+ * own scan starts from: a path the index has never seen, one it has and whose
+ * size or modification time has moved, or one the index has and the disk no
+ * longer does.
+ *
+ * Approximate in one direction only, and safely: an edit that preserves both
+ * size and mtime is not counted, which understates rather than claiming more
+ * is synced than is. A number here is never wrong about there being work.
+ */
+async function unsentHere(args: Args, stored: StoredState | undefined): Promise<number> {
+  if (!stored) return 0;
+  let vault;
+  try {
+    vault = new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore });
+    const onDisk = await vault.list();
+    const known = new Map(Object.entries(stored.entries));
+    let unsent = 0;
+    const seen = new Set<string>();
+    for (const f of onDisk) {
+      seen.add(f.path);
+      if (f.folder) continue;
+      const was = known.get(f.path) as { size?: number; mtime?: number } | undefined;
+      if (was === undefined) {
+        unsent++;
+        continue;
+      }
+      if (was.size !== f.size || was.mtime !== Math.ceil(f.mtime)) unsent++;
+    }
+    for (const [path, entry] of known) {
+      if ((entry as { folder?: boolean }).folder) continue;
+      if (!seen.has(path)) unsent++;
+    }
+    return unsent;
+  } catch {
+    // A vault that will not list is a vault this command cannot describe, and
+    // guessing at zero would be the claim the whole item is about. Reported as
+    // nothing rather than as a number, and the reachability lines below still
+    // say what they know.
+    return 0;
+  }
+}
+
 async function cmdStatus(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
   // Checked the way the engine checks it, so a status never reports numbers
@@ -1292,6 +1340,8 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // plugin ignores nothing beyond the dot rule and the config folder, and
     // a folder ignored here is one the phone uploads.
     ignore: [...args.ignore],
+    // Notes changed here since the last pass (F27).
+    unsent: await unsentHere(args, stored),
   };
 
   // Reachability is reported, never assumed. "up to date" from a client that
@@ -1381,7 +1431,14 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
         ? `state    ${server.behind} changes behind`
         : local.pending > 0
           ? `state    caught up with the server, with ${local.pending} still not applied here`
-          : "state    up to date with the server",
+          : local.unsent > 0
+            ? // F27. The cursors matching says what the server has told this
+              // device, and nothing at all about what has been typed here
+              // since. A note edited after a successful sync left the two
+              // numbers equal and the pending set empty, and the status said
+              // everything was current while the paragraph sat on the disk.
+              `state    caught up with the server, with ${local.unsent} not yet sent from here`
+            : "state    up to date with the server",
     );
     return 0;
   }

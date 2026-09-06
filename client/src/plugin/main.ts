@@ -869,6 +869,16 @@ export default class BasaltPlugin extends Plugin {
    * invite that carried it is already spent (rule 4).
    */
   private async pairWithInvite(invite: Invite, name: string): Promise<void> {
+    // The generation this pairing belongs to, taken before the network (F23).
+    //
+    // Redeeming is a round trip, and the plugin can be unloaded, unlinked or
+    // paired again while it is in flight. This wrote its config and started a
+    // sync loop unconditionally when it came back, so completing after an
+    // unload revived a plugin that had been retired: a save, a client, and a
+    // ticker belonging to nothing. The root registration path next door has
+    // used `saveDuringRun` for this since it was written; this one reached
+    // straight for `saveVerified`.
+    const mine = this.generation;
     const redeemed = await redeemInvite(invite, name, {
       log: (message, ...rest) => console.info("Basalt:", message, ...rest),
     });
@@ -880,7 +890,21 @@ export default class BasaltPlugin extends Plugin {
       deviceSecret: redeemed.deviceSecret,
       dataKey: redeemed.dataKey,
     };
-    await this.saveVerified(config);
+    // Refuses once this run has been retired, and is registered where
+    // `unlink` waits for it, which is the pair of guarantees the two halves
+    // of `saveDuringRun` exist for.
+    await this.saveDuringRun(mine, config);
+    // Checked again after the save, because the save is itself an await: a
+    // config that landed for a retired run is one `unlink` has waited for and
+    // is about to remove, and starting a loop on it would put the pairing
+    // back. The row on the server is real either way, and the panel's
+    // counsellor is what names it.
+    if (mine !== this.generation) {
+      throw new Error(
+        "this vault was unlinked while the invite was being redeemed. The device row it " +
+          "registered is on the server; remove it with basalt revoke, or pair again.",
+      );
+    }
     this.config = config;
     this.start();
   }

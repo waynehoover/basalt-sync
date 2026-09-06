@@ -158,6 +158,46 @@ const exited = (child: ChildProcess) =>
  * `exitCodeFor`, so an incomplete replay was a failure interactively and a
  * success in automation: exactly the difference a cron job cannot see.
  */
+/**
+ * F27. Cursors matching is not the same as nothing to send.
+ *
+ * `status` read the persisted index and the server's cursor. With the two
+ * equal and the pending set empty it printed "up to date with the server"
+ * without looking at the disk at all, so a note edited after a successful
+ * sync sat there while the status said everything was current. That is the
+ * one thing the status rule in docs/design.md forbids.
+ */
+describe("what status knows about this device (F27)", () => {
+  it("does not claim everything is current with an unsent edit on the disk", async () => {
+    const dir = await paired("statusedit");
+    await writeFile(join(dir, "note.md"), "first");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+
+    const settled = await cli("status", "--dir", dir);
+    expect(settled.all).toContain("up to date with the server");
+
+    // Typed after the pass, which is the whole of it.
+    await writeFile(join(dir, "note.md"), "and a paragraph nobody has sent");
+    const after = await cli("status", "--dir", dir);
+    expect(after.all, `status called an unsent edit up to date:\n${after.all}`).not.toContain(
+      "up to date with the server",
+    );
+    expect(after.all).toMatch(/not yet sent from here/);
+
+    // And the machine-readable answer carries the same fact.
+    const asJson = await cli("status", "--dir", dir, "--json");
+    expect(asJson.json()["unsent"]).toBe(1);
+
+    // A new note counts too, and so does one that was removed.
+    await writeFile(join(dir, "fresh.md"), "brand new");
+    expect((await cli("status", "--dir", dir, "--json")).json()["unsent"]).toBe(2);
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    expect((await cli("status", "--dir", dir, "--json")).json()["unsent"]).toBe(0);
+    await rm(join(dir, "fresh.md"));
+    expect((await cli("status", "--dir", dir, "--json")).json()["unsent"]).toBe(1);
+  }, 300_000);
+});
+
 describe("what a rebase exits with (F26)", () => {
   it("gives JSON and text the same status when a path cannot be replayed", async () => {
     // A server that refuses anything over a few bytes, so the replay after

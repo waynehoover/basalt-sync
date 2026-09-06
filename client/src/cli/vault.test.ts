@@ -736,6 +736,49 @@ describe("a symlinked folder is not a way out of the vault", () => {
     await removeTree(outside);
   });
 
+  /**
+   * F24. The internal directories are destinations too.
+   *
+   * A note's own path was validated on the way in and the trash path was
+   * then built from it and used without the same question being asked, so a
+   * `.trash` that is a link out of the vault turned the deletion path into
+   * an export: notes moved outside, in plaintext, by a sync doing what it
+   * was told. `.basalt`, where every write is staged, is the same shape
+   * one step earlier.
+   */
+  it("refuses to move a note into a trash that leaves the vault", async () => {
+    const { symlink, mkdir: mkdirp, writeFile: wf, readdir: rd } = await import("node:fs/promises");
+    const outside = join(root, "..", `outside-trash-${Date.now()}`);
+    await mkdirp(outside, { recursive: true });
+    await symlink(outside, join(root, ".trash"));
+    await wf(join(root, "note.md"), "the only copy\n");
+
+    const vault = new NodeVault(root);
+    await expect(vault.remove("note.md")).rejects.toThrow(/leaves the vault through a link/);
+
+    // The note is still where it was, and nothing was written outside.
+    expect(await rd(outside)).toEqual([]);
+    expect(await readFile(join(root, "note.md"), "utf8")).toBe("the only copy\n");
+    await removeTree(outside);
+  });
+
+  it("refuses to stage a write through a linked state folder", async () => {
+    const { symlink, mkdir: mkdirp, readdir: rd } = await import("node:fs/promises");
+    const outside = join(root, "..", `outside-state-${Date.now()}`);
+    await mkdirp(outside, { recursive: true });
+    await symlink(outside, join(root, ".basalt"));
+
+    const vault = new NodeVault(root);
+    await expect(
+      vault.write("note.md", enc.encode("staged somewhere else\n"), {
+        mtime: 1_700_000_000_000,
+        ctime: 1_700_000_000_000,
+      }),
+    ).rejects.toThrow(/leaves the vault through a link/);
+    expect(await rd(outside), "a note was staged outside the vault").toEqual([]);
+    await removeTree(outside);
+  });
+
   it("refuses to make a directory through one", async () => {
     const { symlink, mkdir: mkdirp } = await import("node:fs/promises");
     const outside = join(root, "..", `outside2-${Date.now()}`);
