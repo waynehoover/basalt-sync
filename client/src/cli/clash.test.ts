@@ -385,16 +385,37 @@ describe("a never-synced name nested inside an ordinary folder (C3, P2)", () => 
     server = new TestServer();
     await server.start();
     const a = await memoryDevice("a");
-    const b = await device("b");
 
     await a.vault.edit("proj/node_modules/readme.md", "kept by device a\n");
     await a.vault.edit("proj/.hidden/note.md", "also kept by device a\n");
     await a.vault.edit("proj/real.md", "an ordinary note\n");
     await a.c.settle();
 
+    // b arrives after the push. A device joining a vault that is already there
+    // is the case worth testing, and bench-sync.ts made the same correction
+    // for the same reason.
+    const b = await device("b");
+
     const r1 = await b.c.settle();
-    expect(r1.downloaded).toBe(1);
+    void r1;
+    // What is on the disk, rather than which pass put it there.
+    //
+    // This used to assert `r1.downloaded === 1`, which is a race however the
+    // devices are ordered: a connected device applies an arriving batch as it
+    // arrives, so the credit goes to whichever pass happened to be running,
+    // and on a loaded machine that is not this one. It failed once in a full
+    // suite run with everything it actually checks still true, and a 400 ms
+    // sleep in front of this line reproduces it every time.
+    //
+    // The listing is what makes the check stronger than the counter it
+    // replaces: "exactly one file arrived, and it is the right one" is the
+    // claim in the test's name, and a count of downloads was only ever a
+    // proxy for it.
     expect(await readFile(join(b.dir, "proj", "real.md"), "utf8")).toBe("an ordinary note\n");
+    expect(
+      (await readdir(join(b.dir, "proj"))).sort(),
+      "something arrived that should never have been listed",
+    ).toEqual(["real.md"]);
     await expect(readFile(join(b.dir, "proj", "node_modules", "readme.md"))).rejects.toThrow();
     await expect(readFile(join(b.dir, "proj", ".hidden", "note.md"))).rejects.toThrow();
 

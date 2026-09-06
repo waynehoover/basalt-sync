@@ -405,6 +405,42 @@ export function synced(
   uid: number,
   now: number,
 ): void {
+  // A pass where the two sides already agreed did not sync anything, and must
+  // not say it did (I07).
+  //
+  // The engine calls this from `case "nothing"`, which is the branch for two
+  // sides that already agree, and it is right to: the ancestor has to move or
+  // the next divergence merges against a version neither side has. But once
+  // the ancestor is where it belongs, calling it again changes exactly one
+  // field, `synctime`, to the current clock.
+  //
+  // That was every entry, on every pass, for ever. A settled vault of four
+  // thousand notes appended 155 KiB to its index journal on each watch tick and
+  // rewrote the whole 1.8 MiB snapshot whenever that log got long enough, to
+  // record that nothing had happened. The store's own comment says a settled
+  // vault "must write nothing at all"; nothing checked it above a handful of
+  // notes, where the difference does not show.
+  //
+  // It was also slightly wrong on its own terms. `synctime` feeds
+  // `readyToSyncAgain`, which is the debounce before re-uploading a file that
+  // is being edited. Refreshing it here measured the time since agreement was
+  // last confirmed rather than the time since the file last went anywhere, so
+  // a pass that did nothing pushed a legitimate upload further away.
+  //
+  // `synctime` is deliberately not in this comparison: it is the field being
+  // decided about, and including it would make every call rewrite it again.
+  const same =
+    entry.hash === hash &&
+    entry.synchash === hash &&
+    entry.syncuid === uid &&
+    entry.prev === "" &&
+    entry.chunks.length === chunks.length &&
+    entry.chunks.every((c, i) => c === chunks[i]);
+  // A zero `synctime` is read elsewhere as "never seen on this device"
+  // (`decideFolder`), so the first agreement always writes even when every
+  // other field already matches.
+  if (same && entry.synctime !== 0) return;
+
   entry.hash = hash;
   entry.chunks = [...chunks];
   entry.synchash = hash;

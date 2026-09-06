@@ -41,7 +41,9 @@
     "typecheck": "tsc --noEmit",
     "stress": "vitest run --config vitest.stress.config.ts",
     "scale": "bun run src/stress/scale.ts",
-    "dedup": "bun run src/stress/dedup.ts"
+    "dedup": "bun run src/stress/dedup.ts",
+    "bench:pass": "bun run bench-pass.ts",
+    "bench:merge": "bun run bench-merge.ts"
   },
   "devDependencies": {
     "@types/diff-match-patch": "^1.0.36",

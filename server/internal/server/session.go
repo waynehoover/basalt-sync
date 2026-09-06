@@ -1822,6 +1822,17 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 // a device with the wrong date, and naming somebody's phone as broken when it
 // is not is worse than saying nothing. A device with a genuinely wrong clock is
 // out by days.
+// fetchKeepBytes is how much of a fetch's verified bodies the session holds on
+// to between verifying them and sending them (I09).
+//
+// Eight mebibytes because that is most fetches whole. The client asks in sets
+// bounded by its own batching, and a set larger than this is an attachment
+// being fetched in one go, where the double read is a smaller share of the cost
+// than the network is anyway. What this must not become is MaxFetchBytes: 64
+// MiB held per session, for the length of a send over whatever link the device
+// is on, is a worse trade than reading the tail of a large fetch twice.
+const fetchKeepBytes = 8 << 20
+
 const clockSkewTolerance = 24 * time.Hour
 
 // noteFutureMTime says so, once, when a device declares a modification time
@@ -2002,11 +2013,32 @@ func (s *Session) handleFetch(m wire.In) error {
 	// act on: it asks again for a smaller set, or for the ones it still needs
 	// once a device has resent the bad one. After the size cap, so a fetch that
 	// is refused for being too large is refused without reading anything.
+	//
+	// The bodies this pass read are kept while they fit in fetchKeepBytes, so
+	// the send below does not read and hash them a second time (I09). Measured
+	// at exactly twice the work, in `BenchmarkFetch`: the page cache makes the
+	// second read cheap and the second SHA-256 and the second allocation are
+	// paid in full, 17.9 ms and 34.7 MB of garbage for a 16 MiB fetch against
+	// 9.0 ms and 17.4 MB.
+	//
+	// Bounded, and it re-reads whatever did not fit. A map of every body in a
+	// fetch would be up to MaxFetchBytes, 64 MiB, held per session for as long
+	// as the send takes, which is trading a cost that is paid to a cost that is
+	// merely held. The guarantee is untouched either way: every body is
+	// verified before the header, and nothing here decides whether to verify,
+	// only whether to remember.
+	kept := make(map[string][]byte, len(m.Chunks))
+	var keptBytes int64
 	for i, n := range m.Chunks {
-		if err := s.srv.st.Chunks().Check(s.vaultID, n); err != nil {
+		body, err := s.srv.st.Chunks().Get(s.vaultID, n)
+		if err != nil {
 			s.quarantineIfCorrupt(n, err)
 			return s.reject(wire.CodeNoChunk,
 				fmt.Errorf("chunk %d of %d (%s): %w", i+1, len(m.Chunks), n, err))
+		}
+		if _, already := kept[n]; !already && keptBytes+int64(len(body)) <= fetchKeepBytes {
+			kept[n] = body
+			keptBytes += int64(len(body))
 		}
 	}
 
@@ -2018,18 +2050,24 @@ func (s *Session) handleFetch(m wire.In) error {
 	}
 
 	for i, n := range m.Chunks {
-		// Get verifies the body against its name, so a chunk that rotted on
-		// disk is reported here rather than shipped to a device that would fail
-		// to decrypt it for reasons it cannot diagnose.
-		body, err := s.srv.st.Chunks().Get(s.vaultID, n)
-		if err != nil {
-			s.quarantineIfCorrupt(n, err)
-			// It verified a moment ago and cannot be read now, so the disk went
-			// bad between the two passes. Frames are already on the wire under
-			// a count this fetch can no longer meet, so the session ends: the
-			// close is what tells the client the count was not kept.
-			return s.fatal(wire.CodeNoChunk,
-				fmt.Errorf("chunk %d of %d (%s): %w", i+1, len(m.Chunks), n, err))
+		body, ok := kept[n]
+		if !ok {
+			// Did not fit in the budget above, so it is read again. Get
+			// verifies the body against its name, so a chunk that rotted on
+			// disk is reported here rather than shipped to a device that would
+			// fail to decrypt it for reasons it cannot diagnose.
+			var err error
+			body, err = s.srv.st.Chunks().Get(s.vaultID, n)
+			if err != nil {
+				s.quarantineIfCorrupt(n, err)
+				// It verified a moment ago and cannot be read now, so the disk
+				// went bad between the two passes. Frames are already on the
+				// wire under a count this fetch can no longer meet, so the
+				// session ends: the close is what tells the client the count
+				// was not kept.
+				return s.fatal(wire.CodeNoChunk,
+					fmt.Errorf("chunk %d of %d (%s): %w", i+1, len(m.Chunks), n, err))
+			}
 		}
 		if err := s.writeBinary(body); err != nil {
 			return err

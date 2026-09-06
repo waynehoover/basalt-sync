@@ -35,6 +35,59 @@ import { diff_match_patch } from "diff-match-patch";
 const DELETE = -1;
 const EQUAL = 0;
 
+/**
+ * How much diffing one side is worth, and why there is a limit at all (I08).
+ *
+ * diff-match-patch's bisect is O(m*n) on the two texts once their common ends
+ * are trimmed, and the merge is synchronous and on Obsidian's UI thread. That
+ * combination was measured rather than reasoned about, in client/bench-merge.ts,
+ * on the shape two devices produce most often: both edited the same note in
+ * places spread through it.
+ *
+ *     1,000 lines,   91 KiB      45 ms
+ *     5,000 lines,  458 KiB   1,230 ms
+ *    20,000 lines,  1.8 MiB  23,000 ms
+ *
+ * Twenty-three seconds of a frozen editor, on a note that is nothing more
+ * remarkable than long. Nothing in the suite could see it: every merge test is
+ * a handful of lines, where quadratic and linear are the same number.
+ *
+ * The limit is on work rather than on time. A clock would make which regions
+ * exist depend on how busy the machine was, so two devices with the same three
+ * texts could compute different merges and neither would be wrong; for a sync
+ * engine that is not a tradeoff, it is a defect. A product of two lengths is
+ * the same number on every device, for ever.
+ *
+ * 4 million is about 180 ms here and perhaps a second on a phone, which is the
+ * most a merge should ever cost. Above it the caller falls back to the
+ * character merge, which has its own hard bound, and that in practice keeps
+ * both versions. That is the right answer for a note this tangled: a conflict
+ * copy is two files, and the alternative measured above is an editor that
+ * stops responding for half a minute.
+ *
+ * What this does NOT bound is a note where the two sides differ in only a few
+ * places, however large the note is. The common ends are trimmed off first, so
+ * a 50,000-line note with one changed paragraph has a product in the hundreds
+ * and merges as it always did.
+ */
+const WORK_BUDGET = 4_000_000;
+
+/**
+ * What `side` would cost, in the units the budget is denominated in.
+ *
+ * Trimming the common ends first is not an optimisation here, it is the whole
+ * accuracy of the estimate: it is what diff-match-patch does before it
+ * bisects, so the product of what is left is what it will actually work on.
+ */
+function bisectWork(dmp: InstanceType<typeof diff_match_patch>, a: string, b: string): number {
+  const prefix = dmp.diff_commonPrefix(a, b);
+  const suffix = dmp.diff_commonSuffix(a.slice(prefix), b.slice(prefix));
+  const m = a.length - prefix - suffix;
+  const n = b.length - prefix - suffix;
+  if (m <= 0 || n <= 0) return 0;
+  return m * n;
+}
+
 /** A text as lines, each keeping its newline; a final line without one stays distinct. */
 export function splitLines(text: string): string[] {
   return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
@@ -64,8 +117,13 @@ interface Hunk {
 }
 
 /**
- * One side's diff against the ancestor, by lines, or undefined when the line
- * encoding could not represent the file.
+ * One side's diff against the ancestor, by lines, or undefined when this cannot
+ * or should not be computed.
+ *
+ * Two reasons for undefined, and the caller treats them the same because the
+ * answer to both is the same: fall back to the merge that needs no line
+ * structure. Either the line encoding cannot represent the file, or the diff
+ * would cost more than a merge is allowed to (see WORK_BUDGET).
  *
  * diff-match-patch encodes one line as one character, and stops giving out new
  * characters after 65,535 distinct lines, lumping the rest of the text into a
@@ -77,12 +135,16 @@ interface Hunk {
 function side(base: string, baseLines: string[], text: string, mine: boolean): Hunk[] | undefined {
   const sideLines = splitLines(text);
   const dmp = new diff_match_patch();
-  // No time limit. It is one character per line, so it is small, and a limit
-  // would make which regions exist depend on the clock.
+  // No time limit, deliberately: a clock would make which regions exist depend
+  // on how busy the machine is, and two devices computing different merges from
+  // the same three texts is not something a sync engine can have. The bound is
+  // WORK_BUDGET above instead, which is the same number everywhere.
   dmp.Diff_Timeout = 0;
   const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(base, text);
   if (chars1.length !== baseLines.length || chars2.length !== sideLines.length) return undefined;
   if (lineArray.length > 65535) return undefined;
+  // Before the diff, not after: the point is not to have done the work.
+  if (bisectWork(dmp, chars1, chars2) > WORK_BUDGET) return undefined;
   const diff = dmp.diff_main(chars1, chars2, false);
 
   const hunks: Hunk[] = [];

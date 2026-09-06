@@ -84,7 +84,9 @@ is one handle, and the stats are what run to hundreds.
 
 ### I07 — Reduce CPU and allocations on unchanged or lightly changed passes
 
-- [ ] **Medium; measure before changing.** Track dirty paths or immutable revisions instead of repeatedly rebuilding the entire index representation.
+- [x] **Medium; measure before changing.** Track dirty paths or immutable revisions instead of repeatedly rebuilding the entire index representation.
+
+Measured first, in [bench-pass.ts](client/bench-pass.ts), and the answer was not the one this item guessed at. Rebuilding the index representation is not what a quiet pass spends its time on: `case "nothing"` called `synced`, which stamped `synctime` with the clock, so every entry differed from the last pass by one field and the whole index was journalled every time. A settled vault of 4,000 notes appended 155 KiB per watch tick and periodically rewrote the 1.8 MiB snapshot, to record that nothing had happened. Now it writes nothing, and the pass costs 17 ms rather than 40. A dirty-path scheme was not needed and was not built: it would have meant a mutation flag at twenty sites, where one missed site loses an index update silently.
 
 [Engine.save](client/src/core/engine.ts#L2757) packs all local/remote entries; [journal delta construction](client/src/core/index-journal-store.ts) compares full shapes. The journal reduces disk writes but does not by itself eliminate full-map traversal, serialization, and retained copies. Incoming chunk-reuse planning is another place to profile repeated vault-wide work.
 
@@ -92,7 +94,9 @@ Benchmark unchanged, one-note-changed, rename-heavy, and catch-up workloads at i
 
 ### I08 — Budget merge/diff work and keep the Obsidian UI responsive
 
-- [ ] **Medium.** Add time/input/work budgets and safe fallbacks for synchronous merge, preview diff, and compression/decompression.
+- [x] **Medium.** Add time/input/work budgets and safe fallbacks for synchronous merge, preview diff, and compression/decompression.
+
+[bench-merge.ts](client/bench-merge.ts) on the commonest merge shape, both devices editing the same note in places spread through it: 45 ms at a thousand lines, 1.2 s at five thousand, 23 s at twenty thousand, all of it synchronous and on Obsidian's UI thread. Bounded by work rather than by time, because a clock would let two devices compute different merges from the same three texts. 23 s is now 38 ms; a note too tangled to afford keeps both versions, which is two files rather than half a minute of a frozen editor.
 
 [merge-regions.ts](client/src/core/merge-regions.ts#L77) disables the diff timeout; [merge.ts](client/src/core/merge.ts) performs several comparisons and span cross-products; [history diff](client/src/plugin/history.ts#L374) runs on the UI path. Valid but repetitive or heavily rewritten notes can consume disproportionate CPU even below file-size ceilings.
 
@@ -100,7 +104,9 @@ Benchmark adversarial text shapes, not just random inputs. Where supported, move
 
 ### I09 — Reduce duplicate chunk I/O without weakening verification
 
-- [ ] **Medium; measurement-driven.** Profile the server fetch path and client byte copies before changing caching.
+- [x] **Medium; measurement-driven.** Profile the server fetch path and client byte copies before changing caching.
+
+`BenchmarkFetch` in [chunks](server/internal/chunks/fetch_bench_test.go) put a number on it: exactly twice the work, 17.9 ms and 34.7 MB of garbage for a 16 MiB fetch against 9.0 ms and 17.4 MB. The verify pass now keeps its bodies while they fit in 8 MiB and the send reuses them, which leaves the guarantee untouched (every body verified before the header) and does not trade a cost that is paid for 64 MiB held per session.
 
 [Session fetch](server/internal/server/session.go#L1988) checks requested chunks and later reads them again to send. Client receive/decrypt/assemble paths can retain encrypted, framed, and plaintext buffers at the same time. Batching improves latency, but can multiply peak memory.
 
@@ -108,7 +114,9 @@ Consider verified reads with bounded retention or streaming within the protocol'
 
 ### I10 — Profile SQLite queries and startup work against large histories
 
-- [ ] **Medium; when data warrants it.** Use query plans and representative databases before adding indexes or denormalization.
+- [x] **Medium; when data warrants it.** Use query plans and representative databases before adding indexes or denormalization.
+
+`BenchmarkHistory` in [store](server/internal/store/history_bench_test.go) builds three vault shapes and times the four queries. No index was added, because none of them warranted one: history of a path is 48 to 227 us, a batch from the cursor is 0.7 ms, and the two that are slower (deletions at 2.6 to 9.8 ms, stats at 11 to 16 ms) are commands a person runs and not the sync path. What did warrant a change was the startup summary, which walked the chunk tree before the socket existed, so a device reconnecting during a restart of a large vault got connection refused for as long as the walk took.
 
 [History/deletions](server/internal/store/store.go#L839), [chunk attachment](server/internal/store/store.go#L997), [stats](server/internal/store/store.go#L1141), and [startup reporting](server/cmd/basaltd/main.go#L570) scale with entries, chunk references, or on-disk files. Large chunk lists and unbounded history growth are different workloads from many small current notes.
 

@@ -232,6 +232,14 @@ func requireVault(st *store.Store, vault string) error {
 // The context is how a test stops it. Before it existed, serving could only be
 // ended by signalling the process, which in a test means signalling the test
 // runner, so nothing here could be exercised at all.
+// afterListening is called with the bound address once the port is open and
+// Serve is running, and before the startup summary walks the store.
+//
+// A seam for one test, and it is here rather than in the test because the thing
+// under test is an ordering inside this function: that the socket answers while
+// the summary is still to come. Nil everywhere but that test.
+var afterListening func(addr string)
+
 func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
@@ -358,21 +366,45 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		log.Warn("could not tell whether the vault is claimed", "err", hashErr)
 	}
 	printSetup(out, *addr, *vault, token, fresh, *local, hash == "" || hashErr != nil)
-	if err := logStartup(log, st, *vault, srv.Version()); err != nil {
-		log.Warn("could not summarise the store at startup", "err", err)
-	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Bound here rather than inside ListenAndServe, so that the port is open
+	// before the summary below walks the chunk tree (I10).
+	//
+	// The walk is measured at 56 ms over ten thousand bodies, which is nothing,
+	// and it is proportional to how many bodies a vault holds. A vault with a
+	// few hundred thousand of them, which is a few years of attachments, spends
+	// seconds in it. Every one of those seconds used to be before the socket
+	// existed, so a device that reconnected during a restart got "connection
+	// refused" and reported the server as down, and the log said "starting" and
+	// then nothing. Binding first means the kernel queues those connections
+	// instead of refusing them, and they are answered as soon as Serve picks
+	// them up, which is immediately.
+	ln, err := net.Listen("tcp", hs.Addr)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", hs.Addr, err)
+	}
+
 	errc := make(chan error, 1)
 	go func() {
-		err := hs.ListenAndServe()
+		err := hs.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
 		errc <- err
 	}()
+
+	// After the port is open, and after Serve is running. An operator greps for
+	// this line after a restart; nothing waits on it, so nothing should wait
+	// behind it.
+	if afterListening != nil {
+		afterListening(ln.Addr().String())
+	}
+	if err := logStartup(log, st, *vault, srv.Version()); err != nil {
+		log.Warn("could not summarise the store at startup", "err", err)
+	}
 
 	select {
 	case err := <-errc:

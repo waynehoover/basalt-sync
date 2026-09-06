@@ -28,6 +28,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
+	"net/http"
 )
 
 // A mac of the right shape, standing in for a real writer's. The server holds no
@@ -1502,5 +1503,56 @@ func TestBackupStillWorksWhenTheDestinationIsFree(t *testing.T) {
 	mustRun(t, "backup", "-data", dir, "-to", dest)
 	if v := mustRun(t, "verify", "-data", dest); !strings.Contains(v, "0 faults") {
 		t.Fatalf("the backup does not verify:\n%s", v)
+	}
+}
+
+// The port is open before the startup summary runs (I10).
+//
+// The summary walks the served vault's chunk tree to say how much a purge would
+// reclaim, which is 56 ms over ten thousand bodies and seconds over a few
+// hundred thousand. All of it used to happen before the socket existed, so a
+// device reconnecting during a restart got "connection refused" and reported
+// the server as down, and the log said "starting" and then nothing for as long
+// as the walk took. It is not a hang and it is indistinguishable from one.
+//
+// Asserted through a seam rather than by timing a large vault: what is wrong is
+// an ordering, and an ordering is a fact rather than a measurement. A test that
+// built a vault big enough for the delay to show would be slow, would still be
+// a race, and would pass on a fast disk.
+func TestThePortAnswersBeforeTheStartupSummaryRuns(t *testing.T) {
+	dir := seeded(t)
+
+	type answer struct {
+		status int
+		err    error
+	}
+	got := make(chan answer, 1)
+	afterListening = func(addr string) {
+		// Inside the window: Serve is running and logStartup has not been
+		// called. If the listener were still inside ListenAndServe behind the
+		// summary, there would be nothing here to connect to.
+		res, err := http.Get("http://" + addr + "/health")
+		if err != nil {
+			got <- answer{err: err}
+			return
+		}
+		defer func() { _ = res.Body.Close() }()
+		got <- answer{status: res.StatusCode}
+	}
+	t.Cleanup(func() { afterListening = nil })
+
+	stop := serveInBackground(t, dir)
+	defer stop()
+
+	select {
+	case a := <-got:
+		if a.err != nil {
+			t.Fatalf("the port was not answering before the startup summary: %v", a.err)
+		}
+		if a.status != http.StatusOK {
+			t.Fatalf("/health answered %d before the startup summary, wanted 200", a.status)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the server never reached the point where the port is open")
 	}
 }
