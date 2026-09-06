@@ -184,7 +184,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F19 — Apply the served-vault restriction to every authentication route
 
-- [ ] Enforce the configured vault before registrar, device, or invite authentication.
+- [x] Enforce the configured vault before registrar, device, or invite authentication.
 
 **Evidence — reproduced for device authentication.** [DerivedAuth](server/internal/server/server.go#L683) checks the allowed vault; [helloAsDevice](server/internal/server/session.go#L900) and [helloAsInvite](server/internal/server/session.go#L1073) bypass it and query the supplied vault directly. A device connected to a different existing vault while the configured authenticator served only `served-vault`. The CLI describes `-vault` as the one served vault and startup calls other vaults “not served.”
 
@@ -192,7 +192,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F20 — Validate MAC/parent shape on folders and tombstones too
 
-- [ ] Move common authenticated metadata validation before the no-body early return, and extend store verification to catch already-persisted malformed rows.
+- [x] Move common authenticated metadata validation before the no-body early return, and extend store verification to catch already-persisted malformed rows.
 
 **Evidence — reproduced.** [Entry.Validate](server/internal/store/store.go#L583) returns for folders/deletions before checking `Mac` and `Parent`. Both kinds accepted an empty MAC and malformed parent. [verifyEntries](server/internal/store/store.go#L1816) checks body/chunk-count consistency but does not detect this shape error. A buggy authenticated writer can persist an entry that honest clients refuse to apply.
 

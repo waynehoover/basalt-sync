@@ -1047,3 +1047,81 @@ func TestTwoConcurrentRotationsAndOnlyOneWins(t *testing.T) {
 	old.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old"})
 	old.expectErr(wire.CodeAuth)
 }
+
+// F19. Every hello route enforces the served vault, not only the one that
+// claims.
+//
+// `DerivedAuth` checks it, and for a while that was taken to be the whole of
+// the rule. It only sees the registrar's route: `helloAsDevice` and
+// `helloAsInvite` look a vault up by the name the caller sent, so a device
+// registered to another vault in the same store connected to a server that had
+// logged that vault as "not served" at startup. Scope, not access: the caller
+// still needs that vault's own credentials.
+func TestADeviceOfAnUnservedVaultIsRefused(t *testing.T) {
+	r := newRigDerived(t)
+	r.srv.Serves(testVault)
+
+	// A second vault in the same store, with a device of its own. This is what
+	// a data directory that has served two vaults over its life looks like.
+	other, otherHash := claimOtherVault(t, r)
+	const deviceID = "AAAAAAAAAAAAAAAAAAAAAA"
+	key := strings.Repeat("k", 43)
+	sum := sha256.Sum256([]byte(key))
+	if err := r.st.RegisterDevice(other, deviceID, "theirs", hex.EncodeToString(sum[:]), otherHash, 8,
+		r.srv.now().UnixMilli()); err != nil {
+		t.Fatalf("register a device on the other vault: %v", err)
+	}
+
+	cl := r.dial("stranger")
+	cl.sendJSON(wire.In{Op: "hello", Proto: wire.Proto, Crypto: wire.Crypto,
+		Vault: other, DeviceID: deviceID, Token: key, Device: "stranger"})
+	msg := cl.expectErr(wire.CodeAuth)
+	if !strings.Contains(msg, other) {
+		t.Fatalf("the refusal does not name the vault it refused: %s", msg)
+	}
+
+	// And the served vault still works from the same server.
+	device := claimed(t, r, "mine")
+	device.put("note.md", "still fine")
+}
+
+func TestAnInviteForAnUnservedVaultIsRefusedWithoutBeingSpent(t *testing.T) {
+	r := newRigDerived(t)
+	r.srv.Serves(testVault)
+
+	other, _ := claimOtherVault(t, r)
+	const invite = "an-invite-string-for-the-other-vault"
+	if err := r.st.AddInvite(other, invite, "sealed", r.srv.now().UnixMilli()+600_000,
+		r.srv.now().UnixMilli()); err != nil {
+		t.Fatalf("add an invite on the other vault: %v", err)
+	}
+
+	cl := r.dial("stranger")
+	cl.sendJSON(wire.In{Op: "hello", Proto: wire.Proto, Crypto: wire.Crypto,
+		Vault: other, DeviceID: "BBBBBBBBBBBBBBBBBBBBBB", Invite: invite, Device: "stranger"})
+	cl.expectErr(wire.CodeAuth)
+
+	// Unspent: a refusal for the wrong vault must not burn somebody's invite.
+	left, err := r.st.Invites(other, r.srv.now().UnixMilli())
+	if err != nil {
+		t.Fatalf("read the invites: %v", err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("the invite was consumed by a refusal: %d left", len(left))
+	}
+}
+
+// A second claimed vault in the same store, which is what a data directory
+// that has served two vaults over its life looks like.
+func claimOtherVault(t *testing.T, r *rig) (string, string) {
+	t.Helper()
+	const other = "the-other-vault"
+	if err := r.st.EnsureVault(other, 1); err != nil {
+		t.Fatalf("ensure the other vault: %v", err)
+	}
+	hash := strings.Repeat("c", 64)
+	if _, err := r.st.ClaimVault(other, hash, testWrapped, r.srv.now().UnixMilli()); err != nil {
+		t.Fatalf("claim the other vault: %v", err)
+	}
+	return other, hash
+}

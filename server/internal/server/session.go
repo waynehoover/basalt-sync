@@ -898,6 +898,16 @@ func (s *Session) handleHello(m wire.In) error {
 // a device of that vault, and asking it here is exactly how the vault's
 // credential would find its way back to syncing.
 func (s *Session) helloAsDevice(m wire.In) error {
+	// The served vault, before this looks one up by the name the caller sent
+	// (F19). `DerivedAuth` enforces it on the registrar's route and only
+	// there, so a device of another vault in the same store connected to a
+	// server that had logged that vault as "not served" at startup.
+	//
+	// The same refusal a wrong key gets, and for the same reason: which half
+	// is wrong is not the caller's business.
+	if err := s.srv.refuseUnservedVault(m.Vault); err != nil {
+		return s.fatal(wire.CodeAuth, err)
+	}
 	_, stored, ok, err := s.srv.st.DeviceByID(m.Vault, m.DeviceID)
 	if err != nil {
 		return s.fatal(wire.CodeInternal, err)
@@ -1075,6 +1085,11 @@ func (s *Session) helloAsInvite(m wire.In) error {
 	// one. `badname` and `badentry` rather than `auth`, because these are
 	// facts about the frame and not about the vault: the same rule the device
 	// id shape check on an ordinary hello follows.
+	// Before the invite is looked up, so an invite for an unserved vault is
+	// refused without being spent (F19).
+	if err := s.srv.refuseUnservedVault(m.Vault); err != nil {
+		return s.fatal(wire.CodeAuth, err)
+	}
 	if !store.ValidDeviceID(m.DeviceID) {
 		return s.fatal(wire.CodeBadName, fmt.Errorf(
 			"redeeming an invite registers the device redeeming it, so this hello must carry the "+

@@ -610,6 +610,27 @@ func (e Entry) Validate() error {
 		}
 	}
 
+	// The authenticator's shape, before the split below (F20).
+	//
+	// This used to sit at the end, after the early return for a folder or a
+	// deletion, so those two kinds were committed with an empty MAC and a
+	// malformed parent. Both are entries every honest client then refuses for
+	// ever, and the only party who could have noticed is the one that wrote
+	// them. The server holds no key and cannot check the value; it can insist
+	// there is one of the right shape, so the refusal lands on the writer at
+	// the moment of writing rather than on everybody else afterwards.
+	//
+	// After the checks above, so an entry that is wrong in some other way says
+	// so first: a missing authenticator is the least specific thing that can be
+	// wrong with an entry and the most confusing to be told when the real fault
+	// is the path.
+	if !isHex64(e.Mac) {
+		return fmt.Errorf("%w: mac is not a 64 character hex digest", ErrBadEntry)
+	}
+	if e.Parent != "" && !isHex64(e.Parent) {
+		return fmt.Errorf("%w: parent is neither empty nor a 64 character hex digest", ErrBadEntry)
+	}
+
 	if !e.HasBody() {
 		// A folder or a deletion with chunks attached is a client bug, and
 		// accepting it would put bodies into the live set that nothing serves.
@@ -642,21 +663,6 @@ func (e Entry) Validate() error {
 			ErrBadEntry, len(e.Chunks))
 	}
 
-	// Last, so that an entry which is wrong in some other way says so first: a
-	// missing authenticator is the least specific thing that can be wrong with
-	// it, and the most confusing to be told when the real fault is the path.
-	//
-	// An entry nothing can authenticate is a poison pill. Every reader refuses
-	// it, for ever, and the only party in a position to notice is the one that
-	// wrote it. The server holds no key and cannot check the value, but it can
-	// insist there is one of the right shape, so the refusal lands on the writer
-	// at the moment of writing rather than on everybody else afterwards.
-	if !isHex64(e.Mac) {
-		return fmt.Errorf("%w: mac is not a 64 character hex digest", ErrBadEntry)
-	}
-	if e.Parent != "" && !isHex64(e.Parent) {
-		return fmt.Errorf("%w: parent is neither empty nor a 64 character hex digest", ErrBadEntry)
-	}
 	return nil
 }
 
@@ -1815,7 +1821,7 @@ func (s *Store) verifyRegistry() ([]Fault, int, error) {
 // folder or a deletion carrying content nobody will ever read.
 func (s *Store) verifyEntries() ([]Fault, error) {
 	rows, err := s.db.Query(
-		`SELECT e.vault_id, e.uid, e.path, e.size, e.folder, e.deleted,
+		`SELECT e.vault_id, e.uid, e.path, e.size, e.folder, e.deleted, e.mac, e.parent,
 		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid)
 		   FROM entries e
 		  ORDER BY e.vault_id, e.uid`)
@@ -1829,9 +1835,32 @@ func (s *Store) verifyEntries() ([]Fault, error) {
 		var f Fault
 		var size int64
 		var folder, deleted bool
+		var mac, parent string
 		var chunkCount int
-		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted, &chunkCount); err != nil {
+		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted,
+			&mac, &parent, &chunkCount); err != nil {
 			return faults, err
+		}
+		// The authenticator's shape, on every kind (F20). `Validate` used to
+		// skip it for a folder and a deletion, so a store can already hold
+		// rows an honest client refuses for ever. Naming them here with the
+		// vault and the uid is the only way an operator finds out, because
+		// nothing else in the system can: every reader that meets one simply
+		// declines it.
+		if !isHex64(mac) {
+			f.Reason = "nomac"
+			f.Detail = "the authenticator is not a 64 character hex digest, so every client " +
+				"refuses this version. Delete it with a newer write of the same path, or " +
+				"restore from a backup taken before it."
+			faults = append(faults, f)
+			continue
+		}
+		if parent != "" && !isHex64(parent) {
+			f.Reason = "badparent"
+			f.Detail = "the parent is neither empty nor a 64 character hex digest, so every " +
+				"client refuses this version"
+			faults = append(faults, f)
+			continue
 		}
 		wantsChunks := size > 0 && !folder && !deleted
 		switch {

@@ -313,6 +313,8 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	srv := server.New(st, server.DerivedAuth(st, *vault, token, func() int64 {
 		return time.Now().UnixMilli()
 	}), log)
+	// Every hello route, not only the one that claims (F19).
+	srv.Serves(*vault)
 	srv.SetVersion(resolveVersion(version, moduleVersion()))
 	srv.SetPerFileMax(*maxFile)
 	if srv.PerFileMax() != *maxFile {

@@ -198,6 +198,18 @@ type Server struct {
 
 	maxPeers int
 
+	// servedVault is the one vault this server answers for, or empty when it
+	// has not been told (which is every test that builds a server directly).
+	//
+	// `DerivedAuth` closes over the same name and enforces it, and for a while
+	// that was taken to be the whole of the rule. It is not: it only sees the
+	// registrar's route. `helloAsDevice` and `helloAsInvite` look a vault up
+	// by the name the caller sent, so a device registered to another vault in
+	// the same store connected to it while this server was configured to serve
+	// one name and had logged every other as "not served" (F19). Scope, not
+	// access: the caller still needs that vault's own credentials.
+	servedVault string
+
 	// version is what `ready.serverVersion` says and what the startup line
 	// logs: the stamped release, or "dev". It is sent only after a hello has
 	// authenticated; a refusal before that names the protocol range and nothing
@@ -524,6 +536,20 @@ func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeer
 		maxBatchBytes: wire.MaxBatchBytes, maxFetchBytes: wire.MaxFetchBytes,
 		now: time.Now, batchSize: BatchSize,
 	}
+}
+
+// Serves names the one vault this server answers for, so every hello route
+// enforces it and not only the one that claims. Empty means unrestricted,
+// which is what a test that builds a server directly gets.
+func (s *Server) Serves(vaultID string) { s.servedVault = vaultID }
+
+// refuseUnservedVault is the check every hello route makes before it looks a
+// vault up by the name the caller sent.
+func (s *Server) refuseUnservedVault(vaultID string) error {
+	if s.servedVault == "" || vaultID == s.servedVault {
+		return nil
+	}
+	return fmt.Errorf("this server serves %q, not %q", s.servedVault, vaultID)
 }
 
 // SetVersion names the release this server is, for `ready` and the log. Empty

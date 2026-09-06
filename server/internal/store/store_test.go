@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1248,9 +1249,13 @@ func TestVerifyNoticesAnEntryWhoseChunksAreGone(t *testing.T) {
 func TestVerifyNoticesChunksOnSomethingThatShouldHaveNone(t *testing.T) {
 	h := newTestStore(t)
 	e := h.file(t, "note.md", "content")
+	// A well-formed authenticator, so this row's only fault is the one the
+	// test is about. Verification checks the MAC's shape on every kind now
+	// (F20), and a folder seeded without one is reported for that first.
 	if _, err := h.db.Exec(
-		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path)
-		 VALUES ('v1', ?, 'folder', 0, 1, 1, 1, 0, 'test', '')`, e.UID+1000); err != nil {
+		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac)
+		 VALUES ('v1', ?, 'folder', 0, 1, 1, 1, 0, 'test', '', ?)`,
+		e.UID+1000, strings.Repeat("a", 64)); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
 	if _, err := h.db.Exec(
@@ -1327,5 +1332,70 @@ func TestPurgeCompletesWithAQuarantinedBody(t *testing.T) {
 	// The purge still did its job: the old version is gone and the newest stays.
 	if rep.VersionsAfter != 1 {
 		t.Fatalf("VersionsAfter = %d, want 1", rep.VersionsAfter)
+	}
+}
+
+// F20. The authenticator's shape is checked on every kind of entry.
+//
+// `Validate` used to return for a folder or a deletion before it looked at
+// `Mac` and `Parent`, so both were committed with an empty authenticator and a
+// malformed parent. Those are entries every honest client refuses for ever,
+// and the only party who could have noticed is the one that wrote them.
+func TestValidateChecksTheAuthenticatorOnFoldersAndDeletions(t *testing.T) {
+	good := strings.Repeat("a", 64)
+	for _, k := range []struct {
+		what  string
+		entry Entry
+	}{
+		{"a folder", Entry{Path: "notes", Folder: true, Mac: good}},
+		{"a deletion", Entry{Path: "gone.md", Deleted: true, Mac: good}},
+	} {
+		if err := k.entry.Validate(); err != nil {
+			t.Fatalf("%s with a good mac was refused: %v", k.what, err)
+		}
+
+		empty := k.entry
+		empty.Mac = ""
+		if err := empty.Validate(); err == nil {
+			t.Fatalf("%s was accepted with no authenticator at all", k.what)
+		} else if !strings.Contains(err.Error(), "mac") {
+			t.Fatalf("%s with no mac was refused for the wrong reason: %v", k.what, err)
+		}
+
+		bent := k.entry
+		bent.Parent = "not a digest"
+		if err := bent.Validate(); err == nil {
+			t.Fatalf("%s was accepted with a malformed parent", k.what)
+		}
+	}
+}
+
+// And a store that already holds such a row says so, with the vault and the
+// uid, because nothing else in the system can: every reader that meets one
+// simply declines it.
+func TestVerifyNoticesAnEntryWithNoAuthenticator(t *testing.T) {
+	h := newTestStore(t)
+	e := h.file(t, "note.md", "content")
+	if _, err := h.db.Exec(
+		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac)
+		 VALUES ('v1', ?, 'folder', 0, 1, 1, 1, 0, 'test', '', '')`, e.UID+2000); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+
+	rep, err := h.Verify(false)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	found := false
+	for _, f := range rep.Faults {
+		if f.Reason == "nomac" && f.UID == e.UID+2000 {
+			found = true
+			if !strings.Contains(f.Detail, "refuses this version") {
+				t.Fatalf("the fault says nothing an operator can act on: %s", f.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("verify did not notice an entry with no authenticator: %v", rep.Faults)
 	}
 }
