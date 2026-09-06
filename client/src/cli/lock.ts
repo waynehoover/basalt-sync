@@ -14,10 +14,10 @@
  * waited on for ever.
  */
 
-import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { STATE_DIR } from "./config.ts";
 import { refuseOutsideVaultAt } from "./vault.ts";
@@ -216,12 +216,10 @@ async function evicting(
   mine: LockHolder,
   remove: (at: LockState) => boolean,
 ): Promise<void> {
-  const marker = `${path}.evicting.${who}`;
+  const marker = `${path}.evicting.${who}.${evictionEpoch()}`;
   if (!(await publish(dir, marker, mine))) {
-    // Somebody else is evicting this holder, or an evictor died inside the
-    // window above. Either way this attempt does nothing and the loop looks
-    // again; a marker whose own holder is gone is cleared below.
-    await clearDeadMarker(marker);
+    // Somebody else is evicting this holder in this window. This attempt does
+    // nothing and the loop looks again.
     return;
   }
   try {
@@ -238,28 +236,62 @@ async function evicting(
   } finally {
     await rm(marker, { force: true });
   }
+  // Markers from earlier windows, cleared on the way out. Never the current
+  // one, and never anybody's live one: see the note on `evictionEpoch`.
+  await sweepOldMarkers(path);
 }
 
 /**
- * Removes an eviction marker whose own holder has died.
+ * The window an eviction marker belongs to (R20).
  *
- * The same liveness rule the lock itself gets, and the same conditional
- * removal: only while it is still that dead marker. A marker is held for a few
- * filesystem operations rather than for a command, so this is rare enough that
- * the alternative, leaving it, would wedge takeover of that one holder for
- * ever.
+ * The marker gives one process the exclusive right to evict one dead holder,
+ * and the first version of it had the same shape as the bug it was closing: a
+ * marker left behind by an evictor that died had to be removed by somebody,
+ * and removing it was a read followed by an unlink with a gap in between, so
+ * two contenders could each end up believing they held the right. Guarding
+ * that with a further marker only moves the problem up a level, for ever.
+ *
+ * So no live marker is ever removed. The name carries a coarse time window,
+ * and contenders in the same window contend for the same name, which `link`
+ * settles exclusively. A marker from an earlier window is not a name anybody
+ * is using now, so deleting it cannot take anybody's exclusion away: it is
+ * debris by construction rather than by judgement.
+ *
+ * Eviction is a handful of filesystem calls and the window is a minute, so
+ * losing exclusivity by straddling a boundary needs an eviction to take a
+ * minute; the re-read under the marker still stands behind that. This is one
+ * machine's clock compared only with itself, and takeover is already
+ * host-scoped: a holder on another host is believed and never evicted.
  */
-async function clearDeadMarker(marker: string): Promise<void> {
-  const at = await lockState(marker);
-  if (at.state === "unreadable") {
-    await rm(marker, { force: true });
+const EVICTION_WINDOW_MS = 60_000;
+
+function evictionEpoch(): number {
+  return Math.floor(Date.now() / EVICTION_WINDOW_MS);
+}
+
+/**
+ * Removes eviction markers from windows that have passed.
+ *
+ * Safe without asking who holds them, which is the whole point: a marker from
+ * an earlier window is not a name any current evictor can be using, so this
+ * cannot remove a live exclusion. Anything from the current window or a later
+ * one is left alone whatever it says about itself.
+ */
+async function sweepOldMarkers(path: string): Promise<void> {
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.evicting.`;
+  const now = evictionEpoch();
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
     return;
   }
-  if (at.state !== "held") return;
-  if (at.holder.host !== hostname() || alive(at.holder.pid)) return;
-  const still = await lockState(marker);
-  if (still.state === "held" && still.holder.token === at.holder.token) {
-    await rm(marker, { force: true });
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const epoch = Number(name.slice(name.lastIndexOf(".") + 1));
+    if (!Number.isInteger(epoch) || epoch >= now) continue;
+    await rm(join(dir, name), { force: true }).catch(() => undefined);
   }
 }
 

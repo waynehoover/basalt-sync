@@ -201,6 +201,30 @@ func DatabaseStamp(dir string) (Snapshot, error) {
 	}, nil
 }
 
+// isSHA256Hex is whether a string is what fileDigest produces, and nothing
+// else (R27).
+func isSHA256Hex(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// short is the first few characters of a digest, for a message, and never
+// panics on one that is shorter than that.
+func short(digest string) string {
+	if len(digest) <= 16 {
+		return digest
+	}
+	return digest[:16]
+}
+
 // fileDigest is the SHA-256 of a file, streamed.
 //
 // One pass over the database, which is metadata only: the bodies are files
@@ -353,12 +377,29 @@ func ReadBackupMeta(dir string) (BackupMeta, error) {
 	// two backups of one store, taken an hour apart, are the same size and at
 	// the same change, and swapping one for the other passed both. Nothing
 	// short of the contents can tell those apart.
-	if meta.Database.Digest != "" && stamp.Digest != meta.Database.Digest {
-		return meta, fmt.Errorf(
-			"%s describes a database whose contents hash to %s and the one beside it hashes to %s, so "+
-				"it is a different snapshot: something republished the database without rewriting the "+
-				"coverage. Run `basaltd backup` into this directory again, or read the database itself",
-			BackupMetaFile, meta.Database.Digest[:16], stamp.Digest[:16])
+	if meta.Database.Digest != "" {
+		// The shape first, and then the value (R27).
+		//
+		// This came out of JSON, which is to say out of a file on a disk that
+		// may be the reason somebody is reading it. A short one made the
+		// mismatch message slice past the end of it and panic, so a damaged
+		// sidecar took the diagnostic down with it: exactly the moment the
+		// tool has to keep working, and rule 2 in the small, an unreadable
+		// field being reported as a crash rather than as an unreadable field.
+		if !isSHA256Hex(meta.Database.Digest) {
+			return meta, fmt.Errorf(
+				"%s records a database digest of %q, which is not a SHA-256. The file is damaged; "+
+					"take a fresh backup, or read the database itself",
+				BackupMetaFile, short(meta.Database.Digest))
+		}
+		if stamp.Digest != meta.Database.Digest {
+			return meta, fmt.Errorf(
+				"%s describes a database whose contents hash to %s and the one beside it hashes to %s, "+
+					"so it is a different snapshot: something republished the database without "+
+					"rewriting the coverage. Run `basaltd backup` into this directory again, or read "+
+					"the database itself",
+				BackupMetaFile, short(meta.Database.Digest), short(stamp.Digest))
+		}
 	}
 	return meta, nil
 }

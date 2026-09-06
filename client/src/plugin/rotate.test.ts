@@ -164,6 +164,19 @@ const tooltips = (): string => {
   return found.join("\n");
 };
 
+/**
+ * Whether a promise has already finished, without waiting on it.
+ *
+ * A macrotask, not a microtask: the thing being asked about awaits a promise
+ * that a button press resolves, and `Promise.race` against an immediate
+ * resolution would win before any of that had a chance to run.
+ */
+async function settledYet(p: Promise<unknown>): Promise<boolean> {
+  const pending = Symbol("pending");
+  const later = new Promise((r) => setTimeout(() => r(pending), 50));
+  return (await Promise.race([p.then(() => true), later])) !== pending;
+}
+
 /** What `data.json` says, which is the only thing a restart is worth. */
 const saved = (p: Testable) => p.savedData as Record<string, string> | null;
 
@@ -197,7 +210,12 @@ describe("replacing the vault's secret from the panel", () => {
     expect(notices.map((n) => n.message).join("\n")).not.toMatch(/new secret/);
 
     field.setValue(oldKey);
-    await button.click();
+    // The click does not come back until somebody says they have the new key
+    // (R24). Showing it and carrying on was not a handoff: the rotation is
+    // what retires the old secret, and a key that nobody has read is a vault
+    // nobody can get back into. So the acknowledgement comes first and the
+    // await comes after it, as the pairing's does.
+    const rotating = button.click();
     await until("the new key to be shown", () =>
       modals.at(-1)!.contentEl.allText().includes("Write this down"),
     );
@@ -207,6 +225,15 @@ describe("replacing the vault's secret from the panel", () => {
       .split(/\s+/)
       .find((w) => w.startsWith("basalt3_") && w !== oldKey)!;
     expect(shown, "no new recovery key was put on screen").toBeDefined();
+    // Still waiting, because nothing has been acknowledged.
+    expect(
+      await settledYet(rotating),
+      "the rotation did not wait for the key to be written down",
+    ).toBe(false);
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
+      .buttons[0]!.click();
+    await rotating;
 
     // This device's own credential is untouched, which is why it keeps
     // syncing: a rotation replaces the vault's secret and no device row.

@@ -766,3 +766,68 @@ func TestCoverageWithNoDigestStillReads(t *testing.T) {
 		t.Fatalf("a backup from before the digest was stamped was refused: %v", err)
 	}
 }
+
+// A damaged sidecar is an error, not a crash (R27).
+//
+// The digest came out of JSON, which is to say out of a file on a disk that may
+// be the reason somebody is reading it, and the mismatch message sliced the
+// first sixteen characters off it. A shorter value panicked, so a damaged
+// sidecar took the diagnostic down with it at exactly the moment the tool has
+// to keep working. Rule 2 in the small: an unreadable field is an unreadable
+// field, not a crash.
+func TestAMalformedDigestIsRefusedRatherThanPanicking(t *testing.T) {
+	for _, digest := range []string{
+		"x",
+		"short",
+		"nothex!!nothex!!nothex!!nothex!!nothex!!nothex!!nothex!!nothex!!",
+		strings.Repeat("a", 63),
+		strings.Repeat("a", 65),
+		strings.Repeat("A", 64), // upper case is not what fileDigest writes
+	} {
+		t.Run(short(digest), func(t *testing.T) {
+			dir := t.TempDir()
+			src := filepath.Join(dir, "live")
+			dbPath, chunkDir := DataDir(src)
+			st, err := Open(dbPath, chunkDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = st.Close() }()
+			if err := st.EnsureVault("default", 1000); err != nil {
+				t.Fatal(err)
+			}
+			dest := filepath.Join(dir, "backup")
+			if _, err := st.Backup(dest, false); err != nil {
+				t.Fatal(err)
+			}
+
+			path := filepath.Join(dest, BackupMetaFile)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var meta BackupMeta
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				t.Fatal(err)
+			}
+			meta.Database.Digest = digest
+			out, err := json.Marshal(meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, out, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// The assertion is as much that this returns at all as what it
+			// returns: a panic here fails the test by crashing it.
+			_, err = ReadBackupMeta(dest)
+			if err == nil {
+				t.Fatalf("a digest of %q was accepted", digest)
+			}
+			if !strings.Contains(err.Error(), "not a SHA-256") {
+				t.Fatalf("refused, but not as a damaged digest: %v", err)
+			}
+		})
+	}
+}

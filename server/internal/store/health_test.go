@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"os"
 	"strings"
 	"testing"
 )
@@ -130,5 +132,76 @@ func TestHealthWritesNothing(t *testing.T) {
 	}
 	if before.Digest != "" && before.Digest != after {
 		t.Error("twenty health checks changed the database")
+	}
+}
+
+// Health means the chunk store can be written to, not that it has room (R28).
+//
+// The database side was corrected to exercise a real write; the chunk side
+// stayed a `statfs`, which says the volume is mounted and has space and says
+// nothing about whether this process may write to it. A chunk root whose
+// permissions have gone, or one on a mount the kernel turned read-only after
+// an I/O error, answers `statfs` perfectly and refuses every upload. Same
+// mistake, one directory over, under a field still called CanPersist.
+func TestHealthNoticesAChunkStoreItCannotWriteTo(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, where a mode of 500 stops nothing")
+	}
+	dbPath, chunkDir := newStore(t)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	// Readable and not writable, which is what a permissions accident and a
+	// read-only remount both look like from here.
+	if err := os.Chmod(chunkDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(chunkDir, 0o700) })
+
+	// The premise: the database is still perfectly writable, so anything that
+	// only asks SQLite reports a healthy server.
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatalf("the database is not writable either, so this proves nothing: %v", err)
+	}
+	// And a body genuinely cannot be stored.
+	body := []byte("a chunk that will not land")
+	if err := st.Chunks().Put("default", chunks.Name(body), body); err == nil {
+		t.Fatal("the chunk store took a write, so this proves nothing")
+	}
+
+	h := healthOf(t, st)
+	if h.CanPersist {
+		t.Fatal("a server that cannot store a body reported that it can take a note")
+	}
+	if h.Why != HealthUnwritable {
+		t.Errorf("the reason was %q, wanted %q", h.Why, HealthUnwritable)
+	}
+}
+
+// And the probe leaves nothing behind, because it runs every few seconds.
+func TestHealthLeavesNoProbeFileBehind(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	for range 5 {
+		if h := healthOf(t, st); !h.CanPersist {
+			t.Fatalf("health failed on a working store: %q", h.Why)
+		}
+	}
+	left, err := os.ReadDir(chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range left {
+		if strings.Contains(e.Name(), "health") {
+			t.Errorf("the health probe left %s behind", e.Name())
+		}
 	}
 }

@@ -1424,8 +1424,17 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // plugin ignores nothing beyond the dot rule and the config folder, and
     // a folder ignored here is one the phone uploads.
     ignore: [...args.ignore],
-    // Notes changed here since the last pass (F27).
+    // Notes changed here since the last pass (F27), and how that was decided
+    // (R25).
+    //
+    // It is a comparison of sizes and timestamps, not of content: hashing
+    // every note in the vault is what a sync pass does, and this command takes
+    // no lock and is meant to be cheap. So an edit that keeps a file's length
+    // and its timestamp is not visible here, and the number is an estimate.
+    // Saying which basis it is on is the difference between an estimate and a
+    // claim; `unsent: 0` used to be printed as "up to date with the server".
     unsent: await unsentHere(args, stored),
+    unsentFrom: "size and timestamp" as const,
   };
 
   // Reachability is reported, never assumed. "up to date" from a client that
@@ -1478,9 +1487,18 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     server = { reachable: answered, refused: answered, error: (err as Error).message };
   }
 
+  // One outcome, and both formats derive their status from it (R25).
+  //
+  // The two disagreed: text returned failure when the local scan could not
+  // run and JSON returned success for the same vault in the same state, so a
+  // cron job and a person looking at the same command were told different
+  // things. Whether the exit code is right is a separate argument from
+  // whether it is the same in both, and it has to be the same in both.
+  const wrong = !server.reachable || server.refused || local.unsent === "unknown";
+
   if (args.json) {
-    io.out(JSON.stringify({ ok: true, ...local, server }));
-    return server.reachable && !server.refused ? 0 : 1;
+    io.out(JSON.stringify({ ok: !wrong, ...local, server }));
+    return wrong ? 1 : 0;
   }
 
   io.out(`vault    ${local.vault}`);
@@ -1529,9 +1547,13 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
                 // numbers equal and the pending set empty, and the status said
                 // everything was current while the paragraph sat on the disk.
                 `state    caught up with the server, with ${local.unsent} not yet sent from here`
-              : "state    up to date with the server",
+              : // Not "up to date": that is a claim about content, and what
+                // this compared was sizes and timestamps (R25). An edit that
+                // keeps both is invisible here, and a sync is what settles it.
+                "state    caught up with the server; nothing here looks changed " +
+                "(sizes and timestamps only)",
     );
-    return local.unsent === "unknown" ? 1 : 0;
+    return wrong ? 1 : 0;
   }
   io.out(`state    cannot reach the server: ${server.error}`);
   return 1;

@@ -74,6 +74,8 @@ class Device {
   }
 }
 
+const basename = (path: string): string => path.slice(path.lastIndexOf("/") + 1);
+
 let server: TestServer;
 const devices: Device[] = [];
 
@@ -196,10 +198,17 @@ describe("a vault reaching another device", () => {
     await converge(a, b);
 
     expect(b.notes()).not.toContain("doomed.md");
-    expect(b.adapter.trashedLocally).toContain("doomed.md");
+    // Under the name it had. A trash keeps a basename and drops every folder
+    // above it, so the move that takes the note out of the way before it is
+    // identified has to be into a folder rather than under a new name (R22):
+    // renamed, it reaches the trash as `.basalt-tmp-9f2c-doomed.md`, which is
+    // not what somebody looking for the note they deleted searches for.
+    expect(b.adapter.trashedLocally.map(basename)).toContain("doomed.md");
     // Recoverable by hand, and not syncing back out to undo the deletion
     // everywhere else.
     expect(b.adapter.text(".trash/doomed.md")).toBe("here for now\n");
+    // And nothing of that move is left behind.
+    expect(b.adapter.everything().filter((p) => p.includes(".basalt-tmp-"))).toEqual([]);
   }, 300_000);
 
   it("merges edits to different parts of one note", async () => {

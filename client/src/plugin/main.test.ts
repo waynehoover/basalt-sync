@@ -3618,3 +3618,70 @@ describe("a pairing that outlives the plugin", () => {
     expect(`${shown}|${said}`, "the recovery key was not offered anywhere").toMatch(/basalt/);
   }, 90_000);
 });
+
+/**
+ * Rotation waits for the new key to be taken, exactly as first pairing does
+ * (R24).
+ *
+ * The panel's rotation callback set the key, re-rendered, and returned, so the
+ * request went out immediately. `rotateVault` documents its callback as the
+ * step that makes everything after it survivable and awaits it; a callback
+ * that returns before anybody has read the screen satisfies the type and not
+ * the obligation.
+ *
+ * Rotation is the worse of the two to get wrong. It retires the key that was
+ * written down, so a reload between the candidate appearing and somebody
+ * copying it leaves a vault with no way back at all.
+ */
+describe("handing over a replacement recovery key", () => {
+  it("does not send the rotation until the key has been taken", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin);
+    const key = keyOf(plugin);
+
+    let release: (() => void) | undefined;
+    let shown = "";
+    const rotating = plugin
+      .rotate(key, async (candidate: string) => {
+        shown = candidate;
+        await new Promise<void>((go) => {
+          release = go;
+        });
+      })
+      .catch((err: Error) => err);
+
+    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(shown, "no candidate was offered").toMatch(/^basalt/);
+
+    // Still waiting, so the vault must still answer to the *old* key. That is
+    // the direct observation: rotation retires it, and a device credential
+    // keeps working either way, so asking the vault anything as a device
+    // proves nothing at all.
+    await new Promise((r) => setTimeout(r, 150));
+    const { Registrar } = await import("../core/client.ts");
+    const { parsePairing } = await import("../core/pairing.ts");
+    const old = parsePairing(key);
+    const stillOpens = await Registrar.open({
+      url: old.url,
+      vaultId: old.vaultId,
+      device: "probe",
+      secret: old.secret,
+      timeoutMs: 10_000,
+    })
+      .then((r) => {
+        r.close();
+        return true;
+      })
+      .catch(() => false);
+    expect(
+      stillOpens,
+      "the old recovery key had already been retired, so the rotation went out before " +
+        "anybody said they had the new one",
+    ).toBe(true);
+
+    release?.();
+    const out = await rotating;
+    expect(out instanceof Error ? out.message : "rotated").toBeTruthy();
+  }, 90_000);
+});

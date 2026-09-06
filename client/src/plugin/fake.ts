@@ -198,6 +198,16 @@ export class FakeAdapter implements DataAdapter {
    */
   fault: ((op: FaultOp, path: string, to?: string) => Error | number | undefined) | undefined;
 
+  /**
+   * Runs just before a rename, which is where an editor's save lands (R19).
+   *
+   * The preserving write moves the old bytes out of the way before writing
+   * over them, and the instant before that move is the one a save can still
+   * reach. A hook rather than a race, because the window is a few statements
+   * wide.
+   */
+  beforeRename: ((from: string, to: string) => Promise<void> | void) | undefined;
+
   /** Every operation, in order, for a test that cares about sequence. */
   readonly calls: { op: FaultOp; path: string; to?: string }[] = [];
 
@@ -543,6 +553,7 @@ export class FakeAdapter implements DataAdapter {
    * event suite fires them the way the application does.
    */
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
+    await this.beforeRename?.(normalizedPath, normalizedNewPath);
     this.check("rename", normalizedPath, normalizedNewPath);
     if (normalizedPath === normalizedNewPath) return;
     const from = this.real(normalizedPath);

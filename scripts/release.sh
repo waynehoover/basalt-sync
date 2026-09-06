@@ -248,11 +248,19 @@ tag to be exactly the manifest version:
     release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \\
     release/plugin/SHA256SUMS
 
-A draft, and that is not a detail. The attest workflow checks that CI passed on
-that commit, rebuilds these three files, signs them, writes the checksums for
-what it built, and publishes the release as its last step. Nothing is
-downloadable until all of that has passed, and a run that fails leaves a draft
-you can delete. Creating it public put the files in front of the checks.
+Then start the workflow that finishes it:
+
+  gh workflow run attest.yml -f tag=$pluginversion
+
+A draft, and that is not a detail: it checks that CI passed on that commit,
+rebuilds these three files, signs them, writes the checksums for what it built,
+and publishes the release as its last step. Nothing is downloadable until all
+of that has passed, and a run that fails leaves a draft you can delete.
+
+The dispatch is a second command because GitHub does not fire a release event
+for a draft: `created` is documented as excluding them, so a workflow listening
+for it would leave the draft sitting there with nothing running and no sign
+that anything was wrong.
 
 To publish the server, on its own tag because it moves on its own clock:
 
@@ -260,8 +268,11 @@ To publish the server, on its own tag because it moves on its own clock:
   gh release create server/v$version --draft --title "basaltd $version" \\
     release/server/*
 
-A draft here too, and published by the same workflow once it has rebuilt,
-signed and checksummed the binaries.
+A draft here too, and finished the same way:
+
+  gh workflow run attest.yml -f tag=server/v$version
+
+which rebuilds, signs and checksums the binaries and then publishes it.
 
 Pushing that tag is also what builds and pushes the container image.
 

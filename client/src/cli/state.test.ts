@@ -173,16 +173,19 @@ describe("what status knows about this device (F27)", () => {
     await writeFile(join(dir, "note.md"), "first");
     expect((await cli("sync", "--dir", dir)).code).toBe(0);
 
+    // The settled wording, which no longer says "up to date": that would be a
+    // claim about content, and the comparison is of sizes and timestamps
+    // (R25). This is the string the edit below has to displace.
     const settled = await cli("status", "--dir", dir);
-    expect(settled.all).toContain("up to date with the server");
+    expect(settled.all).toContain("nothing here looks changed");
 
     // Typed after the pass, which is the whole of it.
     await writeFile(join(dir, "note.md"), "and a paragraph nobody has sent");
     const after = await cli("status", "--dir", dir);
-    expect(after.all, `status called an unsent edit up to date:\n${after.all}`).not.toContain(
-      "up to date with the server",
+    expect(after.all, `status called an unsent edit settled:\n${after.all}`).not.toContain(
+      "nothing here looks changed",
     );
-    expect(after.all).toMatch(/not yet sent from here/);
+    expect(after.all).toMatch(/1 not yet sent from here/);
 
     // And the machine-readable answer carries the same fact.
     const asJson = await cli("status", "--dir", dir, "--json");

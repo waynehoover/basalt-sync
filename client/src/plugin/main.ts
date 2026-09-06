@@ -1506,7 +1506,7 @@ export default class BasaltPlugin extends Plugin {
    */
   async rotate(
     recoveryKey: string,
-    onKey?: (key: string) => void,
+    onKey?: (key: string) => void | Promise<void>,
   ): Promise<{ recoveryKey: string; settled: boolean }> {
     const config = this.config;
     if (!config) throw new Error("this vault is not paired yet.");
@@ -1526,7 +1526,15 @@ export default class BasaltPlugin extends Plugin {
         recoveryKey,
         dataKey,
       },
-      (candidate: string) => onKey?.(candidate),
+      // Awaited, like first pairing's (R24). `rotateVault` documents this as
+      // the step that makes the rest survivable and awaits it; passing a
+      // callback that returns before anybody has read the screen satisfies the
+      // type and not the obligation. Rotation is the worse of the two to get
+      // wrong: it retires the key that was written down, so a reload before
+      // the new one is copied leaves a vault with no way back at all.
+      async (candidate: string) => {
+        await onKey?.(candidate);
+      },
     );
 
     switch (rotation.kind) {
@@ -2574,9 +2582,13 @@ class BasaltPanel {
             // rotation that commits and loses its reply has already changed
             // the vault, and a key that only exists in a resolved promise is
             // one a crash takes with it.
-            const { settled } = await this.plugin.rotate(given, (key) => {
+            const { settled } = await this.plugin.rotate(given, async (key) => {
               this.freshRecoveryKey = key;
               this.render();
+              // Held here until somebody says they have it (R24). Nothing has
+              // been sent yet, so abandoning this costs only the candidate:
+              // the vault still has the key that was typed in above.
+              await this.writtenDown;
             });
             new Notice(
               settled

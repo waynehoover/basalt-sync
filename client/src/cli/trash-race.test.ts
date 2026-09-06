@@ -26,6 +26,7 @@ import { copyVerifiedThenRemove, midTrash } from "./vault.ts";
 const dirs: string[] = [];
 afterEach(async () => {
   midTrash.pause = async () => {};
+  midTrash.afterCompare = async () => {};
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -97,5 +98,40 @@ describe("copying a note away and then removing it", () => {
     // gone, because its copy did match.
     expect(await readFile(join(source, "busy.md"), "utf8")).toBe("edited while copying\n");
     expect(await readdir(source)).toEqual(["busy.md"]);
+  });
+
+  /**
+   * The window the previous attempt left, and the reason this hook is where it
+   * is (R22).
+   *
+   * The old code hashed the source, compared it with the copy, and then
+   * unlinked the source's *path*. An editor saving between those two took the
+   * place of the file that had just been approved, and the unlink deleted it.
+   * Shrinking the window from a whole-tree flush to one hash is not closing it.
+   *
+   * The hook fires after the comparison, which is exactly where the earlier
+   * tests did not look.
+   */
+  it("does not delete a version saved after the final comparison", async () => {
+    const dir = await scratch();
+    const source = join(dir, "note.md");
+    const target = join(dir, "trash", "note.md");
+    await mkdir(join(dir, "trash"), { recursive: true });
+    await writeFile(source, "the version that was copied\n");
+
+    midTrash.afterCompare = async (at) => {
+      midTrash.afterCompare = async () => {};
+      await writeFile(`${at}.editor`, "saved after the check\n");
+      await (await import("node:fs/promises")).rename(`${at}.editor`, at);
+    };
+
+    await copyVerifiedThenRemove(source, target).catch(() => undefined);
+
+    const stillThere = await readFile(source, "utf8").catch(() => "");
+    const inTrash = await readFile(target, "utf8").catch(() => "");
+    expect(
+      `${stillThere}|${inTrash}`,
+      "the version saved after the copy was approved is gone",
+    ).toContain("saved after the check\n");
   });
 });

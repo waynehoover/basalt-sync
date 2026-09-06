@@ -170,7 +170,19 @@ export const midRespell = { pause: async (_path: string): Promise<void> => {} };
  * when the tree is one file, so a test stops the world in it. It does nothing
  * in every build.
  */
-export const midTrash = { pause: async (_path: string): Promise<void> => {} };
+export const midTrash = {
+  pause: async (_path: string): Promise<void> => {},
+  /**
+   * The instant after a file's copy has been checked and before the original
+   * is disposed of (R22).
+   *
+   * The window the previous attempt left: the comparison described the bytes
+   * that were there a moment ago, and the unlink took whatever is there now.
+   * The hook sits after the comparison on purpose, because that is the only
+   * place it can prove anything.
+   */
+  afterCompare: async (_path: string): Promise<void> => {},
+};
 
 /**
  * Takes away a name whose file now has a second, normalised name, without
@@ -218,11 +230,53 @@ export async function retireName(
   try {
     await link(spare, from);
     await rm(spare, { force: true });
+    return;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    // The name was taken again while this was deciding. The file stays in
-    // staging rather than being thrown away.
   }
+  // The name was taken again while this was deciding, so there are now two
+  // versions somebody wrote and one name. The one in hand goes beside the
+  // note, not into staging (R21).
+  //
+  // It used to stay in staging, which is where the scan's reaper looks, and a
+  // rename carries the file's timestamp: the preserved version was older than
+  // the cutoff the instant it arrived and was deleted on the next pass as
+  // write debris. A note somebody typed is not debris, and staging is not
+  // recovery storage.
+  const kept = await freeSiblingName(from, "kept");
+  try {
+    await link(spare, kept);
+  } catch {
+    // Nothing left to try that does not risk the file. Leaving it in staging
+    // is worse than saying so, so this throws and the caller reports it: the
+    // bytes are still at `spare` and the message names it.
+    throw new Error(
+      `two versions of ${from} were saved at once and neither could be put beside the other; ` +
+        `the one this scan moved is at ${spare}`,
+    );
+  }
+  await rm(spare, { force: true });
+}
+
+/**
+ * A free name beside a file, for a version that has to be kept and has
+ * nowhere else to go.
+ *
+ * Not the engine's conflict naming, which needs the device name and a clock
+ * this module does not have. What it shares is the important half: the file
+ * lands next to the note it came from, under a name a person will see.
+ */
+async function freeSiblingName(full: string, why: string): Promise<string> {
+  const dir = dirname(full);
+  const base = basename(full);
+  const dot = base.lastIndexOf(".");
+  const stem = dot <= 0 ? base : base.slice(0, dot);
+  const ext = dot <= 0 ? "" : base.slice(dot);
+  for (let n = 1; n < 1000; n++) {
+    const at = join(dir, `${stem} (${why} ${n})${ext}`);
+    if (!(await lstat(at).catch(() => undefined))) return at;
+  }
+  throw new Error(`no free name beside ${full}`);
 }
 
 /**
@@ -744,6 +798,21 @@ export class NodeVault implements Vault {
    * worse than a temporary that waits.
    */
   private async reapStaleTemps(): Promise<void> {
+    // Containment first, and before the directory is even read (R21).
+    //
+    // This walks a directory and deletes things in it, and it did so without
+    // ever asking whether the directory is inside the vault. A `.basalt/tmp`
+    // that is a symlink somewhere else therefore had its contents deleted by
+    // an ordinary scan: no race, no hostile process, just a filesystem laid
+    // out in a way nobody checked. It is the most destructive loop in this
+    // file and it was the only writer with no guard.
+    try {
+      await this.checkStaging();
+    } catch {
+      // Not a directory this vault owns. Nothing here is ours to remove, and
+      // the write paths refuse it too.
+      return;
+    }
     let names: string[];
     try {
       names = await readdir(this.staging);
@@ -752,6 +821,12 @@ export class NodeVault implements Vault {
     }
     const cutoff = Date.now() - STALE_TEMP_MS;
     for (const name of names) {
+      // Only what this code makes (R21). It used to delete anything old, and
+      // "old" is not a property of debris: a rename carries the file's
+      // timestamp, so anything moved in here looks ancient the moment it
+      // lands. Deleting by age alone is how a preserved version of somebody's
+      // note became write debris.
+      if (!disposableTemp(name)) continue;
       const full = join(this.staging, name);
       if (liveTemps.has(full)) continue;
       try {
@@ -1154,6 +1229,7 @@ export class NodeVault implements Vault {
     expect: ExpectedContent | undefined,
     bytes: Uint8Array,
     times: Times,
+    keepAt: string,
   ): Promise<Replaced> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
@@ -1168,24 +1244,33 @@ export class NodeVault implements Vault {
       // caller must not land on an occupied name.
       await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
       this.dirty(full, had);
-      return {};
+      return { landed: true };
     }
 
-    const token = randomBytes(8).toString("hex");
-    const staged = join(this.staging, `replace.${token}`);
-    const keep = join(this.staging, `keep.${token}`);
+    const kept = await this.absolute(keepAt);
+    await this.insideForReal(kept);
+    const staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
+    let stagedGone = false;
     try {
       // Durable before anything is moved: a crash after the rename below must
       // not leave the path empty and the new content only in memory.
       await writeDurably(staged, bytes, true, { mtime: times.mtime, stageIn: this.staging });
 
+      // The displaced version goes to a real path in the vault, not to staging
+      // (R18, R21). Staging is swept by the scan's reaper, which cannot tell a
+      // half-finished write from somebody's only copy of a note, and a rename
+      // carries the old timestamp so it looks old the moment it lands there.
+      // A note is a note: discoverable, backed up, and never aged out.
+      //
+      // A sibling of the file, so this rename is within one directory and
+      // cannot meet EXDEV however the vault is mounted.
       let moved = true;
       try {
-        await rename(full, keep);
+        await rename(full, kept);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         // Nothing there. The caller expected content and found none, which is
-        // itself a change, but there is nothing to hand back.
+        // itself a change, and there is nothing to preserve.
         moved = false;
       }
 
@@ -1195,24 +1280,38 @@ export class NodeVault implements Vault {
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
         // Somebody created a file in the instant the name was free. Theirs
-        // stays: it is the newest thing anybody wrote and this write is
-        // acting on a decision older than it.
+        // stays: it is the newest thing anybody wrote, and this write is
+        // acting on a decision older than it. The caller is told the incoming
+        // version has nowhere to go.
         landed = false;
       }
       this.dirty(full, had);
       this.unflushed.add(dirname(full));
 
-      if (!moved) return landed ? {} : { kept: bytes };
-      const was = await readFile(keep);
-      const id = await expect.idOf(was);
-      if (id === expect.contentId && landed) return {};
-      // Either what was there is not what this write was decided about, or a
-      // new file arrived at the name. Both mean the caller has something to
-      // keep; hand back the bytes that were displaced.
-      return { kept: landed ? was : bytes };
+      if (!moved) return { landed };
+      if (landed) {
+        // Was what was displaced the version this write was decided about? If
+        // so the copy is a duplicate of something the server already has, and
+        // removing it is the one deletion here that destroys nothing.
+        const digest = await this.contentDigest(keepAt);
+        if (digest !== undefined && digest === expect.contentId) {
+          await rm(kept, { force: true });
+          return { landed: true };
+        }
+      }
+      // Kept: either it was not what this write expected, or the write did not
+      // land and the displaced version is all there is. Its path is returned
+      // rather than its bytes, so nothing depends on the caller finishing.
+      this.dirty(kept, had);
+      this.unflushed.add(dirname(kept));
+      return { keptAt: keepAt, landed };
     } finally {
-      await rm(staged, { force: true });
-      await rm(keep, { force: true });
+      // Only the staged copy, and only ever the staged copy. The preserved
+      // version is a note now and is not this function's to remove; deleting
+      // recovery data in a `finally` is how a failure anywhere above used to
+      // take the original with it (R18).
+      if (!stagedGone) await rm(staged, { force: true });
+      stagedGone = true;
     }
   }
 
@@ -1226,23 +1325,72 @@ export class NodeVault implements Vault {
    * a deletion decided before a fetch does not quietly take an edit made
    * during it and report it as an ordinary removal.
    */
-  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
+  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
-    let was: Uint8Array | undefined;
+    if ((await this.contentDigest(path)) === undefined) {
+      // Nothing readable there. Two devices deleting one file produces this
+      // routinely; `remove` says the same by doing nothing.
+      await this.remove(path);
+      return { landed: true };
+    }
+
+    // Moved out of the way first, and identified afterwards (R22).
+    //
+    // It used to hash the file and then `rm` the path, and `rm` removes
+    // whatever is at the name at that moment: an editor replacing it between
+    // the two deleted a version nothing had ever seen. A rename takes the
+    // exact bytes that were there, atomically, and then they can be looked at
+    // at leisure.
+    const kept = await this.absolute(keepAt);
+    await this.insideForReal(kept);
+    await mkdir(dirname(kept), { recursive: true });
     try {
-      was = await readFile(full);
+      await rename(full, kept);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      return { landed: true }; // gone between the read and here
     }
-    await this.remove(path);
-    if (was === undefined) return {};
-    // Read before the removal rather than out of the trash, because the trash
-    // path is chosen by `remove` and a folder removal has no single file to
-    // read back. This is one read of a file that is about to move anyway.
-    const id = await expect.idOf(was);
-    return id === expect.contentId ? {} : { kept: was };
+    this.unflushed.add(dirname(full));
+
+    const digest = await this.contentDigest(keepAt);
+    if (digest !== undefined && digest === expect.contentId) {
+      // The version the pass decided to delete. It goes where a deletion goes,
+      // which is the trash, so it is recoverable exactly as before.
+      await this.remove(keepAt);
+      return { landed: true };
+    }
+    // Something else. It stays, under a name a person will find.
+    this.dirty(kept, await this.deepestExisting(kept));
+    this.unflushed.add(dirname(kept));
+    return { keptAt: keepAt, landed: true };
   }
+
+  /**
+   * The digest of one path's contents, hashed as it is read (R31).
+   *
+   * The engine used to do this by collecting every block a vault streamed and
+   * joining them, which holds the file twice: once in the pieces and once in
+   * the copy. Here the hash consumes each block and keeps none of them, so a
+   * 256 MiB attachment costs one pass and a few kilobytes.
+   */
+  contentDigest = async (path: string): Promise<string | undefined> => {
+    try {
+      const full = await this.absolute(path);
+      const handle = await open(full, "r");
+      const hash = createHash("sha256");
+      try {
+        for await (const block of handle.createReadStream({ autoClose: false })) {
+          hash.update(block as Buffer);
+        }
+      } finally {
+        await handle.close();
+      }
+      return hash.digest("hex");
+    } catch {
+      return undefined;
+    }
+  };
 
   async remove(path: string): Promise<void> {
     const full = await this.absolute(path);
@@ -1707,11 +1855,32 @@ async function read(path: string, what: string): Promise<string | undefined> {
  */
 export const TEMP_MARK = ".basalt-tmp-";
 
+/**
+ * The names this code gives its own throwaway files, and nothing else (R21).
+ *
+ * The reaper deletes what is in the staging directory, and it decided by age.
+ * Age says nothing: a rename keeps the file's timestamp, so anything moved in
+ * there is instantly older than the cutoff, and a version of somebody's note
+ * preserved from a losing race was deleted as write debris on the next scan.
+ *
+ * So the reaper deletes only what it can name. Every writer here stages under
+ * one of these prefixes; anything else in the directory is somebody's, or
+ * something this project has not thought about, and either way it stays.
+ */
+const DISPOSABLE_PREFIXES = ["replace.", "respell.", "keep."];
+
+function disposableTemp(name: string): boolean {
+  // `openTemp` builds `<basename><TEMP_MARK><counter>`, so the mark is inside
+  // the name rather than at the front of it; the rest are staged under a
+  // prefix of their own.
+  return name.includes(TEMP_MARK) || DISPOSABLE_PREFIXES.some((p) => name.startsWith(p));
+}
+
 /** Temporaries open in this process, by full path. Exact, so a note is never mistaken for one. */
 const liveTemps = new Set<string>();
 
 /** How old a staged temporary must be before it is taken for a crash's leftover. */
-const STALE_TEMP_MS = 60 * 60 * 1000;
+export const STALE_TEMP_MS = 60 * 60 * 1000;
 
 /**
  * Whether a directory entry is one of this client's temporary files.
@@ -1957,15 +2126,47 @@ async function removeMatching(source: string, target: string): Promise<string[]>
       return;
     }
     if (!info.isFile()) return;
-    const [now, copied] = await Promise.all([
-      digestOf(from).catch(() => undefined),
-      digestOf(to).catch(() => undefined),
-    ]);
-    if (now === undefined || copied === undefined || now !== copied) {
+    // Moved out of the way, and identified afterwards (R22).
+    //
+    // Hashing the source and then unlinking its path is a check followed by a
+    // destructive act on a name, and a save between the two is deleted: the
+    // hash described the old bytes and the unlink took the new ones. Shrinking
+    // that window is not closing it, which is what the previous attempt did.
+    //
+    // A rename takes exactly the bytes that were there, atomically, into a
+    // name only this walk knows. Then it can be hashed at leisure: if it
+    // matches the copy already in the trash it is a duplicate and goes, and if
+    // it does not it is put back where it came from.
+    const aside = `${from}.${TEMP_MARK}moving`;
+    try {
+      await rename(from, aside);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return; // already gone
       left.push(from);
       return;
     }
-    await rm(from, { force: true });
+    const [moved, copied] = await Promise.all([
+      digestOf(aside).catch(() => undefined),
+      digestOf(to).catch(() => undefined),
+    ]);
+    // *After* the comparison, which is where the old window was and where a
+    // hook has to sit to prove it is closed. A test that pauses before the
+    // check it is testing misses the race that follows it.
+    await midTrash.afterCompare(from);
+    if (moved !== undefined && copied !== undefined && moved === copied) {
+      await rm(aside, { force: true });
+      return;
+    }
+    // Not the version that was copied. It goes back under its own name, and
+    // if something has taken that name in the meantime it stays where it is
+    // and is reported rather than deleted.
+    try {
+      await link(aside, from);
+      await rm(aside, { force: true });
+      left.push(from);
+    } catch {
+      left.push(aside);
+    }
   };
   await walk(source, target);
   // A directory that is empty only because its own children were removed

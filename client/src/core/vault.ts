@@ -83,14 +83,41 @@ export interface ExpectedContent {
 }
 
 /**
+ * A digest of one path's contents, computed however the platform can do it
+ * without holding the file (R31).
+ *
+ * The engine used to do this itself by collecting every block a vault streamed
+ * and concatenating them, which holds the file twice over: once in the pieces
+ * and once in the joined copy. For an attachment being replaced that is the
+ * memory this whole mechanism is supposed to be careful with.
+ *
+ * Optional, and the engine falls back to reading the file whole. A vault that
+ * can hash as it reads should, and the headless one can.
+ */
+export type ContentDigest = (path: string) => Promise<string | undefined>;
+
+/**
  * What a preserving write or removal found in the way.
  *
- * `kept` is present only when the bytes at the path were not what the caller
- * expected. They have been moved out of the destructive operation's way and
- * are handed back so the caller can put them somewhere a person will find them.
+ * `keptAt` is a vault path, not bytes, and that is the whole of the contract
+ * (R18). Handing back a buffer meant the only copy of somebody's edit existed
+ * in memory between the adapter returning and the caller writing it down, and
+ * the adapter's own cleanup deleted the file it came from on the way out. A
+ * failure anywhere in that window, or in the caller, lost it. So the adapter
+ * moves the displaced version to a real path inside the vault before it
+ * returns, and says where: it is on the disk, it is a note like any other, and
+ * nothing has to remember to save it.
+ *
+ * `landed` says whether the new content reached the path it was meant for.
+ * False means something else took the name in the instant it was free, and
+ * that file is newer than this write's decision, so it was left alone; the
+ * caller has an incoming version with nowhere to go and must place it.
  */
 export interface Replaced {
-  readonly kept?: Uint8Array;
+  /** Where a displaced local version was preserved, when there was one. */
+  readonly keptAt?: string;
+  /** Whether the bytes this call was given are now at the path. */
+  readonly landed: boolean;
 }
 
 export interface Vault {
@@ -204,6 +231,15 @@ export interface Vault {
     expect: ExpectedContent | undefined,
     bytes: Uint8Array,
     times: Times,
+    /**
+     * A free path inside the vault where a displaced version may be kept.
+     *
+     * Chosen by the caller, because conflict naming is the engine's and a
+     * name a person will recognise is the point of it. A sibling of `path`,
+     * so the move onto it is a rename within one directory and cannot meet
+     * `EXDEV` however the vault is mounted.
+     */
+    keepAt: string,
   ): Promise<Replaced>;
   remove(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
@@ -247,6 +283,13 @@ export interface Vault {
    */
   create?(path: string, bytes: Uint8Array, times: Times): Promise<boolean>;
   /**
+   * The digest of one path's contents, without holding the whole file (R31).
+   *
+   * Must agree with `ExpectedContent.idOf` over the same bytes, because the two
+   * are compared. Optional; without it the engine reads the file.
+   */
+  contentDigest?: ContentDigest;
+  /**
    * Removes a file, keeping it if it is not what the caller expected (R01).
    *
    * The deletion half of `replace`, and the same reasoning: a deletion applied
@@ -255,7 +298,7 @@ export interface Vault {
    * `expect` described, so the caller can put them back where somebody will
    * see them.
    */
-  removeExpecting?(path: string, expect: ExpectedContent): Promise<Replaced>;
+  removeExpecting?(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced>;
   /**
    * Watches for changes, returning a function that stops watching.
    *
@@ -461,24 +504,58 @@ export class MemoryVault implements Vault {
     expect: ExpectedContent | undefined,
     bytes: Uint8Array,
     times: Times,
+    keepAt: string,
   ): Promise<Replaced> {
     await this.midReplace?.(path);
     const was = this.files.get(path);
+    // Read after the hook, so a write landing in the gap is the version this
+    // preserves rather than the one it was told to expect.
+    if (expect === undefined || was === undefined) {
+      await this.write(path, bytes, times);
+      return { landed: true };
+    }
+    // Moved to its own path before anything is written over it, and it stays
+    // there: the caller is told where, not handed a buffer (R18).
+    this.files.set(keepAt, was);
+    this.files.delete(path);
     await this.write(path, bytes, times);
-    if (expect === undefined || was === undefined) return {};
     const id = await expect.idOf(was.bytes);
-    return id === expect.contentId ? {} : { kept: was.bytes };
+    if (id === expect.contentId) {
+      // A duplicate of what the server already has.
+      this.files.delete(keepAt);
+      this.notify(keepAt);
+      return { landed: true };
+    }
+    this.notify(keepAt);
+    return { keptAt: keepAt, landed: true };
   }
 
   /** The deletion half, and the same reasoning. */
-  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
+  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
     await this.midReplace?.(path);
     const was = this.files.get(path);
-    await this.remove(path);
-    if (was === undefined) return {};
+    if (was === undefined) {
+      await this.remove(path);
+      return { landed: true };
+    }
     const id = await expect.idOf(was.bytes);
-    return id === expect.contentId ? {} : { kept: was.bytes };
+    if (id === expect.contentId) {
+      await this.remove(path);
+      return { landed: true };
+    }
+    this.files.set(keepAt, was);
+    await this.remove(path);
+    this.notify(keepAt);
+    return { keptAt: keepAt, landed: true };
   }
+
+  /** Hashes without holding the file, which in memory is the same thing. */
+  contentDigest = async (path: string): Promise<string | undefined> => {
+    const f = this.files.get(path);
+    if (f === undefined) return undefined;
+    const { plainDigest } = await import("./crypto.ts");
+    return plainDigest(f.bytes);
+  };
 
   /**
    * Makes the next removal of this path fail, once.

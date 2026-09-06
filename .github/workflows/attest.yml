@@ -10,28 +10,33 @@
 # On release rather than on tag: the tag is pushed first and the release is made
 # afterwards, so a tag trigger would fire before there was anything to upload to.
 #
-# On `created` rather than `published`, and the release is made as a draft
-# (R16). The old order put the assets in front of the checks: `release.sh`
-# printed a `gh release create`, the operator ran it, the files were public
-# immediately, and only then did this workflow ask whether CI had passed, rebuild
-# them and replace them with `--clobber`. If CI had failed, the unchecked bytes
-# stayed downloadable; if the rebuild differed, whoever downloaded first got
+# The release is created as a draft and this publishes it (R16), and it is
+# started by hand rather than by an event (R29).
+#
+# The old order put the assets in front of the checks: `release.sh` printed a
+# `gh release create`, the operator ran it, the files were public immediately,
+# and only then did this workflow ask whether CI had passed, rebuild them and
+# replace them with `--clobber`. If CI had failed the unchecked bytes stayed
+# downloadable, and if the rebuild differed whoever downloaded first got
 # something nobody else would.
 #
-# So a release is created as a draft, which is not downloadable and does not fire
-# `published`. This validates it, rebuilds and attests the exact files, writes
-# the checksums for them, and publishes as its last step. A run that fails leaves
-# a draft, which is the right thing to leave.
+# A draft fixes that and cannot be the trigger. GitHub excludes draft releases
+# from the `created`, `edited` and `deleted` release events, so listening for
+# `created` meant the documented flow produced a draft and started nothing at
+# all: worse than before, because it looks like it is working. `published` is
+# no use either, since publishing is the thing this is supposed to do last.
+#
+# So `release.sh` prints the dispatch beside the draft and this runs on
+# `workflow_dispatch`. One command more, and the ordering is real: validate,
+# rebuild, attest, checksum, publish. A run that fails leaves a draft, which is
+# the right thing to leave.
 name: attest
 
 on:
-  release:
-    types: [created]
-  # For a release that predates this workflow, or one to re-attest.
   workflow_dispatch:
     inputs:
       tag:
-        description: The release tag to build and attest
+        description: The release tag to build, attest and publish
         required: true
 
 permissions:
@@ -57,7 +62,7 @@ jobs:
       - name: refuse to publish from an unchecked commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/ci-passed.sh "${{ github.repository }}" "${{ github.event.release.tag_name || inputs.tag }}"
+        run: ./scripts/ci-passed.sh "${{ github.repository }}" "${{ inputs.tag }}"
 
   plugin:
     name: plugin
@@ -66,11 +71,11 @@ jobs:
     # Plugin releases only, which are the ones tagged with a bare version.
     # Every other line is prefixed, so a slash means this is not one. The tag
     # and manifest check below fails closed for anything that slips past.
-    if: ${{ !contains(github.event.release.tag_name || inputs.tag, '/') }}
+    if: ${{ !contains(inputs.tag, '/') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ inputs.tag }}
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -98,7 +103,7 @@ jobs:
       # would be attested happily, so check before signing anything.
       - name: the tag and the manifest agree
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           want="${TAG#v}"
           got=$(node -p "require('./attested/manifest.json').version")
@@ -128,7 +133,7 @@ jobs:
       - name: upload
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           gh release upload "$TAG" \
             attested/main.js attested/manifest.json attested/styles.css attested/SHA256SUMS \
@@ -139,7 +144,7 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           echo "$TAG is public, with the files that were just checked and signed"
@@ -153,11 +158,11 @@ jobs:
     # by the same script from the same bytes, and uploaded. SHA256SUMS generated
     # beside them proves the download was not corrupted in transit and nothing
     # whatsoever about where the bytes came from.
-    if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'server/v') }}
+    if: ${{ startsWith(inputs.tag, 'server/v') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -170,7 +175,7 @@ jobs:
       # gave the published bytes exactly, which is what makes --clobber safe.
       - name: build
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           version="${TAG#server/v}"
           mkdir -p attested
@@ -195,7 +200,7 @@ jobs:
       # the same lie the plugin's manifest check refuses.
       - name: the tag and the binary agree
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           want="${TAG#server/v}"
           got=$(./attested/basaltd-linux-amd64 version | awk '{print $2}')
@@ -211,7 +216,7 @@ jobs:
       - name: upload
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           gh release upload "$TAG" attested/basaltd-* attested/SHA256SUMS \
             --clobber --repo "$GITHUB_REPOSITORY"
@@ -220,7 +225,7 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
           echo "$TAG is public, with the files that were just checked and signed"

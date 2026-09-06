@@ -1760,3 +1760,67 @@ func TestPurgeStillAcceptsAGoodBackup(t *testing.T) {
 		t.Fatalf("purge said:\n%s", out)
 	}
 }
+
+// The backup stays locked through the deletion it authorises (R23).
+//
+// The exclusion used to be taken and released inside the check, so it was gone
+// by the time the check returned and before any history had been deleted.
+// Everything the check established was then true of a directory nothing was
+// protecting: another backup could replace it, or a purge could run against
+// it, in the gap. A verification that does not outlive itself authorises
+// nothing.
+func TestThePurgeHoldsItsBackupUntilItIsDone(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+
+	// Between the successful check and the deletion, which is exactly where
+	// the protection has to still be there.
+	var heldDuringPurge bool
+	beforePurge = func() {
+		lock, err := dirlock.Exclusive(dest, dirlock.Data, "a competing backup")
+		if err != nil {
+			heldDuringPurge = true
+			return
+		}
+		lock.Release()
+	}
+	t.Cleanup(func() { beforePurge = func() {} })
+
+	mustRun(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default", "-backup", dest)
+
+	if !heldDuringPurge {
+		t.Fatal("the backup could be taken exclusively between its verification and the purge, " +
+			"so nothing was protecting what the check had just established")
+	}
+}
+
+// And it is let go afterwards, or one purge would wedge every later backup.
+func TestThePurgeReleasesItsBackupAfterwards(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+	mustRun(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default", "-backup", dest)
+
+	lock, err := dirlock.Exclusive(dest, dirlock.Data, "a later backup")
+	if err != nil {
+		t.Fatalf("the backup is still locked after the purge finished: %v", err)
+	}
+	lock.Release()
+}
+
+// A refused check holds nothing: it authorised no deletion, so it has no
+// business keeping the directory.
+func TestARefusedBackupCheckDoesNotKeepTheLock(t *testing.T) {
+	dir := seeded(t)
+	dest := t.TempDir() // not a backup at all
+	if _, err := basalt(t, "purge", "-data", dir, "-vault", "default",
+		"-confirm", "default", "-backup", dest); err == nil {
+		t.Fatal("purge accepted a directory that is not a backup")
+	}
+	lock, err := dirlock.Exclusive(dest, dirlock.Data, "afterwards")
+	if err != nil {
+		t.Fatalf("a refused check left the directory locked: %v", err)
+	}
+	lock.Release()
+}

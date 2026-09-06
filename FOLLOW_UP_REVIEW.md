@@ -263,3 +263,183 @@ These items were intentionally incremental and measurement-driven. A scoped impl
 5. Add deterministic regressions at the actual failed boundaries. Re-run the full suite and the supported platform checks, and mark fixes complete only when the corresponding invariant survives the relevant failure schedule.
 
 Keep F11 visibly documented as a POC limitation unless authenticated replay/rollback protection is intentionally taken into scope. Keep the real Obsidian and platform acceptance gaps visible as well; the current automated checks do not establish those guarantees.
+
+## Second verification — 2026-09-06
+
+This section reviews **`0527f7bcef9039576f9307ea46d9514bd9ad24e2` — “Close the seventeen the follow-up review found.”** The changes were initially uncommitted and were committed while verification was running. File fingerprints confirmed that the reviewed source bytes did not change during the checks. The earlier sections above are historical findings against `cddca48`; this section supplies their updated status.
+
+**The seventeen findings are not all closed.** Six original failure cases are addressed within the verification limits below; eleven still have gaps. There are also regressions in the new implementations. The **14 findings below comprise 7 P1 and 7 P2 items**; ten have local reproductions and four are supported by source/platform-documentation review. A fixed original failure can coexist with a different new defect in the same component.
+
+### Checks and confirmed repairs
+
+`bash scripts/check.sh` passed **24 checks, with 0 failed and 0 skipped**. This includes **1,355 client tests in 72 files**, the separate 16-test panel run and 10 stress tests, Go race tests/vet, build/type/format checks, packaged Node CLI, and local Docker checks. Linux mounted-filesystem and actual systemd execution remain explicitly CI-only. Real Obsidian desktop/mobile, power loss, and live GitHub publication were not exercised.
+
+Independent positive probes confirmed that opposite-order chunk batches now finish; failed chunk publication stays unavailable until a successful retry flush; entry commit refuses a body before batch close; a different completed backup is rejected by the new digest; the sixth retrying restored path is no longer reported sent; and recovery-key pairing no longer restarts after unload at the previously reproduced boundary. The Go probes also ran under race detection.
+
+New failure probes used disposable directories, the repository's Obsidian stub, a real local test server for CLI status, and a copied Go module. Temporary copies of source added scheduling/fault hooks for replacement publication, stale-marker cleanup, normalization, and final trash removal. No application code was changed by this verification. Evidence and runnable probe sources are retained in `/tmp/basalt-review-round2/`, including `check.log`, `client-probes.log`, `plugin-probes.log`, `status-probes.log`, `server-probes.log`, `fixed-probes.log`, and `limits-probe.log`.
+
+### Updated status of R01–R17
+
+| Original finding | Current assessment | Evidence / remaining work |
+|---|---|---|
+| R01: incoming edit preservation | Partial, with regressions | Ordinary downloads use the new adapter operation, but error cleanup can lose the original; local reuse and merge still bypass it, and the plugin still has a destructive read/write gap. R18/R19. |
+| R02: recovery-key handoff | Partial | First pairing now waits for the panel acknowledgement, and CLI key-file creation syncs its parent. Rotation still proceeds after display without acknowledgement. R24. |
+| R03: CLI stale takeover | Partial | Ordinary stale takeover is serialized; recovery of a stale eviction marker repeats the ownership race. R20. |
+| R04: usable/stable purge backup | Partial | Complete entry comparison, body hashing, and read-only opening landed. The backup lock ends before purge starts. R23. |
+| R05: overlapping chunk deadlock | Fixed for the reproduced case | Per-batch held claims were removed. Independent opposite-order batches both completed. |
+| R06: visibility versus durability | Fixed for the reproduced cases | Unproven bodies are withheld from presence/commit; independent pre-close commit and failed-flush retry probes now behave correctly. This is not a physical power-cut certification. |
+| R07: normalization source replacement | Partial | The first source replacement is protected by rename-aside. A second competing save can leave the preserved version in a directory whose reaper deletes it. R21. |
+| R08: cross-filesystem trash race | Partial | It compares the source again after flushing, but comparison and final unlink are still separate. R22. |
+| R09: sixth failed restored path | Fixed for the reproduced case | Success now consults `serverHasOurs`; the independent six-retry probe returns `sent: false`. |
+| R10: pairing restart after unload | Fixed for the reproduced case | Final generation checks reject stale completion; the independent proof-after-unload probe no longer calls `start`. |
+| R11: state/staging containment | Partial | Configuration, lock, and exclusive-create guards improved. The normal scan's staging cleanup still follows an outside symlink and deletes external files. R21. |
+| R12: truthful observational status | Partial | Missing-index counting, observing scans, and unknown-state text landed. Same-stamp edits remain invisible, and unknown-state JSON exits successfully. R25. |
+| R13: pre-allocation limits | Partial | Incremental inflation, raw plaintext bounds, text checks, and cumulative fetch bytes landed. Network limits are still selected by the peer and notification bytes are not budgeted. R26. |
+| R14: backup snapshot identity | Fixed for the reproduced case | A SHA-256 binding rejects substitution of another completed backup. A malformed digest introduces a separate panic, R27. |
+| R15: health persistence claim | Partial | Read-only SQLite detection and measured duration are corrected. Unwritable chunk storage can still report healthy. R28. |
+| R16: validate before release publication | Incomplete; default flow stalls | Draft creation/checksum generation improved, but draft creation does not trigger the selected Actions event. R29. |
+| R17: moving-tag rollback | Original two-release race addressed; new queue defect | Promotion is serialized and tag eligibility is refreshed. With three releases, the default concurrency queue can cancel a release before its immutable image is published. R30. |
+
+### R18 — Replacement cleanup can delete the only copy of a local edit
+
+- [x] **P1 · CLI adapter/core · Regression in R01 · Reproduced.** Retain displaced content durably until the entire preservation operation succeeds.
+
+[NodeVault.replace](client/src/cli/vault.ts#L1152) renames the original into `keep.<token>`, then unconditionally removes that file in `finally`. This cleanup runs if publication, reading the preserved file, or computing its digest fails. It also removes the file before the engine has successfully written the returned bytes to a conflict copy.
+
+**Observed:** injecting an EIO at publication after rename-aside left no `note.md` and an empty staging directory: the original had been deleted by failure cleanup. A second probe began with an unsent A, created unsent B at the destination after A was moved aside, and attempted to land a remote version. The result retained B at the destination and returned the remote bytes, while A was deleted. The `landed ? was : bytes` return can preserve only one of the two displaced versions in this schedule.
+
+**Fix and acceptance:** make preservation a durable handoff with explicit successful cleanup, not a `finally` that deletes recovery data. Keep every distinct local version when another editor save takes the destination. Do not remove preserved files before the engine's conflict copy is durable. Include read/hash/publish/conflict-write failure and crash/restart tests. The new rename into root staging also needs a supported cross-filesystem strategy: an existing file under another mount currently reaches an unhandled `EXDEV` path.
+
+### R19 — Local reuse, merge, and plugin landing still lose intervening edits
+
+- [x] **P1 · Core/plugin · Remaining R01 · Reproduced.** Apply the preservation contract to every destructive landing path and distinguish absence from an unreadable baseline.
+
+[landFromLocal](client/src/core/engine.ts#L2585) still calls ordinary `vault.write` after a metadata check. [Merge](client/src/core/engine.ts#L3022) also retains its read-then-stat baseline and ordinary write. [ObsidianVault.replace](client/src/plugin/vault.ts#L672) reads the old bytes, writes, and only then compares the bytes it read; an editor save between read and write is not preserved. Missing expectations take an unconditional write branch in the adapters, and failed baseline reads can become that same missing expectation.
+
+**Observed:** when an incoming note reused another local file's chunks, a same-length/same-mtime edit to the destination disappeared; both remaining files contained the incoming version. In the Obsidian stub, an edit injected after the preservation read was overwritten and `replace` returned no preserved bytes.
+
+**Fix and acceptance:** route reuse and merge through a safe adapter contract, capture baselines consistently, and refuse destructive work when preservation cannot be established. Treat expected absence and failed observation as different states. Test all landing routes, a new destination created after the last stat, and read failures. The updated design document acknowledges a plugin gap; that documents the limitation but does not repair it.
+
+### R20 — Recovering an abandoned eviction marker can still create two lock owners
+
+- [x] **P1 · CLI locking · Remaining R03 · Reproduced.** Make recovery of the new lock-recovery mechanism obey the same ownership invariant.
+
+[clearDeadMarker](client/src/cli/lock.ts#L252) checks the eviction marker's owner/token and then unlinks its path separately. Another contender can replace the marker between those operations. This removes a live evictor's exclusion, permitting two evictors to act on stale observations of the original lock.
+
+**Observed:** start with a dead vault lock and a dead eviction marker. Pause A after its final check of the marker. B removes the old marker, takes a new one, and pauses after reading the dead vault lock. A resumes, deletes B's marker, takes eviction ownership, and acquires the vault. B resumes its stale unlink and subsequently acquires the vault too. Both callers receive release functions.
+
+**Fix and acceptance:** use ownership/recovery primitives that cannot unlink a replacement owner at either level. Test a process dying during eviction, two contenders recovering its marker, and a live holder acquired during that recovery. Serializing the first-level stale operation alone is insufficient.
+
+### R21 — Staging cleanup deletes both external files and preserved note versions
+
+- [x] **P1 · CLI filesystem adapter · Remaining R07/R11 · Reproduced twice.** Separate recovery data from disposable temporaries and validate containment before cleanup.
+
+[reapStaleTemps](client/src/cli/vault.ts#L746) follows the staging directory and removes every old file in it without a containment check or a disposable-file classification. [retireName](client/src/cli/vault.ts#L196) now leaves an unexpected displaced version there if a second save takes its original name. That preserved version is never surfaced as a normal note and is eligible for the same reaper. Rename preserves the file's mtime, so it can be considered old immediately.
+
+**Observed:** a pre-existing `.basalt/tmp` symlink to another temporary directory caused `NodeVault.list()` to delete an old `valuable.md` outside the vault. Separately, normalization preserved unsent A in staging when unsent B took its old name; the next scan deleted A because it carried an old timestamp. The reaper was invoked by an ordinary scan, before any guarded write.
+
+**Fix and acceptance:** check containment before enumeration/removal; delete only positively identified disposable artifacts. Put preserved versions in durable, discoverable recovery storage and never age them out as write debris. Test symlinked staging, two consecutive editor replacements, old timestamps, and restart. Include the remaining index/journal write paths in the common internal-directory audit rather than assuming the config check covers them.
+
+### R22 — The final trash digest check still races with unlink
+
+- [x] **P1 · CLI filesystem adapter · Remaining R08 · Reproduced.** Preserve the actual version removed, rather than checking the path once more.
+
+The new [removeMatching](client/src/cli/vault.ts#L1943) hashes the source and copied destination, compares them, and then calls `rm(from)`. An editor replacement after the hash still makes that unlink remove a newer file. The old flush-width window became a shorter window; it was not closed.
+
+**Observed:** inject a new unsent source after the final successful digest comparison and before unlink. The helper succeeds, the source is gone, and the trash contains only the old bytes.
+
+**Fix and acceptance:** couple removal to preservation/identification of the actual removed object. If that cannot be established, retain the source and report the incomplete move. Put the regression hook after the final comparison, including the analogous descendant-file boundary for directory trees.
+
+### R23 — The backup lock is released before purge uses its verification
+
+- [x] **P1 · Server administration · Remaining R04 · Reproduced.** Hold backup exclusion through the destructive operation.
+
+[backupCovers](server/cmd/basaltd/main.go#L1146) acquires the new backup lock and [defers its release inside the helper](server/cmd/basaltd/main.go#L1174). That defer runs when the helper returns, before `cmdPurge` deletes history. The comment claiming the caller's defer chain retains the lock is incorrect. A backup replacement or purge can therefore change the checked backup in the gap.
+
+**Observed:** immediately after `backupCovers` returned successfully, and before any source purge, the probe acquired the backup's exclusive data lock successfully. The caller no longer held the protection that the check purported to establish.
+
+**Fix and acceptance:** acquire/release the backup lock in the caller's lifetime, or return a verified snapshot handle whose cleanup occurs after purge. Pause between successful verification and source deletion and prove that competing backup replacement/purge cannot acquire the destination. Retain the new full-entry comparison, body hashes, and read-only opening.
+
+### R24 — Rotation does not await the new recovery-key acknowledgement
+
+- [x] **P1 · Plugin credentials · Remaining R02 · Inspection.** Wire the acknowledgement stage into rotation as well as first pairing.
+
+The first-pairing panel callback now waits for `writtenDown`. The callback in [renderRotate](client/src/plugin/main.ts#L2577) still sets `freshRecoveryKey`, renders, and returns immediately. [Plugin.rotate](client/src/plugin/main.ts#L1521) consequently proceeds to the remote rotation without waiting for the newly displayed acknowledgement button. The new candidate remains only in memory until the user retains it.
+
+**Failure boundary:** remote rotation commits; the plugin/app reloads before the user copies or acknowledges the candidate. Normal device configs do not contain that root, and the old key has been retired. First-pairing acknowledgement tests do not exercise this operation.
+
+**Fix and acceptance:** use the same explicit awaited handoff for rotation, with cancellation and recoverable pending state where required. Test the actual rotation panel callback: no rotation request before acknowledgement, and recoverability around reload, committed/lost replies, and failed probes.
+
+### R25 — Status still produces false-clean or inconsistent outcomes
+
+- [x] **P2 · CLI · Remaining R12 · Reproduced twice.** Separate metadata estimates from synchronization proof, and align text/JSON exit policy.
+
+The [unsent scan](client/src/cli/cli.ts#L1371) still checks only size/mtime. A same-stamp edit is counted as zero, allowing the final text to claim the vault is up to date. Separately, the [JSON branch](client/src/cli/cli.ts#L1481) returns success whenever the server is reachable, even when `unsent` is `"unknown"`; the text branch now returns failure for that same state.
+
+**Observed:** changing `base` to `edit` while retaining an exact integral timestamp returned zero unsent files. Against a real local server, making a subdirectory unreadable produced `unsent: "unknown"` with text exit **1** and JSON exit **0**.
+
+**Fix and acceptance:** either establish content equality or label local state as an estimate/unverified instead of claiming synchronization. Derive text and JSON exit status from the same outcome. Test matching timestamps, missing index, read failure, and server reachability combinations in both formats. Keep the new observational scan and first-sync counting.
+
+### R26 — A peer can raise the client's network memory limits arbitrarily
+
+- [x] **P2 · Client transport · Remaining R13 · Reproduced limit acceptance; allocation risk inspected.** Impose local ceilings and account for queued bytes independently of server advertisements.
+
+[readReady](client/src/core/transport.ts#L1296) accepts any non-negative safe integer for `maxBatchBytes` and `maxFetchBytes`. The new text-frame ceiling is twice the advertised batch value; the fetch-byte ceiling is the advertised fetch value. A faulty or hostile server therefore chooses how much the client will accept. Notification queuing still limits the number of messages to 1,024 rather than the total bytes retained by those messages.
+
+**Observed:** a handshake advertising `9,007,199,254,740,991` for both limits was accepted and produced a text-frame ceiling of `18,014,398,509,481,982`. The probe did not allocate a large frame or induce an OOM.
+
+**Fix and acceptance:** apply independent local resource caps, taking the minimum of local policy and negotiated limits; validate units and ranges, and bound queued notification bytes. Keep the incremental inflater/raw bounds. Test oversized advertisements and multiple individually valid frames that together exceed the queue budget, verifying refusal before retaining excessive work.
+
+### R27 — A malformed backup digest panics during validation
+
+- [x] **P2 · Server backup inspection · New regression near R14 · Reproduced.** Validate the digest shape and format errors without unsafe slicing.
+
+[ReadBackupMeta](server/internal/store/backup.go#L354) accepts a nonempty digest of any length from JSON, then slices `meta.Database.Digest[:16]` when reporting a mismatch. A short value panics instead of returning an ordinary invalid-backup error.
+
+**Observed:** take a valid backup and change only its sidecar digest to `"x"`. Reading the metadata panics with `slice bounds out of range [:16] with length 1`. The new snapshot digest correctly rejects a different normal backup; this is a separate malformed-input regression.
+
+**Fix and acceptance:** require a correctly encoded SHA-256 value when the field is present; safely report invalid length/encoding. Test empty legacy values, short strings, non-hex values, and valid-but-wrong digests. Diagnostics for damaged recovery metadata must remain usable.
+
+### R28 — Health still reports persistence available on unwritable chunk storage
+
+- [x] **P2 · Server health · Remaining R15 · Reproduced.** Include chunk-write capability in the advertised persistence guarantee.
+
+[CheckHealth](server/internal/store/health.go#L100) now correctly exercises a SQLite write transaction and returns a nonzero duration. Its chunk-side check remains [statfs](server/internal/store/health.go#L150), which establishes space/volume availability but not write permission. The runbook still describes `200 ok` as a note arriving now being stored.
+
+**Observed:** remove write permission from the chunk root while leaving the database writable. Health returns `CanPersist=true`; an immediate chunk upload fails with permission denied. This was run as a non-root user so the permission failure was real.
+
+**Fix and acceptance:** add appropriate bounded write-capability/failure evidence for chunk storage or narrow the health claim and expose storage-write readiness separately. Test database and chunk storage failures independently, including permissions, read-only mounts, and flush errors.
+
+### R29 — Draft release creation does not trigger the new attestation workflow
+
+- [x] **P2 · Release automation · Regression in R16 fix · Source and platform documentation.** Use an event that actually runs while assets are still private.
+
+[release.sh](scripts/release.sh#L247) now instructs operators to create draft releases and says the attestation workflow will publish them. [attest.yml](.github/workflows/attest.yml#L29) listens for `release: created`. GitHub explicitly excludes draft releases from the `created`, `edited`, and `deleted` workflow triggers. Following the documented default flow therefore leaves a draft without starting the workflow. [GitHub release-event documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#release).
+
+**Fix and acceptance:** explicitly dispatch the existing workflow after creating the draft, or trigger a workflow that creates/builds the draft itself. Keep publication last and verify that assets are still private before replacement. Test the platform event/dispatch flow; merely checking that the YAML contains `created` and the script contains `--draft` cannot establish this behavior. No live release was created during this review.
+
+### R30 — The image concurrency group can cancel an unpublished queued release
+
+- [x] **P2 · Container release · Regression adjacent to R17 · Source and platform documentation.** Queue all required immutable releases instead of retaining only the newest pending job.
+
+[The image job](.github/workflows/release.yml#L60) has a common concurrency group with `cancel-in-progress: false`. This prevents cancellation of the running job, but the default concurrency policy retains only one pending job; another arrival cancels the previous pending one. The setting covers the entire build/publish job, so that canceled release never receives its immutable image tag. GitHub documents an explicit `queue` policy for retaining multiple pending runs. [GitHub concurrency documentation](https://docs.github.com/en/enterprise-cloud%40latest/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+
+**Failure schedule:** A is building, B waits, C arrives, and B is canceled despite `cancel-in-progress: false`. The workflow comment and local ordering test incorrectly treat that setting as a guarantee that a queued release will wait.
+
+**Fix and acceptance:** opt into the supported multi-pending queue policy, such as `queue: max`, with appropriate handling of capacity, or decouple immutable publication from a durable promotion queue. Retain promotion-time tag refresh. Validate three concurrent releases and confirm that each immutable tag appears while moving aliases stay monotonic.
+
+### R31 — The new “streamed” baseline digest buffers the entire file twice
+
+- [x] **P2 · Client memory/performance · Regression in R01 implementation · Inspection.** Compute the baseline digest incrementally or enforce an explicit whole-file budget.
+
+[Engine.digestOf](client/src/core/engine.ts#L2651) stores every `readBlocks` result in `parts`, then allocates another array of the complete file size and copies all parts into it before hashing. The comment claims streaming avoids a whole-file copy, but the implementation retains all source blocks and the concatenated allocation. For a 256 MiB attachment, the assembly stage alone can require roughly 512 MiB of file payload buffers, excluding other sync state. No peak-memory benchmark was run for this finding.
+
+This helper runs when queuing downloads and local deletions, adding that memory requirement to paths that previously compared metadata. [toBuffer](client/src/core/crypto.ts#L812) avoids another copy for a whole-span array; it does not remove the earlier duplication.
+
+**Fix and acceptance:** use a digest implementation that consumes blocks incrementally, or make the whole-file limit explicit and safe for supported devices. Measure an incoming replacement of a large existing attachment, not just first download into an empty vault, and retain the edit-preservation guarantees while bounding peak memory.
+
+### Next verification targets
+
+Close the destructive preservation/cleanup and ownership gaps first: R18–R23. Complete rotation handoff through R24, then align status/resource/health behavior and repair the release flow. Add regression schedules at the **last destructive boundary**, including errors and recovery of abandoned recovery state; several new tests pause before an added check and therefore miss the race immediately after it.
+
+The positive repairs above should be retained. The new section records remaining defects and regressions, rather than resetting the earlier work or treating every original finding as still unchanged. F11's authenticated replay protection and real Obsidian/platform acceptance remain the previously documented scope limitations.

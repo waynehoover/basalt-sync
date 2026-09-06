@@ -998,10 +998,24 @@ func cmdPurge(args []string, out io.Writer) error {
 	// with a new date.
 	var covered int64
 	if !*noBackupCheck {
-		if covered, err = backupCovers(*backup, *vault, *dataDir, st); err != nil {
+		// The backup is held for the whole of the purge, not just the check
+		// (R23).
+		//
+		// The lock used to be taken and released inside the helper, so it was
+		// gone by the time the helper returned and the deletion had not
+		// started. Everything the check established was true of a directory
+		// nothing was protecting any more: another backup could replace it, or
+		// a purge could run against it, in the gap. A verification that does
+		// not outlive itself authorises nothing.
+		var release func()
+		if covered, release, err = backupCovers(*backup, *vault, *dataDir, st); err != nil {
 			return err
 		}
+		defer release()
 	}
+	// The pause a test uses to prove the lock is still held here, between the
+	// verification and the deletion it authorises.
+	beforePurge()
 
 	rep, err := st.Purge(*vault, *grace)
 	// Print the versions before returning any error. They were deleted before
@@ -1143,19 +1157,32 @@ func cmdPurge(args []string, out io.Writer) error {
 //
 // It walks the whole history, which is O(versions) on a rare administrative
 // command that is about to delete data for good. That is the right trade.
-func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error) {
+// beforePurge runs between a successful backup check and the deletion it
+// authorises, and does nothing outside the test that proves the backup is
+// still locked at that moment (R23).
+var beforePurge = func() {}
+
+// backupCovers checks the backup and hands back the exclusion it took.
+//
+// The release is the caller's to run, after the purge, which is the whole
+// correction: a lock released when this returns protects the check and not the
+// thing the check authorises.
+func backupCovers(
+	dir, vault, dataDir string,
+	source *store.Store,
+) (latest int64, release func(), err error) {
 	if err := store.RefuseSamePlace(dir, dataDir); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if _, err := os.Stat(filepath.Join(dir, "basalt.db")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return 0, fmt.Errorf("there is no backup at %s: no basalt.db in it; nothing was purged", dir)
+			return 0, nil, fmt.Errorf("there is no backup at %s: no basalt.db in it; nothing was purged", dir)
 		}
-		return 0, err
+		return 0, nil, err
 	}
 	sourceLatest, err := source.LatestUID(vault)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	// Held for the whole of this check, and released by the caller's defer
 	// chain only after the purge has run (R04). Without it the directory being
@@ -1168,10 +1195,27 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 	// directory is refused while a purge is relying on it.
 	bkLock, err := dirlock.Shared(dir, dirlock.Data)
 	if err != nil {
-		return 0, fmt.Errorf(
+		return 0, nil, fmt.Errorf(
 			"the backup at %s is in use, so it cannot be relied on while it changes: %w", dir, err)
 	}
-	defer bkLock.Release()
+	// Released by the caller, after the purge. Everything below is a statement
+	// about this directory, and a statement whose subject can be replaced
+	// before it is acted on is not one (R23).
+	released := false
+	done := func() {
+		if released {
+			return
+		}
+		released = true
+		bkLock.Release()
+	}
+	// On every path out of here that is not success, because a check that
+	// refused has authorised nothing and must not hold the directory.
+	defer func() {
+		if err != nil {
+			done()
+		}
+	}()
 
 	// Read-only (I15, R04). This inspects a backup and must not migrate it,
 	// write its schema, or create anything: a diagnostic that modifies what it
@@ -1179,15 +1223,15 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 	bkDB, bkChunks := store.DataDir(dir)
 	bk, err := store.OpenForInspection(bkDB, bkChunks)
 	if err != nil {
-		return 0, fmt.Errorf("opening the backup at %s: %w", dir, err)
+		return 0, nil, fmt.Errorf("opening the backup at %s: %w", dir, err)
 	}
 	defer bk.Close()
 	backupLatest, err := bk.LatestUID(vault)
 	if err != nil {
-		return 0, fmt.Errorf("reading the backup at %s: %w", dir, err)
+		return 0, nil, fmt.Errorf("reading the backup at %s: %w", dir, err)
 	}
 	if backupLatest < sourceLatest {
-		return 0, fmt.Errorf(
+		return 0, nil, fmt.Errorf(
 			"the backup at %s holds %q up to uid %d and this store is at uid %d, so it is missing "+
 				"versions this purge would drop for good; nothing was purged.\n"+
 				"Take a fresh one first: basaltd backup -to %s", dir, vault, backupLatest, sourceLatest, dir)
@@ -1260,13 +1304,13 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 		}
 		return nil
 	}); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if seen == 0 && sourceLatest > 0 {
-		return 0, fmt.Errorf(
+		return 0, nil, fmt.Errorf(
 			"the backup at %s holds no versions of %q at all; nothing was purged", dir, vault)
 	}
-	return backupLatest, nil
+	return backupLatest, done, nil
 }
 
 // sameVersion says why two records of one uid differ, or "" when they do not.

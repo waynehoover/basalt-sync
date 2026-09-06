@@ -148,6 +148,32 @@ async function freeStagingPath(adapter: Writer, normalized: string): Promise<str
   return firstFreeName(named(), (path) => adapter.exists(path), named);
 }
 
+/**
+ * A folder beside `normalized` to move it into while it is identified (R22).
+ *
+ * A folder rather than a name, and that is the whole of it. Both trashes keep
+ * a file's basename and drop every folder above it, so a note moved aside
+ * under a different *name* reaches the trash under that name: delete
+ * `doomed.md` and find `.basalt-tmp-9f2c-doomed.md` in there, which is not
+ * what a person looking for the note they deleted searches for. Moved into a
+ * folder, it keeps the only part of the path a trash reads.
+ *
+ * Dot-prefixed and random for the reasons `stagingPath` is: never synced,
+ * never listed, and not a name somebody could already have taken. Emptied and
+ * removed on the way out; a crash in the middle leaves a hidden folder with
+ * one note in it, which is the same litter a staging copy leaves and is
+ * findable by the same search.
+ */
+function removalFolder(normalized: string, id: string): string {
+  const cut = normalized.lastIndexOf("/");
+  return `${cut === -1 ? "" : normalized.slice(0, cut + 1)}${STAGING_MARK}${id}`;
+}
+
+async function freeRemovalFolder(adapter: Writer, normalized: string): Promise<string> {
+  const named = () => removalFolder(normalized, nonce());
+  return firstFreeName(named(), (path) => adapter.exists(path), named);
+}
+
 function nonce(): string {
   const bytes = new Uint8Array(4);
   crypto.getRandomValues(bytes);
@@ -157,7 +183,7 @@ function nonce(): string {
 /** Writes and reads, minus the paths: what staging needs from an adapter. */
 type Writer = Pick<
   DataAdapter,
-  "writeBinary" | "readBinary" | "stat" | "exists" | "rename" | "remove"
+  "writeBinary" | "readBinary" | "stat" | "exists" | "rename" | "remove" | "mkdir" | "rmdir"
 >;
 
 /**
@@ -179,6 +205,21 @@ async function stage(
   } catch (err) {
     await adapter.remove(temp).catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * The bytes at a normalized path, or undefined when there is nothing to read.
+ *
+ * Straight at the adapter, because the paths this is used for are the hidden
+ * ones: `resolve` refuses a dot-prefixed name, which is exactly what staging
+ * and removal folders are.
+ */
+async function readRaw(adapter: Writer, normalized: string): Promise<Uint8Array | undefined> {
+  try {
+    return new Uint8Array(await adapter.readBinary(normalized));
+  } catch {
+    return undefined;
   }
 }
 
@@ -651,58 +692,136 @@ export class ObsidianVault implements Vault {
 
   /**
    * Writes over a file, keeping what was there when it is not what the caller
-   * expected (R01).
+   * expected (R01, R19).
    *
-   * The headless client does this by moving the old bytes aside with a rename
-   * before writing, so nothing is ever about to be destroyed. Obsidian's
-   * adapter has no way to do that: there is no hard link, and a rename to a
-   * side name followed by a write would leave the note missing from the vault
-   * for as long as the write took, which Obsidian's own indexer would notice.
+   * Obsidian's adapter has no hard link, so the headless client's trick of
+   * staging the new bytes and linking them into a name that has just been
+   * vacated is not available. What it does have is `rename`, and that is
+   * enough for the half that matters: the old bytes are moved to a path of
+   * their own *before* anything is written over them, so at no moment are
+   * bytes about to be destroyed.
    *
-   * So this reads the bytes it is about to replace and compares them. That is
-   * weaker in one way and stronger in another. Weaker, because an edit landing
-   * between the read and the write is still overwritten, which is the gap
-   * docs/design.md names and no adapter here can close. Stronger than what was
-   * here before, because what it compares is the content: the check it
-   * replaces looked at the file's length and its rounded modification time,
-   * and an ordinary correction is the same number of characters, saved by an
-   * editor that carries the timestamp across. Those edits were invisible and
-   * are not any more.
+   * It used to read the old bytes, write, and compare afterwards. That saw an
+   * edit the previous check could not, because it compared content rather than
+   * a length and a timestamp, and it still overwrote one that landed between
+   * the read and the write (R19). Moving first removes that: whatever is at
+   * the path when the rename happens is what comes out, whenever it was
+   * written.
+   *
+   * What remains is the instant between the rename and the write, when the
+   * name does not exist. A save landing exactly there is overwritten, because
+   * this adapter cannot create a name exclusively. docs/design.md says so.
    */
   async replace(
     path: string,
     expect: ExpectedContent | undefined,
     bytes: Uint8Array,
     times: Times,
+    keepAt: string,
   ): Promise<Replaced> {
     if (expect === undefined) {
       await this.write(path, bytes, times);
-      return {};
+      return { landed: true };
     }
-    const was = await this.readIfThere(path);
+    const from = this.resolve(path);
+    const kept = this.resolve(keepAt);
+    let moved = true;
+    try {
+      await this.adapter.rename(from, kept);
+    } catch {
+      // Nothing there, or the rename refused. Either way there is nothing this
+      // can promise about what it is replacing, so it writes and says nothing
+      // was preserved; the stat check above the caller is what is left.
+      moved = false;
+    }
     await this.write(path, bytes, times);
-    if (was === undefined) return {};
-    const id = await expect.idOf(was);
-    return id === expect.contentId ? {} : { kept: was };
+    if (!moved) return { landed: true };
+
+    this.entryChanged(kept);
+    const was = await this.readIfThere(keepAt);
+    if (was !== undefined && (await expect.idOf(was)) === expect.contentId) {
+      // The version this write was decided about: the copy is a duplicate of
+      // something the server already holds.
+      await this.adapter.remove(kept).catch(() => undefined);
+      return { landed: true };
+    }
+    this.wrote(kept);
+    return { keptAt: keepAt, landed: true };
   }
 
   /**
-   * Removes a file, and says so when what it removed was not what the caller
-   * meant to remove (R01).
+   * Removes a file, keeping it when it is not the version the caller meant to
+   * remove (R01, R22).
    *
-   * The deletion half, and the same reasoning. `remove` puts the file in a
-   * trash rather than unlinking it, so nothing is destroyed either way; what
-   * this adds is telling the caller that what it deleted had changed, so a
-   * deletion decided before a fetch does not quietly take an edit made during
-   * it and report an ordinary removal.
+   * Moved first and identified afterwards, for the reason `replace` is: a
+   * removal that hashes the path and then deletes it deletes whatever is
+   * there at the second step.
    */
-  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
-    const was = await this.readIfThere(path);
-    await this.remove(path);
-    if (was === undefined) return {};
-    const id = await expect.idOf(was);
-    return id === expect.contentId ? {} : { kept: was };
+  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
+    const from = this.resolve(path);
+    const kept = this.resolve(keepAt);
+    if (!(await this.adapter.exists(from))) {
+      await this.remove(path);
+      return { landed: true };
+    }
+
+    // Aside first, into a folder that keeps the note's own name, because what
+    // happens to it next depends on bytes nobody has read yet and reading
+    // them where it lies would identify one file and dispose of another.
+    const folder = await freeRemovalFolder(this.adapter, from);
+    const aside = `${folder}/${from.slice(from.lastIndexOf("/") + 1)}`;
+    try {
+      await this.adapter.mkdir(folder);
+      await this.adapter.rename(from, aside);
+    } catch {
+      // Could not be moved, so it cannot be identified either. Left where it
+      // is rather than deleted on an unproven decision.
+      await this.adapter.rmdir(folder, false).catch(() => undefined);
+      return { keptAt: path, landed: true };
+    }
+    this.entryChanged(from);
+
+    let emptied = false;
+    try {
+      const was = await readRaw(this.adapter, aside);
+      if (was !== undefined && (await expect.idOf(was)) === expect.contentId) {
+        // The version the pass decided to delete. It goes where a deletion
+        // goes, under the name it had: both trashes read the basename, which
+        // is why the move above was into a folder.
+        await this.intoTrash(aside);
+        emptied = true;
+        this.wentAway(from);
+        return { landed: true };
+      }
+      // Somebody else's version, so it is not deleted at all. It comes back
+      // out under a name a person will find, and the engine says so.
+      await this.adapter.rename(aside, kept);
+      emptied = true;
+      this.wrote(kept);
+      return { keptAt: keepAt, landed: true };
+    } catch {
+      // The note is still in the hidden folder, so the folder stays and the
+      // path is reported. Mislaid is recoverable; unmentioned is not.
+      return { keptAt: aside, landed: true };
+    } finally {
+      // Only once it is known to be empty. Obsidian's `rmdir` is `rm -rf`
+      // when told to recurse, and the note is what would be under there.
+      if (emptied) await this.adapter.rmdir(folder, false).catch(() => undefined);
+    }
   }
+
+  /**
+   * The digest of one path's contents (R31).
+   *
+   * Obsidian's adapter reads whole files and offers no stream, so this holds
+   * one copy and no more. The headless vault hashes as it reads.
+   */
+  contentDigest = async (path: string): Promise<string | undefined> => {
+    const bytes = await this.readIfThere(path);
+    if (bytes === undefined) return undefined;
+    const { plainDigest } = await import("../core/crypto.ts");
+    return plainDigest(bytes);
+  };
 
   /** The bytes at a path, or undefined when there is nothing there to read. */
   private async readIfThere(path: string): Promise<Uint8Array | undefined> {
@@ -1036,18 +1155,25 @@ export class ObsidianVault implements Vault {
     }
     // Either way it left its directory, and a pass that only deleted used to
     // save the index without ever fsyncing the directory it changed.
+    await this.intoTrash(normalized);
+    this.wentAway(normalized);
+  }
+
+  /**
+   * Into whichever trash this platform has, by normalized path.
+   *
+   * Separate from `remove` because `removeExpecting` disposes of a note that
+   * is sitting in a hidden folder at the time, and `resolve` refuses those.
+   */
+  private async intoTrash(normalized: string): Promise<void> {
     try {
-      if (await this.adapter.trashSystem(normalized)) {
-        this.wentAway(normalized);
-        return;
-      }
+      if (await this.adapter.trashSystem(normalized)) return;
     } catch {
       // No system trash here, or it refused. The local one is next, and a
       // failure to reach the recycle bin is not a reason to give up on the
       // deletion.
     }
     await this.adapter.trashLocal(normalized);
-    this.wentAway(normalized);
   }
 
   /**

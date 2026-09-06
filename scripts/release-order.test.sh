@@ -17,11 +17,29 @@
 # Asserted rather than trusted because the tempting edit is to hoist that
 # `release-tags.sh` call back out of the promotion step into the earlier one,
 # where it reads more tidily and is wrong.
+#
+# The other tempting edit is to put the build back inside the group, which is
+# what this file used to check for (R30). A concurrency group keeps one run
+# pending and no more: a third arrival discards the one that was waiting, and
+# `cancel-in-progress: false` does not change that, because it governs the
+# running job rather than the queue. Losing a queued promotion costs an alias
+# the next release will set correctly anyway. Losing a queued build costs the
+# immutable version tag, which nothing else will ever apply, so the build must
+# stay out of the group and the version tag must be applied there.
 set -uo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 workflow="$root/.github/workflows/release.yml"
 fails=0
+
+# One top-level job, by name, comments and all.
+job() {
+  awk -v want="  $1:" '
+    $0 == want { inside = 1; next }
+    inside && /^  [^ #]/ { inside = 0 }
+    inside { print }
+  ' "$workflow"
+}
 
 fail() {
   printf '  FAIL %s\n' "$1" >&2
@@ -31,26 +49,41 @@ ok() { printf '  ok   %s\n' "$1"; }
 
 echo "the image release:"
 
+build=$(job image)
+promotion=$(job promote)
+[ -n "$build" ] || fail "there is no image job to read"
+[ -n "$promotion" ] || fail "there is no promote job to read"
+
+# Comment lines dropped throughout: every one of these settings is quoted in
+# the paragraph explaining it, so a plain grep would find the explanation even
+# with the setting itself deleted, which is a check that cannot fail.
+settings() { grep -v '^ *#'; }
+
 # One promotion at a time.
-if grep -q "group: image-promotion" "$workflow"; then
+if printf '%s\n' "$promotion" | settings | grep -q "group: image-promotion"; then
   ok "promotion is serialised by a concurrency group"
 else
-  fail "the image job has no concurrency group, so two releases can promote at once"
+  fail "the promote job has no concurrency group, so two releases can promote at once"
 fi
 
-# And a queued one waits rather than being thrown away: an immutable version
-# tag that never got published is a release that silently did not happen.
-# Comment lines dropped first: the paragraph above the setting quotes it, so a
-# plain grep finds the explanation even when the setting itself has been
-# flipped, which is a check that cannot fail.
-if grep -v '^ *#' "$workflow" | grep -A 3 "group: image-promotion" | grep -q "cancel-in-progress: false"; then
-  ok "a queued release waits rather than being cancelled"
+# And the build is not in that group, because a queue that holds one pending
+# run drops the second, and a version tag nothing published is a release that
+# silently did not happen (R30).
+if printf '%s\n' "$build" | settings | grep -q "concurrency:"; then
+  fail "the build shares the promotion group, so a third release discards a queued build and its version tag"
 else
-  fail "a queued release is cancelled, so its version tag is never published"
+  ok "the build is outside the promotion group, where a queue cannot discard it"
+fi
+
+# Which is only worth anything if the version tag is applied there.
+if printf '%s\n' "$build" | settings | grep -q 'imagetools create --tag "\$IMAGE:\$VERSION"'; then
+  ok "the immutable version tag is applied by the build itself"
+else
+  fail "nothing outside the promotion group applies the version tag, so a dropped promotion loses it"
 fi
 
 # The decision is made inside the step that applies it.
-promote=$(awk '/name: give the checked image its names/,/^      - name: the published/' "$workflow")
+promote=$(printf '%s\n' "$promotion" | awk '/name: give the checked image its names/,/^      - name: the published/')
 if printf '%s' "$promote" | grep -q "release-tags.sh"; then
   ok "the tags are worked out inside the promotion step"
 else

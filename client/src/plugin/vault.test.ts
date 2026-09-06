@@ -1593,7 +1593,7 @@ describe("the index write that is skipped because nothing changed (P-D6)", () =>
  * and compares the content.
  */
 describe("writing over a file the pass did not decide about", () => {
-  it("hands back what it displaced when the bytes are not the expected ones", async () => {
+  it("keeps what it displaced at a path of its own, not in memory", async () => {
     const enc = new TextEncoder();
     await adapter.write("note.md", "the original line\n", { mtime: 1000 });
 
@@ -1602,15 +1602,17 @@ describe("writing over a file the pass did not decide about", () => {
       { contentId: "not-what-is-there", idOf: async () => "something-else" },
       enc.encode("the server's version\n"),
       { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
     );
 
-    expect(out.kept, "the displaced bytes were not handed back").toBeDefined();
-    expect(new TextDecoder().decode(out.kept!)).toBe("the original line\n");
-    // And the write still happened: preserving is not refusing.
+    expect(out.keptAt, "the displaced version was not preserved anywhere").toBe("note (kept).md");
+    // On the disk, which is the point: nothing has to remember to save it.
+    expect(adapter.text("note (kept).md")).toBe("the original line\n");
     expect(adapter.text("note.md")).toBe("the server's version\n");
+    expect(out.landed).toBe(true);
   });
 
-  it("hands back nothing when it wrote over exactly what it expected", async () => {
+  it("keeps nothing when it wrote over exactly what it expected", async () => {
     const enc = new TextEncoder();
     await adapter.write("note.md", "the original line\n", { mtime: 1000 });
 
@@ -1619,19 +1621,51 @@ describe("writing over a file the pass did not decide about", () => {
       { contentId: "the-one-we-expect", idOf: async () => "the-one-we-expect" },
       enc.encode("the server's version\n"),
       { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
     );
-    expect(out.kept, "a file nobody had touched was reported as displaced").toBeUndefined();
+    expect(out.keptAt, "a file nobody had touched was preserved").toBeUndefined();
     expect(adapter.text("note.md")).toBe("the server's version\n");
+    expect(adapter.text("note (kept).md"), "a needless copy was left behind").toBeUndefined();
+  });
+
+  /**
+   * The gap R19 named: an edit landing after the adapter has looked and before
+   * it writes. Moving the old bytes out first is what closes it, because
+   * whatever is at the path when the rename happens is what comes out.
+   */
+  it("keeps an edit that lands while it is deciding", async () => {
+    const enc = new TextEncoder();
+    await adapter.write("note.md", "the original line\n", { mtime: 1000 });
+    // The editor, between this adapter's first look and its write.
+    adapter.beforeRename = async () => {
+      adapter.beforeRename = undefined;
+      await adapter.write("note.md", "the unsent edit\n", { mtime: 1000 });
+    };
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "the-original", idOf: async () => "whatever-it-is" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    const everywhere = [adapter.text("note.md"), adapter.text(out.keptAt ?? "")].join("|");
+    expect(everywhere, "the edit made during the write is gone").toContain("the unsent edit\n");
   });
 
   it("says what a removal took away when it was not the expected version", async () => {
     await adapter.write("gone.md", "the edit nobody sent\n", { mtime: 1000 });
 
-    const out = await vault.removeExpecting("gone.md", {
-      contentId: "the version the pass decided about",
-      idOf: async () => "something else entirely",
-    });
-    expect(out.kept, "the removal did not say what it took").toBeDefined();
-    expect(new TextDecoder().decode(out.kept!)).toBe("the edit nobody sent\n");
+    const out = await vault.removeExpecting(
+      "gone.md",
+      {
+        contentId: "the version the pass decided about",
+        idOf: async () => "something else entirely",
+      },
+      "gone (kept).md",
+    );
+    expect(out.keptAt, "the removal did not preserve what it took").toBe("gone (kept).md");
+    expect(adapter.text("gone (kept).md")).toBe("the edit nobody sent\n");
   });
 });

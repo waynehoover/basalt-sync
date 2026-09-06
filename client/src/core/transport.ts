@@ -496,6 +496,24 @@ interface Pending {
 const MAX_UNAGREED_FRAME_BYTES = 1 << 20;
 const MAX_UNAGREED_FETCH_BYTES = 1 << 20;
 
+/**
+ * What this device will hold for one batch and one fetch, whatever the server
+ * advertises (R26).
+ *
+ * The handshake numbers are a server saying how much it may send. They were
+ * used directly as the client's own ceilings, which makes the peer the one
+ * deciding how much memory this process commits; a handshake advertising
+ * `Number.MAX_SAFE_INTEGER` was accepted and produced a text-frame ceiling of
+ * eighteen quadrillion. Whether the server is hostile or simply wrong does not
+ * change what it costs.
+ *
+ * Set at the protocol's own defaults, so an ordinary server is unaffected and
+ * one asking for more than the protocol describes is held to it. A server that
+ * advertises *less* still gets its way: the smaller of the two wins.
+ */
+const LOCAL_MAX_BATCH_BYTES = 16 << 20;
+const LOCAL_MAX_FETCH_BYTES = 64 << 20;
+
 export class Transport {
   private socket: SocketLike | undefined;
 
@@ -762,7 +780,7 @@ export class Transport {
         );
         return;
       }
-      this.onTextFrame(frame);
+      this.onTextFrame(frame, data.length);
       return;
     }
 
@@ -818,12 +836,14 @@ export class Transport {
     }
   }
 
-  private onTextFrame(frame: Reply): void {
+  private onTextFrame(frame: Reply, frameBytes = 0): void {
     // Notifications first, and by name. Everything else is the answer to a
     // request, matched by id; see the note at the top about why a client that
     // skips this reads a batch as its reply and hangs.
     if (frame["op"] === "batch") {
-      this.queueNotification(() => this.onBatchFrame(frame));
+      // Charged its own size, because a batch is the notification that holds
+      // anything: its entries stay alive for as long as it is queued (R26).
+      this.queueNotification(() => this.onBatchFrame(frame), frameBytes);
       return;
     }
     if (frame["op"] === "caught-up") {
@@ -924,9 +944,34 @@ export class Transport {
    */
   private static readonly MAX_BACKLOG = 1024;
 
-  private backlog = 0;
+  /**
+   * And how many *bytes* those notifications may be holding (R26).
+   *
+   * A count of messages is not a bound on memory. Each queued batch holds its
+   * frame's entries alive, and a thousand batches of sixteen megabytes each is
+   * sixteen gigabytes with the counter reading well inside its limit. The
+   * count still matters, because a flood of tiny frames is its own problem;
+   * this is the other half.
+   *
+   * Sized at four batches, which is more than the engine is ever behind by on
+   * an honest server and far below what makes a phone unhappy.
+   */
+  private static readonly MAX_BACKLOG_BYTES = 4 * LOCAL_MAX_BATCH_BYTES;
 
-  private queueNotification(work: () => void | Promise<void>): void {
+  private backlog = 0;
+  private backlogBytes = 0;
+
+  private queueNotification(work: () => void | Promise<void>, bytes = 0): void {
+    if (this.backlogBytes + bytes > Transport.MAX_BACKLOG_BYTES) {
+      this.die(
+        new ProtocolError(
+          "protostate",
+          `server sent ${this.backlogBytes + bytes} bytes of notifications faster than this ` +
+            `device could apply them, over the ${Transport.MAX_BACKLOG_BYTES} it will hold`,
+        ),
+      );
+      return;
+    }
     if (this.backlog >= Transport.MAX_BACKLOG) {
       // Ended rather than dropped. Dropping a batch would advance nothing and
       // leave a hole this device never asks about again, which is the silent
@@ -942,6 +987,7 @@ export class Transport {
       return;
     }
     this.backlog++;
+    this.backlogBytes += bytes;
     this.notifying = this.notifying
       .then(work)
       .catch((err: unknown) => {
@@ -949,6 +995,7 @@ export class Transport {
       })
       .finally(() => {
         this.backlog--;
+        this.backlogBytes -= bytes;
       });
   }
 
@@ -1319,8 +1366,18 @@ export class Transport {
       perFileMax: this.count(reply, "perFileMax", "ready"),
       chunkMax: this.count(reply, "chunkMax", "ready"),
       maxChunks: this.count(reply, "maxChunks", "ready"),
-      maxBatchBytes: this.count(reply, "maxBatchBytes", "ready"),
-      maxFetchBytes: this.count(reply, "maxFetchBytes", "ready"),
+      // Capped by what this device is willing to hold, not only by what the
+      // server says it will send (R26).
+      //
+      // These decide how much memory the client will commit: the text-frame
+      // ceiling is derived from the batch figure and the fetch budget is the
+      // fetch figure. Taking them from the handshake as given means the peer
+      // chooses, and a server advertising `Number.MAX_SAFE_INTEGER` was
+      // accepted, which is the same as having no ceiling at all. A limit is a
+      // negotiation: the smaller of what they will send and what this device
+      // will accept.
+      maxBatchBytes: Math.min(this.count(reply, "maxBatchBytes", "ready"), LOCAL_MAX_BATCH_BYTES),
+      maxFetchBytes: Math.min(this.count(reply, "maxFetchBytes", "ready"), LOCAL_MAX_FETCH_BYTES),
       wrapped,
     };
     if (limits.proto !== PROTO) {

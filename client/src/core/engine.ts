@@ -2294,7 +2294,7 @@ export class Engine {
     for (const d of batch) {
       try {
         const from = local.get(d);
-        if (from !== undefined && (await this.landFromLocal(d, from))) {
+        if (from !== undefined && (await this.landFromLocal(d, from, report))) {
           if (d.kind === "download") report.downloaded++;
           else report.restored++;
           this.log(d.kind, d.path, `${d.why}, from ${from} without asking`);
@@ -2492,13 +2492,14 @@ export class Engine {
         // length is invisible to it. `removeExpecting` says whether what it
         // took away was the version this decided about, and hands it back when
         // it was not.
-        const kept = await this.removedSomethingElse(path, based, baselines);
-        if (kept !== undefined) {
+        const keptAt = await this.removedSomethingElse(path, based, baselines);
+        if (keptAt !== undefined) {
           this.log("kept what was about to be deleted", path, {
             why: "it changed after the pass decided to delete it",
             deletion: why,
+            keptAt,
           });
-          await this.keepBesides(path, kept, report);
+          this.landed(keptAt);
           report.conflicted++;
           this.entries.delete(path);
           continue;
@@ -2582,7 +2583,7 @@ export class Engine {
    * every time. A false positive would write the wrong bytes into somebody's
    * note, so there is no version of this worth guessing at.
    */
-  private async landFromLocal(d: Incoming, from: string): Promise<boolean> {
+  private async landFromLocal(d: Incoming, from: string, report: SyncReport): Promise<boolean> {
     let bytes: Uint8Array;
     try {
       bytes = await this.opts.vault.read(from);
@@ -2603,7 +2604,21 @@ export class Engine {
     // wire does not make the destination any less somebody's open note.
     if (!(await this.unchangedSince(d.path, d.based))) return false;
 
-    await this.opts.vault.write(d.path, bytes, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+    // And the same preserving write (R19). This path used to call
+    // `vault.write` straight after the stat, so a version rebuilt from chunks
+    // this device already had overwrote an edit that the stat could not see,
+    // while the identical download beside it kept one.
+    if (
+      await this.writePreserving(
+        d.path,
+        this.expecting(d.baseDigest),
+        bytes,
+        { mtime: d.remote.mtime, ctime: d.remote.mtime },
+        report,
+      )
+    ) {
+      return false;
+    }
     this.landed(d.path);
     observe(d.entry, {
       folder: false,
@@ -2649,22 +2664,17 @@ export class Engine {
    * reads it whole, which is what the pass was about to do anyway.
    */
   private async digestOf(path: string): Promise<string | undefined> {
+    // The vault's own, where it has one (R31).
+    //
+    // This used to collect every block the vault streamed and then allocate a
+    // second buffer of the whole file to join them into, which holds a large
+    // attachment twice over and does it on the path that queues a download.
+    // The comment called it streaming; it was not. A vault that can hash as it
+    // reads keeps nothing, and the headless one can.
+    const streamed = this.opts.vault.contentDigest;
+    if (streamed !== undefined) return await streamed(path);
     try {
-      const blocks = this.opts.vault.readBlocks;
-      if (blocks === undefined) return await plainDigest(await this.opts.vault.read(path));
-      const parts: Uint8Array[] = [];
-      let total = 0;
-      for await (const block of blocks.call(this.opts.vault, path)) {
-        parts.push(block);
-        total += block.length;
-      }
-      const all = new Uint8Array(total);
-      let at = 0;
-      for (const part of parts) {
-        all.set(part, at);
-        at += part.length;
-      }
-      return await plainDigest(all);
+      return await plainDigest(await this.opts.vault.read(path));
     } catch {
       // A file that cannot be read is one this cannot make a promise about.
       // Undefined means "no baseline", and every caller treats that as a
@@ -2682,36 +2692,62 @@ export class Engine {
   }
 
   /**
-   * Writes the incoming version, keeping anything it displaced that this pass
-   * did not decide about (R01).
+   * Writes over a path, keeping anything it displaces that this pass did not
+   * decide about (R01, R18, R19).
    *
-   * Returns true when something was kept, which means the incoming version did
-   * not land as itself and the caller must not record it as synced.
+   * The one door every destructive landing goes through: an ordinary download,
+   * a version rebuilt from chunks this device already had, and a merge. Two of
+   * those still called `vault.write` after a stat, which is the check this
+   * whole mechanism exists because it is not enough.
    *
-   * A vault with no `replace` falls back to the plain write, which is what
-   * every vault did before and is still guarded by the stat above.
+   * Returns true when something was preserved or the write did not land. Both
+   * mean the incoming version is not simply in place, so the caller must not
+   * record it as synced.
+   *
+   * A vault with no `replace` falls back to the plain write, guarded only by
+   * the stat, which is what every vault had before.
    */
-  private async landedOverSomethingElse(
-    d: Incoming,
+  private async writePreserving(
+    path: string,
+    expect: ExpectedContent | undefined,
     content: Uint8Array,
-    report: SyncReport,
     times: Times,
+    report: SyncReport,
   ): Promise<boolean> {
     const vault = this.opts.vault;
     if (vault.replace === undefined) {
-      await vault.write(d.path, content, times);
+      await vault.write(path, content, times);
       return false;
     }
-    const out = await vault.replace(d.path, this.expecting(d.baseDigest), content, times);
-    if (out.kept === undefined) return false;
-    // Something else was at the path. It is in hand rather than gone, which is
-    // the whole point, and it goes beside the note under a conflict name.
-    this.log("kept what was already there", d.path, {
-      why: "it changed while its next version was being fetched",
-    });
-    await this.keepBesides(d.path, out.kept, report);
-    report.conflicted++;
-    return true;
+    // The name a displaced version will take, worked out here because conflict
+    // naming is the engine's and a name a person recognises is the point of
+    // it. A sibling, so the adapter's move onto it is a rename inside one
+    // directory.
+    const keepAt = await this.freeConflictPath(path);
+    const out = await vault.replace(path, expect, content, times, keepAt);
+
+    if (out.keptAt !== undefined) {
+      // On the disk already, under a name of its own. Nothing here has to
+      // write it down, which is the difference between this and handing back
+      // a buffer: no failure between the adapter and here can lose it (R18).
+      this.log("kept what was already there", path, {
+        why: "it changed while its next version was being fetched",
+        keptAt: out.keptAt,
+      });
+      this.landed(out.keptAt);
+      report.conflicted++;
+    }
+    if (!out.landed) {
+      // Something else took the name in the instant it was free, and it is
+      // newer than this decision. The incoming version needs a home of its own
+      // rather than being dropped.
+      const beside = await this.freeConflictPath(path);
+      await vault.write(beside, content, times);
+      this.landed(beside);
+      this.log("kept the incoming version beside", path, { at: beside });
+      if (out.keptAt === undefined) report.conflicted++;
+    }
+    return out.keptAt !== undefined || !out.landed;
   }
 
   /**
@@ -2729,24 +2765,16 @@ export class Engine {
     path: string,
     based: LocalState | undefined,
     baselines: ReadonlyMap<string, string>,
-  ): Promise<Uint8Array | undefined> {
+  ): Promise<string | undefined> {
     const vault = this.opts.vault;
     const digest = based === undefined || based.folder ? undefined : baselines.get(path);
     if (vault.removeExpecting === undefined || digest === undefined) {
       await vault.remove(path);
       return undefined;
     }
-    const out = await vault.removeExpecting(path, { contentId: digest, idOf: plainDigest });
-    return out.kept;
-  }
-
-  /** Puts bytes a write displaced beside the note, under a free conflict name. */
-  private async keepBesides(path: string, bytes: Uint8Array, report: SyncReport): Promise<void> {
-    void report;
-    const where = await this.freeConflictPath(path);
-    await this.opts.vault.write(where, bytes, { mtime: this.now(), ctime: this.now() });
-    this.landed(where);
-    this.log("kept a displaced version", where);
+    const keepAt = await this.freeConflictPath(path);
+    const out = await vault.removeExpecting(path, { contentId: digest, idOf: plainDigest }, keepAt);
+    return out.keptAt;
   }
 
   private async unchangedSince(path: string, based: LocalState | undefined): Promise<boolean> {
@@ -2840,10 +2868,13 @@ export class Engine {
     // write. So the adapter moves whatever is there aside before writing over
     // it and hands back anything that was not what this decided about.
     if (
-      await this.landedOverSomethingElse(d, content, report, {
-        mtime: d.remote.mtime,
-        ctime: d.remote.mtime,
-      })
+      await this.writePreserving(
+        d.path,
+        this.expecting(d.baseDigest),
+        content,
+        { mtime: d.remote.mtime, ctime: d.remote.mtime },
+        report,
+      )
     ) {
       return false;
     }
@@ -3086,10 +3117,24 @@ export class Engine {
         await this.conflict(path, entry, remote, report, why, theirsBytes);
         return;
       }
-      await this.opts.vault.write(path, new TextEncoder().encode(text), {
-        mtime: this.now(),
-        ctime: entry.ctime,
-      });
+      // Preserving, like every other landing (R19), and with the one baseline
+      // that is exactly right: `mine` is the bytes this merge was computed
+      // from, so a digest of them says precisely "is the file still the one I
+      // merged". The metadata check above was taken *after* those bytes were
+      // read, which let a newer file wear an older baseline's stat.
+      if (
+        await this.writePreserving(
+          path,
+          { contentId: await plainDigest(new TextEncoder().encode(mine)), idOf: plainDigest },
+          new TextEncoder().encode(text),
+          { mtime: this.now(), ctime: entry.ctime },
+          report,
+        )
+      ) {
+        // Something else was at the path and has been kept. The merge did not
+        // land as itself, so the ancestor must not move.
+        return;
+      }
     }
     // Uploaded whatever the outcome, because even "take theirs" has to be
     // acknowledged for this path before the ancestor can move.

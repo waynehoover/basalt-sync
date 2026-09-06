@@ -126,3 +126,63 @@ describe("the scan status makes", () => {
     ).toBe(0);
   });
 });
+
+/**
+ * The two formats agree about what happened (R25).
+ *
+ * They did not: text returned failure when the local scan could not run and
+ * JSON returned success for the same vault in the same state, so a cron job
+ * and a person looking at the same command were told different things.
+ */
+describe("the exit status", () => {
+  it("is the same in both formats when the vault cannot be read", async () => {
+    const dir = await pairedVault();
+    const shut = join(dir, "shut");
+    await mkdir(shut);
+    await (await import("node:fs/promises")).chmod(shut, 0o000);
+    dirs.push(shut);
+
+    const codes: Record<string, number> = {};
+    for (const json of [false, true]) {
+      const args = ["status", "--dir", dir, "--timeout", "300", ...(json ? ["--json"] : [])];
+      codes[json ? "json" : "text"] = await run(args, { out: () => {}, err: () => {} });
+    }
+    await (await import("node:fs/promises")).chmod(shut, 0o700).catch(() => {});
+
+    if (codes["text"] === 0 && codes["json"] === 0) {
+      expect(process.getuid?.(), "the scan succeeded, so this proves nothing").toBe(0);
+      return;
+    }
+    expect(
+      codes["json"],
+      `text exited ${codes["text"]} and json exited ${codes["json"]} for one vault`,
+    ).toBe(codes["text"]);
+  });
+
+  /**
+   * And the count says what it is. Hashing every note is what a sync does;
+   * this compares sizes and timestamps, so an edit that keeps both is
+   * invisible and the number is an estimate.
+   */
+  it("says what the unsent count was decided from", async () => {
+    const dir = await pairedVault();
+    await writeFile(join(dir, "one.md"), "a note\n");
+    const said = (await status(dir)) as { unsent: number | string; unsentFrom?: string };
+    expect(said.unsentFrom, "the basis of the count is not stated").toBe("size and timestamp");
+  });
+
+  it("does not call a vault up to date on the strength of timestamps", async () => {
+    const dir = await pairedVault();
+    const out: string[] = [];
+    await run(["status", "--dir", dir, "--timeout", "300"], {
+      out: (l) => out.push(l),
+      err: () => {},
+    });
+    const text = out.join("\n");
+    if (!text.includes("state")) return; // could not reach a server; nothing to judge
+    expect(
+      text,
+      "status claimed the vault is up to date from a comparison of sizes and timestamps",
+    ).not.toMatch(/up to date with the server/);
+  });
+});

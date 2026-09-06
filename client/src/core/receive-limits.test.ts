@@ -75,3 +75,93 @@ describe("a chunk that expands past what a chunk may hold", () => {
     }
   }, 60_000);
 });
+
+/**
+ * The peer does not choose how much memory this device commits (R26).
+ *
+ * The handshake's `maxBatchBytes` and `maxFetchBytes` are a server saying how
+ * much it may send. They were taken as the client's own ceilings, which makes
+ * the peer the one deciding: a handshake advertising `Number.MAX_SAFE_INTEGER`
+ * was accepted and produced a text-frame ceiling of eighteen quadrillion.
+ * Whether the server is hostile or simply wrong does not change the cost.
+ */
+describe("what a server may talk this device into holding", () => {
+  it("caps the advertised limits at what this device will accept", async () => {
+    const { FakeSocket } = await import("./fake-socket.ts");
+    const { Transport } = await import("./transport.ts");
+
+    const socket = new FakeSocket();
+    const t = new Transport("ws://test", {
+      onBatch: () => {},
+      socketFactory: () => socket,
+      timeoutMs: 2000,
+    });
+    const connecting = t.connect();
+    socket.open();
+    await connecting;
+
+    const hello = t.hello({ vault: "v", deviceId: "d1", device: "d", token: "t", cursor: 0 });
+    await new Promise((r) => setTimeout(r, 0));
+    socket.raw({
+      res: "ready",
+      id: 1,
+      proto: 4,
+      minProto: 4,
+      cursor: 0,
+      perFileMax: Number.MAX_SAFE_INTEGER,
+      chunkMax: Number.MAX_SAFE_INTEGER,
+      maxChunks: Number.MAX_SAFE_INTEGER,
+      maxBatchBytes: Number.MAX_SAFE_INTEGER,
+      maxFetchBytes: Number.MAX_SAFE_INTEGER,
+      wrapped: "not-a-real-key",
+      serverVersion: "0",
+    });
+    const limits = await hello;
+
+    expect(
+      limits.maxBatchBytes,
+      "the server chose how large a frame this device will parse",
+    ).toBeLessThanOrEqual(16 * 1024 * 1024);
+    expect(
+      limits.maxFetchBytes,
+      "the server chose how many bytes of bodies this device will hold",
+    ).toBeLessThanOrEqual(64 * 1024 * 1024);
+    t.close();
+  });
+
+  it("still honours a server that asks for less", async () => {
+    const { FakeSocket } = await import("./fake-socket.ts");
+    const { Transport } = await import("./transport.ts");
+
+    const socket = new FakeSocket();
+    const t = new Transport("ws://test", {
+      onBatch: () => {},
+      socketFactory: () => socket,
+      timeoutMs: 2000,
+    });
+    const connecting = t.connect();
+    socket.open();
+    await connecting;
+
+    const hello = t.hello({ vault: "v", deviceId: "d1", device: "d", token: "t", cursor: 0 });
+    await new Promise((r) => setTimeout(r, 0));
+    socket.raw({
+      res: "ready",
+      id: 1,
+      proto: 4,
+      minProto: 4,
+      cursor: 0,
+      perFileMax: 1024,
+      chunkMax: 1024,
+      maxChunks: 8,
+      maxBatchBytes: 4096,
+      maxFetchBytes: 8192,
+      wrapped: "not-a-real-key",
+      serverVersion: "0",
+    });
+    const limits = await hello;
+    expect(limits.maxBatchBytes, "a smaller advertised limit was raised").toBe(4096);
+    expect(limits.maxFetchBytes, "a smaller advertised limit was raised").toBe(8192);
+    t.close();
+  });
+});

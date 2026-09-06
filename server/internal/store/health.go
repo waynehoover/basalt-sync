@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -166,6 +167,39 @@ func (s *Store) CheckHealth(ctx context.Context) (h Health) {
 	if h.FreeBytes < lowSpaceBytes {
 		h.CanPersist = false
 		h.Why = HealthNoSpace
+		return h
+	}
+
+	// And whether a body can actually be written there (R28).
+	//
+	// `statfs` says the volume is mounted and has room, which is not the same
+	// as this process being allowed to write to it: a chunk root whose
+	// permissions have gone, or one on a mount the kernel turned read-only
+	// after an I/O error, answers `statfs` perfectly and refuses every upload.
+	// That is the same mistake the database side made with `SELECT 1`, one
+	// directory over, and the field is still called CanPersist.
+	//
+	// A file created and removed, which is what an upload does and costs one
+	// inode for the length of this call. Named so that anything that survives
+	// a crash here is obviously this and obviously disposable, and it lives at
+	// the chunk root rather than in a vault's shard so it can never be mistaken
+	// for a body.
+	probe := filepath.Join(dir, ".basalt-health-probe")
+	f, openErr := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if openErr != nil {
+		h.CanPersist = false
+		h.Why = HealthUnwritable
+		return h
+	}
+	chunkWriteErr := func() error {
+		defer func() { _ = f.Close() }()
+		_, failed := f.Write([]byte("ok"))
+		return failed
+	}()
+	_ = os.Remove(probe)
+	if chunkWriteErr != nil {
+		h.CanPersist = false
+		h.Why = HealthUnwritable
 	}
 	return h
 }
