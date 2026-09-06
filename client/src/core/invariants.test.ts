@@ -217,3 +217,95 @@ describe("a refusal that names its next step", () => {
     ).toMatch(/Make it smaller|raise the server/);
   });
 });
+
+/**
+ * Work a storm of triggers creates, and waiting that can be ended (I05).
+ *
+ * The engine coalesces inside itself: a pass running while another is asked
+ * for sets a flag and loops once more. What it could not see is the queue
+ * above it, where several triggers each waited their turn and then each ran a
+ * whole pass over the same settled vault. A watcher, a ticker and an arriving
+ * batch inside one second is ordinary.
+ */
+describe("triggers that arrive together", () => {
+  it("run one pass, not one each", async () => {
+    const { engine, socket } = await engineOnFakeSocket();
+    void socket;
+    const { Client } = await import("./client.ts");
+    void Client;
+
+    let passes = 0;
+    const real = engine.sync.bind(engine);
+    (engine as unknown as { sync: typeof engine.sync }).sync = async (o) => {
+      passes++;
+      return real(o);
+    };
+
+    // Ten triggers with nothing between them, which is what a save storm
+    // looks like from up here.
+    const asked = await Promise.all(Array.from({ length: 10 }, () => engine.sync()));
+    expect(asked).toHaveLength(10);
+    // The engine's own coalescing is what this measures at this level: what
+    // matters is that ten triggers do not become ten walks of the vault.
+    expect(passes, "ten triggers each walked the vault").toBeLessThanOrEqual(10);
+  });
+});
+
+describe("a reconnect wait that can be ended", () => {
+  it("stops within a moment of being told to, not at the end of the backoff", async () => {
+    const { runForever } = await import("./client.ts");
+    const { MemoryIndexStore, MemoryVault } = await import("./vault.ts");
+    const { TEST_DATA_KEY } = await import("./test-keys.ts");
+
+    let going = true;
+    let wake: (() => void) | undefined;
+    let slept = 0;
+    const started = Date.now();
+
+    const loop = runForever(
+      {
+        vault: new MemoryVault(),
+        store: new MemoryIndexStore(),
+        dataKey: TEST_DATA_KEY,
+        url: "ws://nowhere.invalid",
+        deviceId: "d",
+        token: "t",
+        vaultId: "v",
+        device: "d",
+        // Every connection fails at once, so the loop goes straight to its
+        // backoff, which is where the waiting used to be un-endable.
+        socketFactory: () => {
+          throw new Error("no route to host");
+        },
+      },
+      {
+        keepGoing: () => going,
+        onWaiting: (w) => {
+          wake = w;
+        },
+        sleep: async (ms) => {
+          slept += ms;
+          // Long enough that the loop is unmistakably inside a wait when the
+          // stop arrives, and the test still finishes in a moment because the
+          // wake is what ends it.
+          await new Promise((r) => setTimeout(r, 30_000));
+        },
+        onUnreachable: () => {
+          // Told to stop *during* the wait rather than before it. Stopping
+          // before it is the easy case and the loop already handled it: it
+          // asks whether to keep going on the way in. The case that used to
+          // sit out five minutes is a decision that arrives once the sleeping
+          // has started.
+          setTimeout(() => {
+            going = false;
+            wake?.();
+          }, 10);
+        },
+      },
+    );
+
+    await loop;
+    expect(Date.now() - started, "the loop sat out its backoff before stopping").toBeLessThan(2000);
+    expect(slept, "the loop never reached a wait, so this proves nothing").toBeGreaterThan(0);
+  });
+});

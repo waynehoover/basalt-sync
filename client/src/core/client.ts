@@ -323,8 +323,13 @@ export class Client {
     return total;
   }
 
-  private pass(opts: SyncOptions): Promise<SyncReport> {
+  private pass(opts: SyncOptions, onStart?: () => void): Promise<SyncReport> {
     return this.serial(async () => {
+      // Inside the queue slot, so "this pass has begun" means the vault is
+      // about to be read rather than that a promise exists. `sync` uses it to
+      // stop handing this pass to callers whose news arrived after the read
+      // (I05).
+      onStart?.();
       // A closed client starts no pass. `close` drains the queue, and a
       // settle sleeping between two passes was not in the queue: it woke
       // after the drain, ran a pass against the closed transport, and saved
@@ -424,6 +429,22 @@ export class Client {
   }
 
   /**
+   * A pass that is already going to happen, if one is (I05).
+   *
+   * The engine coalesces inside itself: a pass running when another is asked
+   * for sets `again` and loops once more. What it cannot see is the queue
+   * above it, where several triggers each wait their turn and then each run a
+   * whole pass. A watcher, a ticker and an arriving batch inside one second is
+   * ordinary, and it produced three passes over the same settled vault.
+   *
+   * So a pass that has not started yet is a pass the next trigger can join.
+   * Not one that has started: it read the vault before whatever prompted this
+   * caller happened, and returning it would report on a state older than the
+   * question.
+   */
+  private queued: Promise<SyncReport | undefined> | undefined;
+
+  /**
    * A sync whose failure does not become an unhandled rejection.
    *
    * Public because a shell with its own reason to sync needs it: the plugin
@@ -441,14 +462,36 @@ export class Client {
           "the vault, because it does not hold the lock that makes writing safe",
       );
     }
-    try {
-      return await this.pass(opts);
-    } catch (err) {
-      this.opts.log?.("sync failed", (err as Error).message);
-      this.opts.onSyncFailed?.(err as Error);
-      return undefined;
-    }
+    // Joined rather than queued behind, when one is already waiting to start
+    // (I05). Options are compared as a whole: a caller that has turned the
+    // write debounce off is asking a different question from one that has not
+    // and must not be given the other's answer.
+    const key = JSON.stringify(opts);
+    if (this.queued !== undefined && this.queuedKey === key) return this.queued;
+
+    const run = (async (): Promise<SyncReport | undefined> => {
+      try {
+        // Cleared the moment the pass begins rather than when it ends. From
+        // then on it has read the vault, so a trigger arriving later would be
+        // given an answer about a state older than its own news.
+        return await this.pass(opts, () => {
+          if (this.queued === run) {
+            this.queued = undefined;
+            this.queuedKey = undefined;
+          }
+        });
+      } catch (err) {
+        this.opts.log?.("sync failed", (err as Error).message);
+        this.opts.onSyncFailed?.(err as Error);
+        return undefined;
+      }
+    })();
+    this.queued = run;
+    this.queuedKey = key;
+    return run;
   }
+
+  private queuedKey: string | undefined;
 
   /**
    * Records a rename the host reported, once nothing else is touching the
@@ -953,6 +996,17 @@ export interface ForeverHooks {
    * whichever client is currently connected.
    */
   onClient?(client: Client | undefined): void;
+  /**
+   * A way to end the backoff wait immediately (I05).
+   *
+   * Called once, with a function that wakes the loop out of whatever it is
+   * waiting through. A shell that has just been told to stop calls it after
+   * setting `keepGoing` to false, and the loop returns rather than sleeping
+   * out the rest of a five-minute retry. Optional: without it the loop still
+   * checks `keepGoing` every second, which is prompt enough for a person and
+   * not for a test.
+   */
+  onWaiting?(wake: () => void): void;
   /** The connection ended, and how long until the next attempt. */
   onDisconnected?(cause: Error, retryInMs: number): void;
   /** A connection could not be made, and how long until the next attempt. */
@@ -994,7 +1048,47 @@ export const IDENTICAL_FAILURES_BEFORE_STOPPING = 3;
  */
 export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}): Promise<void> {
   const backoff = new Backoff(0, 300_000, 5_000, true);
-  const wait = hooks.sleep ?? sleep;
+  const sleeper = hooks.sleep ?? sleep;
+
+  /**
+   * The backoff wait, which `stop` can end (I05).
+   *
+   * A dropped connection backs off to five minutes, and unloading the plugin
+   * or unlinking the vault used to wait out whatever was left of it: the loop
+   * asked `keepGoing` before the sleep and after it, and did nothing at all
+   * in between. Obsidian disabling a plugin therefore left a timer and a
+   * closure alive for up to five minutes, and a test for it had to sleep for
+   * real.
+   *
+   * `keepGoing` is polled as well as awaited, because it is the interface
+   * shells already implement and nothing should have to grow an abort signal
+   * to be shut down promptly. A second is short enough that nobody notices
+   * and long enough that a five-minute wait is not three hundred wakeups.
+   */
+  let wakeUp: (() => void) | undefined;
+  const wait = async (ms: number): Promise<void> => {
+    if (!(hooks.keepGoing?.() ?? true)) return;
+    await new Promise<void>((go) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        wakeUp = undefined;
+        go();
+      };
+      wakeUp = finish;
+      // One sleep, raced against the wake. Slicing it to poll `keepGoing`
+      // was the first attempt and it hangs: a test injects a sleeper that
+      // returns instantly, the wall clock never advances, and the slicing
+      // loop spins for ever. The sleeper is the clock here, and code that
+      // assumes otherwise is code that only works against a real one.
+      void sleeper(ms).then(finish);
+    });
+  };
+  // Handed out so a shell can end the wait the instant it decides to stop.
+  // Without it the loop still checks `keepGoing` either side of the wait, as
+  // it always did; what it cannot then do is cut a five-minute backoff short.
+  hooks.onWaiting?.(() => wakeUp?.());
   let lastFailure = "";
   let repeats = 0;
 

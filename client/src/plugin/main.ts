@@ -179,6 +179,9 @@ export default class BasaltPlugin extends Plugin {
    */
   private readonly settling = new Set<Promise<void>>();
 
+  /** Ends the reconnect loop's backoff wait, when there is one to end (I05). */
+  private wakeLoop: (() => void) | undefined;
+
   override async onload(): Promise<void> {
     // Obsidian mobile has no status bar, and the declaration says so:
     // addStatusBarItem is "not available on mobile". The ribbon is on both,
@@ -329,6 +332,10 @@ export default class BasaltPlugin extends Plugin {
     this.running = false;
     this.generation++;
     this.clearTimers();
+    // After `running` is false, so the loop wakes into a decision to stop
+    // rather than into another attempt (I05).
+    this.wakeLoop?.();
+    this.wakeLoop = undefined;
     const { live, client } = this.retireClients();
     this.closing = Promise.all([live?.close(), client?.close()])
       .then(() => undefined)
@@ -442,7 +449,16 @@ export default class BasaltPlugin extends Plugin {
         fatal = cause;
       },
       keepGoing: () => this.running && current(),
+      // Ends the backoff wait rather than letting it run down (I05).
+      // Obsidian disabling a plugin used to leave a timer and a closure alive
+      // for whatever was left of a five-minute retry, because the loop asked
+      // whether to keep going before the sleep and after it and did nothing
+      // in between.
+      onWaiting: (wake) => {
+        this.wakeLoop = wake;
+      },
     });
+    this.wakeLoop = undefined;
     if (current()) this.live = undefined;
     return fatal;
   }

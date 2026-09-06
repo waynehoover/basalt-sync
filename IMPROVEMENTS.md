@@ -54,7 +54,7 @@ Document stable CLI exit codes and JSON/JSON-lines events, including partial com
 
 ### I05 — Coalesce queued passes and make waiting cancellable
 
-- [ ] **Medium.** Bound queued work as well as active work.
+- [x] **Medium.** Bound queued work as well as active work.
 
 [Client.serial](client/src/core/client.ts#L186) queues requests; multiple external triggers can enqueue redundant sync passes. [runForever](client/src/core/client.ts#L928) waits through its backoff delay without an abort signal. The engine's internal coalescing does not automatically eliminate passes already serialized above it.
 
