@@ -29,19 +29,39 @@ permissions:
   id-token: write
 
 jobs:
-  publish:
-    name: publish
+  # Nothing is published from a commit CI has not passed on (I21). The reasons
+  # and the waiting are in scripts/ci-passed.sh, which all three publishing
+  # workflows call so there is one answer to "was this checked" rather than
+  # three that can drift.
+  checked:
+    name: CI passed on this commit
+    # `github.token` gets only what the workflow declares, and reading another
+    # workflow's runs is not in the default set.
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: refuse to publish from an unchecked commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci-passed.sh "${{ github.repository }}" "${{ github.sha }}"
+
+  publish:
+    name: publish
+    needs: checked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Built with bun, like CI, so what is published is what the tests ran
       # against. npm is here only to do the publishing.
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -51,9 +71,14 @@ jobs:
       # with a message about authentication, which sends you looking for a token
       # that is deliberately not there, so this does not depend on which npm
       # came with the Node above.
+      #
+      # Pinned rather than `@latest` (I22). This step decides how the package
+      # is published, and a moving version means the thing that publishes a
+      # release is not the thing that published the last one. Raise it
+      # deliberately, in a commit, where it can be reverted.
       - name: npm new enough to publish this way
         run: |
-          npm install -g npm@latest
+          npm install -g npm@11.6.2
           npm --version
 
       - name: install
@@ -79,9 +104,14 @@ jobs:
         working-directory: client
         run: bun run build
 
-      - name: it is actually there
-        working-directory: client
-        run: test -s dist/basalt.mjs
+      # `test -s dist/basalt.mjs` used to be the whole of this: that a build
+      # had produced a file. This packs the tarball, installs it somewhere with
+      # no relationship to the checkout, and runs the command out of it under
+      # node, which is what the next person to install this will do and the one
+      # thing nothing here had ever done. An npm version cannot be replaced
+      # once published, so it is checked on the way out as well as in CI.
+      - name: the packed CLI installs and runs under node
+        run: scripts/pack-check.sh
 
       - name: publish
         working-directory: client

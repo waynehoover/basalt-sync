@@ -58,6 +58,14 @@ run "the systemd unit verifies" server go test -race -run 'TestService' ./cmd/ba
 run "the pinned image is not behind the newest server release" "" \
   bash "$root/scripts/pin-check.sh"
 
+# ---- the publish gate ------------------------------------------------------
+run "the publish gate refuses an unchecked commit" "" \
+  bash "$root/scripts/ci-passed.test.sh"
+run "the tags a release may move are the right ones" "" \
+  bash "$root/scripts/release-tags.test.sh"
+run "every action is pinned to a commit" "" \
+  bash "$root/scripts/actions-pinned.sh"
+
 # ---- the restore rehearsal -------------------------------------------------
 #
 # Behind a build tag, so it is not one of the six hundred tests above that a
@@ -75,6 +83,8 @@ run "typecheck" client bun run typecheck
 run "test" client bun run test
 run "compression golden, under bun" client bun run src/core/compression-golden.run.ts
 run "build" client bun run build
+run "the packed CLI installs and runs under node" "" \
+  bash "$root/scripts/pack-check.sh"
 
 # ---- the panel states ------------------------------------------------------
 #

@@ -216,7 +216,7 @@ Prioritize real Obsidian desktop editing-during-fetch, mobile suspend/resume and
 
 ### I21 — Gate published artifacts on validation of the same commit
 
-- [ ] **Medium.** Require successful checks before npm/container/release assets become public, and test the artifact that will actually ship.
+- [x] **Medium.** Require successful checks before npm/container/release assets become public, and test the artifact that will actually ship.
 
 [npm publishing](.github/workflows/npm-publish.yml), [container release](.github/workflows/release.yml), and [release attestation](.github/workflows/attest.yml) build artifacts but do not depend on this repository's checks for that exact commit. Running CI elsewhere is useful only if publication cannot race ahead of a failed or missing run.
 
@@ -224,7 +224,7 @@ Use reusable validation jobs or an explicit successful-check gate. Test the pack
 
 ### I22 — Pin the build environment and schedule dependency checks
 
-- [ ] **Small to medium.** Pin action revisions and reproducible tool versions; update them deliberately through a tested workflow.
+- [x] **Small to medium.** Pin action revisions and reproducible tool versions; update them deliberately through a tested workflow.
 
 Workflows use mutable action tags, `bun-version: latest`, and `npm@latest`; the Docker base and build environment also influence outputs. Keep lockfiles and the existing compression golden check, and record the versions used for released artifacts. Changes to compression bytes can affect deduplication and protocol assumptions, so retain cross-runtime compatibility checks when updating libraries.
 
@@ -232,7 +232,7 @@ Add scheduled JavaScript and Go dependency advisory checks with actionable owner
 
 ### I23 — Make release channels, checksums, and version preparation consistent
 
-- [ ] **Small to medium.** Define stable/prerelease/backport behavior before relying on automated moving tags.
+- [x] **Small to medium.** Define stable/prerelease/backport behavior before relying on automated moving tags.
 
 [Container release](.github/workflows/release.yml) always requests `latest` for matching server tags. Explicitly decide whether a prerelease or an older maintenance release may move that tag or a minor alias. Validate full tag syntax and the version printed by the published image before promotion.
 

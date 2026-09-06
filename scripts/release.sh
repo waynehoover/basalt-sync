@@ -36,6 +36,39 @@ cd "$(dirname "$0")/.."
 root=$(pwd)
 out="$root/release"
 
+# --prepare, which is the step that has to be committed before a release is
+# built (I23). It writes versions.json and stops. Nothing else here runs,
+# because the whole point is that its output is a commit rather than an asset.
+if [ "${1:-}" = --prepare ]; then
+  minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
+  pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
+  python3 - "$pluginversion" "$minapp" <<'PY'
+import json, os, sys
+
+version, minapp = sys.argv[1], sys.argv[2]
+path = "versions.json"
+# In place, keeping every older entry: Obsidian looks up the newest version an
+# install can run, and a file rewritten with only the current one tells an
+# older install that nothing it can run exists.
+known = json.load(open(path)) if os.path.exists(path) else {}
+known[version] = minapp
+with open(path, "w") as f:
+    json.dump(known, f, indent=2)
+    f.write("\n")
+PY
+  echo "versions.json: plugin $pluginversion needs Obsidian $minapp"
+  echo
+  if git diff --quiet -- versions.json; then
+    echo "Already said so. Nothing to commit; run scripts/release.sh next."
+  else
+    git --no-pager diff -- versions.json
+    echo
+    echo "Commit this, then run scripts/release.sh. Obsidian reads the file at"
+    echo "the tag, so it has to be in the commit the tag points at."
+  fi
+  exit 0
+fi
+
 version=${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
@@ -49,6 +82,22 @@ commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "release: the tree has uncommitted changes, and a release is built from a commit" >&2
   git status --short >&2
+  exit 1
+fi
+
+# And nothing untracked in what the build reads.
+#
+# `git diff` only ever compares files git has heard of, so a new .ts under
+# client/src is invisible to it and entirely visible to esbuild: it is bundled
+# into main.js like any other module, and the release ships a plugin containing
+# a file that exists on one machine. The same goes for a .go file the server
+# build picks up. Ignored files are excluded, which is what --exclude-standard
+# does, so release/ and dist/ do not count.
+untracked=$(git ls-files --others --exclude-standard -- server client manifest.json versions.json)
+if [ -n "$untracked" ]; then
+  echo "release: these are not in git, and the build reads them anyway:" >&2
+  echo "$untracked" | sed 's/^/  /' >&2
+  echo "Commit them, delete them, or ignore them. A release is built from a commit." >&2
   exit 1
 fi
 
@@ -92,25 +141,43 @@ done
 minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
 pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
 
-# versions.json maps a plugin version to the oldest Obsidian it runs on.
+# versions.json maps a plugin version to the oldest Obsidian it runs on, and
+# it must already say so before this runs (I23).
 #
-# It lives at the repo root, because that is where Obsidian reads it from, and
-# is updated in place rather than generated fresh: an older entry is the whole
-# point of the file, and rewriting it with only the current version would tell
-# every older install that nothing it can run exists.
+# This used to write the file, which meant the release refused to build over a
+# dirty tree and then made one, and the tag went on a commit where the entry
+# did not exist yet. Obsidian reads versions.json from the repository at the
+# tag: an installer on an older Obsidian looks up the version it is offered,
+# finds nothing, and the entry arrives in a follow-up commit that the tag does
+# not point at. The git history has that follow-up commit after every release,
+# which is the shape of a step in the wrong place.
 #
-# It is not a release asset. Obsidian fetches it from the repository.
-python3 - "$pluginversion" "$minapp" <<'PY'
+# So preparing it is its own step, run and committed first:
+#
+#   scripts/release.sh --prepare
+#
+# and this one only checks. An older entry is the whole point of the file, so
+# --prepare updates it in place rather than generating it fresh: rewriting it
+# with only the current version tells every older install that nothing it can
+# run exists.
+have=$(python3 - "$pluginversion" <<'PY'
 import json, os, sys
-
-version, minapp = sys.argv[1], sys.argv[2]
 path = "versions.json"
 known = json.load(open(path)) if os.path.exists(path) else {}
-known[version] = minapp
-with open(path, "w") as f:
-    json.dump(known, f, indent=2)
-    f.write("\n")
+print(known.get(sys.argv[1], ""))
 PY
+)
+if [ "$have" != "$minapp" ]; then
+  echo "release: versions.json does not say plugin $pluginversion needs Obsidian $minapp" >&2
+  [ -z "$have" ] && echo "  it has no entry for $pluginversion" >&2 \
+                 || echo "  it says $have" >&2
+  echo >&2
+  echo "  scripts/release.sh --prepare" >&2
+  echo >&2
+  echo "writes it. Commit that, then run this again: Obsidian reads the file at" >&2
+  echo "the tag, so the entry has to be in the commit the tag points at." >&2
+  exit 1
+fi
 rm -f "$out/plugin/versions.json"
 
 printf '  %-24s %s\n' "main.js" "$(du -h "$out/plugin/main.js" | cut -f1)"
@@ -118,23 +185,51 @@ printf '  %-24s %s\n' "styles.css" "$(du -h "$out/plugin/styles.css" | cut -f1)"
 printf '  %-24s %s\n' "manifest.json" "version $pluginversion, needs Obsidian $minapp"
 
 # ---- checksums -----------------------------------------------------------
+#
+# One file per release, with names that match what somebody downloads (I23).
+#
+# There was a single SHA256SUMS covering both, written from `find .` so its
+# lines read ./plugin/main.js and ./server/basaltd-linux-amd64. It was attached
+# to the server release only. Neither half worked: `shasum -c SHA256SUMS` in a
+# directory of downloaded files looks for a plugin/ and a server/ that are not
+# there and reports every file missing, and the plugin release had no checksums
+# at all while its sums were published against a release they did not belong to.
+#
+# Written from inside each directory so the paths are bare names, which is what
+# the files are called once downloaded, which is the only spelling under which
+# `shasum -c` is a check rather than a puzzle.
 echo
-( cd "$out" && find . -type f -not -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > SHA256SUMS )
-echo "release/"
-sed 's/^/  /' "$out/SHA256SUMS"
+for part in server plugin; do
+  ( cd "$out/$part" && find . -type f -not -name SHA256SUMS -print0 \
+      | sort -z | xargs -0 -n1 basename | tr '\n' '\0' | xargs -0 shasum -a 256 > SHA256SUMS )
+  echo "release/$part/SHA256SUMS"
+  sed 's/^/  /' "$out/$part/SHA256SUMS"
+done
+
+# And that they verify here, so nobody finds out they do not from a download.
+for part in server plugin; do
+  ( cd "$out/$part" && shasum -a 256 -c --status SHA256SUMS ) \
+    || { echo "release: release/$part/SHA256SUMS does not check out here" >&2; exit 1; }
+done
 
 # ---- for the release notes -----------------------------------------------
-# One line per asset that the attest workflow signs, so the release notes can
-# carry them as they are and a reader can check what they downloaded came from
-# this repository at that commit. Printed here because this is the one place
-# that knows every asset name.
+# What a reader can run to check what they downloaded came from this repository
+# at that commit. Printed here because this is the one place that knows every
+# asset name, and the sums first because it is the check that needs no tools.
 echo
-echo "For the release notes, so anyone can verify what they downloaded:"
+echo "For the release notes, so anyone can check what they downloaded:"
 echo
 echo '  ```bash'
+echo "  shasum -a 256 -c SHA256SUMS"
 for asset in main.js manifest.json styles.css; do
   echo "  gh attestation verify $asset --repo waynehoover/basalt-sync"
 done
+echo '  ```'
+echo
+echo "and for the server release:"
+echo
+echo '  ```bash'
+echo "  shasum -a 256 -c SHA256SUMS"
 for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
   echo "  gh attestation verify basaltd-${target%/*}-${target#*/} --repo waynehoover/basalt-sync"
 done
@@ -150,16 +245,18 @@ tag to be exactly the manifest version:
 
   git tag -a $pluginversion -m "Basalt Sync $pluginversion" && git push origin $pluginversion
   gh release create $pluginversion --title "Basalt Sync $pluginversion" \\
-    release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css
+    release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \\
+    release/plugin/SHA256SUMS
 
 The attest workflow signs those three on publish and replaces them with what it
-signed.
+signed, which is why the release is worth checking again once it is out rather
+than only before.
 
 To publish the server, on its own tag because it moves on its own clock:
 
   git tag -a server/v$version -m "basaltd $version" && git push origin server/v$version
   gh release create server/v$version --title "basaltd $version" \\
-    release/server/* release/SHA256SUMS
+    release/server/*
 
 Pushing that tag is also what builds and pushes the container image.
 
@@ -169,4 +266,15 @@ client/package.json on its own clock, then:
   git tag -a cli/v1.2.3 -m "basalt CLI 1.2.3" && git push origin cli/v1.2.3
 
 That tag publishes it over OIDC, with no token and no 2FA code.
+
+Then check the release from the outside, which is the only place several of
+these can be wrong: the attestations are rebuilt and re-uploaded after the
+release is created, \`latest\` moves during it, and an npm version cannot be
+replaced once it is there.
+
+  scripts/verify-release.sh --plugin $pluginversion --server $version --cli $version
+
+It fetches the assets, checks the sums under the names somebody downloads them
+as, verifies the attestations on the bytes that are there now, runs the image on
+both architectures, and installs the package from npm.
 EOF

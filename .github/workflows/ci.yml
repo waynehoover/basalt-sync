@@ -17,8 +17,8 @@ jobs:
     name: server
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
@@ -77,12 +77,32 @@ jobs:
     name: the compose pin is current
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: the pinned image is not behind the newest server release
         run: scripts/pin-check.sh
+
+      # The gate the three publishing workflows call. Checked here rather than
+      # only in those, because the only place it runs for real is a release,
+      # and a release is the wrong moment to find out it says yes to a commit
+      # nothing has tested.
+      - name: the publish gate refuses an unchecked commit
+        run: scripts/ci-passed.test.sh
+
+      # And which tags a release is allowed to move. The cases it gets wrong
+      # are the ones that happen once: the first backport, the first
+      # prerelease, both of which used to take `latest` from the newest stable
+      # server without saying so.
+      - name: the tags a release may move are the right ones
+        run: scripts/release-tags.test.sh
+
+      # And that no workflow reaches for a mutable tag, here included. A tag is
+      # a name somebody else can repoint, and these files are what builds,
+      # signs and publishes the project.
+      - name: every action is pinned to a commit
+        run: scripts/actions-pinned.sh
 
   # docs/server.md has carried the restore rehearsal as prose since the backup
   # was written, and a recovery path tested only in docs is a rumour. Not
@@ -98,8 +118,8 @@ jobs:
     name: the restore rehearsal
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
@@ -116,17 +136,17 @@ jobs:
     name: client
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The client's tests build cmd/basaltd and talk to it over a real socket,
       # so this job needs both toolchains.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.1
 
       - name: install
         working-directory: client
@@ -161,6 +181,17 @@ jobs:
         working-directory: client
         run: bun run build
 
+      # Everything between that build and a working `basalt` on somebody else's
+      # machine: what `files` ships, what `bin` points at, and whether the
+      # bundle starts under node, which is the runtime the package claims and
+      # the one nothing above uses. An npm version cannot be replaced once it
+      # is published, so this runs here as well as in the publish workflow.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: the packed CLI installs and runs under node
+        run: scripts/pack-check.sh
+
   # The panel, in every state it has, walked and written down so that somebody
   # can look at it. Two layout bugs here have been found by taking a screenshot
   # and none by a test, and taking a screenshot only happens when somebody
@@ -187,18 +218,18 @@ jobs:
     name: the panel states
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The walk starts a vault and pairs a second device into it against a
       # real basaltd, so this needs both toolchains for the same reason the
       # client job does.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.1
 
       # Unnamed on purpose: it is the same install the client job already does
       # under that name, and scripts/check.sh's guard matches step names.
@@ -209,7 +240,7 @@ jobs:
         working-directory: client
         run: bunx vitest run src/plugin/panel-shots.test.ts
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         if: always()
         with:
           name: panel-states
@@ -228,14 +259,14 @@ jobs:
     name: stress
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.1
 
       - name: install
         working-directory: client
@@ -249,7 +280,7 @@ jobs:
     name: docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: build the image
         run: docker build -t basalt:ci .
       - name: it runs

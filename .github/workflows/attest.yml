@@ -27,21 +27,41 @@ permissions:
   attestations: write # records it
 
 jobs:
+  # Nothing is published from a commit CI has not passed on (I21). The reasons
+  # and the waiting are in scripts/ci-passed.sh, which all three publishing
+  # workflows call so there is one answer to "was this checked" rather than
+  # three that can drift.
+  checked:
+    name: CI passed on this commit
+    # `github.token` gets only what the workflow declares, and reading another
+    # workflow's runs is not in the default set.
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: refuse to publish from an unchecked commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci-passed.sh "${{ github.repository }}" "${{ github.event.release.tag_name || inputs.tag }}"
+
   plugin:
     name: plugin
+    needs: checked
     runs-on: ubuntu-latest
     # Plugin releases only, which are the ones tagged with a bare version.
     # Every other line is prefixed, so a slash means this is not one. The tag
     # and manifest check below fails closed for anything that slips past.
     if: ${{ !contains(github.event.release.tag_name || inputs.tag, '/') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.1
 
       - name: install
         working-directory: client
@@ -74,7 +94,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/attest-build-provenance@v4
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             attested/main.js
@@ -92,6 +112,7 @@ jobs:
 
   server:
     name: server
+    needs: checked
     runs-on: ubuntu-latest
     # The server's own tag line. Without this the binaries were the one thing a
     # release shipped with no provenance at all: built on a laptop, checksummed
@@ -100,11 +121,11 @@ jobs:
     # whatsoever about where the bytes came from.
     if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'server/v') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: server/go.mod
 
@@ -149,7 +170,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/attest-build-provenance@v4
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: attested/basaltd-*
 
