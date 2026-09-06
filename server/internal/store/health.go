@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -44,6 +46,9 @@ type Health struct {
 	// Took is how long the check itself needed, which is the thing to look at
 	// when a probe starts timing out: a store whose fsync has gone slow answers
 	// this correctly and slowly, and "correct and slow" is its own failure.
+	//
+	// Filled by a deferred assignment to a named return. It was a plain return
+	// with a defer writing to a local, so callers received zero every time.
 	Took time.Duration
 }
 
@@ -60,6 +65,12 @@ const (
 	// HealthNoChunkDir is the body directory gone: an unmounted volume, most
 	// likely, which SQLite on another filesystem will not notice at all.
 	HealthNoChunkDir HealthReason = "chunks-unreachable"
+	// HealthUnwritable is a database that answers reads and refuses writes: a
+	// connection opened read-only, a file whose permissions have gone, or a
+	// filesystem remounted read-only after an error, which is how Linux
+	// reacts to a disk that is failing. A read-only store is the case a
+	// `SELECT 1` cannot see and the one most likely to be true (R15).
+	HealthUnwritable HealthReason = "store-read-only"
 	// HealthClosing is a server draining its sessions. Set by the server rather
 	// than by anything here; it is in this list so the vocabulary is in one
 	// place, which is what a monitor matching on it needs.
@@ -86,17 +97,45 @@ func LowSpaceBytes() int64 { return lowSpaceBytes }
 //
 // The context bounds it: a probe should time out rather than hang, and a
 // database whose disk has stopped answering will hang rather than fail.
-func (s *Store) CheckHealth(ctx context.Context) Health {
+func (s *Store) CheckHealth(ctx context.Context) (h Health) {
 	started := time.Now()
-	h := Health{CanPersist: true}
+	h = Health{CanPersist: true}
+	// A *named* return, and that is the whole of the fix for this line (R15).
+	// Assigning to a local in a deferred function after an unnamed return has
+	// already copied it changes nothing the caller sees, so every probe was
+	// told the check took no time at all, which is exactly the figure to look
+	// at when one starts timing out.
 	defer func() { h.Took = time.Since(started) }()
 
-	// The cheapest question that reaches the file: does the database answer.
-	// A count would scale with the vault; this touches one page.
-	var one int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1`).Scan(&one); err != nil || one != 1 {
+	// Whether the database can be *written*, which is what this promises
+	// (R15).
+	//
+	// It used to be `SELECT 1`. That succeeds against a database opened
+	// read-only, one whose file has lost write permission, and one on a
+	// filesystem remounted read-only after an error, which is the ordinary way
+	// a Linux box reacts to a failing disk. So the field called CanPersist was
+	// answered by a question about reading, and an immediate AppendEntry then
+	// failed with "attempt to write a readonly database" while health said all
+	// was well.
+	//
+	// A transaction that is begun and rolled back is the cheapest thing that
+	// asks the real question: SQLite takes the write lock and refuses here if
+	// it cannot, and nothing is committed, so the store is not touched. It
+	// costs no page writes and does not grow the write-ahead log.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		h.CanPersist = false
 		h.Why = HealthUnreadable
+		return h
+	}
+	// `PRAGMA user_version` is a write to the header and SQLite refuses it on
+	// a read-only connection, which is the refusal being looked for; setting
+	// it to what it already is means the rollback has nothing to undo.
+	_, writeErr := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion))
+	rollbackErr := tx.Rollback()
+	if writeErr != nil || (rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone)) {
+		h.CanPersist = false
+		h.Why = HealthUnwritable
 		return h
 	}
 

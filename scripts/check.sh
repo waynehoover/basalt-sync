@@ -119,6 +119,8 @@ run "the publish gate refuses an unchecked commit" "" \
   bash "$root/scripts/ci-passed.test.sh"
 run "the tags a release may move are the right ones" "" \
   bash "$root/scripts/release-tags.test.sh"
+run "the image release promotes in order" "" \
+  bash "$root/scripts/release-order.test.sh"
 run "every action is pinned to a commit" "" \
   bash "$root/scripts/actions-pinned.sh"
 

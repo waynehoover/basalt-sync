@@ -34,7 +34,7 @@ import BasaltPlugin, { connectionDetail, describeConnection, describeDeleted } f
 import { describeRestore } from "./history.ts";
 import type { SyncReport } from "../core/engine.ts";
 import { redeemInvite } from "../core/client.ts";
-import { parseInvite } from "../core/pairing.ts";
+import { parseInvite, parsePairing } from "../core/pairing.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -2121,15 +2121,29 @@ describe("a restore whose upload fails (P31)", () => {
     await plugin.syncNow();
     const deletion = (await plugin.deletedNotes()).notes.find((n) => n.path === "gone.md")!;
 
-    // The upload of this one path fails in a way the engine files for retry,
-    // and the pass itself resolves: nothing throws, and the vault is fine.
-    const client = (plugin as unknown as { client: { settle(o: unknown): Promise<unknown> } })
-      .client;
-    const realSettle = client.settle.bind(client);
-    client.settle = async (o: unknown) => {
+    // A pass that resolves while this path has not gone: the report says it is
+    // retrying, and the engine has not acknowledged it.
+    //
+    // Both, and that is the point after R09. `retryingPaths` is a display
+    // sample, sorted and cut to five names, and what decides whether a path
+    // went is whether the server acknowledged that exact content. Faking the
+    // sample alone describes a state the system cannot be in: a path the
+    // engine has acknowledged and the report calls retrying. So the fake says
+    // the same thing twice, which is what a real failing upload does.
+    const held = plugin as unknown as {
+      client: {
+        settle(o: unknown): Promise<unknown>;
+        engine: { serverHasOurs(p: string): boolean };
+      };
+    };
+    const realSettle = held.client.settle.bind(held.client);
+    held.client.settle = async (o: unknown) => {
       const report = (await realSettle(o)) as Record<string, unknown>;
       return { ...report, retrying: 1, retryingPaths: ["gone.md"] };
     };
+    const realHas = held.client.engine.serverHasOurs.bind(held.client.engine);
+    held.client.engine.serverHasOurs = (path: string) =>
+      path === "gone.md" ? false : realHas(path);
 
     const done = await plugin.recover(deletion);
     expect(done.path).toBe("gone.md");
@@ -2816,9 +2830,15 @@ describe("adding a device from the panel", () => {
     plugin.ribbonIcons[0]!.callback();
     built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
     built.find((s) => s.name === "Device name")!.texts[0]!.type("laptop");
-    await built
+    // Not awaited yet. The pairing now holds the vault's claim until somebody
+    // says they have the key (R02), so awaiting the click here would wait for
+    // the acknowledgement clicked further down.
+    const starting = built
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
       .buttons[0]!.click();
+    await until("the recovery key to be shown", () =>
+      modals.at(-1)!.contentEl.allText().includes("Write this down"),
+    );
 
     const shown = modals.at(-1)!.contentEl.allText();
     expect(shown).toMatch(/Write this down/);
@@ -2837,6 +2857,8 @@ describe("adding a device from the panel", () => {
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
       .buttons[0]!.click();
+    // And now the pairing may finish.
+    await starting;
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
     modals.at(-1)!.close();
     built.length = 0;
@@ -2913,9 +2935,18 @@ describe("what the panel knows and used to keep to itself", () => {
       expect(suggested).toMatch(/^mac-[0-9a-f]{4}$/);
 
       built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
-      await built
+      // The pairing holds until the key is acknowledged (R02), so the
+      // acknowledgement comes before the await.
+      const starting = built
         .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
         .buttons[0]!.click();
+      await until("the recovery key to be shown", () =>
+        built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
+      );
+      await built
+        .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
+        .buttons[0]!.click();
+      await starting;
       await synced(plugin);
 
       // Used, and used where it is read: the row in the device list, which is
@@ -3317,4 +3348,273 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     expect(report.kind).toBe("synced");
     expect(plugin.paired).toBe(true);
   }, 300_000);
+});
+
+/**
+ * A recovery key on screen is not a recovery key somebody has (R02).
+ *
+ * Starting a vault writes the root to disk, shows it, claims the server, and
+ * then replaces the root with this device's own credential. F02 moved the
+ * display in front of the claim, which was the important half. What it did not
+ * change is that showing it and carrying straight on is not a handoff:
+ * registration retires the only copy of a key nothing can reissue, and
+ * returning from a callback is not evidence that anybody read the screen.
+ *
+ * Two things make it a stage. The pairing waits for the callback, so a surface
+ * that asks for confirmation holds the vault's claim until it has one; and
+ * because nothing is claimed while it waits, an abandoned pairing leaves the
+ * root on disk where the panel finds it and offers it again.
+ */
+describe("handing over the first recovery key", () => {
+  it("does not claim the vault until the key has been taken", async () => {
+    await fresh();
+    const { plugin } = await load();
+
+    let release: (() => void) | undefined;
+    let shown = "";
+    const pairing = plugin
+      .pairFirst(server.setup, "laptop", async (key: string) => {
+        shown = key;
+        await new Promise<void>((go) => {
+          release = go;
+        });
+      })
+      .catch(() => undefined);
+
+    // Wait for the key to be offered.
+    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(shown, "no key was offered before the claim").toMatch(/^basalt/);
+
+    // Still waiting, so nothing has been registered: the config holds the root
+    // and no device credential.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(
+      plugin.pendingFirstPairing(),
+      "the pairing went ahead before anybody said they had the key",
+    ).toBe(shown);
+
+    release?.();
+    await pairing;
+  }, 60_000);
+
+  /**
+   * The abandoned case, which is what a reload in the middle looks like.
+   *
+   * Nothing was claimed, so the config still holds the root, and the root is
+   * the recovery key. The panel offers it rather than leaving somebody with a
+   * key they were shown once and a vault they cannot open.
+   */
+  it("can still produce the key after an interrupted pairing", async () => {
+    await fresh();
+    const { plugin } = await load();
+
+    let shown = "";
+    void plugin
+      .pairFirst(server.setup, "laptop", async (key: string) => {
+        shown = key;
+        await new Promise<void>(() => {}); // the panel was closed
+      })
+      .catch(() => undefined);
+    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+
+    const again = plugin.pendingFirstPairing();
+    expect(again, "an interrupted pairing left no way back to the key").toBeDefined();
+    expect(again, "the key offered afterwards is not the one that was shown").toBe(shown);
+    expect(() => parsePairing(again!)).not.toThrow();
+  }, 60_000);
+
+  /** A finished pairing holds no root, so there is nothing to offer. */
+  it("offers nothing once the device has its own credential", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin);
+    expect(
+      plugin.pendingFirstPairing(),
+      "a paired device is still holding the vault's root",
+    ).toBeUndefined();
+  }, 60_000);
+});
+
+/**
+ * A restore is reported sent only when the server has said so (R09).
+ *
+ * The check was "is this path in the report's list of failures", and those
+ * lists are display samples: sorted, de-duplicated and cut to five, because a
+ * notice naming four hundred files is not a notice. Absence from a sample is
+ * not evidence of anything. A pass with six failures reported the sixth as
+ * sent, and a path that was merely blocked was never in either list at all.
+ */
+describe("what a restore is allowed to claim", () => {
+  it("does not report sent for the sixth failure of a pass", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    const held = plugin as unknown as {
+      client?: {
+        engine: { serverHasOurs(p: string): boolean };
+        history(p: string): Promise<unknown[]>;
+      };
+    };
+    await until("the client to exist", () => held.client !== undefined);
+
+    // A real note with a real version to restore, so the restore succeeds and
+    // the code actually reaches the decision under test.
+    await app.vault.adapter.write("z.md", "the version to restore\n", { mtime: 5000 });
+    await plugin.syncNow();
+    await until("z.md to be acknowledged", () => held.client!.engine.serverHasOurs("z.md"));
+    await app.vault.adapter.remove("z.md");
+    await plugin.syncNow();
+
+    const versions = (await held.client!.history("z.md")) as Array<{
+      path: string;
+      uid: number;
+      deleted?: boolean;
+    }>;
+    // The newest is the deletion; what restores is the version before it.
+    const version = versions.find((v) => v.uid > 0 && v.deleted !== true);
+    expect(version, "the server holds no version of z.md to restore").toBeDefined();
+
+    // A report shaped exactly as the engine produces one: more failures than
+    // the sample holds, and the restored path is not among the five shown.
+    // `z.md` sorts after all of them, so it is exactly the one the display
+    // cannot show.
+    const report: SyncReport = {
+      uploaded: 0,
+      downloaded: 0,
+      merged: 0,
+      conflicted: 0,
+      deletedLocally: 0,
+      deletedRemotely: 0,
+      restored: 1,
+      foldersCreated: 0,
+      unchanged: 0,
+      waiting: 0,
+      retrying: 6,
+      retryingPaths: ["a.md", "b.md", "c.md", "d.md", "e.md"],
+      skipped: 0,
+      skippedPaths: [],
+      ignored: 0,
+      blocked: 0,
+      inTheWay: [],
+      needsAttention: [],
+      chunksSent: 0,
+      bytesSent: 0,
+    };
+    const client = held.client as unknown as { settle: () => Promise<SyncReport> };
+    client.settle = async () => report;
+    // And the engine must not have acknowledged the restored content, which is
+    // the fact the decision turns on.
+    (
+      held.client as unknown as { engine: { serverHasOurs: (p: string) => boolean } }
+    ).engine.serverHasOurs = () => false;
+
+    const out = await (
+      plugin as unknown as {
+        restoreAndSend: (v: unknown) => Promise<{ sent: boolean; why?: string }>;
+      }
+    ).restoreAndSend.call(plugin, version);
+
+    expect(
+      out.sent,
+      `a restore the server never acknowledged was reported as sent: ${JSON.stringify(out)}`,
+    ).toBe(false);
+    expect(out.why, "it did not say why").toBeTruthy();
+  }, 90_000);
+
+  /**
+   * And the affirmative side: a note the server really has is reported sent,
+   * so the check above is not simply refusing everything.
+   */
+  it("reports a note the server holds as sent", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    await app.vault.adapter.write("kept.md", "the contents\n", { mtime: 5000 });
+    const held = plugin as unknown as {
+      client?: { engine: { serverHasOurs(p: string): boolean } };
+    };
+    await until("the client to exist", () => held.client !== undefined);
+    await plugin.syncNow();
+    await until("the note to be acknowledged", () => held.client!.engine.serverHasOurs("kept.md"));
+    expect(
+      held.client!.engine.serverHasOurs("kept.md"),
+      "the note never reached the server, so this proves nothing",
+    ).toBe(true);
+  }, 60_000);
+});
+
+/**
+ * A pairing that finishes after the plugin is gone must not restart it (R10).
+ *
+ * F23 guarded the invite branch. The recovery-key branch and the first-pairing
+ * branch call `start()` after their registration returns without asking again,
+ * and both had recovery paths that read the disk, which is another await, and
+ * then started a loop from whatever they found. Unloading during any of that
+ * left a retired plugin syncing.
+ *
+ * The credential the registration created is real either way; what must not
+ * happen is a loop for a vault somebody has just put down.
+ */
+describe("a pairing that outlives the plugin", () => {
+  /**
+   * Unloaded in the window the review named: after the device credential has
+   * been saved and before the registration returns.
+   *
+   * Earlier than that and `saveDuringRun` refuses the save, which is a guard
+   * that already existed. This is the gap after it.
+   */
+  function unloadAfterCredentialSaved(plugin: Testable): void {
+    const save = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data: unknown) => {
+      await save(data);
+      const record = data as { deviceId?: unknown } | null;
+      if (record !== null && typeof record === "object" && record.deviceId !== undefined) {
+        plugin.saveData = save;
+        plugin.onunload();
+      }
+    };
+  }
+
+  it("does not start a loop after unload, pairing with a recovery key", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin);
+    const key = keyOf(first.plugin);
+
+    const second = await load();
+    unloadAfterCredentialSaved(second.plugin);
+    const out = await second.plugin.pair(key, "second").catch((err: Error) => err);
+
+    expect(
+      (second.plugin as unknown as { client?: unknown }).client,
+      "an unloaded plugin was started by a pairing that finished after it",
+    ).toBeUndefined();
+    // And it says what happened rather than looking like an ordinary failure:
+    // the row may be on the server.
+    expect(out instanceof Error ? out.message : "", "it finished quietly").toMatch(
+      /unlinked|no longer|revoke/i,
+    );
+  }, 90_000);
+
+  it("does not start a loop after unload, starting a vault", async () => {
+    await fresh();
+    const { plugin } = await load();
+    unloadAfterCredentialSaved(plugin);
+
+    let shown = "";
+    const out = await plugin
+      .pairFirst(server.setup, "laptop", (k: string) => {
+        shown = k;
+      })
+      .catch((err: Error) => err);
+
+    expect(
+      (plugin as unknown as { client?: unknown }).client,
+      "an unloaded plugin was started by a pairing that finished after it",
+    ).toBeUndefined();
+    // The key has to reach somebody: the vault was claimed, and nothing else
+    // holds it.
+    const said = out instanceof Error ? out.message : "";
+    expect(`${shown}|${said}`, "the recovery key was not offered anywhere").toMatch(/basalt/);
+  }, 90_000);
 });

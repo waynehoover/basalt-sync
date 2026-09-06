@@ -92,13 +92,37 @@ type Store struct {
 	// mkdirAll for the race it closes.
 	mkdirMu sync.Mutex
 
-	// pending is the chunk names some caller is part way through publishing:
-	// renamed into place, not yet flushed. Visible and not durable are two
-	// different states and `Has` cannot tell them apart, so a second writer of
-	// the same name waits here rather than acking on the first one's rename.
-	// See beginPublish.
-	pendingMu sync.Mutex
-	pending   map[string]chan struct{}
+	// unproven is the chunk names this process has placed and cannot yet
+	// prove durable: renamed into the directory, and that directory not
+	// successfully flushed since. Visible and durable are two different
+	// states, a stat cannot tell them apart, and the difference is the one
+	// server-side fault a client cannot detect (F05, R05, R06).
+	//
+	// This is not a presence table, and the distinction is the whole reason it
+	// is safe to have. A table that *asserts* presence drifts from the disk and
+	// eventually claims a chunk that is gone, which is how an entry becomes
+	// unserveable while everything reports healthy; that is why there is no
+	// such table here and never should be. This one only ever *withholds*
+	// presence. Presence is still a stat; a name in here is reported absent on
+	// top of that. Every way it can be wrong ends in a client being asked for a
+	// body the server already had, which costs an upload and loses nothing.
+	//
+	// A name stays here after a failed flush, deliberately. This process cannot
+	// prove that name durable and will not pretend otherwise: the chunk reads
+	// as absent, the next put writes and flushes it again, and success is what
+	// takes it out. On restart the map is empty and presence is the stat again,
+	// which is the truth a crash leaves behind.
+	//
+	// It replaced a per-name publication claim that made the second writer of a
+	// chunk wait for the first. That closed the same window and introduced a
+	// worse one: a batch held every claim until Close, so two batches wanting
+	// the same two chunks in opposite orders each held one and waited for the
+	// other, for ever (R05). Nothing waits now. Two writers may place the same
+	// body at once, which is safe because a name is the hash of its bytes and
+	// the rename is atomic, and wasteful only in the rare case that they
+	// overlap.
+	unprovenMu sync.Mutex
+	unproven   map[string]struct{}
 
 	// sync flushes one directory and is fsync.Dir in every non-test build. A
 	// test replaces it to see which directories were flushed, because the one
@@ -222,6 +246,15 @@ func (s *Store) Size(vaultID, name string) (int64, bool) {
 	if err != nil || !st.Mode().IsRegular() {
 		return 0, false
 	}
+	// A body that is renamed into place and not yet flushed is on the disk and
+	// is not stored, and every caller of this asks the second question: the
+	// want list a client uploads against, and the reference check a commit is
+	// admitted on. Answering from the stat alone let one session skip an
+	// upload, and its entry be committed, against a body another session had
+	// not made durable yet (R06).
+	if !s.held(vaultID, name) {
+		return 0, false
+	}
 	return st.Size(), true
 }
 
@@ -277,45 +310,71 @@ func (s *Store) Missing(vaultID string, names []string) ([]string, map[string]in
 //
 // Put returns once the body is durable. Nothing above it may acknowledge a push
 // before that; the entry commit that follows is what makes the ack truthful.
-// beginPublish reserves a chunk name until this caller has made it durable,
-// and waits for whoever holds it first (F05).
+// A name is marked unproven before the body can become visible and proven only
+// once the directory flush has succeeded, so nothing anywhere treats a renamed
+// body as a stored one (F05, R06).
 //
 // A body becomes *visible* when it is renamed into place and *durable* when
 // the directory it landed in is flushed, and those are two different moments.
-// `place` short-circuits on `Has`, which answers from visibility, so a second
-// writer of the same chunk arriving in that window found it there, wrote
-// nothing, flushed nothing, and returned success. The version it then
-// committed referenced a chunk whose directory entry was not durable: the one
-// server-side fault a client cannot detect, because it was told the chunk
-// arrived and will never send it again.
+// placing records that a name is being written and cannot yet be treated as
+// held. Call it before the body can become visible.
 //
-// So publication is serialised per name. The second writer waits for the
-// first, and then finds a chunk that really is durable, or finds it gone
-// because the first failed and gets to write it itself. Per name rather than
-// per store, so unrelated chunks still land in parallel; the existing
-// concurrent-directory test covers those and never closed this.
-func (s *Store) beginPublish(vaultID, name string) func() {
-	key := vaultID + "/" + name
-	for {
-		s.pendingMu.Lock()
-		if s.pending == nil {
-			s.pending = map[string]chan struct{}{}
-		}
-		waitOn, busy := s.pending[key]
-		if !busy {
-			mine := make(chan struct{})
-			s.pending[key] = mine
-			s.pendingMu.Unlock()
-			return func() {
-				s.pendingMu.Lock()
-				delete(s.pending, key)
-				s.pendingMu.Unlock()
-				close(mine)
-			}
-		}
-		s.pendingMu.Unlock()
-		<-waitOn
+// A name that is already held is left alone, and that is not an optimisation.
+// Withholding it would take a chunk somebody else has already made durable and
+// report it absent for the length of this write, which refuses a concurrent
+// commit that references it perfectly legitimately. Two devices pushing notes
+// that share a chunk do this constantly, and the store's own stress test found
+// it within a hundred pushes.
+//
+// Re-publishing a body that is already durable cannot un-durable it: the bytes
+// are the hash of the name, so whatever is written is what is already there,
+// and the rename is atomic. The worst case is that the same body is written
+// twice.
+func (s *Store) placing(vaultID string, names ...string) {
+	s.unprovenMu.Lock()
+	defer s.unprovenMu.Unlock()
+	if s.unproven == nil {
+		s.unproven = map[string]struct{}{}
 	}
+	for _, n := range names {
+		key := vaultID + "/" + n
+		if _, waiting := s.unproven[key]; !waiting && s.onDisk(vaultID, n) {
+			// Already durable: somebody flushed it, and this write can only
+			// arrive at the same bytes.
+			continue
+		}
+		s.unproven[key] = struct{}{}
+	}
+}
+
+// onDisk is the stat alone, with no opinion about durability. Only `placing`
+// and `Size` use it; everything else asks `Size`, which is the honest question.
+func (s *Store) onDisk(vaultID, name string) bool {
+	st, err := os.Stat(s.path(vaultID, name))
+	return err == nil && st.Mode().IsRegular()
+}
+
+// proven records that these names are durable: their bodies are on disk and
+// every directory holding them has been flushed since.
+//
+// Only ever called after a successful flush. A failed one leaves the names
+// where they are, so they go on reading as absent until somebody writes them
+// again, which is the safe direction and the whole point of the map.
+func (s *Store) proven(vaultID string, names ...string) {
+	s.unprovenMu.Lock()
+	defer s.unprovenMu.Unlock()
+	for _, n := range names {
+		delete(s.unproven, vaultID+"/"+n)
+	}
+}
+
+// held is whether this name may be treated as durably stored: on the disk, and
+// not something this process is part way through publishing.
+func (s *Store) held(vaultID, name string) bool {
+	s.unprovenMu.Lock()
+	_, waiting := s.unproven[vaultID+"/"+name]
+	s.unprovenMu.Unlock()
+	return !waiting
 }
 
 func (s *Store) Put(vaultID, name string, body []byte) error {
@@ -325,9 +384,11 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 	if int64(len(body)) > s.max {
 		return fmt.Errorf("%w: %d > %d", ErrTooLarge, len(body), s.max)
 	}
-	// Held across the write *and* the flush below, which is what makes the
-	// `Has` inside `place` mean "durable" rather than "renamed" (F05).
-	defer s.beginPublish(vaultID, name)()
+	// Withheld across the write *and* the flush below, which is what makes
+	// `Has` mean "durable" rather than "renamed" (F05, R06). Not released on
+	// the way out: only a successful flush proves this name, and a failed one
+	// must leave it reading as absent so the next put writes it again.
+	s.placing(vaultID, name)
 
 	// The name-against-body check is place's, so that it happens on whichever
 	// goroutine is about to do the write. Storing a body under a claimed name
@@ -342,6 +403,7 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 			return err
 		}
 	}
+	s.proven(vaultID, name)
 	return nil
 }
 
@@ -501,10 +563,15 @@ type Writer struct {
 	mu   sync.Mutex
 	dirs map[string]struct{}
 	err  error
-	// One per body placed, called by Close once its directory is flushed.
-	release []func()
-	// The names this batch has already claimed, so a repeated body does not
-	// wait for a release only Close can make. See run.
+	// Every name this batch placed, so Close can mark them durable once every
+	// directory they landed in has been flushed. All of them or none: a batch
+	// with one failed flush has proved nothing about any of its names, and
+	// working out which names were in which directory to be exact about it
+	// would be more machinery for a case that ends in a retry either way.
+	placed []string
+	// The names this batch has already placed, so a body repeated inside one
+	// batch is written once. A chunk name is the hash of its bytes, so the
+	// second copy has nothing to add. See run.
 	claimed map[string]struct{}
 }
 
@@ -544,31 +611,32 @@ func (w *Writer) run() {
 			// this channel and would block on a closed pool for ever.
 			continue
 		}
-		// One claim per name per batch, and this check has to come first.
-		//
-		// Two bodies in one batch can share a name: a chunk name is a hash of
-		// its bytes, so the same content twice is the same name twice. Letting
-		// both workers claim it deadlocks the batch, because the second waits
-		// for a release that Close makes and Close waits for every worker. The
-		// first claim covers the second, whose bytes are identical by
-		// definition and which has nothing left to write.
+		// Once per name per batch. Two bodies in one batch can share a name,
+		// because a chunk name is a hash of its bytes, and the second copy has
+		// nothing to add.
 		w.mu.Lock()
 		_, already := w.claimed[job.name]
 		if !already {
 			w.claimed[job.name] = struct{}{}
+			w.placed = append(w.placed, job.name)
 		}
 		w.mu.Unlock()
 		if already {
 			continue
 		}
 
-		// Claimed before the write and released by Close, after the flush:
-		// a batch publishes on `place` and becomes durable pages later, so
-		// the window this closes is the widest one in the store (F05).
-		release := w.store.beginPublish(w.vaultID, job.name)
+		// Withheld before the write and proven by Close, after the flush: a
+		// batch's body becomes visible on `place` and durable pages later, so
+		// this is the widest window in the store (F05).
+		//
+		// Nothing waits here. It used to: each name was claimed and every claim
+		// held until Close, so two batches wanting the same two chunks in
+		// opposite orders each held one and waited for the other for ever
+		// (R05). Two batches may now place the same body at once, which the
+		// content-addressed name and the atomic rename make harmless.
+		w.store.placing(w.vaultID, job.name)
 		dirs, err := w.store.place(w.vaultID, job.name, job.body)
 		w.mu.Lock()
-		w.release = append(w.release, release)
 		if err != nil && w.err == nil {
 			w.err = err
 		}
@@ -620,18 +688,6 @@ func (w *Writer) Add(name string, body []byte) error {
 func (w *Writer) Close() error {
 	close(w.work)
 	w.wg.Wait()
-	// After the flushes below, whatever they do: a name this batch reserved
-	// and then failed on has to be released, or the next writer of that chunk
-	// waits for a batch that has already gone.
-	defer func() {
-		w.mu.Lock()
-		releases := w.release
-		w.release = nil
-		w.mu.Unlock()
-		for _, release := range releases {
-			release()
-		}
-	}()
 	if w.err != nil {
 		return w.err
 	}
@@ -640,6 +696,10 @@ func (w *Writer) Close() error {
 			return err
 		}
 	}
+	// Only here, and only on the way out clean. A batch that failed leaves its
+	// names unproven, so they read as absent and the next put writes them
+	// again; nothing is stuck waiting on this batch, because nothing waits.
+	w.store.proven(w.vaultID, w.placed...)
 	return nil
 }
 

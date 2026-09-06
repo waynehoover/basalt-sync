@@ -9,7 +9,7 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   access,
   cp,
@@ -22,6 +22,7 @@ import {
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
@@ -46,9 +47,11 @@ import {
 } from "../core/index-journal-store.ts";
 import type {
   Ambiguous,
+  ExpectedContent,
   FileStat,
   IndexStamp,
   IndexStore,
+  Replaced,
   StoredState,
   Times,
   Vault,
@@ -103,6 +106,21 @@ export interface NodeVaultOptions {
   /** Extra names to leave alone, at any depth. */
   readonly alsoIgnore?: readonly string[];
   /**
+   * Look and do not touch (R12).
+   *
+   * `list` is a scan and is not observational: it reaps the temporary files a
+   * crashed run left behind, and it re-spells names into their normal form,
+   * both of which are writes. That is right for a pass, which is going to
+   * write anyway and wants the vault tidy first. It is wrong for `basalt
+   * status`, which takes no lock, may run beside a watcher, and is described
+   * to people as a question rather than an action.
+   *
+   * With this set the walk reports exactly what is on the disk and changes
+   * nothing. A name the disk spells its own way is reported the way the disk
+   * spells it, which is what the logical spelling map is for.
+   */
+  readonly observeOnly?: boolean;
+  /**
    * Obsidian's config folder, which is `.obsidian` until somebody overrides
    * it in the app.
    *
@@ -131,14 +149,146 @@ export interface NodeVaultOptions {
   readonly normalForm?: (name: string) => string;
 }
 
+/**
+ * The instant between reserving a normalised name and taking the old one
+ * away (R07).
+ *
+ * An editor saving through a temporary file replaces the old name atomically,
+ * and if that lands here the old code deleted the new file during what is
+ * meant to be a read-only scan. Too short to hit by racing, so a test stops
+ * the world in it. It does nothing in every build.
+ */
+export const midRespell = { pause: async (_path: string): Promise<void> => {} };
+
+/**
+ * The instant between a trash copy being made durable and the original being
+ * removed (R08).
+ *
+ * Where the vault and its trash are on different filesystems, that gap is a
+ * whole-tree flush wide, and a save landing in it used to be deleted on the
+ * strength of a comparison about an older version. Too short to hit by racing
+ * when the tree is one file, so a test stops the world in it. It does nothing
+ * in every build.
+ */
+export const midTrash = { pause: async (_path: string): Promise<void> => {} };
+
+/**
+ * Takes away a name whose file now has a second, normalised name, without
+ * deleting anything that is not that file (R07).
+ *
+ * The old code reserved the new name with `link` and removed the old one with
+ * `rm`. `rm` removes whatever is at the name at that moment, and an editor
+ * replacing the file in between, which is what an atomic save is, had its new
+ * version deleted by a read-only scan.
+ *
+ * `rename` into staging is the atomic half: whatever is at the old name comes
+ * out whole, and only then is it identified. Our own inode is a second name
+ * for a file that is safely at its new one, so it is dropped. Anything else is
+ * a save that landed in the instant between the link and here, and it goes
+ * back; if the name has been taken again in the meantime the file stays in
+ * staging, which `list` reports and reaps only when it is old, so it is
+ * recoverable rather than gone.
+ *
+ * Module-level so it can be driven directly. Through `list` it is reachable
+ * only on a filesystem that keeps two Unicode spellings apart, which macOS
+ * does not, and a preservation rule tested on one platform is tested nowhere.
+ */
+export async function retireName(
+  staging: string,
+  from: string,
+  source: { dev: number; ino: number },
+): Promise<void> {
+  await midRespell.pause(from);
+  // Created first. `rename` reports a missing *destination* directory as
+  // ENOENT too, and reading that as "the source is already gone" left both
+  // spellings on the disk with nothing said, which is the divergence the
+  // re-spelling exists to end.
+  await mkdir(staging, { recursive: true });
+  const spare = join(staging, `respell.${randomBytes(8).toString("hex")}`);
+  const there = await lstat(from).catch(() => undefined);
+  if (there === undefined) return; // already gone: two passes racing
+  await rename(from, spare);
+
+  const moved = await lstat(spare).catch(() => undefined);
+  if (moved !== undefined && moved.dev === source.dev && moved.ino === source.ino) {
+    await rm(spare, { force: true });
+    return;
+  }
+  // Not ours. Put it back under the name it was saved at.
+  try {
+    await link(spare, from);
+    await rm(spare, { force: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    // The name was taken again while this was deciding. The file stays in
+    // staging rather than being thrown away.
+  }
+}
+
+/**
+ * Refuses a path whose real location is outside the vault (F24, R11).
+ *
+ * Walks up from the path's parent resolving links until it finds something
+ * that exists, and requires that to be the vault or inside it. Walking up is
+ * what makes it work on a path that is about to be created: the file is not
+ * there yet, and the question is about the directory it will land in.
+ *
+ * Module-level and shared, because the containment rule was on the vault
+ * adapter and three writers were not going through it. The config, the index
+ * and the lock all live under `.basalt`, and a `.basalt` that is a symlink out
+ * of the vault sent this device's recovery material somewhere else with
+ * nothing said. One implementation, so the next writer added under there gets
+ * the rule by using the same door.
+ *
+ * `root` must already be resolved.
+ */
+export async function refuseOutsideVault(root: string, full: string): Promise<void> {
+  let at = dirname(full);
+  for (;;) {
+    const real = await realpath(at).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return undefined;
+      throw err;
+    });
+    if (real !== undefined) {
+      if (real !== root && !real.startsWith(root + sep)) {
+        throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
+      }
+      return;
+    }
+    const up = dirname(at);
+    // The filesystem root, which cannot be inside the vault.
+    if (up === at) return;
+    at = up;
+  }
+}
+
+/**
+ * The same check for a writer that has only the vault's path (R11).
+ *
+ * `saveConfig`, the index and the lock are module-level and hold no adapter,
+ * so they resolve the root themselves. A vault root that does not exist yet is
+ * not a containment failure: the caller is about to create it.
+ */
+export async function refuseOutsideVaultAt(vault: string, full: string): Promise<void> {
+  const root = await realpath(vault).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return undefined;
+    throw err;
+  });
+  if (root === undefined) return;
+  await refuseOutsideVault(root, full);
+}
+
 export class NodeVault implements Vault {
   private readonly root: string;
   private readonly ignore: Set<string>;
   /** How this vault spells one name. NFC everywhere but a test. */
   private readonly normal: (name: string) => string;
+  /** Whether this vault may write while listing. See NodeVaultOptions. */
+  private readonly observeOnly: boolean;
 
   constructor(root: string, opts: NodeVaultOptions = {}) {
     this.root = resolve(root);
+    this.observeOnly = opts.observeOnly ?? false;
     this.normal = opts.normalForm ?? canonicalSpelling;
     // NFC, because everything this is compared against is NFC now. `list`
     // folds the disk's spelling before asking `isNeverSynced`, and a Mac shell
@@ -248,24 +398,7 @@ export class NodeVault implements Vault {
    * below it is about to be created and cannot be a link yet.
    */
   private async insideForReal(full: string): Promise<void> {
-    const root = await (this.realRootOnce ??= realpath(this.root));
-    let at = dirname(full);
-    for (;;) {
-      const real = await realpath(at).catch((err: NodeJS.ErrnoException) => {
-        if (err.code === "ENOENT") return undefined;
-        throw err;
-      });
-      if (real !== undefined) {
-        if (real !== root && !real.startsWith(root + sep)) {
-          throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
-        }
-        return;
-      }
-      const up = dirname(at);
-      // The filesystem root, which cannot be inside the vault.
-      if (up === at) return;
-      at = up;
-    }
+    await refuseOutsideVault(await (this.realRootOnce ??= realpath(this.root)), full);
   }
 
   /**
@@ -524,28 +657,77 @@ export class NodeVault implements Vault {
       } else {
         try {
           await link(from, to);
-          await rm(from, { force: true });
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
           if (!(await sameFileAt())) throw err;
           await rename(from, to);
+          this.finishNormalising(path, entry, dir);
+          return;
         }
+        // The destination is reserved and is the same inode. What is left is
+        // to take the old name away, and `rm(from)` is the wrong tool for it
+        // (R07).
+        //
+        // `rm` removes whatever is at the name *now*. An editor that replaced
+        // the file between the link above and here, which is what an atomic
+        // save does, has its new file deleted by a read-only scan, and the
+        // normalised name still points at the old inode. The review
+        // reproduced exactly that.
+        //
+        // So the old name is moved rather than removed. `rename` is atomic:
+        // whatever is at `from` at that instant comes out in one piece, and
+        // then it can be looked at. Our own inode is debris and is dropped.
+        // Anything else is a file somebody saved in the last microsecond, and
+        // it goes back where it came from.
+        await this.retireOldSpelling(from, source);
       }
-      // Remembered on success, not on the attempt. A rename that succeeded
-      // and left the name where it was is a filesystem storing its own normal
-      // form, and asking it again will get the same answer for ever. A rename
-      // that threw may have thrown for a reason that passes, and writing the
-      // name off on the first EBUSY would leave a watching client diverged
-      // from every other device until somebody restarted it.
-      this.normalized.add(path);
-      entry.disk = entry.name;
-      this.unflushed.add(dir);
+      this.finishNormalising(path, entry, dir);
     } catch {
       // Kept under the spelling the disk has, which is what the map is for.
       // A destination that appeared since the listing lands here too, and
       // leaving both is the point: the alias machinery reports two spellings
       // of one name, and replacing one with the other would report nothing.
     }
+  }
+
+  /**
+   * Records that a name has been put into its normal form.
+   *
+   * Remembered on success, not on the attempt. A rename that succeeded and
+   * left the name where it was is a filesystem storing its own normal form,
+   * and asking it again will get the same answer for ever. A rename that threw
+   * may have thrown for a reason that passes, and writing the name off on the
+   * first EBUSY would leave a watching client diverged from every other device
+   * until somebody restarted it.
+   */
+  private finishNormalising(
+    path: string,
+    entry: { name: string; disk: string },
+    dir: string,
+  ): void {
+    this.normalized.add(path);
+    entry.disk = entry.name;
+    this.unflushed.add(dir);
+  }
+
+  /**
+   * Takes away a name that now has a normalised twin, without deleting
+   * anything that is not the file we linked (R07).
+   *
+   * `rename` into staging is the atomic half: whatever is at the old name
+   * comes out whole, and only then is it identified. Our own inode is a
+   * second name for a file that is safely at its new one, so it is dropped.
+   * Anything else is a save that landed in the instant between the link and
+   * here, and it is put back; if the name has been taken again in the
+   * meantime the file stays in staging rather than being thrown away, and the
+   * next scan finds it there.
+   */
+  private async retireOldSpelling(
+    from: string,
+    source: { dev: number; ino: number },
+  ): Promise<void> {
+    await this.checkStaging();
+    await retireName(this.staging, from, source);
   }
 
   /** Temporary files of a crashed earlier run that `list` has removed. */
@@ -605,7 +787,9 @@ export class NodeVault implements Vault {
    * 2.6x worse than the default 4.
    */
   async list(): Promise<FileStat[]> {
-    await this.reapStaleTemps();
+    // Neither of the two writes a scan normally makes happens in observe-only
+    // mode (R12): reaping a crashed run's temporaries, and re-spelling names.
+    if (!this.observeOnly) await this.reapStaleTemps();
     this.diskName.clear();
     this.spellingsKnown.clear();
     this.ambiguousPaths = [];
@@ -699,7 +883,9 @@ export class NodeVault implements Vault {
           continue;
         }
         const only = group[0]!;
-        if (only.disk !== name && !rawNames.has(name)) await this.normalizeName(dir, only, path);
+        if (!this.observeOnly && only.disk !== name && !rawNames.has(name)) {
+          await this.normalizeName(dir, only, path);
+        }
         if (only.disk !== name) this.diskName.set(path, only.disk);
         kept.push(only);
       }
@@ -941,6 +1127,123 @@ export class NodeVault implements Vault {
    * `.trash` is in the never-sync list, so what lands there does not travel
    * back out and undo the deletion everywhere else.
    */
+  /**
+   * Writes over a file without ever destroying the bytes that were there
+   * (R01).
+   *
+   * The engine's guard used to be a stat taken immediately before the write:
+   * same size, same rounded mtime, presumed untouched. An edit that keeps the
+   * length, which is most corrections, saved inside the same second, passes
+   * it and is overwritten with no copy anywhere. Narrowing the window does not
+   * help, because there is no compare-and-swap on a file.
+   *
+   * So nothing here predicts. The order is: stage the new bytes and make them
+   * durable, *move* whatever is at the path aside, then link the new content
+   * into the name that is now free. The move is a rename, which is atomic and
+   * keeps every byte; at no point are bytes about to be destroyed. Whatever
+   * came out is hashed afterwards, and if it is not what the caller decided
+   * about it is handed back for the caller to keep.
+   *
+   * The one remaining instant is between the rename away and the link back,
+   * when the name does not exist. A save landing exactly there wins: `link`
+   * refuses an occupied name, so the new file stays and the caller is handed
+   * the older bytes to place beside it. That is the safe way round.
+   */
+  async replace(
+    path: string,
+    expect: ExpectedContent | undefined,
+    bytes: Uint8Array,
+    times: Times,
+  ): Promise<Replaced> {
+    const full = await this.absolute(path);
+    await this.insideForReal(full);
+    const had = await this.deepestExisting(full);
+    await mkdir(dirname(full), { recursive: true });
+    await this.matchCase(full);
+    await this.checkStaging();
+
+    if (expect === undefined) {
+      // Nothing was expected at the path, so there is nothing to preserve and
+      // this is an ordinary write. `create` is the exclusive variant when a
+      // caller must not land on an occupied name.
+      await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
+      this.dirty(full, had);
+      return {};
+    }
+
+    const token = randomBytes(8).toString("hex");
+    const staged = join(this.staging, `replace.${token}`);
+    const keep = join(this.staging, `keep.${token}`);
+    try {
+      // Durable before anything is moved: a crash after the rename below must
+      // not leave the path empty and the new content only in memory.
+      await writeDurably(staged, bytes, true, { mtime: times.mtime, stageIn: this.staging });
+
+      let moved = true;
+      try {
+        await rename(full, keep);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        // Nothing there. The caller expected content and found none, which is
+        // itself a change, but there is nothing to hand back.
+        moved = false;
+      }
+
+      let landed = true;
+      try {
+        await link(staged, full);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        // Somebody created a file in the instant the name was free. Theirs
+        // stays: it is the newest thing anybody wrote and this write is
+        // acting on a decision older than it.
+        landed = false;
+      }
+      this.dirty(full, had);
+      this.unflushed.add(dirname(full));
+
+      if (!moved) return landed ? {} : { kept: bytes };
+      const was = await readFile(keep);
+      const id = await expect.idOf(was);
+      if (id === expect.contentId && landed) return {};
+      // Either what was there is not what this write was decided about, or a
+      // new file arrived at the name. Both mean the caller has something to
+      // keep; hand back the bytes that were displaced.
+      return { kept: landed ? was : bytes };
+    } finally {
+      await rm(staged, { force: true });
+      await rm(keep, { force: true });
+    }
+  }
+
+  /**
+   * Removes a file, and says so when what it removed was not what the caller
+   * meant to remove (R01).
+   *
+   * The deletion half of `replace`. `remove` already moves the file to the
+   * trash rather than unlinking it, so nothing is destroyed either way; what
+   * this adds is telling the caller that the thing it deleted had changed, so
+   * a deletion decided before a fetch does not quietly take an edit made
+   * during it and report it as an ordinary removal.
+   */
+  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
+    const full = await this.absolute(path);
+    await this.insideForReal(full);
+    let was: Uint8Array | undefined;
+    try {
+      was = await readFile(full);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    await this.remove(path);
+    if (was === undefined) return {};
+    // Read before the removal rather than out of the trash, because the trash
+    // path is chosen by `remove` and a folder removal has no single file to
+    // read back. This is one read of a file that is about to move anyway.
+    const id = await expect.idOf(was);
+    return id === expect.contentId ? {} : { kept: was };
+  }
+
   async remove(path: string): Promise<void> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
@@ -1093,6 +1396,11 @@ export class NodeVault implements Vault {
   async create(path: string, bytes: Uint8Array, times: Times): Promise<boolean> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
+    // The staging directory too (R11). `write` checks it and this did not, so
+    // the one write that must not clobber anything staged its bytes through a
+    // directory nothing had asked about: a `.basalt/tmp` that is a link out of
+    // the vault put a conflict copy's contents outside it on the way past.
+    await this.checkStaging();
     const had = await this.deepestExisting(full);
     await mkdir(dirname(full), { recursive: true });
     const { tmp, handle } = await openTemp(full, undefined, this.staging);
@@ -1597,7 +1905,73 @@ export async function copyVerifiedThenRemove(source: string, target: string): Pr
         `${(err as Error).message}`,
     );
   }
-  await rm(source, { recursive: true, force: true });
+  await midTrash.pause(source);
+  // Removed file by file, each one checked against its copy first (R08).
+  //
+  // `rm -r` on the source removed whatever was there, and what was there was
+  // last looked at before a flush of the whole copied tree, which for a folder
+  // of attachments is not a short operation. An editor saving into that window
+  // had its work deleted on the strength of a comparison made about an older
+  // version of the file. The review reproduced exactly that: replace the
+  // source after the target flush, and the helper deletes it and leaves only
+  // the old bytes in the trash.
+  //
+  // Comparing again immediately before each unlink does not close the window
+  // either, because nothing here can. What it does is shrink it from "the
+  // length of a tree flush" to "the length of one hash", and anything that
+  // does not match is left where it is rather than deleted, so the worst case
+  // is a note in the trash and in the vault, which somebody can see.
+  const left = await removeMatching(source, target);
+  if (left.length > 0) {
+    throw new Error(
+      `moved ${source} to ${target}, and left ${left.length} ` +
+        `${left.length === 1 ? "file" : "files"} in place because ${
+          left.length === 1 ? "it changed" : "they changed"
+        } while the copy was being made: ${left.slice(0, 3).join(", ")}`,
+    );
+  }
+}
+
+/**
+ * Removes every file under `source` whose copy under `target` still matches
+ * it, and returns the paths of any that did not (R08).
+ *
+ * Directories go last and only when they have emptied, so a file left behind
+ * keeps its parents. A file that has changed is left with its copy already in
+ * the trash, which is two copies rather than none.
+ */
+async function removeMatching(source: string, target: string): Promise<string[]> {
+  const left: string[] = [];
+  const walk = async (from: string, to: string): Promise<void> => {
+    const info = await stat(from).catch(() => undefined);
+    if (info === undefined) return; // already gone
+    if (info.isDirectory()) {
+      for (const name of await readdir(from)) await walk(join(from, name), join(to, name));
+      // Only if nothing under it was kept. `rmdir` refuses a directory that
+      // is not empty, which is the check and the removal in one; `rm` will
+      // not remove a directory at all without `recursive`, and asking for
+      // that would take the children this walk deliberately kept.
+      await rmdir(from).catch(() => {
+        left.push(from);
+      });
+      return;
+    }
+    if (!info.isFile()) return;
+    const [now, copied] = await Promise.all([
+      digestOf(from).catch(() => undefined),
+      digestOf(to).catch(() => undefined),
+    ]);
+    if (now === undefined || copied === undefined || now !== copied) {
+      left.push(from);
+      return;
+    }
+    await rm(from, { force: true });
+  };
+  await walk(source, target);
+  // A directory that is empty only because its own children were removed
+  // reports itself as left above; filter those out, because the caller cares
+  // about files it could not remove and not about the shape of the tree.
+  return left.filter((p) => !left.some((other) => other !== p && other.startsWith(`${p}/`)));
 }
 
 /** Flushes every file under a path, then every directory holding one. */

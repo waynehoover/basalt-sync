@@ -872,7 +872,13 @@ export default class BasaltPlugin extends Plugin {
         // so a save that succeeded with a read-back that then failed was told
         // to revoke a row it was itself holding the key to.
         const remains = await whatTheDiskHolds(() => this.readConfig());
-        if (remains.kind === "credential") {
+        // Guarded, because reading the disk is itself an await (R10). A
+        // pairing that was retired while this was asking is one `unlink` has
+        // waited for and is about to remove, and starting a loop on what it
+        // finds would put the pairing back on a vault somebody has just
+        // unlinked. The credential on the server is real either way, and the
+        // message below names it.
+        if (remains.kind === "credential" && mine === this.generation) {
           // The row is real and this phone holds the only copy of its
           // credential, so what was written stays and the panel says as much
           // rather than looking unpaired.
@@ -887,6 +893,17 @@ export default class BasaltPlugin extends Plugin {
               surface: "panel",
               where: this.dataPath,
             }),
+        );
+      }
+      // The same guard the invite branch has, and for the same reason (R10).
+      // `registerAsDevice` is a round trip and a save; a vault unlinked while
+      // it was in flight must not be started again from the credential it
+      // produced. The row on the server is real, so this says so rather than
+      // pretending the registration did not happen.
+      if (mine !== this.generation) {
+        throw new Error(
+          "this vault was unlinked while it was being paired. The device row it registered is " +
+            "on the server; remove it with basalt revoke, or pair again.",
         );
       }
       this.config = paired;
@@ -980,8 +997,17 @@ export default class BasaltPlugin extends Plugin {
    * and before the first byte goes out, and everything after it is allowed to
    * fail.
    */
-  async pairFirst(setup: string, device: string, onKey?: (key: string) => void): Promise<string> {
+  async pairFirst(
+    setup: string,
+    device: string,
+    onKey?: (key: string) => void | Promise<void>,
+  ): Promise<string> {
     return this.onePairing(async () => {
+      // Captured before anything is awaited (R10). It was taken after the
+      // save and the key handoff below, so an unload during either of those
+      // was invisible to every check that followed and the pairing went on to
+      // start a loop for a vault that had been retired.
+      const mine = this.generation;
       const { url, token } = parseSetup(setup);
       const secret = generateSecret();
       const name = deviceName(device);
@@ -989,11 +1015,26 @@ export default class BasaltPlugin extends Plugin {
       await this.saveVerified(starting);
       this.config = starting;
       const recoveryKey = formatPairing({ url, vaultId: "default", secret });
-      // On screen now, while the root above is still the only thing on disk
-      // and nothing has been sent. Every later step is allowed to fail.
-      onKey?.(recoveryKey);
+      // On screen now, and *waited for*, while the root above is still the
+      // only thing on disk and nothing has been sent (R02).
+      //
+      // Showing it and carrying on was not a handoff. Registration replaces
+      // the root-bearing config with this device's own credential the moment
+      // there is one, so a reload, a crash or a closed panel between the two
+      // took the only copy of a key nothing can reissue. Returning from a
+      // callback is not evidence that anybody read the screen.
+      //
+      // Awaited, so a surface that asks somebody to confirm they have written
+      // it down actually holds the vault's claim until they have. The same
+      // obligation `rotateVault` documents and for the same reason; this is
+      // the other half of it.
+      //
+      // If the wait is abandoned, nothing has been claimed and the config
+      // still holds the root: `pendingFirstPairing` finds it on the next load
+      // and offers the key again, so the interrupted case recovers rather
+      // than losing anything.
+      await onKey?.(recoveryKey);
 
-      const mine = this.generation;
       let registered = false;
       try {
         this.config = await registerAsDevice(
@@ -1015,8 +1056,14 @@ export default class BasaltPlugin extends Plugin {
         // far as saving a credential, that is what is on disk and `start`
         // connects with it. Read back rather than assumed (rule 4).
         const remains = await whatTheDiskHolds(() => this.readConfig());
-        this.config = "config" in remains ? remains.config : starting;
-        this.start();
+        // Guarded, because reading the disk is an await (R10): a vault
+        // unlinked while this was asking must not be started again from what
+        // it finds. The key is still put on screen below, which is the part
+        // that must happen whatever the lifecycle did.
+        if (mine === this.generation) {
+          this.config = "config" in remains ? remains.config : starting;
+          this.start();
+        }
         // The recovery key only when the root is still what is held: a
         // credential that landed has replaced it, and there is then nothing on
         // the panel to write down. The row this may have left is named by the
@@ -1040,6 +1087,15 @@ export default class BasaltPlugin extends Plugin {
               surface: "panel",
               where: this.dataPath,
             }),
+        );
+      }
+      // And the success path (R10). Registration is a round trip, a save and
+      // a wait for somebody to write the key down, so a vault retired during
+      // any of that must not be started again from the credential it made.
+      if (mine !== this.generation) {
+        throw new Error(
+          "this vault was unlinked while it was being started. The device row it registered is " +
+            `on the server. Its recovery key is ${recoveryKey} and nothing else holds it.`,
         );
       }
       this.start();
@@ -1125,6 +1181,29 @@ export default class BasaltPlugin extends Plugin {
     // Only this path. Another note failing elsewhere in the vault says
     // nothing about this one, and marking the restore unsent for it would
     // send somebody looking in the wrong place.
+    // Asked about this path, not looked for in a list (R09).
+    //
+    // `skippedPaths` and `retryingPaths` are display samples: sorted,
+    // de-duplicated and cut to five, because a notice naming four hundred
+    // files is not a notice. Absence from a sample is not evidence of
+    // anything, and a pass with six failures reported the sixth as sent. A
+    // path that is merely blocked, or one in a pass that still has waiting
+    // work, was never in either list to begin with.
+    //
+    // So the question is put the other way round and answered affirmatively:
+    // is the server holding what this device holds for this path. Only
+    // `synced` writes that, and only where the server has acknowledged a
+    // version.
+    if (client.engine.serverHasOurs(done.path)) {
+      // No staleness check on this side on purpose: the upload happened, so
+      // "sent to your other devices" is true whatever became of the pairing
+      // afterwards, and saying otherwise would be the same lie reversed.
+      return { path: done.path, sent: true };
+    }
+
+    // Not acknowledged. The samples are used only to say *why*, which is what
+    // they are good for, and there is an answer for the case where they say
+    // nothing at all.
     if (report.skippedPaths.includes(done.path)) {
       return {
         path: done.path,
@@ -1133,19 +1212,20 @@ export default class BasaltPlugin extends Plugin {
         why: "the server refused it, so it is on this device only",
       };
     }
-    if (report.retryingPaths.includes(done.path)) {
+    if (report.inTheWay.some((t) => t.path === done.path)) {
       return {
         path: done.path,
         sent: false,
-        willRetry: true,
-        why: "it could not be sent yet, and will be tried again",
+        willRetry: false,
+        why: "another file is in the way of that name, so it is on this device only",
       };
     }
-
-    // No staleness check on this side on purpose: the upload happened, so
-    // "sent to your other devices" is true whatever became of the pairing
-    // afterwards, and saying otherwise would be the same lie reversed.
-    return { path: done.path, sent: true };
+    return {
+      path: done.path,
+      sent: false,
+      willRetry: true,
+      why: "it has not been acknowledged by the server yet, and will be tried again",
+    };
   }
 
   /**
@@ -1527,6 +1607,22 @@ export default class BasaltPlugin extends Plugin {
    * strength of it. `decodeConfig` refuses a half-written config, so a torn
    * write is caught here rather than on the next start.
    */
+  /**
+   * The recovery key of a first pairing that never finished, or undefined
+   * (R02).
+   *
+   * A config holding the vault's root and no device credential is not a
+   * device: it is a vault that was started here and never joined. The root is
+   * the recovery key, so an interrupted pairing is recoverable, and the panel
+   * offers it rather than leaving somebody with a key they were shown once and
+   * a vault they cannot open.
+   */
+  pendingFirstPairing(): string | undefined {
+    const config = this.config;
+    if (config?.secret === undefined || config.deviceId !== undefined) return undefined;
+    return formatPairing({ url: config.url, vaultId: config.vaultId, secret: config.secret });
+  }
+
   private async saveVerified(config: DeviceConfig): Promise<void> {
     const record = encodeConfig(config);
     await this.saveData(record);
@@ -2052,8 +2148,13 @@ class BasaltPanel {
     // offer the way out, without anybody opening anything first.
     if (drewRejoin) this.renderRejoin(contentEl);
 
-    if (this.freshRecoveryKey !== undefined)
-      this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
+    // A key this panel has just produced, or one from a pairing that never
+    // finished (R02). The second is what a reload in the middle of starting a
+    // vault leaves behind: the config still holds the root, nothing was
+    // claimed, and the key is recoverable from it. Offering it is the
+    // difference between "shown once and lost" and "shown until you have it".
+    const unfinished = this.freshRecoveryKey ?? this.plugin.pendingFirstPairing();
+    if (unfinished !== undefined) this.renderRecoveryKey(contentEl, unfinished);
 
     // Adding a device and recovering a note: the two things somebody comes
     // here to do that are not "is it working".
@@ -2593,14 +2694,20 @@ class BasaltPanel {
         try {
           // Rendered the moment the key exists, which is before the vault is
           // claimed and long before the registration replaces the root on
-          // disk (F02). Waiting for the call to return meant a failure or a
-          // crash anywhere after the registration took the only copy with
-          // it. Shown once, in this panel, until it is closed: not a notice,
-          // which goes away on its own, and not stored anywhere it could be
-          // shown again by accident.
-          await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), (key) => {
+          // disk (F02), and the pairing *waits here* until somebody says they
+          // have it (R02).
+          //
+          // Showing it and carrying on was not a handoff. Registration
+          // replaces the root with this device's own credential, so a reload
+          // or a closed panel in between took the only copy of a key nothing
+          // can reissue, and returning from a callback is not evidence that
+          // anybody read the screen. Nothing has been claimed while this
+          // waits, so abandoning it costs nothing: the config still holds the
+          // root, and the panel offers the key again on the next load.
+          await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), async (key) => {
             this.freshRecoveryKey = key;
             this.render();
+            await this.writtenDown;
           });
           new Notice(
             "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
@@ -2618,7 +2725,22 @@ class BasaltPanel {
   /** The recovery key of a vault this panel just started, shown once. */
   private freshRecoveryKey: string | undefined;
 
+  /**
+   * Resolves when somebody presses "I have written it down" (R02).
+   *
+   * What makes the handoff a stage rather than a notification: the pairing
+   * awaits this before it claims the vault, so a key on screen that nobody has
+   * read cannot be retired by the next step.
+   */
+  private writtenDown: Promise<void> = Promise.resolve();
+  private confirmWrittenDown: (() => void) | undefined;
+
   private renderRecoveryKey(contentEl: HTMLElement, key: string): void {
+    if (this.confirmWrittenDown === undefined) {
+      this.writtenDown = new Promise<void>((go) => {
+        this.confirmWrittenDown = go;
+      });
+    }
     contentEl.createEl("h3", { text: "Write this down" });
     const said = contentEl.createEl("p", {
       text:
@@ -2634,6 +2756,11 @@ class BasaltPanel {
     new Setting(contentEl).addButton((b) =>
       b.setButtonText("I have written it down").onClick(() => {
         this.freshRecoveryKey = undefined;
+        // Releases the pairing, which has been holding the vault's claim
+        // until now. Cleared so a later key gets a wait of its own.
+        this.confirmWrittenDown?.();
+        this.confirmWrittenDown = undefined;
+        this.writtenDown = Promise.resolve();
         this.render();
       }),
     );

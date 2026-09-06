@@ -1157,7 +1157,27 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 	if err != nil {
 		return 0, err
 	}
-	bk, err := openStore(dir)
+	// Held for the whole of this check, and released by the caller's defer
+	// chain only after the purge has run (R04). Without it the directory being
+	// examined can be replaced by another backup between the verification and
+	// the deletion, and everything below would be a true statement about a
+	// directory that no longer exists.
+	//
+	// Shared, not exclusive: a second reader is harmless and `basaltd backup`
+	// takes the destination exclusively, so a backup writing into this
+	// directory is refused while a purge is relying on it.
+	bkLock, err := dirlock.Shared(dir, dirlock.Data)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"the backup at %s is in use, so it cannot be relied on while it changes: %w", dir, err)
+	}
+	defer bkLock.Release()
+
+	// Read-only (I15, R04). This inspects a backup and must not migrate it,
+	// write its schema, or create anything: a diagnostic that modifies what it
+	// was asked to look at is one nobody can trust about the day it matters.
+	bkDB, bkChunks := store.DataDir(dir)
+	bk, err := store.OpenForInspection(bkDB, bkChunks)
 	if err != nil {
 		return 0, fmt.Errorf("opening the backup at %s: %w", dir, err)
 	}
@@ -1173,10 +1193,17 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 				"Take a fresh one first: basaltd backup -to %s", dir, vault, backupLatest, sourceLatest, dir)
 	}
 
-	// Every version this store holds, present in the backup and the same one.
-	// The MAC is the client's authentication of the entry's content and
-	// metadata; two stores agreeing on it for every uid are holding the same
-	// history, and a store that merely counted as high is not.
+	// Every version this store holds, present in the backup, identical, and
+	// readable.
+	//
+	// It used to compare the MAC alone, on the reasoning that a client's
+	// authenticator over an entry identifies its content. That is true of what
+	// the *client* signed and says nothing about what this database stores
+	// beside it: a row whose path, size or chunk list differs while carrying
+	// the same MAC string passes such a check, and so does a chunk file of the
+	// right name holding the wrong bytes (R04). Purge is the one command that
+	// destroys something no device holds, so what it accepts as proof has to be
+	// the thing it is proof of.
 	seen := 0
 	bodies := 0
 	if err := source.EachEntry(vault, func(e store.Entry) error {
@@ -1190,23 +1217,44 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 					"good; nothing was purged.\nTake a fresh one first: basaltd backup -to %s",
 				dir, e.UID, vault, dir)
 		}
-		if held.Mac != e.Mac {
+		if why := sameVersion(e, held); why != "" {
 			return fmt.Errorf(
-				"the backup at %s holds a different version %d of %q than this store does, so it "+
-					"is a backup of some other vault that reused the name; nothing was purged",
-				dir, e.UID, vault)
+				"the backup at %s holds a different version %d of %q than this store does (%s), so it "+
+					"is a backup of some other vault that reused the name, or of this one before it "+
+					"changed; nothing was purged", dir, e.UID, vault, why)
 		}
 		seen++
 		if !e.HasBody() {
 			return nil
 		}
 		for _, name := range e.Chunks {
-			if !bk.Chunks().Has(vault, name) {
+			// Read and hashed, not stat'ed. A file of the right name holding
+			// the wrong bytes is exactly what a backup on a failing disk looks
+			// like, and it is indistinguishable from a good one until somebody
+			// restores it. This is the moment to find out, because it is the
+			// moment before the only other copy is deleted.
+			//
+			// It costs a full read of every body the vault currently
+			// references, which is what `basaltd backup -deep` costs and is
+			// the same order as taking the backup was. Purge already means
+			// stop, back up, purge, start.
+			if err := bk.Chunks().Check(vault, name); err != nil {
+				// Two different states, and they read differently to whoever
+				// is holding the only other copy of this history (rule 2). A
+				// body that is absent is a copy that did not finish, or a
+				// retention policy that swept it; a body that is there and
+				// hashes wrong is a disk going bad.
+				missing := "the record of version %d of %q but not its contents (chunk %s is not " +
+					"in its chunk tree), so restoring from it would give back an empty note"
+				what := fmt.Sprintf(missing, e.UID, vault, name)
+				if !errors.Is(err, chunks.ErrNotFound) {
+					what = fmt.Sprintf(
+						"version %d of %q and cannot serve it: chunk %s %v, so restoring from it "+
+							"would give back a note that will not decrypt", e.UID, vault, name, err)
+				}
 				return fmt.Errorf(
-					"the backup at %s has the record of version %d of %q but not its contents "+
-						"(chunk %s is not in its chunk tree), so restoring from it would give back "+
-						"an empty note; nothing was purged.\nTake a fresh one first: "+
-						"basaltd backup -to %s", dir, e.UID, vault, name, dir)
+					"the backup at %s has %s; nothing was purged.\nTake a fresh one first: "+
+						"basaltd backup -to %s", dir, what, dir)
 			}
 			bodies++
 		}
@@ -1219,6 +1267,45 @@ func backupCovers(dir, vault, dataDir string, source *store.Store) (int64, error
 			"the backup at %s holds no versions of %q at all; nothing was purged", dir, vault)
 	}
 	return backupLatest, nil
+}
+
+// sameVersion says why two records of one uid differ, or "" when they do not.
+//
+// Every field the store persists, because the question being answered is "can
+// this backup give me back exactly what I am about to delete", and any field
+// that differs is a field the restore would give back wrongly. Named
+// explicitly rather than compared with reflect.DeepEqual so that a field added
+// to Entry fails to compile here rather than silently dropping out of the one
+// check that stands between a purge and somebody's history.
+func sameVersion(want, got store.Entry) string {
+	switch {
+	case got.Path != want.Path:
+		return "a different path"
+	case got.Size != want.Size:
+		return fmt.Sprintf("size %d rather than %d", got.Size, want.Size)
+	case got.CTime != want.CTime || got.MTime != want.MTime:
+		return "different timestamps"
+	case got.Folder != want.Folder:
+		return "one is a folder and the other is not"
+	case got.Deleted != want.Deleted:
+		return "one is a deletion and the other is not"
+	case got.Device != want.Device:
+		return "a different device wrote it"
+	case got.Prev != want.Prev:
+		return "a different previous path"
+	case got.Mac != want.Mac:
+		return "a different authenticator"
+	case got.Parent != want.Parent:
+		return "a different parent version"
+	case len(got.Chunks) != len(want.Chunks):
+		return fmt.Sprintf("%d chunks rather than %d", len(got.Chunks), len(want.Chunks))
+	}
+	for i, name := range want.Chunks {
+		if got.Chunks[i] != name {
+			return fmt.Sprintf("chunk %d of %d is a different body", i+1, len(want.Chunks))
+		}
+	}
+	return ""
 }
 
 /* ---------------------------------------------------------------- *

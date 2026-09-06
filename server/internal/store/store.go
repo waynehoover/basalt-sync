@@ -523,6 +523,18 @@ func OpenForInspection(dbPath, chunkDir string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// ExecForTest runs one statement against the database.
+//
+// A seam for tests that have to produce a store in a state no code path can
+// reach: a backup whose row differs from the source in a field nothing here
+// would ever change on its own, for instance, which is what proves the purge's
+// comparison looks at more than the authenticator (R04). Named so that its one
+// legitimate use is obvious and any other is not.
+func (s *Store) ExecForTest(statement string, args ...any) error {
+	_, err := s.db.Exec(statement, args...)
+	return err
+}
+
 // Chunks exposes the chunk store for the put/get paths, which upload and serve
 // bodies without touching an entry.
 func (s *Store) Chunks() *chunks.Store { return s.chunks }

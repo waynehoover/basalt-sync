@@ -244,19 +244,24 @@ To publish the plugin, tagged bare because the community directory requires the
 tag to be exactly the manifest version:
 
   git tag -a $pluginversion -m "Basalt Sync $pluginversion" && git push origin $pluginversion
-  gh release create $pluginversion --title "Basalt Sync $pluginversion" \\
+  gh release create $pluginversion --draft --title "Basalt Sync $pluginversion" \\
     release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \\
     release/plugin/SHA256SUMS
 
-The attest workflow signs those three on publish and replaces them with what it
-signed, which is why the release is worth checking again once it is out rather
-than only before.
+A draft, and that is not a detail. The attest workflow checks that CI passed on
+that commit, rebuilds these three files, signs them, writes the checksums for
+what it built, and publishes the release as its last step. Nothing is
+downloadable until all of that has passed, and a run that fails leaves a draft
+you can delete. Creating it public put the files in front of the checks.
 
 To publish the server, on its own tag because it moves on its own clock:
 
   git tag -a server/v$version -m "basaltd $version" && git push origin server/v$version
-  gh release create server/v$version --title "basaltd $version" \\
+  gh release create server/v$version --draft --title "basaltd $version" \\
     release/server/*
+
+A draft here too, and published by the same workflow once it has rebuilt,
+signed and checksummed the binaries.
 
 Pushing that tag is also what builds and pushes the container image.
 

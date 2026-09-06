@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"github.com/waynehoover/basalt-sync/server/internal/fsync"
 	"io"
@@ -133,7 +135,19 @@ type Snapshot struct {
 	Bytes int64 `json:"bytes"`
 	// Change is SQLite's file change counter. Zero in a Format 2 file, which is
 	// why reading one is not an error: it means "not recorded", not "zero".
-	Change     int64  `json:"change"`
+	//
+	// It is a cheap first look and not an identifier, which is what it was
+	// briefly taken for (R14). `VACUUM INTO` writes a *fresh* database, so its
+	// counter starts from the handful of transactions that built it rather
+	// than carrying anything over from the source: two backups of the same
+	// store taken an hour apart are both at three, and swapping one database
+	// for the other was accepted. What it still does is catch a file that has
+	// been written to in place, which is worth a stat and a four-byte read.
+	Change int64 `json:"change"`
+	// Digest is the SHA-256 of the database file, and is what actually
+	// identifies this snapshot. Empty in a file written before it, which reads
+	// as "not recorded" rather than as a mismatch.
+	Digest     string `json:"digest,omitempty"`
 	ModifiedAt string `json:"modifiedAt"`
 }
 
@@ -175,11 +189,36 @@ func DatabaseStamp(dir string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	digest, err := fileDigest(dbPath)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	return Snapshot{
 		Bytes:      info.Size(),
 		Change:     change,
+		Digest:     digest,
 		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339Nano),
 	}, nil
+}
+
+// fileDigest is the SHA-256 of a file, streamed.
+//
+// One pass over the database, which is metadata only: the bodies are files
+// beside it and are not read here. Against what a backup costs to take, and
+// against what a purge costs to verify, this is not a figure anybody will
+// notice, and it is the only thing in the sidecar that actually says *which*
+// snapshot it describes (R14).
+func fileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // VaultCoverage is the uid range one vault's snapshot covers.
@@ -296,11 +335,9 @@ func ReadBackupMeta(dir string) (BackupMeta, error) {
 				"Run `basaltd backup` into this directory again, or read the database itself",
 			BackupMetaFile, meta.Database.Bytes, stamp.Bytes)
 	}
-	// The change counter, which is what catches a replacement of the same size
-	// (I16). Skipped when the file records zero, which is every Format 2 file
-	// and every file written before this was stamped: "not recorded" is not
-	// "zero", and treating it as a mismatch would fail every backup taken
-	// before the upgrade.
+	// The change counter, which catches a database written to in place. Skipped
+	// when the file records zero: "not recorded" is not "zero", and treating it
+	// as a mismatch would fail every backup taken before it was stamped.
 	if meta.Database.Change != 0 && stamp.Change != meta.Database.Change {
 		return meta, fmt.Errorf(
 			"%s describes a database at change %d and the one beside it is at change %d. They are the same "+
@@ -308,6 +345,20 @@ func ReadBackupMeta(dir string) (BackupMeta, error) {
 				"something republished the database without rewriting the coverage. "+
 				"Run `basaltd backup` into this directory again, or read the database itself",
 			BackupMetaFile, meta.Database.Change, stamp.Change)
+	}
+	// And the digest, which is what actually identifies the snapshot (R14).
+	//
+	// The two checks above are a size and a counter, and `VACUUM INTO` writes a
+	// fresh database whose counter starts from the transactions that built it:
+	// two backups of one store, taken an hour apart, are the same size and at
+	// the same change, and swapping one for the other passed both. Nothing
+	// short of the contents can tell those apart.
+	if meta.Database.Digest != "" && stamp.Digest != meta.Database.Digest {
+		return meta, fmt.Errorf(
+			"%s describes a database whose contents hash to %s and the one beside it hashes to %s, so "+
+				"it is a different snapshot: something republished the database without rewriting the "+
+				"coverage. Run `basaltd backup` into this directory again, or read the database itself",
+			BackupMetaFile, meta.Database.Digest[:16], stamp.Digest[:16])
 	}
 	return meta, nil
 }

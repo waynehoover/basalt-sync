@@ -485,6 +485,17 @@ interface Pending {
   armed: boolean;
 }
 
+/**
+ * The ceilings that apply before the server has advertised its own (R13).
+ *
+ * Only the handshake happens before `ready`, and its frames are a few hundred
+ * bytes. These are generous enough that nothing legitimate meets them and
+ * small enough that meeting one is not dangerous, and they exist so that
+ * "before the limits are known" is not the same as "unlimited".
+ */
+const MAX_UNAGREED_FRAME_BYTES = 1 << 20;
+const MAX_UNAGREED_FETCH_BYTES = 1 << 20;
+
 export class Transport {
   private socket: SocketLike | undefined;
 
@@ -515,7 +526,15 @@ export class Transport {
    * before.
    */
   private collecting:
-    { pending: Pending; want: number; got: Uint8Array[]; waiter?: () => void } | undefined;
+    | {
+        pending: Pending;
+        want: number;
+        got: Uint8Array[];
+        /** Bytes received so far, against the server's own fetch ceiling (R13). */
+        bytes: number;
+        waiter?: () => void;
+      }
+    | undefined;
 
   /**
    * How many requests this connection has sent.
@@ -540,6 +559,21 @@ export class Transport {
   private notifying: Promise<void> = Promise.resolve();
   /** What the server said at hello, for the bounds this side keeps to. */
   private limits: ServerLimits | undefined;
+
+  /**
+   * The largest text frame this device will parse (R13).
+   *
+   * A control message, so the bound is the largest legitimate one: a batch,
+   * which the server bounds by the `maxBatchBytes` it advertised. Before
+   * `ready` nothing has been advertised and the only frames that should arrive
+   * are the handshake's, so the fallback is generous enough for any of those
+   * and far below what makes a parse dangerous.
+   */
+  private textFrameCeiling(): number {
+    const agreed = this.limits?.maxBatchBytes;
+    // Room for the framing around a batch that is exactly at the limit.
+    return agreed === undefined ? MAX_UNAGREED_FRAME_BYTES : agreed * 2;
+  }
 
   constructor(
     private readonly url: string,
@@ -678,6 +712,25 @@ export class Transport {
 
   private onFrame(data: unknown): void {
     if (typeof data === "string") {
+      // The size before the parse (R13).
+      //
+      // `JSON.parse` on a 200 MB string allocates the string's worth of
+      // objects before anything here sees a frame, and every check this class
+      // makes runs afterwards. A text frame is a control message: the largest
+      // legitimate one is a batch, which the server bounds by `maxBatchBytes`,
+      // and this is that bound applied to what arrives rather than to what
+      // was meant to be sent. Characters rather than bytes, which is within a
+      // factor of the limit and needs no encoder.
+      if (data.length > this.textFrameCeiling()) {
+        this.die(
+          new ProtocolError(
+            "toolarge",
+            `server sent a ${data.length} character frame, over the ` +
+              `${this.textFrameCeiling()} this device will parse`,
+          ),
+        );
+        return;
+      }
       let frame: Reply;
       try {
         frame = JSON.parse(data) as Reply;
@@ -729,6 +782,28 @@ export class Transport {
         new ProtocolError(
           "protostate",
           `server sent a ${bytes.length} byte body with nothing outstanding to receive it`,
+        ),
+      );
+      return;
+    }
+    // A budget over the whole fetch, not a count of frames (R13).
+    //
+    // The header says how many bodies are coming and each one is bounded by
+    // the chunk ceiling, so the count alone allows a fetch of the maximum
+    // number of maximum-sized bodies to sit in memory at once. What was asked
+    // for is known: the sizes were agreed when the fetch went out, and the
+    // server's own `maxFetchBytes` is the number it promised not to exceed.
+    fetch.bytes += bytes.length;
+    // Before `ready` there are no advertised limits, and a fetch cannot have
+    // been sent either, so the fallback is only ever reached by a peer sending
+    // bodies nobody asked for; the branch above has already refused that.
+    const ceiling = this.limits?.maxFetchBytes ?? MAX_UNAGREED_FETCH_BYTES;
+    if (fetch.bytes > ceiling) {
+      this.die(
+        new ProtocolError(
+          "toolarge",
+          `server sent ${fetch.bytes} bytes of bodies for a fetch it said would hold at most ` +
+            `${ceiling}`,
         ),
       );
       return;
@@ -1701,7 +1776,7 @@ export class Transport {
       armed: false,
     };
     const got: Uint8Array[] = [];
-    this.collecting = { pending: collector, want: names.length, got };
+    this.collecting = { pending: collector, want: names.length, got, bytes: 0 };
     const checks: Promise<void>[] = [];
 
     // The first failing hash, made observable the moment it fails (F18).

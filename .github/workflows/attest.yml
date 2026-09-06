@@ -9,11 +9,24 @@
 #
 # On release rather than on tag: the tag is pushed first and the release is made
 # afterwards, so a tag trigger would fire before there was anything to upload to.
+#
+# On `created` rather than `published`, and the release is made as a draft
+# (R16). The old order put the assets in front of the checks: `release.sh`
+# printed a `gh release create`, the operator ran it, the files were public
+# immediately, and only then did this workflow ask whether CI had passed, rebuild
+# them and replace them with `--clobber`. If CI had failed, the unchecked bytes
+# stayed downloadable; if the rebuild differed, whoever downloaded first got
+# something nobody else would.
+#
+# So a release is created as a draft, which is not downloadable and does not fire
+# `published`. This validates it, rebuilds and attests the exact files, writes
+# the checksums for them, and publishes as its last step. A run that fails leaves
+# a draft, which is the right thing to leave.
 name: attest
 
 on:
   release:
-    types: [published]
+    types: [created]
   # For a release that predates this workflow, or one to re-attest.
   workflow_dispatch:
     inputs:
@@ -101,14 +114,35 @@ jobs:
             attested/manifest.json
             attested/styles.css
 
+      # Written here, over the rebuilt files, for the reason the server's are
+      # (R16). The three assets were replaced with `--clobber` and the
+      # `SHA256SUMS` beside them was left as the laptop had written it, so a
+      # rebuild that differed by a byte left a checksum file that described
+      # bytes nobody could download.
+      - name: checksums
+        working-directory: attested
+        run: |
+          shasum -a 256 main.js manifest.json styles.css > SHA256SUMS
+          cat SHA256SUMS
+
       - name: upload
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           gh release upload "$TAG" \
-            attested/main.js attested/manifest.json attested/styles.css \
+            attested/main.js attested/manifest.json attested/styles.css attested/SHA256SUMS \
             --clobber --repo "$GITHUB_REPOSITORY"
+
+      # Last, and only now (R16). Everything above has run against a draft:
+      # nothing was downloadable, and a failure anywhere leaves it that way.
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          echo "$TAG is public, with the files that were just checked and signed"
 
   server:
     name: server
@@ -181,3 +215,12 @@ jobs:
         run: |
           gh release upload "$TAG" attested/basaltd-* attested/SHA256SUMS \
             --clobber --repo "$GITHUB_REPOSITORY"
+
+      # Last, and only now (R16). See the plugin job.
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          echo "$TAG is public, with the files that were just checked and signed"

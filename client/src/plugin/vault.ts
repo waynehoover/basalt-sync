@@ -87,9 +87,11 @@ import {
 } from "../core/index-journal-store.ts";
 import type {
   Ambiguous,
+  ExpectedContent,
   FileStat,
   IndexStamp,
   IndexStore,
+  Replaced,
   StoredState,
   Times,
   Vault,
@@ -643,8 +645,76 @@ export class ObsidianVault implements Vault {
     // Copied into its own buffer. A Uint8Array that is a view into a larger
     // one would hand over neighbouring bytes, and chunk reassembly produces
     // exactly that kind of view.
-    await this.replace(normalized, bytes.slice(), writeOptions(times));
+    await this.writeThroughStaging(normalized, bytes.slice(), writeOptions(times));
     this.wrote(normalized);
+  }
+
+  /**
+   * Writes over a file, keeping what was there when it is not what the caller
+   * expected (R01).
+   *
+   * The headless client does this by moving the old bytes aside with a rename
+   * before writing, so nothing is ever about to be destroyed. Obsidian's
+   * adapter has no way to do that: there is no hard link, and a rename to a
+   * side name followed by a write would leave the note missing from the vault
+   * for as long as the write took, which Obsidian's own indexer would notice.
+   *
+   * So this reads the bytes it is about to replace and compares them. That is
+   * weaker in one way and stronger in another. Weaker, because an edit landing
+   * between the read and the write is still overwritten, which is the gap
+   * docs/design.md names and no adapter here can close. Stronger than what was
+   * here before, because what it compares is the content: the check it
+   * replaces looked at the file's length and its rounded modification time,
+   * and an ordinary correction is the same number of characters, saved by an
+   * editor that carries the timestamp across. Those edits were invisible and
+   * are not any more.
+   */
+  async replace(
+    path: string,
+    expect: ExpectedContent | undefined,
+    bytes: Uint8Array,
+    times: Times,
+  ): Promise<Replaced> {
+    if (expect === undefined) {
+      await this.write(path, bytes, times);
+      return {};
+    }
+    const was = await this.readIfThere(path);
+    await this.write(path, bytes, times);
+    if (was === undefined) return {};
+    const id = await expect.idOf(was);
+    return id === expect.contentId ? {} : { kept: was };
+  }
+
+  /**
+   * Removes a file, and says so when what it removed was not what the caller
+   * meant to remove (R01).
+   *
+   * The deletion half, and the same reasoning. `remove` puts the file in a
+   * trash rather than unlinking it, so nothing is destroyed either way; what
+   * this adds is telling the caller that what it deleted had changed, so a
+   * deletion decided before a fetch does not quietly take an edit made during
+   * it and report an ordinary removal.
+   */
+  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
+    const was = await this.readIfThere(path);
+    await this.remove(path);
+    if (was === undefined) return {};
+    const id = await expect.idOf(was);
+    return id === expect.contentId ? {} : { kept: was };
+  }
+
+  /** The bytes at a path, or undefined when there is nothing there to read. */
+  private async readIfThere(path: string): Promise<Uint8Array | undefined> {
+    try {
+      return new Uint8Array(await this.adapter.readBinary(this.resolve(path)));
+    } catch {
+      // Absent, a folder, or unreadable. All three mean this cannot promise
+      // anything about what is being replaced, and every caller treats an
+      // absent baseline as a reason to keep what it finds rather than to
+      // overwrite it.
+      return undefined;
+    }
   }
 
   /** Remembers a file whose bytes or name changed, for `flush`. */
@@ -790,7 +860,7 @@ export class ObsidianVault implements Vault {
    * server's newest version; a failure names the copy so a person can find
    * it.
    */
-  private async replace(
+  private async writeThroughStaging(
     normalized: string,
     bytes: Uint8Array,
     options: { mtime?: number; ctime?: number },

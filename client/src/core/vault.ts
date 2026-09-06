@@ -66,6 +66,33 @@ export interface Ambiguous {
 }
 
 /** What the engine needs from a place files live. */
+/**
+ * What a caller believes is at a path, for `replace` and `removeExpecting`.
+ *
+ * A digest of the bytes, and not their length and timestamp. The metadata is
+ * what the old check compared and is exactly what an ordinary edit can leave
+ * alone: a corrected word is the same number of characters more often than
+ * not, and an editor that writes through a temporary file can reuse the
+ * timestamp. The digest is the thing that actually changed.
+ */
+export interface ExpectedContent {
+  /** The engine's content id for the local version the decision was taken on. */
+  readonly contentId: string;
+  /** Computes the content id of bytes, so the adapter needs no crypto of its own. */
+  readonly idOf: (bytes: Uint8Array) => Promise<string>;
+}
+
+/**
+ * What a preserving write or removal found in the way.
+ *
+ * `kept` is present only when the bytes at the path were not what the caller
+ * expected. They have been moved out of the destructive operation's way and
+ * are handed back so the caller can put them somewhere a person will find them.
+ */
+export interface Replaced {
+  readonly kept?: Uint8Array;
+}
+
 export interface Vault {
   /**
    * Every file and folder, excluding anything the client should not sync.
@@ -143,6 +170,41 @@ export interface Vault {
    * it landed looks locally edited on the next pass.
    */
   write(path: string, bytes: Uint8Array, times: Times): Promise<void>;
+  /**
+   * Writes over a file, keeping whatever was there if it is not what the
+   * caller expected (R01).
+   *
+   * The problem this exists for. A pass decides what to do from a scan, goes
+   * to the network, and writes; the editor is in use for the whole of that
+   * gap, and the engine's guard against it was a stat: same size, same
+   * rounded mtime, so presumed untouched. An edit that changes a line without
+   * changing the length, saved inside the same second or by an editor that
+   * preserves timestamps, passes that check and is overwritten with no copy
+   * anywhere. There is also a gap between the stat and the write itself, and
+   * no filesystem here offers a compare-and-swap to close it.
+   *
+   * So this does not try to detect the edit and refuse. It makes the
+   * destructive step non-destructive: the bytes at `path` are moved aside
+   * before anything is written over them, and the caller is told what was
+   * moved. Whatever was there is in hand afterwards, whether it was expected
+   * or not, and a caller that finds a surprise can keep it. Rule 1 is not to
+   * lose a note, and preserving beats predicting.
+   *
+   * `expect` is the content the caller decided about, or undefined when it
+   * expected nothing at the path. Returns `replaced` with the bytes that were
+   * actually there, when they were not what `expect` described, and undefined
+   * when the write went over exactly what the caller meant it to.
+   *
+   * Optional, because a platform whose API cannot move a file aside cannot
+   * offer it. Without it the engine falls back to the stat check, which is
+   * what it always had.
+   */
+  replace?(
+    path: string,
+    expect: ExpectedContent | undefined,
+    bytes: Uint8Array,
+    times: Times,
+  ): Promise<Replaced>;
   remove(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
@@ -184,6 +246,16 @@ export interface Vault {
    * to the gap it always had.
    */
   create?(path: string, bytes: Uint8Array, times: Times): Promise<boolean>;
+  /**
+   * Removes a file, keeping it if it is not what the caller expected (R01).
+   *
+   * The deletion half of `replace`, and the same reasoning: a deletion applied
+   * from a decision taken before the fetch can remove an edit made during it,
+   * and a stat cannot tell. Returns the bytes it kept when they were not what
+   * `expect` described, so the caller can put them back where somebody will
+   * see them.
+   */
+  removeExpecting?(path: string, expect: ExpectedContent): Promise<Replaced>;
   /**
    * Watches for changes, returning a function that stops watching.
    *
@@ -362,6 +434,50 @@ export class MemoryVault implements Vault {
     this.files.set(path, { bytes: bytes.slice(), mtime: times.mtime, ctime: times.ctime });
     for (const parent of parents(path)) this.folders.add(parent);
     this.notify(path);
+  }
+
+  /**
+   * Runs between reading what is at a path and writing over it, which is
+   * where a save from the editor lands (R01).
+   *
+   * The seam that makes the preserving write testable. In a real vault the
+   * gap is a rename and a link; here it is one statement, and without a hook
+   * inside it there is no way to produce the interleaving the whole mechanism
+   * exists for.
+   */
+  midReplace: ((path: string) => Promise<void> | void) | undefined;
+
+  /**
+   * Writes over a file, keeping what was there when it is not what the caller
+   * expected (R01).
+   *
+   * The in-memory equivalent of the real adapter's rename-aside: read what is
+   * there, write, and hand back what was displaced if it was a surprise. It
+   * reads *after* the hook above, so a write landing in the gap is the version
+   * this preserves rather than the one it was told to expect.
+   */
+  async replace(
+    path: string,
+    expect: ExpectedContent | undefined,
+    bytes: Uint8Array,
+    times: Times,
+  ): Promise<Replaced> {
+    await this.midReplace?.(path);
+    const was = this.files.get(path);
+    await this.write(path, bytes, times);
+    if (expect === undefined || was === undefined) return {};
+    const id = await expect.idOf(was.bytes);
+    return id === expect.contentId ? {} : { kept: was.bytes };
+  }
+
+  /** The deletion half, and the same reasoning. */
+  async removeExpecting(path: string, expect: ExpectedContent): Promise<Replaced> {
+    await this.midReplace?.(path);
+    const was = this.files.get(path);
+    await this.remove(path);
+    if (was === undefined) return {};
+    const id = await expect.idOf(was.bytes);
+    return id === expect.contentId ? {} : { kept: was.bytes };
   }
 
   /**

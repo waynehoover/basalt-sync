@@ -12,7 +12,12 @@ import { join } from "node:path";
 
 import { indexLogPath } from "../core/index-journal-store.ts";
 import { decodeConfig, encodeConfig, type DeviceConfig } from "../core/pairing.ts";
-import { syncDirectory, syncDirectoryIfSupported, writeDurably } from "./vault.ts";
+import {
+  refuseOutsideVaultAt,
+  syncDirectory,
+  syncDirectoryIfSupported,
+  writeDurably,
+} from "./vault.ts";
 
 /** The folder inside a vault that holds this client's state. */
 export const STATE_DIR = ".basalt";
@@ -77,8 +82,17 @@ export async function loadConfig(vault: string): Promise<Config | undefined> {
  */
 export async function saveConfig(vault: string, config: Config): Promise<void> {
   const dir = join(vault, STATE_DIR);
-  await mkdir(dir, { recursive: true });
   const file = configPath(vault);
+  // Before the directory is created, and before anything is written (R11).
+  //
+  // `NodeVault` has checked its writes for this since F24 and the config did
+  // not, which is the one file where it matters most: a `.basalt` that is a
+  // symlink out of the vault wrote this device's recovery and device material
+  // somewhere else, with nothing said, and no race was needed to arrange it.
+  // The staging directory under it gets the same question for the same reason.
+  await refuseOutsideVaultAt(vault, file);
+  await mkdir(dir, { recursive: true });
+  await refuseOutsideVaultAt(vault, join(dir, "tmp", "probe"));
   const text = JSON.stringify(encodeConfig(config), null, 2) + "\n";
   await writeDurably(file, new TextEncoder().encode(text), true, {
     mode: 0o600,
@@ -100,6 +114,7 @@ export async function saveConfig(vault: string, config: Config): Promise<void> {
  * leave the vault paired, which is the state that refuses to pair again.
  */
 export async function removeState(vault: string): Promise<string | undefined> {
+  await refuseOutsideVaultAt(vault, configPath(vault));
   const first = await removeIndex(vault);
   await rm(configPath(vault), { force: true });
   await mustBeGone(configPath(vault), "the config");
@@ -124,6 +139,7 @@ export async function removeState(vault: string): Promise<string | undefined> {
  * taking the wrong function.
  */
 export async function removeIndex(vault: string): Promise<string | undefined> {
+  await refuseOutsideVaultAt(vault, indexPath(vault));
   // The journal first, and this order is the only safe one. A crash between
   // the two leaves a snapshot with no journal, which is exactly what an index
   // looked like before the journal existed and loads without a word. The other

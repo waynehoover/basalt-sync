@@ -1,0 +1,128 @@
+/**
+ * `basalt status` does not say "up to date" about files it never looked at
+ * (R12).
+ *
+ * Two ways it did. A vault with no index returned zero unsent without scanning
+ * anything, and that is the ordinary state immediately after pairing and
+ * before the first sync: every note on the disk is unsent, and the status said
+ * everything was current. A scan that failed also returned zero, under a
+ * comment saying that guessing at zero would be exactly the claim this exists
+ * to prevent.
+ *
+ * And the scan itself was not a scan. `list` reaps the temporary files a
+ * crashed run left behind and re-spells names into their normal form, both of
+ * which are writes, from a command that takes no lock and may be running
+ * beside a watcher.
+ */
+
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { STATE_DIR, saveConfig } from "./config.ts";
+import { NodeVault, TEMP_MARK } from "./vault.ts";
+import { generateSecret } from "../core/crypto.ts";
+import { run } from "./cli.ts";
+
+const dirs: string[] = [];
+afterEach(async () => {
+  while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+});
+
+async function pairedVault(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "basalt-status-"));
+  dirs.push(dir);
+  await saveConfig(dir, {
+    url: "ws://127.0.0.1:1#nothing",
+    vaultId: "default",
+    device: "d",
+    deviceId: "d1",
+    deviceSecret: generateSecret(),
+    dataKey: generateSecret(),
+  });
+  return dir;
+}
+
+/** Runs `basalt status --json` and returns what it printed. */
+async function status(dir: string): Promise<{ unsent: number | string }> {
+  const out: string[] = [];
+  await run(["status", "--dir", dir, "--json", "--timeout", "300"], {
+    out: (l) => out.push(l),
+    err: () => {},
+  });
+  return JSON.parse(out.join("")) as { unsent: number | string };
+}
+
+describe("a vault paired and never synced", () => {
+  it("counts its notes as unsent rather than answering zero", async () => {
+    const dir = await pairedVault();
+    await writeFile(join(dir, "one.md"), "written before the first sync\n");
+    await writeFile(join(dir, "two.md"), "and another\n");
+
+    const said = await status(dir);
+    expect(
+      said.unsent,
+      "a vault with no index reported nothing unsent, which is what it says " +
+        "immediately after pairing",
+    ).toBe(2);
+  });
+});
+
+describe("a vault that cannot be read", () => {
+  it("says unknown rather than zero", async () => {
+    const dir = await pairedVault();
+    // A directory the walk cannot enter. Running as root defeats this, and
+    // then there is nothing to test.
+    const shut = join(dir, "shut");
+    await mkdir(shut);
+    await (await import("node:fs/promises")).chmod(shut, 0o000);
+    dirs.push(shut);
+
+    const said = await status(dir);
+    await (await import("node:fs/promises")).chmod(shut, 0o700).catch(() => {});
+    if (said.unsent !== "unknown") {
+      expect(process.getuid?.(), "the scan succeeded, so this proves nothing").toBe(0);
+      return;
+    }
+    expect(said.unsent).toBe("unknown");
+  });
+});
+
+describe("the scan status makes", () => {
+  it("writes nothing: no reaping, no re-spelling", async () => {
+    const dir = await pairedVault();
+    await writeFile(join(dir, "note.md"), "a note\n");
+    // A temporary from a crashed run, old enough that an ordinary scan would
+    // reap it.
+    const staging = join(dir, STATE_DIR, "tmp");
+    await mkdir(staging, { recursive: true });
+    const debris = join(staging, `${TEMP_MARK}stale`);
+    await writeFile(debris, "left behind");
+    const old = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    await (await import("node:fs/promises")).utimes(debris, old, old);
+
+    const before = (await readdir(staging)).sort();
+    await status(dir);
+    expect(
+      (await readdir(staging)).sort(),
+      "an inspection command reaped a temporary file",
+    ).toEqual(before);
+
+    // And the observing vault really does leave names alone, while an
+    // ordinary one still tidies. Without this the assertion above would pass
+    // for a scan that never ran.
+    const watching = new NodeVault(dir, { observeOnly: true });
+    await watching.list();
+    expect((await readdir(staging)).sort(), "an observing scan reaped a temporary file").toEqual(
+      before,
+    );
+
+    const ordinary = new NodeVault(dir);
+    await ordinary.list();
+    expect(
+      (await readdir(staging)).length,
+      "an ordinary scan no longer reaps, so the observing one proves nothing",
+    ).toBe(0);
+  });
+});

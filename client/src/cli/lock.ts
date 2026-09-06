@@ -20,6 +20,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { STATE_DIR } from "./config.ts";
+import { refuseOutsideVaultAt } from "./vault.ts";
 
 export const lockPath = (vault: string) => join(vault, STATE_DIR, "lock");
 
@@ -33,6 +34,8 @@ export const lockPath = (vault: string) => join(vault, STATE_DIR, "lock");
  * test replaces `pause`.
  */
 export const midPublish = { pause: async (): Promise<void> => {} };
+
+const pause = (ms: number): Promise<void> => new Promise((go) => setTimeout(go, ms));
 
 /** What the lock file says about who holds it. */
 export interface LockHolder {
@@ -62,6 +65,11 @@ export interface LockHolder {
 export async function lockVault(vault: string, command: string): Promise<() => Promise<void>> {
   const path = lockPath(vault);
   const dir = join(vault, STATE_DIR);
+  // The lock lives under `.basalt` like the config and the index, and gets the
+  // same question before it is created (R11): a `.basalt` that is a link out
+  // of the vault would put the thing that decides who owns this vault
+  // somewhere two vaults could share.
+  await refuseOutsideVaultAt(vault, path);
   await mkdir(dir, { recursive: true });
   const mine: LockHolder = {
     pid: process.pid,
@@ -72,6 +80,14 @@ export async function lockVault(vault: string, command: string): Promise<() => P
   };
 
   for (let attempt = 0; attempt < 8; attempt++) {
+    // A short wait between attempts, growing a little.
+    //
+    // Every reason to go round again is another process part way through
+    // something short: publishing a lock, or holding the eviction right for a
+    // dead one. Without this, eight attempts are spent inside a microsecond
+    // and a contender gives up on a vault that was about to be free, which is
+    // a refusal that reads exactly like a real one.
+    if (attempt > 0) await pause(5 * attempt);
     const taken = await publish(dir, path, mine);
     if (taken) {
       return async () => {
@@ -92,26 +108,32 @@ export async function lockVault(vault: string, command: string): Promise<() => P
       // Removing here is what handed the lock to two callers. The old code
       // treated "no holder" as debris and unlinked it, and an absent file plus
       // an unconditional unlink is a live lock deleted whenever somebody links
-      // between the read and the removal. That is not the theoretical residue
-      // this file admits to further down: twelve contenders on one stale lock
+      // between the read and the removal. Twelve contenders on one stale lock
       // reproduced it on the first run.
       continue;
     }
     if (at.state === "unreadable") {
       // A file that is there and says nothing. `publish` cannot produce one,
       // so it is debris from something else, and it has to go or nobody can
-      // ever take this lock again. Removed only while it is still unreadable:
-      // a real lock written in between parses, and is left alone.
-      await removeIfStillUnreadable(path);
+      // ever take this lock again. Under the eviction right, and only while it
+      // is still unreadable: a real lock written in between parses and is left
+      // alone, and nobody else can be removing it at the same time.
+      await evicting(dir, path, "unreadable", mine, (now) => now.state === "unreadable");
       continue;
     }
     const holder = at.holder;
     if (holder.host === mine.host && !alive(holder.pid)) {
-      // Left behind by a crash or a kill. Removed only while it is still that
-      // same dead holder, and the next attempt takes the lock by linking,
-      // which is atomic: if another contender for the same stale lock links
-      // first, this one loses the link and finds a live holder to refuse for.
-      await removeIfStill(path, holder.token);
+      // Left behind by a crash or a kill. Taken over under the eviction right
+      // for this exact holder, so no other contender can be removing it, and
+      // only while it is still that holder. The next attempt takes the lock by
+      // linking, which is atomic.
+      await evicting(
+        dir,
+        path,
+        holder.token,
+        mine,
+        (now) => now.state === "held" && now.holder.token === holder.token,
+      );
       continue;
     }
     throw new Error(
@@ -153,31 +175,92 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
 }
 
 /**
- * Removes the lock only while it still holds the token we decided about.
+ * A seam for the one interleaving this module exists to make impossible: the
+ * instant between deciding a lock is dead and removing it.
  *
- * The check and the unlink are two operations and no filesystem here offers
- * them as one, so this narrows the window rather than closing it: a live lock
- * taken between the re-read and the unlink could still be removed. What makes
- * that survivable is that the caller does not then assume it holds anything.
- * It goes back to `publish`, which is atomic, and the process that linked
- * first keeps the lock while the other finds a live holder and refuses.
- *
- * The window is a token comparison wide, and it is only ever entered by a
- * caller that has already read a *dead* holder. Two contenders taking over
- * one abandoned lock is the case that has to be safe, and it is: the loser of
- * the link finds the winner's live holder next time round.
+ * Like `midPublish`, it does nothing in every build.
  */
-async function removeIfStill(path: string, token: string): Promise<void> {
-  const now = await lockState(path);
-  if (now.state !== "held" || now.holder.token !== token) return;
-  await rm(path, { force: true });
+export const midEvict = { pause: async (): Promise<void> => {} };
+
+/**
+ * Takes the exclusive right to evict one holder, does the work, and gives it
+ * back (R03).
+ *
+ * This is the whole of the fix, and the reason the obvious version is not
+ * enough. Removing a stale lock is a read and then an unlink, and no
+ * filesystem here offers them as one operation. So: A reads a dead holder and
+ * is descheduled; B reads the same dead holder, removes it, and links its own
+ * live lock; A resumes and unlinks *B's* lock, then links its own. Both A and
+ * B have been handed a release function and neither has been told it lost.
+ * Re-reading the token immediately before the unlink narrows that to a few
+ * instructions and does not close it, which the previous comment here admitted
+ * to and then reasoned away: it said the loser would find a live holder next
+ * time round, and B never looks again, because B had already succeeded.
+ *
+ * The marker closes it. Its name carries the token being evicted and it is
+ * created with `link`, which either makes the name or fails, so exactly one
+ * process may be evicting a given holder at a time. Under it, the lock is read
+ * again: if it is still that holder, nobody else can have replaced it, because
+ * replacing it means evicting it and that right is held here. If it is
+ * anything else, somebody got there first and this does nothing at all.
+ *
+ * A marker outlives its evictor only if the process dies inside these few
+ * operations, against a lock that is held for a whole command; when that
+ * happens the marker is a lock like any other and is recovered the same way,
+ * by its own holder's liveness.
+ */
+async function evicting(
+  dir: string,
+  path: string,
+  who: string,
+  mine: LockHolder,
+  remove: (at: LockState) => boolean,
+): Promise<void> {
+  const marker = `${path}.evicting.${who}`;
+  if (!(await publish(dir, marker, mine))) {
+    // Somebody else is evicting this holder, or an evictor died inside the
+    // window above. Either way this attempt does nothing and the loop looks
+    // again; a marker whose own holder is gone is cleared below.
+    await clearDeadMarker(marker);
+    return;
+  }
+  try {
+    // Read again, under the right, and then act on that read.
+    //
+    // Acting on an earlier read is the exact shape of the bug this closes, and
+    // it is safe here for one reason: nothing can replace this holder while
+    // the marker is held, because replacing it means evicting it. The seam
+    // sits in the gap on purpose, so a test can hold a process there and prove
+    // that a second one cannot get in front of it.
+    const still = await lockState(path);
+    await midEvict.pause();
+    if (remove(still)) await rm(path, { force: true });
+  } finally {
+    await rm(marker, { force: true });
+  }
 }
 
-/** The same, for a file that is there and cannot be read as a holder. */
-async function removeIfStillUnreadable(path: string): Promise<void> {
-  const now = await lockState(path);
-  if (now.state !== "unreadable") return;
-  await rm(path, { force: true });
+/**
+ * Removes an eviction marker whose own holder has died.
+ *
+ * The same liveness rule the lock itself gets, and the same conditional
+ * removal: only while it is still that dead marker. A marker is held for a few
+ * filesystem operations rather than for a command, so this is rare enough that
+ * the alternative, leaving it, would wedge takeover of that one holder for
+ * ever.
+ */
+async function clearDeadMarker(marker: string): Promise<void> {
+  const at = await lockState(marker);
+  if (at.state === "unreadable") {
+    await rm(marker, { force: true });
+    return;
+  }
+  if (at.state !== "held") return;
+  if (at.holder.host !== hostname() || alive(at.holder.pid)) return;
+  const still = await lockState(marker);
+  if (still.state === "held" && still.holder.token === at.holder.token) {
+    await rm(marker, { force: true });
+  }
 }
 
 /**

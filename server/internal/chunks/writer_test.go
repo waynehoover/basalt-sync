@@ -264,13 +264,21 @@ func TestACorruptBodyStopsCountingAsHeld(t *testing.T) {
 // A chunk is *visible* when it is renamed into place and *durable* when the
 // directory it landed in is flushed, and those are two different moments (F05).
 //
-// `place` short-circuits on `Has`, which answers from visibility. A second
-// writer of the same chunk arriving in that window found it there, wrote
+// `place` used to short-circuit on a stat, which answers from visibility. A
+// second writer of the same chunk arriving in that window found it there, wrote
 // nothing, flushed nothing, and returned success. The version it then committed
 // referenced a chunk whose directory entry was not durable, which is the one
 // server-side fault a client cannot detect: it was told the chunk arrived and
 // will never send it again.
-func TestASecondPutOfTheSameChunkWaitsForTheFirstToBeDurable(t *testing.T) {
+//
+// These two tests once asserted that the second writer *waits*, which is how it
+// was fixed and was the wrong answer: a batch held every name it had claimed
+// until Close, so two batches wanting the same chunks in opposite orders each
+// held one and waited for the other for ever (R05). What matters is not that
+// the second writer waits, it is that when it returns nil the name is durable.
+// It now gets there by doing the work rather than by queueing behind somebody
+// else's, and that is what these assert.
+func TestASecondPutOfTheSameChunkDoesNotInheritAnUnflushedName(t *testing.T) {
 	s := newTestStore(t)
 	body := []byte("the body both writers have")
 	name := Name(body)
@@ -284,9 +292,9 @@ func TestASecondPutOfTheSameChunkWaitsForTheFirstToBeDurable(t *testing.T) {
 	inFlush := make(chan struct{})
 	release := make(chan struct{})
 	realSync := s.sync
-	var held int32
+	var flushes int32
 	s.sync = func(dir string) error {
-		if dir == leaf && atomic.AddInt32(&held, 1) == 1 {
+		if dir == leaf && atomic.AddInt32(&flushes, 1) == 1 {
 			close(inFlush)
 			<-release
 		}
@@ -297,27 +305,39 @@ func TestASecondPutOfTheSameChunkWaitsForTheFirstToBeDurable(t *testing.T) {
 	go func() { first <- s.Put("v1", name, body) }()
 	<-inFlush
 
-	// The chunk is visible now, and that is the whole trap.
-	if !s.Has("v1", name) {
-		t.Fatal("the body was not renamed into place before its flush, so this proves nothing")
+	// Visible, and that is the whole trap: the file is there and the name is
+	// not durable, so nothing may report it as held.
+	if _, err := os.Stat(s.path("v1", name)); err != nil {
+		t.Fatalf("the body was not renamed into place before its flush, so this proves nothing: %v", err)
+	}
+	if s.Has("v1", name) {
+		t.Fatal("a body that is renamed and not flushed is reported as held")
 	}
 
 	second := make(chan error, 1)
 	go func() { second <- s.Put("v1", name, body) }()
 
+	// The second put does not wait for the first. It writes and flushes the
+	// name itself, and its own flush is what makes its return truthful.
 	select {
 	case err := <-second:
-		t.Fatalf("the second put returned %v while the first had not flushed the name", err)
-	case <-time.After(150 * time.Millisecond):
-		// Waiting, which is the point.
+		if err != nil {
+			t.Fatalf("the second put failed: %v", err)
+		}
+		if !s.Has("v1", name) {
+			t.Fatal("a put returned nil for a chunk that is still not held")
+		}
+		if atomic.LoadInt32(&flushes) < 2 {
+			t.Fatal("the second put returned without flushing the name itself")
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("the second put is waiting for the first, which is how two batches deadlock")
 	}
 
 	close(release)
 	if err := <-first; err != nil {
 		t.Fatalf("first put: %v", err)
-	}
-	if err := <-second; err != nil {
-		t.Fatalf("second put: %v", err)
 	}
 	if got, err := s.Get("v1", name); err != nil || string(got) != string(body) {
 		t.Fatalf("the chunk came back as %q, %v", got, err)
@@ -326,7 +346,7 @@ func TestASecondPutOfTheSameChunkWaitsForTheFirstToBeDurable(t *testing.T) {
 
 // The same window, one level up: a batch publishes on `place` and flushes at
 // Close, so the gap between visible and durable is the whole of the batch.
-func TestAPutWaitsForABatchStillPublishingTheSameChunk(t *testing.T) {
+func TestAPutDoesNotInheritABatchesUnflushedChunk(t *testing.T) {
 	s := newTestStore(t)
 	body := []byte("shared between a batch and a put")
 	name := Name(body)
@@ -335,9 +355,9 @@ func TestAPutWaitsForABatchStillPublishingTheSameChunk(t *testing.T) {
 	inFlush := make(chan struct{})
 	release := make(chan struct{})
 	realSync := s.sync
-	var held int32
+	var flushes int32
 	s.sync = func(dir string) error {
-		if dir == leaf && atomic.AddInt32(&held, 1) == 1 {
+		if dir == leaf && atomic.AddInt32(&flushes, 1) == 1 {
 			close(inFlush)
 			<-release
 		}
@@ -352,19 +372,27 @@ func TestAPutWaitsForABatchStillPublishingTheSameChunk(t *testing.T) {
 	go func() { closed <- w.Close() }()
 	<-inFlush
 
+	if s.Has("v1", name) {
+		t.Fatal("a batch's body is reported as held before the batch has flushed it")
+	}
+
 	put := make(chan error, 1)
 	go func() { put <- s.Put("v1", name, body) }()
 	select {
 	case err := <-put:
-		t.Fatalf("a put returned %v while the batch holding that chunk had not flushed", err)
-	case <-time.After(150 * time.Millisecond):
+		if err != nil {
+			t.Fatalf("the put failed: %v", err)
+		}
+		if !s.Has("v1", name) {
+			t.Fatal("a put returned nil for a chunk that is still not held")
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("a put is waiting for a batch, which is how two of them deadlock")
 	}
 
 	close(release)
 	if err := <-closed; err != nil {
 		t.Fatalf("close: %v", err)
-	}
-	if err := <-put; err != nil {
-		t.Fatalf("put: %v", err)
 	}
 }

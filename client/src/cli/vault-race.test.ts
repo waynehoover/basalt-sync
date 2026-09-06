@@ -10,7 +10,7 @@
  * of a module is for the file that declares it.
  */
 
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,6 +31,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     cp: vi.fn(actual.cp),
     // F13 watches the order of flushes against the removal of the source.
     rm: vi.fn(actual.rm),
+    // And R08 removes directories with rmdir, because `rm` will not take one
+    // without `recursive` and that would remove children this deliberately
+    // keeps.
+    rmdir: vi.fn(actual.rmdir),
     // F25 injects the EXDEV a mounted subdirectory produces.
     link: vi.fn(actual.link),
   };
@@ -380,11 +384,21 @@ describe("moving a note across filesystems", () => {
       };
       return handle;
     });
+    // Both, because the source tree comes away file by file now (R08): the
+    // files go through `rm` and the directories through `rmdir`. What the
+    // ordering has to show is unchanged: nothing under the source is taken
+    // away until every copied file and directory has been flushed.
     const realRm = vi.mocked(rm).getMockImplementation()!;
     vi.mocked(rm).mockImplementation(async (...args: Parameters<typeof rm>) => {
       const path = String(args[0]);
-      if (path.endsWith("src")) order.push("remove the source");
+      if (path.includes("/src")) order.push("remove the source");
       return realRm(...args);
+    });
+    const realRmdir = vi.mocked(rmdir).getMockImplementation()!;
+    vi.mocked(rmdir).mockImplementation(async (...args: Parameters<typeof rmdir>) => {
+      const path = String(args[0]);
+      if (path.includes("/src")) order.push("remove the source");
+      return realRmdir(...args);
     });
 
     await copyVerifiedThenRemove(join(root, "src"), join(root, "dst"));

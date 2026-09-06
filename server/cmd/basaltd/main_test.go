@@ -28,6 +28,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1651,5 +1652,111 @@ func TestHealthCommandSaysWhyNotJustThatItFailed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "disk-full") {
 		t.Errorf("the failure said %q, which does not say which kind of unwell", err)
+	}
+}
+
+/*
+ * What purge accepts as proof that history is safe (R04).
+ *
+ * Purge is the one command that destroys something no device holds, so the
+ * backup it insists on has to be one that could actually give the history back.
+ * It used to check that a row with the same uid existed and carried the same
+ * MAC string, and that a file of the right name existed in the chunk tree.
+ * Neither is the thing it was proof of: the MAC is the client's authenticator
+ * over what the client signed and says nothing about the rest of the row this
+ * database stores, and a file's name says nothing about its contents.
+ */
+
+// A backup whose body is the right size and the wrong bytes. This is a failing
+// disk, and it is indistinguishable from a good backup until somebody restores
+// it: the moment to find out is the moment before the only other copy is gone.
+func TestPurgeRefusesABackupWhoseBodyIsCorrupt(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	if out := mustRun(t, "backup", "-data", dir, "-to", dest); !strings.Contains(out, "backed up to") {
+		t.Fatalf("backup said:\n%s", out)
+	}
+
+	// Corrupt one body in the backup, keeping its filename and length, which
+	// is what a rotted sector leaves behind.
+	victim := ""
+	root := filepath.Join(dest, "chunks")
+	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || victim != "" {
+			return err
+		}
+		victim = p
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if victim == "" {
+		t.Fatal("the backup has no bodies, so this proves nothing")
+	}
+	was, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotted := make([]byte, len(was))
+	copy(rotted, was)
+	rotted[0] ^= 0xff
+	if err := os.WriteFile(victim, rotted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = basalt(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default", "-backup", dest)
+	if err == nil {
+		t.Fatal("purge accepted a backup holding a body that will not decrypt")
+	}
+	if !strings.Contains(err.Error(), "will not decrypt") && !strings.Contains(err.Error(), "cannot serve") {
+		t.Fatalf("purge refused, but not for the corrupt body: %v", err)
+	}
+	// And nothing was dropped on the way to refusing.
+	if out := mustRun(t, "stats", "-data", dir, "-json"); !strings.Contains(out, "\"versions\"") {
+		t.Fatalf("stats after the refusal:\n%s", out)
+	}
+}
+
+// A backup whose row differs from the source in a field the MAC does not
+// cover here: same uid, same authenticator string, different stored path.
+// Restoring it would put the note back under the wrong name.
+func TestPurgeRefusesABackupWhoseRecordDiffers(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+
+	// Reach into the backup and move one row's path, leaving everything else
+	// including the MAC exactly as it was.
+	bkDB, bkChunks := store.DataDir(dest)
+	bk, err := store.Open(bkDB, bkChunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bk.ExecForTest(
+		`UPDATE entries SET path = path || '-moved' WHERE vault_id = 'default' AND uid = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := bk.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = basalt(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default", "-backup", dest)
+	if err == nil {
+		t.Fatal("purge accepted a backup whose record of a version differs from this store's")
+	}
+	if !strings.Contains(err.Error(), "different path") {
+		t.Fatalf("purge refused, but not for the changed record: %v", err)
+	}
+}
+
+// The ordinary case still works, or the checks above are just a way of
+// refusing everything.
+func TestPurgeStillAcceptsAGoodBackup(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+	out := mustRun(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default", "-backup", dest)
+	if !strings.Contains(out, "versions") {
+		t.Fatalf("purge said:\n%s", out)
 	}
 }

@@ -646,3 +646,123 @@ func TestCoverageWithNoChangeCounterStillReads(t *testing.T) {
 		t.Fatalf("a backup from before the counter was stamped was refused: %v", err)
 	}
 }
+
+// Two completed backups of one store are told apart (R14).
+//
+// The sidecar carried the database's size and SQLite's file change counter,
+// and neither identifies a snapshot. `VACUUM INTO` writes a fresh database, so
+// its counter starts from the transactions that built it rather than carrying
+// anything over: two backups of the same store, taken with a real edit between
+// them, are the same size and at the same change. Swapping one database for
+// the other while keeping the first's coverage was accepted, and the coverage
+// then described a snapshot that no longer existed.
+func TestCoverageTellsTwoCompletedBackupsApart(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	first := filepath.Join(dir, "first")
+	if _, err := st.Backup(first, false); err != nil {
+		t.Fatal(err)
+	}
+	// A real change through the ordinary API, then a second real backup.
+	if err := st.EnsureVault("second", 2000); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dir, "second")
+	if _, err := st.Backup(second, false); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDB, _ := DataDir(first)
+	secondDB, _ := DataDir(second)
+	a, err := os.Stat(firstDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(secondDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac, err := sqliteChangeCounter(firstDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc, err := sqliteChangeCounter(secondDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Size() != b.Size() || ac != bc {
+		t.Skipf("the two backups differ in size (%d, %d) or change counter (%d, %d), so the "+
+			"cheap checks catch this one and the digest is not what is under test",
+			a.Size(), b.Size(), ac, bc)
+	}
+
+	// The second database, under the first's coverage.
+	body, err := os.ReadFile(secondDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstDB, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ReadBackupMeta(first)
+	if err == nil {
+		t.Fatal("coverage describing one backup was accepted beside a different one")
+	}
+	if !strings.Contains(err.Error(), "hash") {
+		t.Fatalf("refused, but not because the contents differ: %v", err)
+	}
+}
+
+// And a backup taken before the digest existed still reads.
+func TestCoverageWithNoDigestStillReads(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "backup")
+	if _, err := st.Backup(dest, false); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dest, BackupMetaFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta BackupMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Database.Digest == "" {
+		t.Fatal("the backup just taken recorded no digest, so this proves nothing")
+	}
+	meta.Database.Digest = ""
+	out, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadBackupMeta(dest); err != nil {
+		t.Fatalf("a backup from before the digest was stamped was refused: %v", err)
+	}
+}

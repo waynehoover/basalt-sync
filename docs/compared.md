@@ -322,3 +322,38 @@ exact version. **fflate** for deflate. **modernc.org/sqlite**, so the server is
 one static binary. **github.com/coder/websocket**.
 
 Basalt is MIT, like LiveSync and like Obsidian's own plugin API declarations.
+
+## Locking, and why this does not use `flock`
+
+The CLI's vault lock is a file with a holder written into it, taken by `link`,
+and taken over when the holder's process is gone. Every hard part of that is
+staleness: a lock file outlives the process that made it, so somebody has to
+decide when it is safe to remove, and deciding is a read followed by an unlink
+with a gap in between. R03 was that gap, and closing it took an eviction
+marker: a second exclusive `link` naming the holder being evicted, so no two
+processes can be evicting the same one.
+
+None of that is novel and none of it is the standard answer. The standard
+answer is `flock(2)`, where the kernel releases the lock when the process dies:
+there is no staleness, no takeover, and no protocol to get wrong. What is here
+is a two-phase lock reimplemented in userspace, and it is more complicated and
+weaker than the thing it stands in for.
+
+It is here because Node has no `flock`. `fs-ext` provides one and is a native
+module, which would mean a build step and a per-platform binary for a package
+whose whole shape is "install it and run it". `proper-lockfile` is the pure-JS
+convention and uses a directory plus an mtime heartbeat, which has the same
+staleness problem in a different arrangement and would not have prevented R03.
+
+So this is a platform gap worked around, not a design preference, and it should
+be replaced the day Node grows a portable file lock. The Go server has no such
+problem: `internal/dirlock` uses the real thing.
+
+Prior art worth naming for the rest of it, because these were re-derived here
+rather than invented: git's object write (temp, fsync, link, fsync the
+directory) is the shape of the chunk store's publication barrier; RocksDB and
+LevelDB withhold visibility until a manifest is durable, which is what the
+unproven set does; Kubernetes' liveness and readiness probes are the
+distinction `/health` draws; and restic and borg stamp a repository identifier
+into a backup rather than trying to recognise it by its size, which is what
+R14 came round to.

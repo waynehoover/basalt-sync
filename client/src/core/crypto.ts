@@ -79,7 +79,7 @@ export const DATA_KEY_LENGTH = 32;
  */
 export const DEVICE_SECRET_LENGTH = 32;
 
-import { deflateSync, inflateSync } from "fflate";
+import { deflateSync, Inflate } from "fflate";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -623,6 +623,67 @@ export async function sealChunks(
  */
 export const MAX_CHUNK_PLAINTEXT = 16 * 1024 * 1024;
 
+/**
+ * How much compressed input is fed to the inflater at a time (R13).
+ *
+ * The output has to be watched as it is produced, and it is only produced when
+ * input is pushed, so the slice size is what decides how far past the budget
+ * one push can go. Deflate's best ratio is about 1032 to 1, so four kilobytes
+ * of input cannot make more than about four megabytes before this looks again:
+ * the ceiling is enforced within that of the budget rather than after the whole
+ * expansion is in memory.
+ *
+ * Measured at 2.5% slower than one call over a megabyte of prose, which is what
+ * a chunk actually is.
+ */
+const INFLATE_SLICE = 4096;
+
+/** A chunk over the plaintext ceiling, told apart from a chunk that is malformed. */
+class TooBig extends Error {}
+
+/**
+ * Inflates a payload, stopping as soon as it is clear it will not fit (R13).
+ *
+ * The check used to run on the finished output: `inflateSync`, then compare the
+ * length. That refuses the note and not the allocation, and the allocation is
+ * the whole reason for the limit. A quarter of a gigabyte of zeroes compresses
+ * to 256 kB, and on a phone the difference between refusing it after the fact
+ * and refusing it during is the difference between a message and a dead app.
+ *
+ * fflate has no output ceiling of its own. It does take a pre-allocated output
+ * buffer, and that is worse than nothing here: given one too small it fills it
+ * and returns quietly, so a truncated note would be written over a good one.
+ * The streaming inflater reports each piece as it is produced, which is the
+ * only way to see the size before it is all in hand.
+ */
+function inflateBounded(payload: Uint8Array): Uint8Array {
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  const inflater = new Inflate((piece) => {
+    total += piece.length;
+    // Kept only while it can be used. Past the budget the pieces are counted
+    // and dropped, so even the last push before the throw holds nothing extra.
+    if (total <= MAX_CHUNK_PLAINTEXT) parts.push(piece);
+  });
+  for (let at = 0; at < payload.length; at += INFLATE_SLICE) {
+    const end = Math.min(at + INFLATE_SLICE, payload.length);
+    inflater.push(payload.subarray(at, end), end === payload.length);
+    if (total > MAX_CHUNK_PLAINTEXT) {
+      throw new TooBig(
+        `sealed chunk inflates over the ${MAX_CHUNK_PLAINTEXT} bytes a chunk may hold, so it is ` +
+          "refused rather than kept",
+      );
+    }
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const piece of parts) {
+    out.set(piece, at);
+    at += piece.length;
+  }
+  return out;
+}
+
 export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uint8Array> {
   const framed = await open(keys.content, sealed);
   if (framed.length === 0) {
@@ -630,19 +691,28 @@ export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uin
   }
   const marker = framed[0]!;
   const payload = framed.subarray(1);
-  if (marker === CHUNK_RAW) return payload;
+  if (marker === CHUNK_RAW) {
+    // The ceiling applies to every encoding, not only the compressed one
+    // (R13). A raw chunk over the limit was returned without a word, so the
+    // bound was a property of how the writer had chosen to frame its bytes
+    // rather than of what this reader will hold.
+    if (payload.length > MAX_CHUNK_PLAINTEXT) {
+      throw new TooBig(
+        `sealed chunk carries ${payload.length} bytes, over the ${MAX_CHUNK_PLAINTEXT} a chunk ` +
+          "may hold, so it is refused rather than kept",
+      );
+    }
+    return payload;
+  }
   if (marker === CHUNK_DEFLATE) {
     try {
-      const out = inflateSync(payload);
-      if (out.length > MAX_CHUNK_PLAINTEXT) {
-        throw new Error(
-          `sealed chunk inflates to ${out.length} bytes, over the ${MAX_CHUNK_PLAINTEXT} a chunk ` +
-            "may hold, so it is refused rather than kept",
-        );
-      }
-      return out;
+      return inflateBounded(payload);
     } catch (cause) {
-      if (cause instanceof Error && cause.message.includes("over the")) throw cause;
+      // A class rather than a phrase in the message. This used to test the
+      // text for "over the", so rewording the refusal turned it into "claims
+      // to be deflated and is not", which is a different and wrong diagnosis
+      // of the same chunk.
+      if (cause instanceof TooBig) throw cause;
       // Authenticated, so the bytes are what was sealed, which means the
       // writer produced something this reader cannot inflate. Never
       // recovered from: returning anything here would write a truncated
@@ -666,6 +736,23 @@ export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uin
 export async function chunkName(sealedChunk: Uint8Array): Promise<string> {
   const digest = await subtle().digest("SHA-256", toBuffer(sealedChunk));
   return hex(new Uint8Array(digest));
+}
+
+/**
+ * The plaintext digest of a local file, for deciding whether it is still the
+ * one a pass decided about (R01).
+ *
+ * Not a chunk name and not the content id: those describe *sealed* bytes and
+ * a chunk list, and producing one from a file means chunking, compressing and
+ * encrypting it, which is far too much work to ask before every write. This is
+ * one hash of the bytes as they are, used only to compare a file with itself
+ * at two moments.
+ *
+ * It never leaves the device and is never written down, so it is a checksum
+ * rather than a credential: what it has to be is cheap and exact.
+ */
+export async function plainDigest(bytes: Uint8Array): Promise<string> {
+  return hex(new Uint8Array(await subtle().digest("SHA-256", toBuffer(bytes))));
 }
 
 /**

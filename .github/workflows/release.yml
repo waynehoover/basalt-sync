@@ -45,6 +45,21 @@ jobs:
     name: image
     needs: checked
     runs-on: ubuntu-latest
+    # One image release at a time, and the later one waits (R17).
+    #
+    # Which tags a release may move depends on where its version sits among the
+    # ones already out, and that was decided before the build. Two releases in
+    # flight together each decided while it was the newest, so the one that
+    # finished last applied a `latest` it had earned twenty minutes earlier and
+    # moved the channel backward onto an older server. Both would pass their
+    # own digest checks, because each is checking its own image.
+    #
+    # `cancel-in-progress: false` matters as much as the group: a queued
+    # release must wait, not be thrown away. An immutable version tag that
+    # never got published is a release that silently did not happen.
+    concurrency:
+      group: image-promotion
+      cancel-in-progress: false
     steps:
       # Every tag, because which tags this release may move is decided by where
       # its version sits among the ones already out, and a shallow clone cannot
@@ -53,9 +68,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Which tags this release is allowed to move (I23). Worked out before
-      # anything is built, so a tag this cannot make sense of stops the release
-      # rather than publishing something under a name nothing resolves.
+      # The tag's syntax, checked before anything is built (I23), so a tag this
+      # cannot make sense of stops the release rather than publishing something
+      # under a name nothing resolves.
+      #
+      # Which moving tags it may take is *not* decided here. That answer
+      # depends on the other releases that exist, and it is worked out again
+      # inside the promotion step, where the concurrency group means it cannot
+      # go stale between being decided and being used (R17). What is printed
+      # here is what the answer would be right now, which is useful to read in
+      # a log and is not what gets applied.
       - id: tags
         run: |
           set -euo pipefail
@@ -63,12 +85,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          {
-            echo "refs<<EOF"
-            ./scripts/release-tags.sh "$GITHUB_REF_NAME" | sed "s|^|$image:|"
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-          echo "this release moves:"
+          echo "as things stand, this release would move:"
           ./scripts/release-tags.sh "$GITHUB_REF_NAME" | sed 's/^/  /'
 
       # The docker driver cannot build for several platforms at once; this one
@@ -152,26 +169,40 @@ jobs:
       - name: give the checked image its names
         env:
           REF: ${{ steps.tags.outputs.image }}@${{ steps.build.outputs.digest }}
-          REFS: ${{ steps.tags.outputs.refs }}
+          IMAGE: ${{ steps.tags.outputs.image }}
         run: |
           set -euo pipefail
+          # Worked out again, here, rather than reusing the decision from
+          # before the build (R17).
+          #
+          # The concurrency group above means no other release is promoting
+          # right now, and the tags that were pushed while this one was
+          # building are visible to git by the time it gets here. Deciding
+          # once at the start and applying that answer at the end is how a
+          # release that started first moved `latest` back onto an older
+          # server: the answer was true when it was worked out and stale when
+          # it was used.
+          git fetch --tags --force --quiet
+          mapfile -t names < <(./scripts/release-tags.sh "$GITHUB_REF_NAME")
+          [ ${#names[@]} -gt 0 ] || { echo "no tags to apply" >&2; exit 1; }
           args=()
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            echo "  $t"
-            args+=(--tag "$t")
-          done <<< "$REFS"
-          [ ${#args[@]} -gt 0 ] || { echo "no tags to apply" >&2; exit 1; }
+          for name in "${names[@]}"; do
+            echo "  $IMAGE:$name"
+            args+=(--tag "$IMAGE:$name")
+          done
           docker buildx imagetools create "${args[@]}" "$REF"
+          # Recorded for the check below, which must look at what was applied
+          # and not at what was planned.
+          printf '%s\n' "${names[@]}" | sed "s|^|$IMAGE:|" > /tmp/applied-tags
 
       # What a person will actually type. Pulled by name, so this also proves
       # the names were applied and resolve to the manifest that was checked.
       - name: the published tags resolve to what was checked
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          REFS: ${{ steps.tags.outputs.refs }}
         run: |
           set -euo pipefail
+          REFS=$(cat /tmp/applied-tags)
           while IFS= read -r t; do
             [ -n "$t" ] || continue
             got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$t")

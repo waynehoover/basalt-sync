@@ -470,3 +470,165 @@ describe("a background pass that fails (F16)", () => {
     await client.close();
   });
 });
+
+/**
+ * The edit a stat cannot see (R01).
+ *
+ * The guard added for F01 compares the file's length and its rounded
+ * modification time, and both of those are what an ordinary correction leaves
+ * alone: swapping one word for another of the same length, saved inside the
+ * same second or by an editor that carries the timestamp across a temporary
+ * file, is invisible to it. The review reproduced exactly that and the local
+ * edit was overwritten with no copy anywhere.
+ *
+ * Narrowing the window does not fix it, because there is no compare-and-swap
+ * on a file, so the write itself preserves instead: whatever is displaced is
+ * moved aside first and kept if it is a surprise. These assert the property
+ * that matters, which is not "the write was refused" but "the bytes nobody
+ * sent anywhere are still on this disk".
+ */
+describe("an edit a stat cannot tell apart", () => {
+  it("survives a download that lands on it, same length and same timestamp", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    // Exactly the same number of bytes, written back at exactly the same
+    // stamp: a correction, saved by an editor that preserves timestamps.
+    const before = "the original line\n";
+    const after = "the ORIGINAL line\n";
+    expect(after.length, "the two versions must be the same length or this proves nothing").toBe(
+      before.length,
+    );
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "note.md", before, bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("note.md")).toBe(before);
+    const stamped = await vault.stat("note.md");
+
+    // The editor, inside the fetch for the next version, leaving the metadata
+    // exactly as it was.
+    servingWith(socket, bodies, async () => {
+      await vault.write("note.md", enc.encode(after), {
+        mtime: stamped!.mtime,
+        ctime: stamped!.ctime,
+      });
+    });
+    socket.raw({
+      op: "batch",
+      from: 2,
+      to: 2,
+      entries: [
+        await entryFor(keys, 2, "note.md", "the server's own version\n", bodies, { mtime: 9000 }),
+      ],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const everywhere = vault
+      .paths()
+      .map((p) => vault.text(p) ?? "")
+      .join("\n");
+    expect(
+      everywhere,
+      `the local edit is gone. The vault holds: ${JSON.stringify(vault.paths())}`,
+    ).toContain(after);
+  });
+
+  it("survives a deletion that lands on it, same length and same timestamp", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    // The note has to be one the server knows about, or the tombstone below
+    // is about a path this device has never heard of and there is nothing to
+    // apply.
+    const before = "the original line\n";
+    const after = "the ORIGINAL line\n";
+    expect(after.length).toBe(before.length);
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "doomed.md", before, bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("doomed.md")).toBe(before);
+    const stamped = await vault.stat("doomed.md");
+
+    // The seam is the removal's own, which is the only moment a save can land
+    // for a deletion: it carries no body, so there is no fetch to hide in.
+    vault.midReplace = async (path) => {
+      if (path !== "doomed.md") return;
+      vault.midReplace = undefined;
+      await vault.write("doomed.md", enc.encode(after), {
+        mtime: stamped!.mtime,
+        ctime: stamped!.ctime,
+      });
+    };
+
+    socket.raw({
+      op: "batch",
+      from: 2,
+      to: 2,
+      entries: [await entryFor(keys, 2, "doomed.md", "", bodies, { deleted: true, mtime: 9000 })],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const everywhere = vault
+      .paths()
+      .map((p) => vault.text(p) ?? "")
+      .join("\n");
+    expect(
+      everywhere,
+      `the edit made while the deletion was being applied is gone: ${JSON.stringify(vault.paths())}`,
+    ).toContain(after);
+  });
+
+  /**
+   * And the ordinary case is untouched: a download that lands on exactly what
+   * the pass decided about overwrites it and makes no conflict copy. Without
+   * this, "preserve everything" would pass the two tests above by never
+   * writing anything.
+   */
+  it("still overwrites a file nobody touched, with no copy left behind", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "quiet.md", "what was here\n", bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+    expect(vault.text("quiet.md")).toBe("what was here\n");
+
+    socket.raw({
+      op: "batch",
+      from: 2,
+      to: 2,
+      entries: [
+        await entryFor(keys, 2, "quiet.md", "the server's version\n", bodies, { mtime: 9000 }),
+      ],
+    });
+    await accepted(engine, 1);
+    const report = await engine.sync({ coalesceWrites: false });
+
+    expect(vault.text("quiet.md")).toBe("the server's version\n");
+    expect(vault.paths(), "a conflict copy was made for a file nobody had touched").toEqual([
+      "quiet.md",
+    ]);
+    expect(report.conflicted).toBe(0);
+  });
+});

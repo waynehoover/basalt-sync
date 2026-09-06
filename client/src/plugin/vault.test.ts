@@ -1581,3 +1581,57 @@ describe("the index write that is skipped because nothing changed (P-D6)", () =>
     expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
   });
 });
+
+/**
+ * The plugin keeps an edit a stat cannot see (R01).
+ *
+ * The engine's guard before overwriting was the file's length and its rounded
+ * modification time, and an ordinary correction is the same number of
+ * characters, saved by an editor that carries the timestamp across. The
+ * headless client answers this by moving the old bytes aside before writing;
+ * Obsidian's adapter cannot do that, so it reads what it is about to replace
+ * and compares the content.
+ */
+describe("writing over a file the pass did not decide about", () => {
+  it("hands back what it displaced when the bytes are not the expected ones", async () => {
+    const enc = new TextEncoder();
+    await adapter.write("note.md", "the original line\n", { mtime: 1000 });
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "not-what-is-there", idOf: async () => "something-else" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+    );
+
+    expect(out.kept, "the displaced bytes were not handed back").toBeDefined();
+    expect(new TextDecoder().decode(out.kept!)).toBe("the original line\n");
+    // And the write still happened: preserving is not refusing.
+    expect(adapter.text("note.md")).toBe("the server's version\n");
+  });
+
+  it("hands back nothing when it wrote over exactly what it expected", async () => {
+    const enc = new TextEncoder();
+    await adapter.write("note.md", "the original line\n", { mtime: 1000 });
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "the-one-we-expect", idOf: async () => "the-one-we-expect" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+    );
+    expect(out.kept, "a file nobody had touched was reported as displaced").toBeUndefined();
+    expect(adapter.text("note.md")).toBe("the server's version\n");
+  });
+
+  it("says what a removal took away when it was not the expected version", async () => {
+    await adapter.write("gone.md", "the edit nobody sent\n", { mtime: 1000 });
+
+    const out = await vault.removeExpecting("gone.md", {
+      contentId: "the version the pass decided about",
+      idOf: async () => "something else entirely",
+    });
+    expect(out.kept, "the removal did not say what it took").toBeDefined();
+    expect(new TextDecoder().decode(out.kept!)).toBe("the edit nobody sent\n");
+  });
+});

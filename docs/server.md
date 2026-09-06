@@ -862,18 +862,27 @@ without a shell or curl in the image.
 process replied. It used to answer `ok` without touching anything, so a full
 disk, a database gone read-only, and a chunk directory whose volume had
 unmounted all looked exactly like a healthy server until somebody tried to save
-something. Now it does one indexed read and one `statfs`, and answers:
+something. Now it begins and rolls back a write transaction, which is the
+cheapest thing that asks the real question, and adds one `statfs`:
 
 | | |
 |---|---|
 | `200 ok` | a note arriving now would be stored |
 | `503 store-unreadable` | the database is not answering |
+| `503 store-read-only` | the database answers reads and refuses writes: a filesystem remounted read-only after an I/O error, most likely |
 | `503 disk-full` | less than 64 MiB free, which is not enough for a commit to work in |
 | `503 chunks-unreachable` | the body directory is gone, usually an unmounted volume |
 | `503 shutting-down` | draining, so stop sending devices here |
 
-Both checks are cheap enough for a probe every few seconds. The deep one is
+Both checks are cheap enough for a probe every few seconds, and neither writes
+anything: the transaction is rolled back and commits no page. The deep one is
 `basaltd verify`, which is asked for rather than run on a timer.
+
+A read alone is not enough, and that was the first version of this. `SELECT 1`
+succeeds against a database opened read-only, one whose file has lost write
+permission, and one on a filesystem the kernel remounted read-only after an I/O
+error, which is the ordinary way Linux reacts to a failing disk. That is the
+case an operator most needs to hear about and the one a read cannot see.
 
 `basaltd stats` prints the numbers behind the word, including how much room is
 left. They are not on the endpoint: it needs no credential, and behind a tunnel

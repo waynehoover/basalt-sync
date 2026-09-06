@@ -23,7 +23,7 @@
 
 import { open as openFile, readFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import { generateSecret, randomBytes } from "../core/crypto.ts";
 import {
@@ -59,7 +59,13 @@ import {
 } from "../core/pairing.ts";
 
 export { normaliseUrl };
-import { DEFAULT_CONFIG_DIR, JsonIndexStore, NodeVault, configFolderName } from "./vault.ts";
+import {
+  DEFAULT_CONFIG_DIR,
+  JsonIndexStore,
+  NodeVault,
+  configFolderName,
+  syncDirectoryIfSupported,
+} from "./vault.ts";
 import {
   configPath,
   indexPath,
@@ -1244,6 +1250,24 @@ async function writeKeyOut(path: string, recoveryKey: string): Promise<void> {
   } finally {
     await handle.close();
   }
+  // The directory too, or the file's bytes are durable and its name is not
+  // (R02). This is the only copy of a credential nothing can reissue, and a
+  // power cut between here and the vault being claimed would leave a vault
+  // whose recovery key exists nowhere. The same rule every other durable write
+  // in this project follows; this one was written before the rule had a
+  // helper and did not get it.
+  //
+  // A filesystem with no directory fsync says so and is believed; a disk that
+  // failed is not, and it is reported, because the whole point of `--key-out`
+  // is that the file is there afterwards.
+  const flushed = await syncDirectoryIfSupported(dirname(path));
+  if (!flushed.synced) {
+    throw new Error(
+      `wrote the recovery key to ${path}, and could not make that durable: ${flushed.why}. ` +
+        `Copy it somewhere else before going on: a power cut now could lose the file, and ` +
+        `nothing can reissue this key.`,
+    );
+  }
 }
 
 export function exitCodeFor(report: SyncReport): number {
@@ -1330,13 +1354,34 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
  * size and mtime is not counted, which understates rather than claiming more
  * is synced than is. A number here is never wrong about there being work.
  */
-async function unsentHere(args: Args, stored: StoredState | undefined): Promise<number> {
-  if (!stored) return 0;
-  let vault;
+/**
+ * How many notes on this disk the server has not been told about (F27, R12).
+ *
+ * `unknown` is a real answer and used to be reported as zero, twice over.
+ *
+ * A vault with no index returned zero, and that is the ordinary state
+ * immediately after pairing and before the first sync: every note is unsent,
+ * and status said "up to date with the server". The baseline for a vault with
+ * no index is an empty one, not an excuse to stop counting.
+ *
+ * A scan that failed also returned zero, under a comment saying that guessing
+ * at zero would be exactly the claim this exists to prevent. Now it says so.
+ */
+async function unsentHere(
+  args: Args,
+  stored: StoredState | undefined,
+): Promise<number | "unknown"> {
   try {
-    vault = new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore });
+    const vault = new NodeVault(args.dir, {
+      configDir: args.configDir,
+      alsoIgnore: args.ignore,
+      // Status takes no lock and may run beside a watcher, so its scan reaps
+      // nothing and re-spells nothing (R12). It is a question.
+      observeOnly: true,
+    });
     const onDisk = await vault.list();
-    const known = new Map(Object.entries(stored.entries));
+    // No index is an empty baseline, not a reason to answer zero.
+    const known = new Map(Object.entries(stored?.entries ?? {}));
     let unsent = 0;
     const seen = new Set<string>();
     for (const f of onDisk) {
@@ -1356,10 +1401,8 @@ async function unsentHere(args: Args, stored: StoredState | undefined): Promise<
     return unsent;
   } catch {
     // A vault that will not list is a vault this command cannot describe, and
-    // guessing at zero would be the claim the whole item is about. Reported as
-    // nothing rather than as a number, and the reachability lines below still
-    // say what they know.
-    return 0;
+    // guessing at zero is the claim the whole item is about.
+    return "unknown";
   }
 }
 
@@ -1472,16 +1515,23 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
         ? `state    ${server.behind} changes behind`
         : local.pending > 0
           ? `state    caught up with the server, with ${local.pending} still not applied here`
-          : local.unsent > 0
-            ? // F27. The cursors matching says what the server has told this
-              // device, and nothing at all about what has been typed here
-              // since. A note edited after a successful sync left the two
-              // numbers equal and the pending set empty, and the status said
-              // everything was current while the paragraph sat on the disk.
-              `state    caught up with the server, with ${local.unsent} not yet sent from here`
-            : "state    up to date with the server",
+          : local.unsent === "unknown"
+            ? // The scan failed, so what is on this disk is not known (R12).
+              // Saying "up to date" here would be a claim about files nothing
+              // managed to look at, which is the exact shape of status this
+              // command exists to stop reporting.
+              "state    caught up with the server; this vault could not be read, " +
+              "so what is unsent from here is unknown"
+            : local.unsent > 0
+              ? // F27. The cursors matching says what the server has told this
+                // device, and nothing at all about what has been typed here
+                // since. A note edited after a successful sync left the two
+                // numbers equal and the pending set empty, and the status said
+                // everything was current while the paragraph sat on the disk.
+                `state    caught up with the server, with ${local.unsent} not yet sent from here`
+              : "state    up to date with the server",
     );
-    return 0;
+    return local.unsent === "unknown" ? 1 : 0;
   }
   io.out(`state    cannot reach the server: ${server.error}`);
   return 1;

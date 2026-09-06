@@ -50,6 +50,7 @@ import {
   openChunk,
   openPath,
   parentOf,
+  plainDigest,
   sealChunks,
   sealPath,
   type Schedule,
@@ -90,7 +91,14 @@ import {
   isNeverSynced,
   spellOut,
 } from "./paths.ts";
-import { parents, type FileStat, type IndexStore, type Times, type Vault } from "./vault.ts";
+import {
+  parents,
+  type ExpectedContent,
+  type FileStat,
+  type IndexStore,
+  type Times,
+  type Vault,
+} from "./vault.ts";
 
 /**
  * An index entry with its derivable fields left out.
@@ -868,6 +876,29 @@ export class Engine {
   }
 
   /** What this device knows, for a status line that describes the vault. */
+  /**
+   * Whether the server is holding exactly what this device holds for one path
+   * (R09).
+   *
+   * An affirmative answer about one file, which is what a caller reporting
+   * "sent" actually needs. The alternative was to look for the path in the
+   * report's `skippedPaths` and `retryingPaths`, and those are display
+   * samples: sorted, de-duplicated and cut to five, because a notice naming
+   * four hundred files is not a notice. Absence from a sample is not evidence
+   * of anything, and the sixth failure of a pass was reported as a success.
+   *
+   * `synchash` is written only by `synced`, and `synced` is called only where
+   * the server has acknowledged a version. So this is the acknowledgement,
+   * asked about one path, and it is true for a file that was already up to
+   * date as well as one this pass sent, which is the right answer to "is it
+   * on the server" either way.
+   */
+  serverHasOurs(path: string): boolean {
+    const entry = this.entries.get(path);
+    if (entry === undefined || entry.folder) return false;
+    return entry.syncuid > 0 && entry.synchash !== "" && entry.synchash === entry.hash;
+  }
+
   status(): {
     cursor: number;
     files: number;
@@ -1677,6 +1708,10 @@ export class Engine {
         // the wire instead. Deferring costs nothing and means there is
         // never a moment where neither name holds the note.
         this.pendingDeletes.push({ path, why: action.why, based: local });
+        if (local !== undefined && !local.folder) {
+          const digest = await this.digestOf(path);
+          if (digest !== undefined) this.deleteBaseline.set(path, digest);
+        }
         return;
 
       case "deleteRemote": {
@@ -2192,7 +2227,8 @@ export class Engine {
     const chunks = chunkNamesOf(remote.hash);
     this.checkChunkCount(remote.uid, chunks.length);
 
-    this.inbox.push({ path, entry, remote, chunks, kind, why, based });
+    const baseDigest = based === undefined || based.folder ? undefined : await this.digestOf(path);
+    this.inbox.push({ path, entry, remote, chunks, kind, why, based, baseDigest });
     this.inboxBytes += remote.size;
     if (this.inbox.length >= MAX_BATCH_ENTRIES || this.inboxBytes >= INBOX_BYTES) {
       await this.fill(report);
@@ -2359,6 +2395,15 @@ export class Engine {
    * different" but "the file is a different file".
    */
   private pendingDeletes: { path: string; why: string; based: LocalState | undefined }[] = [];
+  /**
+   * The digest each pending deletion was decided about, taken when it was
+   * decided (R01).
+   *
+   * Kept beside `pendingDeletes` rather than in it so that the read happens
+   * once, at the moment the decision is recorded, and not again at the end of
+   * the pass when it would describe whatever the editor had done since.
+   */
+  private deleteBaseline = new Map<string, string>();
   private wroteThisPass: string[] = [];
 
   /**
@@ -2391,6 +2436,11 @@ export class Engine {
   private async applyDeletes(report: SyncReport): Promise<void> {
     const deletes = this.pendingDeletes;
     this.pendingDeletes = [];
+    // Drained with them, so a digest never outlives the pass that took it and
+    // a later deletion of the same path cannot be checked against a baseline
+    // from an earlier one.
+    const baselines = this.deleteBaseline;
+    this.deleteBaseline = new Map();
     for (const { path, why, based } of deletes) {
       try {
         const same = await this.wouldUndoAWrite(path);
@@ -2437,7 +2487,22 @@ export class Engine {
           });
           continue;
         }
-        await this.opts.vault.remove(path);
+        // And the removal preserves too, for the same reason the write does
+        // (R01): the check above compares metadata, and an edit that keeps the
+        // length is invisible to it. `removeExpecting` says whether what it
+        // took away was the version this decided about, and hands it back when
+        // it was not.
+        const kept = await this.removedSomethingElse(path, based, baselines);
+        if (kept !== undefined) {
+          this.log("kept what was about to be deleted", path, {
+            why: "it changed after the pass decided to delete it",
+            deletion: why,
+          });
+          await this.keepBesides(path, kept, report);
+          report.conflicted++;
+          this.entries.delete(path);
+          continue;
+        }
         this.entries.delete(path);
         report.deletedLocally++;
         this.log("deleted locally", path, why);
@@ -2575,6 +2640,115 @@ export class Engine {
    * difference between "happens on a slow link" and "happens if you hit a
    * microsecond". docs/design.md, "What is not claimed", says so.
    */
+  /**
+   * The plaintext digest of what is at a path now, or undefined if it cannot
+   * be read (R01).
+   *
+   * Streamed where the vault can, so digesting a large attachment costs one
+   * pass over it and not a copy of it in memory. A vault that cannot stream
+   * reads it whole, which is what the pass was about to do anyway.
+   */
+  private async digestOf(path: string): Promise<string | undefined> {
+    try {
+      const blocks = this.opts.vault.readBlocks;
+      if (blocks === undefined) return await plainDigest(await this.opts.vault.read(path));
+      const parts: Uint8Array[] = [];
+      let total = 0;
+      for await (const block of blocks.call(this.opts.vault, path)) {
+        parts.push(block);
+        total += block.length;
+      }
+      const all = new Uint8Array(total);
+      let at = 0;
+      for (const part of parts) {
+        all.set(part, at);
+        at += part.length;
+      }
+      return await plainDigest(all);
+    } catch {
+      // A file that cannot be read is one this cannot make a promise about.
+      // Undefined means "no baseline", and every caller treats that as a
+      // reason to keep whatever it finds rather than to overwrite it.
+      return undefined;
+    }
+  }
+
+  /**
+   * What the adapter should compare against, or undefined when there is no
+   * baseline to compare with.
+   */
+  private expecting(digest: string | undefined): ExpectedContent | undefined {
+    return digest === undefined ? undefined : { contentId: digest, idOf: plainDigest };
+  }
+
+  /**
+   * Writes the incoming version, keeping anything it displaced that this pass
+   * did not decide about (R01).
+   *
+   * Returns true when something was kept, which means the incoming version did
+   * not land as itself and the caller must not record it as synced.
+   *
+   * A vault with no `replace` falls back to the plain write, which is what
+   * every vault did before and is still guarded by the stat above.
+   */
+  private async landedOverSomethingElse(
+    d: Incoming,
+    content: Uint8Array,
+    report: SyncReport,
+    times: Times,
+  ): Promise<boolean> {
+    const vault = this.opts.vault;
+    if (vault.replace === undefined) {
+      await vault.write(d.path, content, times);
+      return false;
+    }
+    const out = await vault.replace(d.path, this.expecting(d.baseDigest), content, times);
+    if (out.kept === undefined) return false;
+    // Something else was at the path. It is in hand rather than gone, which is
+    // the whole point, and it goes beside the note under a conflict name.
+    this.log("kept what was already there", d.path, {
+      why: "it changed while its next version was being fetched",
+    });
+    await this.keepBesides(d.path, out.kept, report);
+    report.conflicted++;
+    return true;
+  }
+
+  /**
+   * Removes a path, and returns what it took away when that was not the
+   * version the pass decided to delete (R01).
+   *
+   * The baseline is read here rather than carried from the scan, because a
+   * deletion has no fetch in front of it: the gap this closes is between the
+   * scan that listed the file and the removal at the end of the pass, and a
+   * digest taken now would be taken after that gap rather than before it. So
+   * the digest of record is the one from the listing where there is one, and
+   * where there is not, the removal simply reports what it took.
+   */
+  private async removedSomethingElse(
+    path: string,
+    based: LocalState | undefined,
+    baselines: ReadonlyMap<string, string>,
+  ): Promise<Uint8Array | undefined> {
+    const vault = this.opts.vault;
+    const digest = based === undefined || based.folder ? undefined : baselines.get(path);
+    if (vault.removeExpecting === undefined || digest === undefined) {
+      await vault.remove(path);
+      return undefined;
+    }
+    const out = await vault.removeExpecting(path, { contentId: digest, idOf: plainDigest });
+    return out.kept;
+  }
+
+  /** Puts bytes a write displaced beside the note, under a free conflict name. */
+  private async keepBesides(path: string, bytes: Uint8Array, report: SyncReport): Promise<void> {
+    void report;
+    const where = await this.freeConflictPath(path);
+    await this.opts.vault.write(where, bytes, { mtime: this.now(), ctime: this.now() });
+    this.landed(where);
+    this.log("kept a displaced version", where);
+  }
+
   private async unchangedSince(path: string, based: LocalState | undefined): Promise<boolean> {
     let now: FileStat | undefined;
     try {
@@ -2659,7 +2833,20 @@ export class Engine {
       return false;
     }
 
-    await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+    // And then the write itself preserves, because the check above cannot be
+    // made exact (R01). A stat compares length and a rounded timestamp, which
+    // is what an ordinary correction leaves alone, and there is no
+    // compare-and-swap on a file to close the gap between the check and the
+    // write. So the adapter moves whatever is there aside before writing over
+    // it and hands back anything that was not what this decided about.
+    if (
+      await this.landedOverSomethingElse(d, content, report, {
+        mtime: d.remote.mtime,
+        ctime: d.remote.mtime,
+      })
+    ) {
+      return false;
+    }
     this.landed(d.path);
     observe(d.entry, {
       folder: false,
@@ -3489,6 +3676,21 @@ interface Incoming {
    * write is a fetch, and the person using the vault is typing through it.
    */
   readonly based: LocalState | undefined;
+  /**
+   * A digest of the bytes this path held when the pass decided to write over
+   * it, or undefined when it held none or could not be read (R01).
+   *
+   * `based` is metadata and metadata is what an ordinary edit leaves alone: a
+   * corrected word is usually the same number of characters, and an editor
+   * writing through a temporary file can carry the timestamp over. This is the
+   * thing that actually changes, and it is what the adapter compares against
+   * whatever it displaces.
+   *
+   * Read at decision time, which is before the fetch, so it describes the
+   * version the decision was actually taken on. That costs one read of a file
+   * this pass is about to overwrite anyway.
+   */
+  readonly baseDigest: string | undefined;
 }
 
 /** One write waiting for company in the outbox. */

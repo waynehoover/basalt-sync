@@ -113,5 +113,32 @@ TAGS
 want server/v0.10.1     "0.10.1 0.10 latest"
 want server/v0.9.1      "0.9.1 0.9"
 
+# Out-of-order releases, which is the failure the workflow's concurrency group
+# and its late re-evaluation are for (R17).
+#
+# Release A starts while it is the newest and records `latest`. Release B is
+# tagged, builds, and promotes a newer version. A finishes last and applies the
+# answer it worked out at the start, moving the channel backward onto an older
+# server. Both pass their own digest checks, because each is checking its own
+# image.
+#
+# The script cannot serialise anything; what it can do is give the right answer
+# for the tags that exist *at the moment it is asked*, so that asking it late is
+# worth doing. These two cases are the same release asked at two moments.
+echo "the same release, asked before and after a newer one appears:"
+cat > "$work/tags" <<'TAGS'
+server/v0.4.0
+TAGS
+want server/v0.4.1      "0.4.1 0.4 latest"
+
+cat > "$work/tags" <<'TAGS'
+server/v0.4.0
+server/v0.4.2
+TAGS
+# Asked again once 0.4.2 is out, the older release must no longer claim either
+# moving tag. This is the answer the workflow gets by re-running it inside the
+# promotion step rather than reusing the one from before the build.
+want server/v0.4.1      "0.4.1"
+
 if [ "$fails" != 0 ]; then echo "$fails case(s) failed"; exit 1; fi
 echo "all cases passed"

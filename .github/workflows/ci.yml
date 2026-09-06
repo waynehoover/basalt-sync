@@ -98,6 +98,13 @@ jobs:
       - name: the tags a release may move are the right ones
         run: scripts/release-tags.test.sh
 
+      # And that the workflow asks for them at the moment it applies them. Two
+      # releases in flight together each decided while it was the newest, and
+      # the one that finished last moved `latest` backward onto an older
+      # server.
+      - name: the image release promotes in order
+        run: scripts/release-order.test.sh
+
       # And that no workflow reaches for a mutable tag, here included. A tag is
       # a name somebody else can repoint, and these files are what builds,
       # signs and publishes the project.

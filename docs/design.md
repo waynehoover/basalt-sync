@@ -507,13 +507,17 @@ published from CI over OIDC with no stored token.
   file is valid JSON, and Obsidian drops the edge silently on the next save.
   Telling it from one the ancestor already had would need the validity check to
   see both sides and the ancestor. Pinned as a test.
-- A write landing between the check and the write it guards. A pass decides
-  from a scan, fetches, and then checks the file is still the one it decided
-  about before overwriting or deleting it; an edit inside *that* gap is still
-  lost. Closing it needs a compare-and-swap the adapters do not have, and
-  Obsidian's has no locking at all. What the check buys is the size of the
-  window: from the length of a fetch, where an edit is ordinary, to the length
-  of one stat.
+- A write landing between the check and the write it guards, on the plugin.
+  A pass decides from a scan, fetches, and then writes, and the editor is in
+  use throughout. On the headless client the write itself no longer trusts the
+  check: it moves whatever is at the path aside before writing over it and
+  keeps anything that was not what the pass decided about, so an edit in that
+  gap is preserved rather than predicted. Obsidian's adapter has no way to move
+  a file aside atomically, so the plugin reads the bytes it is about to replace
+  and compares them: an edit is *seen* wherever it happens, including one that
+  keeps the file's length and timestamp, and what it displaces is kept. What
+  remains on both is an edit landing between that last look and the write
+  itself, which needs a compare-and-swap no adapter here has.
 - The whole-file fallback on mobile. The 64 MiB default came off a desktop
   memory curve, so an older phone syncing a large attachment may be killed
   mid-pass: no note is lost, the file never syncs, and the symptom is a dead
