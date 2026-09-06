@@ -31,6 +31,7 @@ import {
   adviseAfterRegistering,
   attentionLines,
   credentialsFor,
+  didSomething,
   needsAttention,
   rebaseCursors,
   redeemInvite,
@@ -1206,21 +1207,51 @@ export function exitCodeFor(report: SyncReport): number {
  */
 async function watchForever(config: Config, args: Args, io: Console): Promise<number> {
   let fatal: Error | undefined;
-  await runForever(await clientOptions(config, args, io), {
-    onSynced: (report, serverCursor) => {
-      renderReport(report, args, io, serverCursor);
-      if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
+  // Every pass, not only the first (F16).
+  //
+  // `onSynced` reports the settle that runs on connecting, and then watch
+  // sits inside `runUntilClosed` for hours while the ticker and arriving
+  // batches start passes nobody reports. A file that started failing an hour
+  // in said nothing at all, and a pass that failed outright said less: the
+  // exception was swallowed by `Client.sync`, whose callers are event
+  // handlers with nothing to do with one.
+  //
+  // Gated on the settle having been reported, because `onPass` fires for the
+  // passes inside it too and printing both is the same report twice. Quiet
+  // passes are not printed: a watcher that says "nothing happened" every
+  // thirty seconds is a watcher somebody stops reading.
+  let settled = false;
+  // The live client, for the server cursor an ongoing report prints. Held by
+  // `onClient`, which is how `runForever` hands each connection over.
+  let watching: Client | undefined;
+  await runForever(
+    {
+      ...(await clientOptions(config, args, io)),
+      onPass: (report) => {
+        if (!settled || !didSomething(report)) return;
+        renderReport(report, args, io, watching?.serverCursor ?? 0);
+      },
+      onSyncFailed: (err) => {
+        io.err(`basalt: a sync failed: ${err.message}. It will try again.`);
+      },
     },
-    onDisconnected: (cause, retryIn) => {
-      io.err(`Disconnected: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
+    {
+      onSynced: (report, serverCursor) => {
+        renderReport(report, args, io, serverCursor);
+        settled = true;
+        if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
+      },
+      onDisconnected: (cause, retryIn) => {
+        io.err(`Disconnected: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
+      },
+      onUnreachable: (cause, retryIn) => {
+        io.err(`Cannot reach the server: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
+      },
+      onFatal: (cause) => {
+        fatal = cause;
+      },
     },
-    onUnreachable: (cause, retryIn) => {
-      io.err(`Cannot reach the server: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
-    },
-    onFatal: (cause) => {
-      fatal = cause;
-    },
-  });
+  );
   if (fatal) {
     io.err(`basalt: ${withRecovery(fatal)}`);
     io.err("That will not fix itself by trying again.");

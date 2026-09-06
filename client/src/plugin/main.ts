@@ -529,6 +529,17 @@ export default class BasaltPlugin extends Plugin {
         });
         this.announce(report);
       },
+      // A pass that failed outright, from wherever it was started (F16).
+      //
+      // The ticker and an arriving batch start passes this shell never sees
+      // begin, and their exceptions were swallowed, so a device that
+      // connected and then failed every pass went on showing the status of
+      // the last one that worked. `onPass` never fires for those, so nothing
+      // moved the status at all.
+      onSyncFailed: (err) => {
+        if (!current()) return;
+        this.passFailed(err.message);
+      },
       // The engine's running commentary, which had nowhere to go.
       //
       // These are the lines that say why something did not sync: a file

@@ -160,7 +160,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F16 — Surface background sync failures and later watch reports
 
-- [ ] Provide a structured background-error callback and consume per-pass reports in both user-facing clients.
+- [x] Provide a structured background-error callback and consume per-pass reports in both user-facing clients.
 
 **Evidence — inspection.** [Client.sync](client/src/core/client.ts#L396) catches exceptions, logs only when an optional logger exists, and returns `undefined`. Automatic arrival/periodic callers do not turn that into a user-visible failure. [CLI clientOptions](client/src/cli/cli.ts#L1574) does not supply `onPass`; watch's initial settle report therefore does not provide ongoing per-path failure reporting.
 
@@ -168,7 +168,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F17 — Reject malformed JSON frame shapes inside the transport boundary
 
-- [ ] Validate that parsed frames are objects and consistently convert malformed fields to protocol failures.
+- [x] Validate that parsed frames are objects and consistently convert malformed fields to protocol failures.
 
 **Evidence — reproduced.** [Transport.onFrame](client/src/core/transport.ts#L679) catches JSON syntax errors, but passes valid JSON `null` to `onTextFrame` outside that catch. The probe threw a `TypeError` out of the socket callback and left the socket open. Arrays/scalars and several notification fields also lack complete schema validation.
 
@@ -176,7 +176,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F18 — Handle chunk-hash rejection immediately during a multi-body fetch
 
-- [ ] Attach failure handling as each hash check starts, and abort a corrupt fetch without waiting for all later bodies.
+- [x] Attach failure handling as each hash check starts, and abort a corrupt fetch without waiting for all later bodies.
 
 **Evidence — reproduced.** [Transport.fetch](client/src/core/transport.ts#L1629) collects promises that can reject, but only observes them with `Promise.all` after receiving every body. A corrupt first body followed by a delayed second body emitted `unhandledRejection` before the eventual normal fetch rejection. This can terminate runtimes configured to treat unhandled rejections as fatal.
 

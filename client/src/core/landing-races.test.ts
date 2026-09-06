@@ -418,3 +418,55 @@ describe("a note whose name is a property name (F14)", () => {
     }
   });
 });
+
+/**
+ * A pass that fails outright, from wherever it was started (F16).
+ *
+ * `Client.sync` swallows exceptions on purpose: most of its callers are event
+ * handlers with nothing useful to do with one, a ticker, an arriving batch, a
+ * file the host says was saved. What it did with the exception was log it if
+ * a logger happened to be configured, and nothing else. So a device that
+ * connected and then failed every pass went on showing the status of the last
+ * pass that worked, which is the status rule in docs/design.md read backwards.
+ */
+describe("a background pass that fails (F16)", () => {
+  it("tells the shell, rather than logging it if anybody asked", async () => {
+    const { Client } = await import("./client.ts");
+    const { MemoryIndexStore } = await import("./vault.ts");
+    const { TEST_DATA_KEY } = await import("./test-keys.ts");
+    const { FakeSocket, ready } = await import("./fake-socket.ts");
+
+    const socket = new FakeSocket();
+    const failures: string[] = [];
+    const client = new Client({
+      vault: new MemoryVault(),
+      store: new MemoryIndexStore(),
+      dataKey: TEST_DATA_KEY,
+      url: "ws://test",
+      deviceId: "d",
+      token: "t",
+      vaultId: "v",
+      device: "d",
+      socketFactory: () => socket,
+      onSyncFailed: (err) => void failures.push(err.message),
+    });
+    const connecting = client.connect({ waitForBacklog: false });
+    socket.open();
+    await settle();
+    socket.reply(ready({ cursor: 0 }));
+    await connecting;
+
+    // A pass that cannot finish: the engine throws rather than filing one
+    // path for retry, which is the whole-pass case `onPass` never sees.
+    (client as unknown as { engine: { sync(): Promise<never> } }).engine.sync = async () => {
+      throw new Error("the index will not save");
+    };
+
+    const report = await client.sync();
+    expect(report, "a failed pass reported a result").toBeUndefined();
+    expect(failures, "the shell was never told the pass failed").toEqual([
+      "the index will not save",
+    ]);
+    await client.close();
+  });
+});

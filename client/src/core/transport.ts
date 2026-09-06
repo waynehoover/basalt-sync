@@ -692,6 +692,23 @@ export class Transport {
         );
         return;
       }
+      // Parsed is not the same as a frame (F17). `null`, `7`, `"hello"` and
+      // `[]` are all valid JSON, and every one of them left the `try` above
+      // and reached a reader that expects to index into an object: the probe
+      // threw a TypeError out of the socket callback, which nothing here
+      // catches, and left the connection open and unusable. A frame that is
+      // not an object means the two ends disagree about the protocol just as
+      // surely as one that is not JSON, and it is refused in the same place
+      // with the same code.
+      if (typeof frame !== "object" || frame === null || Array.isArray(frame)) {
+        this.die(
+          new ProtocolError(
+            "protostate",
+            `server sent a frame that is not an object: ${data.slice(0, 120)}`,
+          ),
+        );
+        return;
+      }
       this.onTextFrame(frame);
       return;
     }
@@ -1599,6 +1616,27 @@ export class Transport {
     const got: Uint8Array[] = [];
     this.collecting = { pending: collector, want: names.length, got };
     const checks: Promise<void>[] = [];
+
+    // The first failing hash, made observable the moment it fails (F18).
+    //
+    // The checks below run alongside the bodies still arriving, and nothing
+    // looked at them until every body had been received. A corrupt first body
+    // followed by a slow second one therefore rejected with nobody watching:
+    // an `unhandledRejection`, which some runtimes are configured to treat as
+    // fatal, and then a wait for the rest of what an attacker felt like
+    // sending. Racing the wait for each body against this ends the fetch at
+    // the first bad hash instead.
+    //
+    // `stop` is only ever called once, and the `catch` below is what keeps
+    // this promise from being the unhandled rejection it exists to prevent
+    // when nothing is racing it at that instant.
+    let firstBad: Error | undefined;
+    let stop: ((err: Error) => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      stop = reject;
+    });
+    void aborted.catch(() => {});
+
     try {
       const started = this.begin({ op: "fetch", chunks: [...names] }, "bodies");
       const header = await this.awaitReply(started);
@@ -1613,7 +1651,9 @@ export class Transport {
       }
       this.arm(collector);
       for (let i = 0; i < count; i++) {
-        const next = await this.body(i);
+        // Whichever comes first: the next body, or a body already received
+        // turning out to be the wrong bytes.
+        const next = await Promise.race([this.body(i), aborted]);
         // Hashed alongside the next body rather than in front of it.
         //
         // The bodies arrive in order and must be read in order, but
@@ -1626,18 +1666,26 @@ export class Transport {
         // few bodies later than it used to, and nothing is written before
         // the check settles.
         const want = names[i]!;
+        // Recorded rather than thrown, so nothing in this array is ever a
+        // rejection waiting for somebody to notice it. The failure leaves
+        // through `aborted`, which the loop above is racing, and through
+        // `firstBad` below for a body that was the last one.
         checks.push(
           chunkName(next).then((hash) => {
-            if (hash !== want) {
-              throw new ProtocolError(
-                "badchunk",
-                `asked for ${want} and received ${next.length} bytes that hash to ${hash}`,
-              );
+            if (hash === want) return;
+            const bad = new ProtocolError(
+              "badchunk",
+              `asked for ${want} and received ${next.length} bytes that hash to ${hash}`,
+            );
+            if (firstBad === undefined) {
+              firstBad = bad;
+              stop?.(bad);
             }
           }),
         );
       }
       await Promise.all(checks);
+      if (firstBad !== undefined) throw firstBad;
     } catch (err) {
       if (err instanceof ProtocolError && err.code === "badchunk") this.die(err);
       throw err;

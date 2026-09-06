@@ -96,6 +96,22 @@ export interface ClientOptions {
    * nothing here; the error goes to whoever asked for it.
    */
   readonly onPass?: (report: SyncReport) => void;
+  /**
+   * A pass that failed outright, rather than a file within one (F16).
+   *
+   * `sync` swallows exceptions on purpose, because most of its callers are
+   * event handlers with nothing useful to do with one: a ticker, an arriving
+   * batch, a file the host says was saved. What it used to do with the
+   * exception was log it if a logger happened to be configured, and nothing
+   * else, so a device that connected and then failed every pass showed the
+   * status of the last pass that worked. Silence there is the status rule in
+   * docs/design.md read backwards.
+   *
+   * A whole pass, not a path: `onPass` already carries the paths that are
+   * retrying or written off, and this is for the case where there is no
+   * report at all.
+   */
+  readonly onSyncFailed?: (err: Error) => void;
   /** Injectable for tests, and for a platform whose WebSocket is not global. */
   /**
    * Connect to read, and never to write (F08).
@@ -429,6 +445,7 @@ export class Client {
       return await this.pass(opts);
     } catch (err) {
       this.opts.log?.("sync failed", (err as Error).message);
+      this.opts.onSyncFailed?.(err as Error);
       return undefined;
     }
   }

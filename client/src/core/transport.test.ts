@@ -1766,3 +1766,95 @@ describe("keeping to the caps the server advertised", () => {
     for (const f of files) expect(vault.text(f.path)).toBe(new TextDecoder().decode(f.text));
   });
 });
+
+/**
+ * Frames that parse as JSON and are not frames (F17).
+ *
+ * `JSON.parse` was wrapped in a try, so a frame that is not JSON at all ends
+ * the session cleanly. `null`, a number, a string and an array all parse
+ * perfectly well and then reach a reader that indexes into an object: the
+ * probe threw a TypeError out of the socket callback, which nothing catches,
+ * and left the connection open and unusable. A frame that is not an object
+ * means the two ends disagree about the protocol just as surely as one that
+ * is not JSON.
+ */
+describe("a text frame that is not a frame", () => {
+  for (const [what, frame] of [
+    ["null", null],
+    ["a number", 7],
+    ["a string", "hello"],
+    ["an array", [1, 2, 3]],
+  ] as const) {
+    it(`ends the session on ${what}, without throwing out of the socket`, async () => {
+      const { t, socket } = await helloed(0);
+      const thrown: unknown[] = [];
+      const realOnMessage = socket.onmessage!.bind(socket);
+      socket.onmessage = (ev) => {
+        try {
+          realOnMessage(ev);
+        } catch (err) {
+          thrown.push(err);
+        }
+      };
+
+      socket.raw(frame);
+      await settle();
+
+      expect(thrown, `the socket callback threw: ${String(thrown[0])}`).toEqual([]);
+      expect(t.isClosed, "the connection was left open after an unreadable frame").toBe(true);
+      await expect(t.ping()).rejects.toThrow();
+    });
+  }
+});
+
+/**
+ * A body that is the wrong bytes must end the fetch when it is noticed (F18).
+ *
+ * The hashes are checked alongside the bodies still arriving, which is what
+ * makes a fetch of two thousand bodies affordable, and nothing looked at them
+ * until every body had been received. So a corrupt first body followed by a
+ * slow second one rejected with nobody watching: an `unhandledRejection`,
+ * which some runtimes treat as fatal, and then a wait for the rest of
+ * whatever an attacker felt like sending.
+ */
+describe("a corrupt body early in a fetch", () => {
+  it("fails at once rather than waiting for the bodies after it", async () => {
+    const { t, socket } = await helloed(0);
+    const good = new Uint8Array([1, 2, 3]);
+    const alsoGood = new Uint8Array([4, 5, 6]);
+    const names = [await chunkName(good), await chunkName(alsoGood)];
+
+    const unhandled: unknown[] = [];
+    const watch = (err: unknown): void => void unhandled.push(err);
+    process.on("unhandledRejection", watch);
+    try {
+      const fetching = t.fetch(names);
+      await settle();
+      // Two are promised. The first is not what was asked for, and the second
+      // never comes, which is the shape that used to leave a rejection with
+      // nobody watching while the fetch sat waiting for it.
+      socket.reply({ res: "bodies", count: 2 });
+      socket.body(new Uint8Array([9, 9, 9]));
+
+      await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
+      // Waited for, because an unhandled rejection is reported a turn later.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(
+        unhandled,
+        `the corrupt body rejected with nobody watching: ${String(unhandled[0])}`,
+      ).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", watch);
+    }
+  });
+
+  it("still reports a bad hash on the last body of a fetch", async () => {
+    const { t, socket } = await helloed(0);
+    const good = new Uint8Array([1, 2, 3]);
+    const names = [await chunkName(good)];
+    const fetching = t.fetch(names);
+    await settle();
+    socket.bodies(new Uint8Array([8, 8, 8]));
+    await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
+  });
+});
