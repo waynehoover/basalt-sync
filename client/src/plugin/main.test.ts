@@ -2101,6 +2101,65 @@ describe("a restore whose upload fails (P31)", () => {
     expect(done.why).toMatch(/EACCES/);
     expect(app.vault.adapter.text("gone.md")).toBe("bring me back");
   }, 300_000);
+
+  /**
+   * F15. A pass that resolved is not a path that went.
+   *
+   * `settle` resolves for a vault that is retrying, so ignoring its report
+   * reported the restored note as sent to the other devices while its upload
+   * sat queued. The restore is durable either way, which is exactly why the
+   * two outcomes are kept apart; claiming the second because the first
+   * happened is the same conflation from the other side.
+   */
+  it("does not claim a restore was sent when its upload is still retrying", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("gone.md", "bring me back");
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    await app.vault.adapter.remove("gone.md");
+    await plugin.syncNow();
+    const deletion = (await plugin.deletedNotes()).notes.find((n) => n.path === "gone.md")!;
+
+    // The upload of this one path fails in a way the engine files for retry,
+    // and the pass itself resolves: nothing throws, and the vault is fine.
+    const client = (plugin as unknown as { client: { settle(o: unknown): Promise<unknown> } })
+      .client;
+    const realSettle = client.settle.bind(client);
+    client.settle = async (o: unknown) => {
+      const report = (await realSettle(o)) as Record<string, unknown>;
+      return { ...report, retrying: 1, retryingPaths: ["gone.md"] };
+    };
+
+    const done = await plugin.recover(deletion);
+    expect(done.path).toBe("gone.md");
+    expect(done.sent, "a restore whose upload is queued was reported as sent").toBe(false);
+    expect(done.willRetry).toBe(true);
+    // And the local copy is there, because that half really did happen.
+    expect(app.vault.adapter.text("gone.md")).toBe("bring me back");
+  }, 300_000);
+
+  it("does not blame this restore for another path failing", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("gone.md", "bring me back");
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    await app.vault.adapter.remove("gone.md");
+    await plugin.syncNow();
+    const deletion = (await plugin.deletedNotes()).notes.find((n) => n.path === "gone.md")!;
+
+    const client = (plugin as unknown as { client: { settle(o: unknown): Promise<unknown> } })
+      .client;
+    const realSettle = client.settle.bind(client);
+    client.settle = async (o: unknown) => {
+      const report = (await realSettle(o)) as Record<string, unknown>;
+      return { ...report, retrying: 1, retryingPaths: ["something-else.md"] };
+    };
+
+    const done = await plugin.recover(deletion);
+    expect(done.sent, "an unrelated path's failure was blamed on this restore").toBe(true);
+  }, 300_000);
 });
 
 /**

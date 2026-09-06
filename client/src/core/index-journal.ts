@@ -235,8 +235,14 @@ function copyOf(state: StoredState): Fold {
   const from = (state ?? {}) as Partial<StoredState>;
   return {
     cursor: from.cursor,
-    entries: { ...from.entries },
-    remote: { ...from.remote },
+    // Null-prototype, because a filename is not a property name (F14). A note
+    // called `__proto__` assigned into an ordinary object sets the prototype
+    // instead of adding a key, silently, so replaying a delta that named it
+    // produced a state the note was missing from. `constructor` and
+    // `toString` are the same trick under different names. The spread copies
+    // own enumerable keys either way.
+    entries: Object.assign(Object.create(null) as Record<string, unknown>, from.entries),
+    remote: Object.assign(Object.create(null) as Record<string, unknown>, from.remote),
     pending: Array.isArray(from.pending) ? [...from.pending] : from.pending,
   };
 }
@@ -349,7 +355,9 @@ function changed(
   after: ReadonlyMap<string, string>,
   values: Record<string, unknown>,
 ): { set: Record<string, unknown>; del: string[] } {
-  const set: Record<string, unknown> = {};
+  // Null-prototype for the same reason `copyOf` uses one: this is where a
+  // path becomes a key, and `__proto__` is not a key on an ordinary object.
+  const set: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   const del: string[] = [];
   for (const [path, json] of after) if (before.get(path) !== json) set[path] = values[path];
   for (const path of before.keys()) if (!after.has(path)) del.push(path);

@@ -333,3 +333,88 @@ describe("a server that replays a signed old version (F11, pinned)", () => {
     ).toBe("typed again after the deletion");
   });
 });
+
+/**
+ * Filenames that are property names on an ordinary object (F14).
+ *
+ * `entries["__proto__"] = e` does not add a key. It sets the prototype, or on
+ * a frozen prototype does nothing at all, and the assignment succeeds either
+ * way. So a vault holding a note called `__proto__` downloaded it, advanced
+ * the cursor, and saved an index with no record of it: the note was on disk
+ * and the index had never heard of it, for ever. `constructor` and `toString`
+ * are the same trick under different names, and a delta naming one of them
+ * replayed into a state it was missing from.
+ *
+ * These are legal filenames on every filesystem Basalt runs on.
+ */
+describe("a note whose name is a property name (F14)", () => {
+  const awkward = ["__proto__", "constructor", "toString", "hasOwnProperty"];
+
+  it("survives a download, a save and a restart", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    const entries = await Promise.all(
+      awkward.map((name, i) => entryFor(keys, i + 1, name, `contents of ${name}`, bodies)),
+    );
+    socket.raw({ op: "batch", from: 1, to: awkward.length, entries });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    for (const name of awkward) {
+      expect(vault.text(name), `${name} was not written to the vault`).toBe(`contents of ${name}`);
+    }
+
+    // The index has to name every one of them, or the next pass downloads
+    // them all again and the pass after that reports them deleted.
+    const state = (await (
+      engine as unknown as { opts: { store: { load(): Promise<unknown> } } }
+    ).opts.store.load()) as { entries: Record<string, unknown>; remote: Record<string, unknown> };
+    for (const name of awkward) {
+      expect(
+        Object.prototype.hasOwnProperty.call(state.entries, name),
+        `the saved index has no entry for ${name}`,
+      ).toBe(true);
+      expect(
+        Object.prototype.hasOwnProperty.call(state.remote, name),
+        `the saved index has no server record for ${name}`,
+      ).toBe(true);
+    }
+  });
+
+  it("round-trips through a journal delta and its replay", async () => {
+    const { applyDelta, deltaBetween } = await import("./index-journal.ts");
+    const empty = { cursor: 0, entries: {}, remote: {}, pending: [] } as unknown as Parameters<
+      typeof deltaBetween
+    >[0];
+    const withThem = {
+      cursor: 4,
+      entries: Object.fromEntries(awkward.map((n) => [n, { path: n, size: 1 }])),
+      remote: Object.fromEntries(awkward.map((n) => [n, { uid: 1 }])),
+      pending: awkward,
+    } as unknown as Parameters<typeof deltaBetween>[0];
+
+    const delta = deltaBetween(empty, withThem);
+    expect(delta, "nothing was recorded as changed").toBeDefined();
+    const back = applyDelta(empty, delta!) as unknown as { entries: Record<string, unknown> };
+    for (const name of awkward) {
+      expect(
+        Object.prototype.hasOwnProperty.call(back.entries, name),
+        `${name} did not survive the delta`,
+      ).toBe(true);
+    }
+
+    // And removing them again leaves nothing behind, rather than a key that
+    // cannot be deleted because it was never really there.
+    const gone = applyDelta(back as never, deltaBetween(withThem, empty)!) as unknown as {
+      entries: Record<string, unknown>;
+    };
+    for (const name of awkward) {
+      expect(
+        Object.prototype.hasOwnProperty.call(gone.entries, name),
+        `${name} could not be removed`,
+      ).toBe(false);
+    }
+  });
+});

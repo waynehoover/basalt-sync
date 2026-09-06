@@ -144,7 +144,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F14 — Store arbitrary filenames without object-prototype semantics
 
-- [ ] Use null-prototype dictionaries or safe own-property construction throughout index serialization and journal deltas.
+- [x] Use null-prototype dictionaries or safe own-property construction throughout index serialization and journal deltas.
 
 **Evidence — reproduced.** [Engine.save](client/src/core/engine.ts#L2757) assigns filename keys into `{}`. A valid top-level `__proto__` file downloaded successfully and advanced the cursor, but disappeared from both saved maps. [Journal delta construction/replay](client/src/core/index-journal.ts) uses ordinary object assignment too.
 
@@ -152,7 +152,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F15 — Report a restored file as sent only after its upload succeeds
 
-- [ ] Inspect the restore's synchronization result and report the restored path's actual outcome.
+- [x] Inspect the restore's synchronization result and report the restored path's actual outcome.
 
 **Evidence — reproduced using the Obsidian stub.** [restoreAndSend](client/src/plugin/main.ts#L1004) ignores the returned `SyncReport`. `settle` can resolve with retrying/skipped work; the function still returns `sent: true`. A stubbed retrying upload produced that exact result.
 

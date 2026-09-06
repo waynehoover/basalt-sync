@@ -1023,10 +1023,11 @@ export default class BasaltPlugin extends Plugin {
     if (!client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
     const mine = this.generation;
     const done = await client.restore(version);
+    let report;
     try {
       // Sent now rather than at the next pass, so the other devices get it
       // without anybody having to know that they would not have.
-      await client.settle({ coalesceWrites: false });
+      report = await client.settle({ coalesceWrites: false });
     } catch (err) {
       // "It will be sent when the next sync succeeds" is only true while
       // there is a next sync. Unlinked mid-restore there is not one, and the
@@ -1041,6 +1042,35 @@ export default class BasaltPlugin extends Plugin {
       }
       return { path: done.path, sent: false, why: (err as Error).message };
     }
+    // A pass that resolved is not a path that went (F15).
+    //
+    // `settle` resolves for a vault that is retrying or has written a path
+    // off, so ignoring its report reported the restored note as sent to the
+    // other devices when its upload had failed and been queued, or refused
+    // for good. The restore itself is durable either way, which is the whole
+    // reason these two outcomes are kept apart; saying the second happened
+    // because the first did is the same conflation from the other side.
+    //
+    // Only this path. Another note failing elsewhere in the vault says
+    // nothing about this one, and marking the restore unsent for it would
+    // send somebody looking in the wrong place.
+    if (report.skippedPaths.includes(done.path)) {
+      return {
+        path: done.path,
+        sent: false,
+        willRetry: false,
+        why: "the server refused it, so it is on this device only",
+      };
+    }
+    if (report.retryingPaths.includes(done.path)) {
+      return {
+        path: done.path,
+        sent: false,
+        willRetry: true,
+        why: "it could not be sent yet, and will be tried again",
+      };
+    }
+
     // No staleness check on this side on purpose: the upload happened, so
     // "sent to your other devices" is true whatever became of the pairing
     // afterwards, and saying otherwise would be the same lie reversed.

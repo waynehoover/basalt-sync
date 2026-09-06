@@ -428,6 +428,17 @@ export interface SyncReport {
    */
   skippedPaths: string[];
   /**
+   * Paths this pass could not finish and will try again, sorted and bounded
+   * the way `skippedPaths` is.
+   *
+   * `retrying` is a count, and a count cannot answer the one question a
+   * caller acting on a single path has: did *mine* go? Restoring a version
+   * settled the vault, ignored the report, and reported the restored note as
+   * sent to the other devices whatever had happened to it (F15). A number is
+   * enough for a status line and never enough for a promise about one file.
+   */
+  retryingPaths: string[];
+  /**
    * Paths another device syncs that this one is set to ignore.
    *
    * Its own counter rather than folded into `skipped`, and deliberately not
@@ -532,6 +543,12 @@ function noteSkipped(report: SyncReport, path: string): void {
   report.skippedPaths.push(path);
 }
 
+/** The same pairing for a path that will be tried again. */
+function noteRetrying(report: SyncReport, path: string): void {
+  report.retrying++;
+  report.retryingPaths.push(path);
+}
+
 function emptyReport(): SyncReport {
   return {
     uploaded: 0,
@@ -547,6 +564,7 @@ function emptyReport(): SyncReport {
     retrying: 0,
     skipped: 0,
     skippedPaths: [],
+    retryingPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],
@@ -1168,7 +1186,7 @@ export class Engine {
 
       const retry = this.retries.get(path);
       if (retry && retry.at > now) {
-        report.retrying++;
+        noteRetrying(report, path);
         continue;
       }
       try {
@@ -1201,6 +1219,7 @@ export class Engine {
     // reached in a different order is the same set; capped for the reason
     // above the constant.
     report.skippedPaths = [...new Set(report.skippedPaths)].sort().slice(0, SKIPPED_SHOWN);
+    report.retryingPaths = [...new Set(report.retryingPaths)].sort().slice(0, SKIPPED_SHOWN);
 
     // Replaced rather than added to, so a path stops being blocked the
     // moment the file in its way is gone.
@@ -2827,7 +2846,7 @@ export class Engine {
     retry.error = message;
     retry.at = this.now() + Math.min(300_000, 5_000 * Math.pow(2, retry.count));
     this.retries.set(path, retry);
-    report.retrying++;
+    noteRetrying(report, path);
     this.log("will retry", path, { attempt: retry.count, error: message });
   }
 
@@ -2897,9 +2916,21 @@ export class Engine {
   }
 
   private async save(): Promise<void> {
-    const entries: Record<string, unknown> = {};
+    // Null-prototype, because a filename is not a property name (F14).
+    //
+    // `entries["__proto__"] = ...` on an ordinary object does not add a key.
+    // It sets the prototype, or on a frozen prototype does nothing at all, and
+    // either way the assignment succeeds silently and the key is not there
+    // afterwards. A vault holding a note called `__proto__` therefore
+    // downloaded it, advanced the cursor, and saved an index with no record of
+    // it: the note was on disk and the index had never heard of it, for ever.
+    // `constructor` and `toString` are the same trick with a different name.
+    //
+    // Objects rather than Maps because this is what goes to JSON, and
+    // `JSON.stringify` treats a null-prototype object exactly like any other.
+    const entries: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [path, e] of this.entries) entries[path] = packed(e);
-    const remote: Record<string, Remote> = {};
+    const remote: Record<string, Remote> = Object.create(null) as Record<string, Remote>;
     for (const [path, r] of this.remote) remote[path] = r;
     await this.opts.store.save({
       cursor: this.cursor,
@@ -3015,6 +3046,7 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     retrying: b.retrying,
     skipped: b.skipped,
     skippedPaths: b.skippedPaths,
+    retryingPaths: b.retryingPaths,
     ignored: b.ignored,
     blocked: b.blocked,
     inTheWay: b.inTheWay,
