@@ -41,8 +41,7 @@ I wanted self-hosted sync that is as easy as the official one, without the setup
 **1. Run the server.**
 
 ```bash
-docker run -d --name basalt -p 127.0.0.1:3003:3003 \
-  -v basalt-data:/data ghcr.io/waynehoover/basalt-sync:latest
+docker run -d --name basalt -p 127.0.0.1:3003:3003 -v basalt-data:/data ghcr.io/waynehoover/basalt-sync
 docker logs basalt
 ```
 

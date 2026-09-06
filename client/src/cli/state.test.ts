@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -151,6 +151,78 @@ const exited = (child: ChildProcess) =>
  * print held the only copy of it in a local variable, and a kill there left a
  * working device on a vault nobody could ever recover.
  */
+/**
+ * F26. A rebase reports the same outcome to a person and to a script.
+ *
+ * The JSON branch returned zero unconditionally while the text branch called
+ * `exitCodeFor`, so an incomplete replay was a failure interactively and a
+ * success in automation: exactly the difference a cron job cannot see.
+ */
+describe("what a rebase exits with (F26)", () => {
+  it("gives JSON and text the same status when a path cannot be replayed", async () => {
+    // A server that refuses anything over a few bytes, so the replay after
+    // the rebase has a path it cannot finish.
+    server = new TestServer();
+    server.extraArgs = ["-max-file", "32"];
+    await server.start();
+
+    // Two devices of one vault, in the same state, because a rebase changes
+    // the state it was asked about: running one and then the other on a
+    // single vault compares a replay against a refusal.
+    const first = await vaultDir("rebasetext");
+    const started = await cli("init", server.setup, "--dir", first, "--device", "a", "--json");
+    expect(started.code, started.all).toBe(0);
+    const key = started.json()["recoveryKey"] as string;
+
+    const second = await vaultDir("rebasejson");
+    expect((await cli("pair", key, "--dir", second, "--device", "b")).code).toBe(0);
+
+    // One note each side knows about, then a backup, then more history. The
+    // restore puts the server back before the second note, which is exactly
+    // the state `rebase` exists for: the devices hold versions it does not.
+    // Without that a rebase refuses before it replays anything, and both
+    // formats then exit the same way for the wrong reason.
+    await writeFile(join(first, "one.md"), "first");
+    expect((await cli("sync", "--dir", first)).code).toBe(0);
+    expect((await cli("sync", "--dir", second)).code).toBe(0);
+    const backup = await vaultDir("rebasebackup");
+    await server.cli("backup", "-to", backup);
+    await writeFile(join(first, "two.md"), "second");
+    expect((await cli("sync", "--dir", first)).code).toBe(0);
+    expect((await cli("sync", "--dir", second)).code).toBe(0);
+
+    const dataDir = server.dataDir;
+
+    // And a note on each device the restored server will refuse, so the
+    // replay is incomplete rather than clean.
+    await writeFile(join(first, "big.md"), "x".repeat(4096));
+    await writeFile(join(second, "big.md"), "x".repeat(4096));
+
+    const restore = async (): Promise<void> => {
+      await server!.whileStopped(async () => {
+        await rm(dataDir, { recursive: true, force: true });
+        await cp(backup, dataDir, { recursive: true });
+      });
+    };
+
+    await restore();
+    const text = await cli("rebase", "--backup-taken", "--dir", first);
+    // The first rebase pushes its history back, so the server is no longer
+    // behind the second device. Put it back, or the second run measures a
+    // refusal rather than a replay.
+    await restore();
+    const asJson = await cli("rebase", "--backup-taken", "--dir", second, "--json");
+
+    expect(
+      asJson.code,
+      `text exited ${text.code} and json exited ${asJson.code}:\n${asJson.all}`,
+    ).toBe(text.code);
+    expect(text.code, `the oversized note was replayed cleanly:\n${text.all}`).toBe(1);
+    // And the machine-readable answer says so in its own field too.
+    expect(asJson.json()["ok"], `ok disagreed with the exit code:\n${asJson.all}`).toBe(false);
+  }, 300_000);
+});
+
 describe("what init prints, and when (F02)", () => {
   it("prints the recovery key before it registers the device", async () => {
     server = new TestServer();

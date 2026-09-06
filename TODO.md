@@ -208,7 +208,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F22 — Remove the plugin's journal before its snapshot
 
-- [ ] Make plugin index reset/unlink interruption-safe and align it with the CLI's removal order.
+- [x] Make plugin index reset/unlink interruption-safe and align it with the CLI's removal order.
 
 **Evidence — inspection.** [ObsidianIndexStore.remove](client/src/plugin/vault.ts#L1105) iterates [live snapshot, temporary snapshot, journal](client/src/plugin/vault.ts#L1136). Failure after deleting the live snapshot leaves an orphan journal, which the journal loader refuses. [CLI removeIndex](client/src/cli/config.ts#L119) already deletes the journal first for this reason.
 
@@ -240,7 +240,7 @@ The server does not need to forge a MAC. This exceeds the withholding-only limit
 
 ### F26 — Preserve rebase failure exit codes in JSON mode
 
-- [ ] Use the same report-to-exit-status policy for JSON and text rebase results.
+- [x] Use the same report-to-exit-status policy for JSON and text rebase results.
 
 **Evidence — inspection.** [cmdRebase](client/src/cli/cli.ts#L1128) returns zero unconditionally in its JSON branch, while the text branch calls `exitCodeFor(report)`. The same incomplete replay can consequently be a failure interactively and a success in automation.
 

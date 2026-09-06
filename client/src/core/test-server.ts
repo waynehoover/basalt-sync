@@ -145,6 +145,12 @@ export class TestServer {
    * pointed at, which is what recovering from a crash looks like from a
    * device: the same address, the same data directory, a new process.
    */
+  /**
+   * Extra flags for `serve`, for a test that needs a server with a different
+   * limit. Set before `start`.
+   */
+  extraArgs: string[] = [];
+
   async start(samePort?: number): Promise<void> {
     let last: Error | undefined;
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -165,9 +171,11 @@ export class TestServer {
     if (!this.dataDir) this.dataDir = await mkdtemp(join(tmpdir(), "basalt-data-"));
     this.port = fixedPort ?? (await freePort());
     this.stderr.length = 0;
-    this.proc = spawn(binary, ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    this.proc = spawn(
+      binary,
+      ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`, ...this.extraArgs],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
     this.proc.stderr?.on("data", (b: Buffer) => this.stderr.push(b.toString()));
 
     // Waited for rather than slept through.

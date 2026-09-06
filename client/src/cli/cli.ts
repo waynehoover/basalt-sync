@@ -1150,8 +1150,22 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
   try {
     const report = await client.settle({ coalesceWrites: false });
     if (args.json) {
-      io.out(JSON.stringify({ ok: true, localCursor: local, serverCursor, replayed: report }));
-      return 0;
+      // The same exit status the text branch gives, and the same `ok` (F26).
+      //
+      // This returned zero unconditionally, so an incomplete replay was a
+      // failure interactively and a success in automation: exactly the
+      // difference a cron job cannot see. A rebase that left paths retrying
+      // or written off has not finished, whoever is reading.
+      const code = exitCodeFor(report);
+      io.out(
+        JSON.stringify({
+          ok: code === 0,
+          localCursor: local,
+          serverCursor,
+          replayed: report,
+        }),
+      );
+      return code;
     }
     io.out("");
     io.out("Rebased onto the server's history:");

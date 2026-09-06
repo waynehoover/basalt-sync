@@ -1151,7 +1151,20 @@ class ObsidianJournalFiles implements JournalFiles {
 
   /** Every path this store owns, for a removal that must leave nothing behind. */
   everyFile(): string[] {
-    return [this.live, this.temp, this.log];
+    // The journal first, and this order is the only safe one (F22).
+    //
+    // A crash between the removals leaves whatever is still there. Journal
+    // gone and snapshot left is exactly what an index looked like before the
+    // journal existed, and it loads without a word. The other way round is a
+    // delta against a base that is not there, which the loader refuses, so an
+    // unlink that stopped half way left a vault that would not start. The CLI
+    // has removed them in this order since the journal landed; this had the
+    // list the other way up.
+    //
+    // The staged snapshot sits between them: it is a copy of the live one, so
+    // it is safe at any point, and putting it after the journal keeps the two
+    // that matter adjacent.
+    return [this.log, this.temp, this.live];
   }
 
   /**

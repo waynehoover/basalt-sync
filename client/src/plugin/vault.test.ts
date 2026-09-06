@@ -1003,6 +1003,41 @@ describe("the index, interrupted (P18)", () => {
       op === "remove" && path === INDEX ? new Error("EACCES") : undefined;
     await expect(store.remove()).rejects.toThrow(/EACCES/);
   });
+
+  /**
+   * F22. An interrupted removal must leave something that loads.
+   *
+   * A crash between the two removals leaves whatever is still there. Journal
+   * gone and snapshot left is exactly what an index looked like before the
+   * journal existed, and it loads without a word. The other way round is a
+   * delta against a base that is not there, which the loader refuses, so an
+   * unlink that stopped half way left a vault that would not start at all.
+   * The CLI has removed them in the safe order since the journal landed; the
+   * plugin had its list the other way up.
+   */
+  it("leaves a loadable index when the removal is interrupted at any point", async () => {
+    for (const stopAt of [INDEX, TEMP, LOG]) {
+      adapter = new FakeAdapter();
+      const store = new ObsidianIndexStore(adapter, INDEX);
+      await store.save(state(1));
+      await store.save(state(2));
+      await adapter.write(TEMP, JSON.stringify(state(2)));
+
+      adapter.fault = (op, path) =>
+        op === "remove" && path === stopAt ? new Error("EACCES") : undefined;
+      await expect(store.remove()).rejects.toThrow(/EACCES/);
+      adapter.fault = undefined;
+
+      // Whatever survived, the next start has to get somewhere: an older
+      // index, or a clean empty one. Never a refusal.
+      const after = new ObsidianIndexStore(adapter, INDEX);
+      const loaded = await after.load().catch((err: Error) => err);
+      expect(
+        loaded instanceof Error ? loaded.message : "loaded",
+        `stopping the removal at ${stopAt} left an index that will not load`,
+      ).toBe("loaded");
+    }
+  });
 });
 
 /**
