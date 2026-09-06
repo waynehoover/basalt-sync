@@ -255,6 +255,37 @@ does to concurrent writers, not for its arithmetic.
   note index in 228 ms rather than 5, so the fsync cost is real when nothing is
   cached. A journal was built instead.
 
+- **Data-key epochs, re-encryption, and per-device signatures.** Three
+  separate things, refused together because they are asked for together, by
+  the same reasoning about a hostile server. Epochs and re-encryption would
+  make revocation forward-secret: a revoked device could not read ciphertext
+  it obtained after the fact. Per-device signatures would make history say
+  which device wrote a version rather than that a key holder did.
+
+  What they cost is not subtle. A new data key breaks history recovery for a
+  device that was offline across the epoch, invalidates deduplication either
+  side of the boundary, makes every existing backup unreadable by the new
+  client, and needs a migration that rewrites content the whole design is
+  built on never rewriting. Per-device signatures mean a key per device in
+  every entry, a revocation story for verification keys, and a rule for what
+  a device does with an entry signed by a device it has never heard of.
+
+  What they buy, here, is small. The deployment is one person's own machines
+  on a private network, and the threats that actually lose notes are a
+  filesystem, a crash and a race: of the twenty-eight defects the 2026-09-05
+  review found, five involved distrusting the server, and every one of those
+  five fires far more often for an honest reason. A replayed version is what a
+  restored backup looks like. A malformed entry is a buggy client on another
+  device. An unreadable frame is a proxy. The checks are worth keeping because
+  they turn a silent wrong answer into a loud refusal; the machinery above is
+  not, because it defends only against deliberate malice by somebody who
+  already holds the box, and who can then watch the device, the traffic and
+  the disk anyway.
+
+  So the honest paragraph in docs/design.md is the deliverable rather than the
+  mechanism. Revisit if the vault is ever served from a machine somebody else
+  administers, which is the requirement that would change the answer.
+
 ## What was borrowed
 
 None of their code. Ideas, parameters and bug reports, each credited where used.

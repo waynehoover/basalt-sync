@@ -431,6 +431,48 @@ recovery key has been in a chat, a screenshot, a shell history, a repository,
 or on a device you no longer hold, and check `basalt devices` afterwards for a
 row you do not recognise: a rotation deliberately leaves device rows alone.
 
+### What a revoked device can still do
+
+Neither revoking nor rotating takes the **data key** off it, and that is worth
+stating on its own rather than leaving it to be inferred from "does not
+un-read". The data key is what opens content, it is the same key for the life
+of the vault, and rotation replaces the wrapping around it rather than the key
+itself.
+
+So a device that has been revoked can still read any ciphertext it gets hold
+of afterwards, not only the ciphertext it already had. It cannot get it from
+the honest server, which is the whole of what revocation buys. It can get it
+from a backup directory, from another device's disk, from a second server
+somebody points at the same vault, or off the wire on a hop with no TLS in
+front of it. Revocation is an access control on one server; it is not
+forward secrecy, and calling it that would be the lie this section exists to
+prevent.
+
+Making it forward secrecy means a new data key and re-encrypting the history
+under it. That is not implemented, and the reasoning for leaving it out is
+under the keys above: it would break history recovery for offline devices,
+invalidate deduplication across the epoch boundary, and make every existing
+backup unreadable by the new client. For one person's own machines that is a
+large, permanent cost against a threat that already implies somebody has the
+device in their hand.
+
+### What the authenticator proves, and what it does not
+
+The entry MAC is a shared key, not a per-device signature, and the difference
+matters in four ways.
+
+- **Authenticity, yes.** Somebody holding the vault's data key wrote this
+  entry, and the server did not.
+- **Attribution, no.** It does not say *which* device. `entries.device` is a
+  free-text name a device chose for itself and is covered by the MAC, so it
+  cannot be altered by the server, and it is still a name rather than an
+  identity: two laptops may both be called laptop, and any device holding the
+  key can write any name. `basalt devices` identifies devices; history does
+  not.
+- **Freshness, no.** See what the server can do, above: the uid is not
+  covered, so an old entry can be presented as a new one.
+- **Completeness, no.** A server can withhold, and nothing detects it.
+
 ## Provenance
 
 Every release asset is rebuilt in CI from the tag and attested against the

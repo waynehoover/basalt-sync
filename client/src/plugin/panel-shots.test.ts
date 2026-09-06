@@ -294,8 +294,13 @@ describe("the panel walk", () => {
    */
   it("still says the four things that were paid for in incidents", () => {
     // Revoking, beside the buttons that do it.
-    expect(prose("devices-listed")).toMatch(/does not un-read what that device already read/);
-    expect(prose("devices-listed")).toMatch(/replace the vault's secret too if it was stolen/);
+    expect(prose("devices-listed")).toMatch(/still read any copy of the notes/);
+    // What revoking does not do, which is the half that used to be overstated:
+    // the copy said to replace the vault's secret "too", implying that made a
+    // stolen device harmless. It does not. The data key is the same key for
+    // the life of the vault and rotation replaces the wrapping around it
+    // (I24).
+    expect(prose("devices-listed")).toMatch(/keeps the vault's key either way/);
     // An invite: one device, once, and it expires.
     expect(prose("paired")).toMatch(/An invite adds one device, works once, and expires/);
     expect(prose("devices-listed")).toMatch(/adds one device · expires/);
@@ -332,7 +337,7 @@ describe("the panel walk", () => {
     // worse than useless without: revoking stops a device connecting and
     // does not un-read what it already read.
     expect(prose("devices-listed"), "the list does not say what revoking does not do").toMatch(
-      /does not un-read what that device already read/,
+      /still read any copy of the notes/,
     );
   });
 

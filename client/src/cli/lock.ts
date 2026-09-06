@@ -83,18 +83,29 @@ export async function lockVault(vault: string, command: string): Promise<() => P
       };
     }
 
-    const holder = await readHolder(path);
-    if (holder === undefined) {
-      // Not a holder that can be named. This used to mean an empty file, which
-      // was the bug: the lock was created empty and written afterwards, so a
-      // competitor arriving in between read nothing, called it corrupt and
-      // deleted a live lock. `publish` closes that by building the file
-      // complete and linking it into place, so the only ways to be here now
-      // are a file removed under us, which the retry handles, or one that is
-      // genuinely unreadable, which is debris.
-      await removeIfStill(path, undefined);
+    const at = await lockState(path);
+    if (at.state === "absent") {
+      // Gone between the failed link and this read, so there is nothing to
+      // take over and nothing to remove. Straight back to `publish`, which is
+      // atomic and will either create the name or find whoever won.
+      //
+      // Removing here is what handed the lock to two callers. The old code
+      // treated "no holder" as debris and unlinked it, and an absent file plus
+      // an unconditional unlink is a live lock deleted whenever somebody links
+      // between the read and the removal. That is not the theoretical residue
+      // this file admits to further down: twelve contenders on one stale lock
+      // reproduced it on the first run.
       continue;
     }
+    if (at.state === "unreadable") {
+      // A file that is there and says nothing. `publish` cannot produce one,
+      // so it is debris from something else, and it has to go or nobody can
+      // ever take this lock again. Removed only while it is still unreadable:
+      // a real lock written in between parses, and is left alone.
+      await removeIfStillUnreadable(path);
+      continue;
+    }
+    const holder = at.holder;
     if (holder.host === mine.host && !alive(holder.pid)) {
       // Left behind by a crash or a kill. Removed only while it is still that
       // same dead holder, and the next attempt takes the lock by linking,
@@ -150,21 +161,55 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
  * that survivable is that the caller does not then assume it holds anything.
  * It goes back to `publish`, which is atomic, and the process that linked
  * first keeps the lock while the other finds a live holder and refuses.
+ *
+ * The window is a token comparison wide, and it is only ever entered by a
+ * caller that has already read a *dead* holder. Two contenders taking over
+ * one abandoned lock is the case that has to be safe, and it is: the loser of
+ * the link finds the winner's live holder next time round.
  */
-async function removeIfStill(path: string, token: string | undefined): Promise<void> {
-  const now = await readHolder(path);
-  if (now?.token !== token) return;
+async function removeIfStill(path: string, token: string): Promise<void> {
+  const now = await lockState(path);
+  if (now.state !== "held" || now.holder.token !== token) return;
   await rm(path, { force: true });
 }
 
-async function readHolder(path: string): Promise<LockHolder | undefined> {
+/** The same, for a file that is there and cannot be read as a holder. */
+async function removeIfStillUnreadable(path: string): Promise<void> {
+  const now = await lockState(path);
+  if (now.state !== "unreadable") return;
+  await rm(path, { force: true });
+}
+
+/**
+ * What is at the lock's path, keeping absent and unreadable apart.
+ *
+ * They are not the same and treating them as one is what let a live lock be
+ * deleted: absent means retry, unreadable means clear the debris. Rule 2, in
+ * the small.
+ */
+type LockState =
+  | { readonly state: "absent" }
+  | { readonly state: "unreadable" }
+  | { readonly state: "held"; readonly holder: LockHolder };
+
+async function lockState(path: string): Promise<LockState> {
   let text: string;
   try {
     text = await readFile(path, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { state: "absent" };
     throw err;
   }
+  const holder = parseHolder(text);
+  return holder === undefined ? { state: "unreadable" } : { state: "held", holder };
+}
+
+async function readHolder(path: string): Promise<LockHolder | undefined> {
+  const at = await lockState(path);
+  return at.state === "held" ? at.holder : undefined;
+}
+
+function parseHolder(text: string): LockHolder | undefined {
   try {
     const raw = JSON.parse(text) as Partial<LockHolder>;
     if (typeof raw.pid !== "number" || typeof raw.host !== "string") return undefined;

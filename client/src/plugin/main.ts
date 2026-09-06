@@ -2165,8 +2165,9 @@ class BasaltPanel {
               try {
                 await this.plugin.revoke(device.id);
                 new Notice(
-                  "Revoked. It cannot connect again. It still holds the vault's key for every " +
-                    "note it had already synced, so replace the vault's secret too if it was stolen.",
+                  "Revoked. It cannot reach this server again. It keeps the vault's key, so it " +
+                    "can still read any copy of the notes it gets hold of another way; replacing " +
+                    "the vault's secret does not change that.",
                   10_000,
                 );
                 this.render();
@@ -2210,8 +2211,8 @@ class BasaltPanel {
       say(
         said,
         `${answer.devices.length} of at most ${answer.maxDevices} devices. Revoking stops a ` +
-          `device connecting. It does not un-read what that device already read, so replace the ` +
-          `vault's secret too if it was stolen.` +
+          `device reaching this server. It keeps the vault's key either way, so it can still ` +
+          `read any copy of the notes it gets hold of another way.` +
           (never > 0
             ? ` ${never} ${never === 1 ? "has" : "have"} never connected and still ` +
               `${never === 1 ? "holds" : "hold"} a slot.`
@@ -2233,7 +2234,9 @@ class BasaltPanel {
       contentEl,
       "Devices",
       "Who else can reach this vault. Add one with an invite, above. Revoking stops a device " +
-        "connecting and does not un-read what it already read.",
+        "reaching this server. It keeps the vault's key, so it can still read any copy of the " +
+        "notes it gets hold of another way, and replacing the vault's secret does not change " +
+        "that either.",
     ).addButton((b) => b.setButtonText("Show devices").onClick(show));
 
     list = contentEl.createEl("div");

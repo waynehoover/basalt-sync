@@ -3181,7 +3181,7 @@ describe("the device list in the panel", () => {
     // The second does it, and the revoked device finds out by being stopped.
     await button.click();
     expect((await first.plugin.devices()).devices.map((d) => d.name)).toEqual(["laptop"]);
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/still holds the vault's key/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/keeps the vault's key/);
     await until(
       "the revoked device to be stopped",
       () => second.plugin.currentState.kind === "stopped",

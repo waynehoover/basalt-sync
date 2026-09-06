@@ -230,7 +230,7 @@ Add scheduled JavaScript and Go dependency advisory checks with actionable owner
 
 ### I24 — Clarify revocation, rotation, and the scope of cryptographic trust
 
-- [ ] **Small documentation work; large only if requirements change.** Explain the guarantees in terms of credentials, retained data keys, and ciphertext access.
+- [x] **Small documentation work; large only if requirements change.** Explain the guarantees in terms of credentials, retained data keys, and ciphertext access.
 
 [The key design](docs/design.md#the-keys) deliberately keeps the data key stable when rotating the root. Revocation prevents a device from authenticating to the honest server; rotation changes root authority and invalidates outstanding invites. Neither erases a data key already held by a stolen device, and a device possessing that key can decrypt future ciphertext if it obtains it through another route. Make that future-ciphertext distinction explicit in lost/stolen-device guidance and UI copy.
 
