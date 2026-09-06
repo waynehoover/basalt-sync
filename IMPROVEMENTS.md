@@ -106,11 +106,29 @@ Measure startup latency, deletion-page queries, backup/verify duration, and sync
 
 ### I11 — Extend existing diagnostics with durable, actionable failure context
 
-- [ ] **Small to medium.** Build on the existing status/progress UI and operational guidance rather than adding a second dashboard.
+- [x] **Small to medium.** Build on the existing status/progress UI and operational guidance rather than adding a second dashboard.
 
 Expose the last completed pass time, its unresolved paths, the last successful server acknowledgement, and whether the current local scan is fresh. Give each actionable refusal a next step: rename a collision, reduce an oversized file, repair an index, resolve lost server history, or retry a transient failure.
 
 Make a local diagnostic export explicitly redact recovery/device credentials, note contents, and filenames by default. Keep errors available after reconnect so a transient green status does not erase the explanation for a still-unsynchronized path. Coordinate with F16/F27.
+
+**Done.** Each refusal carries its next step, beside the codes rather than in
+either shell, and nothing is invented for a code with no general answer: a
+made-up next step sends somebody to do something that will not help.
+
+Two parts of this were already true and are recorded rather than reimplemented.
+A written-off path is re-reported on every pass, because `reconcile` consults
+the `skipped` map and its fingerprint each time, so a green pass does not erase
+the explanation for a path that is still stuck. Scan freshness is F27's
+`unsent`, and per-path outstanding work is F15's `retryingPaths`.
+
+**Not done, deliberately.** The last completed pass time and the last server
+acknowledgement are not persisted. The panel already shows both from memory;
+the CLI would need them written into the index, which is a stored-format change
+for two timestamps that answer a question `status` already answers better by
+looking at the disk. A diagnostic export does not exist to redact, and building
+one to give it a redaction policy would be inventing the thing the policy is
+about.
 
 ### I12 — Support secret input without shell history or process arguments
 

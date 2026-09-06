@@ -579,6 +579,37 @@ const SKIPPED_SHOWN = 5;
  * bumped without a name is exactly the report the plugin cannot tell apart
  * from the pass before it.
  */
+/**
+ * What to do about a refusal, in one sentence (I11).
+ *
+ * A refusal that names only what went wrong leaves somebody with a file that
+ * will never sync and no idea which of the two devices to go and look at. The
+ * reason and the remedy are different halves and only one of them was ever
+ * printed. Kept beside the codes rather than in either shell, because both
+ * print the same list and neither should be inventing advice.
+ *
+ * Nothing for a code with no general answer: a made-up next step is worse
+ * than none, because it sends somebody to do something that will not help.
+ */
+function nextStepFor(code: string | undefined): string {
+  switch (code) {
+    case "toolarge":
+      return "Make it smaller, or raise the server's -max-file and restart it.";
+    case "badname":
+      return "Rename it to something this server will take, on the device that made it.";
+    case "neversync":
+      return "Nothing syncs under that name here. Move it, or change what this device ignores.";
+    case "badentry":
+      return "The device that wrote it sent something malformed; its logs say what.";
+    case "nochunk":
+      return "The server no longer holds its content. Restore it from a backup, or write it again from a device that still has it.";
+    case "cursor":
+      return "The server has lost history this device applied. Back the server up, then basalt rebase.";
+    default:
+      return "";
+  }
+}
+
 function noteSkipped(report: SyncReport, path: string): void {
   report.skipped++;
   report.skippedPaths.push(path);
@@ -2876,7 +2907,10 @@ export class Engine {
       code !== undefined && ["badentry", "badname", "toolarge", "neversync"].includes(code);
 
     if (permanent) {
-      this.skipped.set(path, { why: message, fingerprint: fingerprintOf(this.entries.get(path)) });
+      this.skipped.set(path, {
+        why: `${message} ${nextStepFor(code)}`.trim(),
+        fingerprint: fingerprintOf(this.entries.get(path)),
+      });
       noteSkipped(report, path);
       this.log("skipped for good", path, message);
       return;

@@ -171,3 +171,49 @@ describe("a read does not mutate", () => {
     expect(engine.status().cursor, "a read moved the cursor").toBe(cursorBefore);
   });
 });
+
+/**
+ * A refusal says what to do about it (I11).
+ *
+ * The reason and the remedy are different halves, and only one of them was
+ * ever printed: somebody was left with a file that will never sync and no
+ * idea which of two devices to go and look at. Both shells print the same
+ * list, so the advice lives beside the codes rather than in either of them.
+ */
+describe("a refusal that names its next step", () => {
+  it("tells somebody what to do about a file the server will not take", async () => {
+    const { engine, socket, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    // The server refuses this path for good, with the code that means it.
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "put" || frame["op"] === "putmany") {
+        s.reply({
+          res: "err",
+          code: "toolarge",
+          msg: "4096 bytes, over the 32 this server takes",
+          retryable: false,
+        });
+      } else if (frame["op"] === "fetch") {
+        s.bodies(...(frame["chunks"] as string[]).map((n) => bodies.get(n)!));
+      }
+    };
+    void keys;
+
+    const { vault } = await Promise.resolve({
+      vault: (engine as never as { opts: { vault: import("./vault.ts").MemoryVault } }).opts.vault,
+    });
+    await vault.edit("big.md", "x".repeat(4096), 5000);
+    const report = await engine.sync({ coalesceWrites: false });
+
+    const listed = report.needsAttention.find((a) => a.path === "big.md");
+    expect(
+      listed,
+      `nothing was listed as needing attention: ${JSON.stringify(report)}`,
+    ).toBeDefined();
+    expect(listed!.why, "the refusal says what is wrong").toMatch(/over the 32/);
+    expect(
+      listed!.why,
+      "the refusal says nothing about what to do next, which is the half somebody acts on",
+    ).toMatch(/Make it smaller|raise the server/);
+  });
+});
