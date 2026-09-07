@@ -377,6 +377,18 @@ process and what to type. The alternative was a mechanism nobody could
 demonstrate the correctness of, standing between two writers and the rule this
 project exists for.
 
+This paragraph used to end by saying it should be replaced "the day Node grows
+a portable file lock". That was wrong, and measuring it is what showed so. Both
+supported CLI platforms already offer a kernel-released exclusion from stock
+Node: `O_EXLOCK` on macOS, passed as the raw flag `0x20` because Node does not
+name it, and an abstract Unix socket on Linux, which has no filesystem entry to
+go stale. Both refuse a second holder and both are released by the kernel when
+the holder is `SIGKILL`ed, which is the property every one of the five attempts
+was trying to synthesise. Neither is a native addon and neither needs a build
+step. `IMPROVEMENTS.md` I27 has the evidence, the two mechanisms being a
+liability of their own, and the part that no local lock covers: a holder on
+another machine.
+
 `basalt unlock` had two windows of its own, and both are closed rather than
 reported.
 

@@ -1177,7 +1177,7 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
       // failure interactively and a success in automation: exactly the
       // difference a cron job cannot see. A rebase that left paths retrying
       // or written off has not finished, whoever is reading.
-      const code = exitCodeFor(report);
+      const code = exitCodeFor(report, client.vault);
       io.out(
         JSON.stringify({
           ok: code === 0,
@@ -1200,7 +1200,7 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
       unknownRecovery(client.vault),
     );
     io.out(`Nothing was deleted. Where the two sides disagreed, both versions were kept.`);
-    return exitCodeFor(report);
+    return exitCodeFor(report, client.vault);
   } finally {
     await client.close();
   }
@@ -1222,7 +1222,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
       client.vault.displaced ?? [],
       unknownRecovery(client.vault),
     );
-    return exitCodeFor(report);
+    return exitCodeFor(report, client.vault);
   } finally {
     await client.close();
   }
@@ -1326,12 +1326,22 @@ async function writeKeyOut(path: string, recoveryKey: string): Promise<void> {
   }
 }
 
-export function exitCodeFor(report: SyncReport): number {
+export function exitCodeFor(
+  report: SyncReport,
+  /** The vault, for what it could establish about versions waiting (RR5). */
+  vault?: { recovery?: Inventory },
+): number {
   // Through the shared vocabulary, so the exit code, the panel's glyph and
   // the JSON all draw the same conclusion from one pass (I04). This counted
   // three fields directly, the panel counted two others, and the two answers
   // were not always the same pass's.
-  return exitCodeOf(outcomeOf(report));
+  //
+  // The vault goes in as well, because the pass report cannot carry this: a
+  // version the adapter displaced and could not place is something the adapter
+  // did, and the engine is told only that a path was kept. `status` worked it
+  // out for itself and `sync` did not, so the two exited differently on one
+  // vault (RR5).
+  return exitCodeOf(outcomeOf(report, undefined, vault?.recovery));
 }
 
 /**
@@ -1931,7 +1941,7 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
           sync: report,
         }),
       );
-      return exitCodeFor(report);
+      return exitCodeFor(report, client.vault);
     }
     io.out(
       `Restored version ${version.uid} of ${path} (${bytes(done.bytes)}, from ${when(version.mtime)}).`,
@@ -1944,7 +1954,7 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
     // that can never sync, or one still failing when the pass gave up, is
     // the same unsuccessful run here as it is under `sync` and `rebase`. The
     // note is on this device either way, and the line above says so.
-    return exitCodeFor(report);
+    return exitCodeFor(report, client.vault);
   } finally {
     await client.close();
   }
@@ -2150,7 +2160,13 @@ export function renderReport(
   /** Why what is waiting could not be established, when it could not (RR2). */
   recoveryUnknown: string | undefined = undefined,
 ): void {
-  const outcome = outcomeOf(r);
+  const outcome = outcomeOf(
+    r,
+    undefined,
+    // From the same string the text renderer prints below, so the JSON's `ok`
+    // and the sentence a person reads cannot say different things.
+    recoveryUnknown === undefined ? undefined : { complete: false, why: recoveryUnknown },
+  );
   if (args.json) {
     // `ok` and `outcome` come from the same conclusion, so a script keying on
     // either gets the same answer as the exit code (I04). `ok: true` beside a

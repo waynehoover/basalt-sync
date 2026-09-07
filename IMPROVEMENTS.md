@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done. **I25 and I26 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done. **I25, I26 and I27 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -14,6 +14,7 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
 | Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I26                  |
+| Open, wanted                 | A product requirement rather than an optimisation: recover from a crash without a person.                | I27                       |
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
 
@@ -175,6 +176,58 @@ marker, both codecs readable during a migration, `compression-golden` extended
 to cover the new one, and a measurement showing the win survives the WASM
 boundary on a phone. Do not start it for the 2.3x; start it only if sealing
 throughput is shown to matter to somebody.
+
+### I27 — Recover from a crashed CLI without anybody typing a command
+
+- [ ] **Medium; two small platform paths, and a hybrid to be careful of.** Take an exclusion the kernel releases when the process exits, so there is no staleness to detect. Do **not** revive the claim protocol.
+
+`basalt unlock` exists because automatic stale-lock takeover was wrong five
+times (R03, R20, R34, R40, R44/R49), and it is a conservative fallback rather
+than the destination: a crashed sync wedges a cron job until a person types
+something. The way out is not a better staleness protocol. It is not having
+staleness, which is what an OS-managed lock gives: the kernel releases it when
+the process dies, so nobody has to decide whether a holder is gone.
+
+`docs/compared.md` used to say this had to wait for "the day Node grows a
+portable file lock". Measured on 2026-09-07, that turns out not to be true.
+Both supported CLI platforms already have one reachable from stock Node with no
+native addon and no build step:
+
+| Platform | Mechanism | Contention | After `SIGKILL` |
+|---|---|---|---|
+| macOS | `open()` with `O_EXLOCK`, the raw flag `0x20`, which Node does not name in `fs.constants` but does pass through | `EAGAIN` | the kernel releases it, verified with a killed child |
+| Linux | an abstract Unix socket, a `\0`-prefixed `net.Server` path, which has no filesystem entry to go stale | `EADDRINUSE` | the kernel releases it, verified in `node:22-alpine` |
+
+Both were probed rather than assumed, including the killed-holder case, which
+is the only property that matters and the one every previous attempt failed.
+
+What to be careful of, because this is not a drop-in:
+
+- **Two mechanisms, not one.** That is the objection raised against native
+  bindings, and it applies here too. The mitigation is that neither has a
+  staleness protocol, and staleness was the whole source of the five failures;
+  each path is a handful of lines with nothing to reason about.
+- **`O_EXLOCK` is spelled as a number.** Node does not expose the constant, so
+  the value comes from macOS's `<sys/fcntl.h>`. It needs a startup assertion
+  that the flag really excludes -- open twice and expect a refusal -- and a
+  refusal to run rather than a silent downgrade if it does not.
+- **The abstract socket is a kernel-wide namespace, not a path.** Derive the
+  name from the vault's *resolved* path so a symlinked vault collides with
+  itself, and note that it is per network namespace: two containers sharing one
+  volume would not exclude each other. That is already an unsupported layout.
+- **Neither covers a second machine.** The current lock refuses a holder on
+  another host, which no local kernel lock can do. So the lock file stays, for
+  naming the holder and for the cross-host case, and the kernel lock sits in
+  front of it. That hybrid is where the bugs would be, and it is the part to
+  design carefully rather than the part to write quickly.
+- **`unlock` does not go away.** It stays for the cross-host case and for
+  clearing a lock file nothing holds. What it stops being is the thing standing
+  between a crashed cron job and the next run.
+
+Keep manual unlock until this is implemented **and** verified on both
+platforms, including the killed-holder case in CI rather than only on a
+developer's Mac. The plugin needs none of it: Obsidian is one process per
+vault, and neither mechanism exists on mobile.
 
 ## User-facing behavior and operations
 

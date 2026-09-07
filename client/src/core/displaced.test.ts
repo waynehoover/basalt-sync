@@ -201,7 +201,9 @@ describe("the displaced-version ledger", () => {
     expect(files.rewrites, "the log was rewritten by a shell that cannot do it safely").toBe(0);
     // The log keeps every record and the answer is filtered on read, which is
     // the trade: an unbounded count of a rare event, against losing the lot.
-    expect(files.text!.trim().split("\n")).toHaveLength(41);
+    // Blank lines are the framing that stops a torn tail swallowing the record
+    // after it (RR6), and are skipped on read.
+    expect(files.text!.split("\n").filter((l) => l.trim().length > 0)).toHaveLength(41);
   });
 
   it("tidies the log rather than growing it for ever", async () => {

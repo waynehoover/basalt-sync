@@ -965,3 +965,105 @@ questions. The immediate priority is to close RR2/RR3 for the Obsidian product,
 repair RR4 so its tests can expose losses, and resolve or explicitly constrain
 RR1 while the CLI remains experimental. None of these findings calls for a
 wholesale rewrite.
+
+## Readiness re-verification — 2026-09-07
+
+Verified the RR1–RR4 repairs in **`c0e972d`**. The working branch advanced during
+verification to **`4505318fe254e34410e8152ef6cd763774efd158`**; that subsequent
+commit changes only `IMPROVEMENTS.md` and `READINESS.md`, so the application code
+is the same as the tested snapshot. **The original reproductions are repaired;
+two P2 follow-ups remain, RR5 and RR6 below.**
+
+### Validation and updated status
+
+`bash scripts/check.sh` passed **27 checks, 0 failed, 0 skipped** in an isolated
+worktree: **1,449 client tests in 76 files**, **16 panel tests**, **24 stress
+tests**, Go race tests/vet, formatting/type/build checks, release-shell tests,
+packaged CLI checks, and local Docker checks. Systemd acceptance and the Linux
+mounted-filesystem run remain CI-only on this macOS host.
+
+| Finding | Assessment | Evidence |
+|---|---|---|
+| RR1: overlapping unlocks | Fixed for the reported schedule | The second unlock is refused by the recovery lock. The two-writer reproduction no longer admits two owners. |
+| RR2: missing/unreadable recovery records | Original cases fixed; follow-ups RR5/RR6 remain | Failed intent append leaves the note at its visible name. A fresh plugin sees the intent after the preservation rename. Unreadable inventory is explicitly incomplete. |
+| RR3: destructive plugin compaction | Fixed | The plugin no longer implements compaction; the short-write probe leaves the existing inventory intact across restart. |
+| RR4: lost token classified as unreached | Fixed for the reported mutation | Deleting the tracked version in the private crash child now returns `fired: true` and a preservation fault. The coverage matrix accounts for all 12 seams, with 7 reached here and 5 explicitly outside these scenarios. |
+
+The five prior safety probes pass with assertions adapted to the intended new
+behavior: a refusal that keeps the note visible is safe, an unreadable inventory
+must be incomplete, and a restart image includes the intent now written before
+the rename. Two additional probes fail as described below.
+
+Evidence is retained in `/tmp/basalt-readiness-recheck.6sonFc/check.log` and
+`/tmp/basalt-readiness-probes.y253cc/`: `probes.log`, `driver-probe.log`, and
+`client/src/readiness-review-probes.test.ts` / `readiness-driver-probe.ts`.
+Private mutations were restored. Application code in the working repository
+was not changed.
+
+### RR5 — Sync still reports success when recovery is unknown
+
+- [x] **P2 · CLI outcome consistency · Reproduced against a real local server.**
+
+[`cmdSync`](client/src/cli/cli.ts#L1209) passes `unknownRecovery` to the renderer
+but still returns `exitCodeFor(report)`. The
+[JSON renderer](client/src/cli/cli.ts#L2153) also derives `ok` and `outcome` only
+from the sync report. Neither success decision incorporates the recovery
+inventory. `status` now correctly incorporates it, so the commands disagree.
+
+**Observed:** initialize an empty vault against a reachable test server, write a
+torn record to `.basalt/displaced.log`, and run both commands. `sync --json`
+returns exit **0**, `ok: true`, and `outcome: { kind: "synced" }` alongside a
+non-null `recoveryUnknown` explaining that the log cannot be parsed.
+`status --json` on the same vault returns exit **1**, `ok: false`, and
+`recoveryComplete: false`. Network/authentication failure is not involved.
+
+The warning is present; the defect is the success signal delivered to automation.
+`rebase` uses the same separation between warning rendering and return status.
+
+**Fix and acceptance:** include recovery completeness in the shared overall
+outcome used for JSON, text, and exit status. Preserve the distinction between
+successful data transfer and unresolved recovery, but do not advertise an
+unqualified successful overall result. Test `sync` and `status` against a
+reachable server with incomplete recovery inventory and assert their success
+flags and exit codes agree on that condition.
+
+### RR6 — A torn ledger tail absorbs the next recovery intent
+
+- [x] **P2 · Plugin recovery after interrupted I/O · Reproduced through the plugin adapter.**
+
+[`DisplacedLedger.record`](client/src/core/displaced.ts#L131) appends a JSON
+record followed by a newline without separating it from an existing torn tail.
+A later append can therefore return success even though its record is joined to
+an unfinished JSON fragment and cannot be parsed. The plugin then treats that
+success as permission to hide the note.
+
+**Observed:** inject a short first append that writes eight bytes and throws.
+The new guard correctly leaves `note.md` visible. Restore normal I/O, create a
+fresh plugin instance, and retry. The next intent append succeeds and the note
+is moved into its hidden folder. Reconstruct the persisted state immediately
+after that rename, including the entire ledger. The log begins with the prior
+fragment immediately followed by the new JSON object, on one malformed line.
+The fresh plugin reports `waiting: []`; the retained note bytes remain readable
+at the hidden path, but that path is not in its recovery inventory.
+
+The new incomplete-inventory warning works: this case is no longer silently
+reported as a complete inventory. It still fails the promise that the intent
+successfully recorded before hiding the note will let a restarted plugin locate
+that note. The subsequent catch-path record cannot repair a process interrupted
+before that catch runs.
+
+**Fix and acceptance:** make append framing recover safely from a torn previous
+record, or refuse to hide a note until the new intent is independently readable.
+Preserve unresolved evidence from the earlier failure. After a short append,
+restored I/O, retry, and interruption after the preservation rename, the new
+hidden path must appear in the recovery inventory even if the older damaged
+record still makes the inventory incomplete.
+
+### Verification limits
+
+Plugin fault probes use the repository's `FakeAdapter` with the actual
+`ObsidianVault`; the restart probe reconstructs persisted adapter state rather
+than killing a real Obsidian process. Real desktop/mobile acceptance, physical
+power cuts, and CI-only filesystem checks were not independently exercised.
+I25/I26 are explicitly deferred improvements, not newly discovered blockers in
+this verification.

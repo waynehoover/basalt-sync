@@ -241,6 +241,25 @@ recovery, and fault-driver defects, recorded as **RR1–RR4** in
 The existing focused tests passed; five additional safety assertions failed.
 See that review for reproductions, acceptance criteria, and verification limits.
 
+## Third review: RR5 and RR6
+
+- [x] **RR5** `sync --json` exited 0 and said `ok: true` on a vault where
+      `status` exited 1, because only `status` had learned that an unreadable
+      recovery record is not a clean vault. Fixed in the shared outcome
+      vocabulary rather than in either command: `recoveryUnknown` is a kind of
+      its own, ranked after the four that name something to do and before the
+      two that exit zero, so it cannot be masked by a conflict.
+- [x] **RR6** An append cut short leaves a line with no newline on the end, and
+      the next record landed on that same line: one malformed object made of
+      two halves, reported as written, and the plugin hid a note on the
+      strength of it. Records are now framed with a newline in front as well as
+      behind, so a damaged fragment stays damaged and alone. And `record` reads
+      the line back before it counts as written, because this is the one place
+      in the client where the answer is used as permission to hide somebody's
+      note, and "the call did not throw" is not a strong enough thing to know
+      (rule 4). Both halves mutation-proven, the second only after the first
+      mutation survived and showed the readback was untested.
+
 ## Second review: RR1 to RR4
 
 An outside review of `e347e02` found four, recorded at
@@ -313,6 +332,22 @@ A crashed `unlock` leaves `.basalt/lock.recovering` and wedges recovery until
 somebody removes it. That is a worse experience and a better failure: it stops
 recovery rather than admitting two writers, and the refusal names the file.
 
+## Wanted, and evaluated: automatic recovery after a crash
+
+Manual `basalt unlock` was the conservative answer to five failed attempts at
+automatic takeover, and it is not the destination: a crashed sync should not
+wedge a cron job until a person types something. **[IMPROVEMENTS.md](IMPROVEMENTS.md)
+I27** is the evaluation, and the finding is that the custom protocol does not
+need reviving, because both supported CLI platforms already hand out an
+exclusion the kernel releases on process exit, reachable from stock Node with
+no native addon: `O_EXLOCK` on macOS and an abstract Unix socket on Linux. Both
+were probed, including the killed-holder case, which is the property every
+previous attempt was trying to synthesise and none of them had.
+
+Manual unlock stays until that is implemented and verified on both platforms in
+CI. What it will not stop being is the answer for a holder on another machine,
+which no local kernel lock can see.
+
 ## Parked, not scheduled
 
 Two things came out of measuring rather than out of a review, and are in
@@ -331,3 +366,13 @@ A native library in the shape of [simdutf](https://simdutf.github.io/simdutf/)
 was considered and is not useful here twice over: UTF-8 work appears nowhere in
 the profile, and a native addon is excluded by the same constraint that rules
 out `flock`.
+
+## Independent re-verification — 2026-09-07
+
+The original RR1–RR4 reproductions are repaired in `c0e972d` (application code
+unchanged in `4505318`). The full gate passed 27/27 checks, including 1,449 client
+tests and 24 stress tests. **Two P2 follow-ups remain:** RR5, sync success signals
+ignore incomplete recovery; and RR6, a torn ledger tail can make the next intent
+unreadable. Reproductions, acceptance criteria, and limits are in
+[FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#readiness-re-verification--2026-09-07).
+I25/I26 remain the deliberately deferred improvements described above.

@@ -528,6 +528,44 @@ describe("the vault lock (C12)", () => {
   }, 120_000);
 });
 
+/**
+ * `sync` and `status` on one vault, giving one answer.
+ *
+ * They are two readings of the same facts and a cron job runs one of them, so
+ * a fact that changes one exit code and not the other is a fact automation
+ * cannot see. This is the shape rule 7 is about, and it went wrong the moment
+ * a new fact was added: `status` learned that an unreadable recovery record is
+ * not a clean vault and `sync` did not (RR5).
+ */
+describe("the two ways of asking how a vault is", () => {
+  it("agree when the record of what is waiting cannot be read", async () => {
+    const dir = await paired("agree");
+    await writeFile(join(dir, "note.md"), "a note\n");
+    // Clean first, so the difference below is the torn record and nothing else.
+    const clean = await cli("sync", "--dir", dir, "--json");
+    expect(clean.code, clean.all).toBe(0);
+    expect((await cli("status", "--dir", dir, "--json")).code).toBe(0);
+
+    // What a crash mid-append leaves: a line that names something and cannot
+    // be read, so what it named is not in the list beside it.
+    await writeFile(join(dir, STATE_DIR, "displaced.log"), '{"at":"note.md..basalt-tmp-keep0a1');
+
+    const synced = await cli("sync", "--dir", dir, "--json");
+    const status = await cli("status", "--dir", dir, "--json");
+    const syncJson = JSON.parse(synced.out.at(-1)!) as { ok: boolean; outcome: { kind: string } };
+    const statusJson = JSON.parse(status.out.at(-1)!) as { ok: boolean };
+
+    expect(
+      { sync: synced.code, status: status.code },
+      `sync exited ${synced.code} and status exited ${status.code} on one vault`,
+    ).toEqual({ sync: 1, status: 1 });
+    expect({ sync: syncJson.ok, status: statusJson.ok }).toEqual({ sync: false, status: false });
+    // And it says which of the two unhappy things it is, rather than looking
+    // like a transfer that failed.
+    expect(syncJson.outcome.kind).toBe("recoveryUnknown");
+  }, 120_000);
+});
+
 describe("unlinking as one transition (C13)", () => {
   it("removes the index before the config, and leaves the vault paired if it cannot", async () => {
     const dir = await paired("unlink");

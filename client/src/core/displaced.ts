@@ -129,12 +129,50 @@ export class DisplacedLedger {
    * false answer with the incompleteness noted instead.
    */
   async record(d: Displaced): Promise<boolean> {
+    const line = JSON.stringify(d);
     try {
-      await this.files.append(`${JSON.stringify(d)}\n`);
-      return true;
+      // A newline in front as well as behind (RR6).
+      //
+      // An append that was cut short leaves a line with no newline on the end,
+      // and the next record written after it lands on that same line: one
+      // malformed object made of two halves, which parses as neither. The
+      // append reported success, so a caller that had been told to hide a note
+      // only if its record was written hid it against a record nobody can
+      // read. Leading with a newline puts every record on a line of its own
+      // whatever came before, so the damaged fragment stays damaged and alone
+      // and this one is readable beside it. Empty lines are skipped on read,
+      // so the cost is one byte at the top of the file.
+      await this.files.append(`\n${line}\n`);
     } catch (err) {
       this.say(`could not write down that ${d.at} is waiting: ${(err as Error).message}`);
       this.missing = `${d.from} was displaced to ${d.at} and could not be written down`;
+      return false;
+    }
+
+    // And then check that it can be read, rather than that the write returned
+    // (rule 4). This is the one place in the client where the answer is used
+    // as permission to hide somebody's note, so "the call did not throw" is
+    // not a strong enough thing to know: a short write that still returns, a
+    // filesystem that reordered, an adapter whose append went somewhere else.
+    // Reading the whole log back costs one read on a path taken only when a
+    // version could not be placed, which is rare by construction.
+    if (!(await this.readableNow(line))) {
+      this.say(`wrote down that ${d.at} is waiting and could not read it back`);
+      this.missing = `${d.from} was displaced to ${d.at} and the record cannot be read back`;
+      return false;
+    }
+    return true;
+  }
+
+  /** Whether the log now contains this exact record, as a line of its own. */
+  private async readableNow(line: string): Promise<boolean> {
+    try {
+      const text = await this.files.read();
+      if (text === undefined) return false;
+      return text.split("\n").some((l) => l.trim() === line);
+    } catch {
+      // Unreadable now is unreadable later, and later is when somebody is
+      // looking for their note.
       return false;
     }
   }

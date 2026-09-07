@@ -33,6 +33,18 @@ export type Outcome =
   | { readonly kind: "retrying"; readonly paths: readonly string[] }
   /** Named paths that will not succeed without somebody doing something. */
   | { readonly kind: "refused"; readonly paths: readonly string[] }
+  /**
+   * The pass finished, and this device cannot say what is waiting to be
+   * recovered (RR5).
+   *
+   * Its own kind rather than a flag on `synced`, because the whole point is
+   * that it is not synced as far as anybody can tell: a note may be sitting
+   * where no listing shows it. `status` worked this out for itself and `sync`
+   * did not, so one exited 1 and the other exited 0 on the same vault, which
+   * is two commands disagreeing about one fact and exactly what this shared
+   * vocabulary exists to stop.
+   */
+  | { readonly kind: "recoveryUnknown"; readonly why: string }
   /** Both versions of something are on this disk, waiting to be looked at. */
   | { readonly kind: "conflicted"; readonly count: number }
   /** Everything this device knows about is where it should be. */
@@ -48,6 +60,14 @@ export type Outcome =
 export function outcomeOf(
   report: SyncReport | undefined,
   failure?: { readonly offline?: boolean; readonly why: string },
+  /**
+   * What the adapter could establish about versions it displaced and could not
+   * place, when it can establish anything (RR5).
+   *
+   * Optional, because an adapter that cannot strand a version has no opinion,
+   * and absent is not the same as incomplete.
+   */
+  recovery?: { readonly complete: boolean; readonly why?: string },
 ): Outcome {
   if (failure !== undefined) {
     return failure.offline === true
@@ -67,6 +87,16 @@ export function outcomeOf(
     return {
       kind: "refused",
       paths: [...report.skippedPaths, ...report.inTheWay.map((t) => t.path)],
+    };
+  }
+  // After the four that name something to do, and before the two that exit
+  // zero. It has to beat `conflicted`, which is an ordinary outcome of using
+  // two devices and reports success: a vault with both a conflict copy and an
+  // unreadable recovery record must not come back as a clean pass.
+  if (recovery !== undefined && !recovery.complete) {
+    return {
+      kind: "recoveryUnknown",
+      why: recovery.why ?? "what is waiting to be recovered could not be established",
     };
   }
   if (report.conflicted > 0) return { kind: "conflicted", count: report.conflicted };
@@ -92,6 +122,7 @@ export function exitCodeOf(outcome: Outcome): number {
     case "passFailed":
     case "retrying":
     case "refused":
+    case "recoveryUnknown":
       return 1;
     case "conflicted":
     case "synced":
@@ -114,6 +145,8 @@ export function describeOutcome(outcome: Outcome): string {
       return outcome.paths.length === 0
         ? "some files need a person before they can sync"
         : `${outcome.paths.length} need a person: ${outcome.paths.join(", ")}`;
+    case "recoveryUnknown":
+      return `everything sent and received, but ${outcome.why}, so a version may be waiting where nothing lists it`;
     case "conflicted":
       return `${outcome.count} kept both versions, which are both on this device`;
     case "synced":

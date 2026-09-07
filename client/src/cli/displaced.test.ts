@@ -202,6 +202,95 @@ describe("the plugin, when a displaced version has nowhere to go", () => {
     expect(await adapter.read(next.stranded[0]!)).toBe(MINE);
   });
 
+  it("survives a torn record swallowing the next one, then an interruption", async () => {
+    // RR6, the reviewer's schedule. A first append is cut short and throws, so
+    // the note stays visible, which is the RR2 guard working. The log now ends
+    // in half a record with no newline. On the retry the next record used to
+    // land on that same line, making one malformed object out of two halves:
+    // the append returned success, the note was hidden on the strength of it,
+    // and nothing could read where it had gone.
+    //
+    // Records are framed with a newline in front now, so the damaged fragment
+    // stays damaged and alone and the new one is readable beside it. The
+    // fragment still makes the inventory incomplete, which is correct: it
+    // named something and nobody can say what.
+    const adapter = new FakeAdapter();
+    adapter.seed("note.md", MINE);
+
+    // Eight bytes, then a failure, which is what a full disk looks like
+    // half-way through a small write.
+    let short = true;
+    adapter.fault = (op) => (op === "append" && short ? 8 : undefined);
+    const first = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    const refused = await first.removeExpecting(
+      "note.md",
+      { contentId: "whatever", idOf },
+      "kept.md",
+    );
+    expect(refused, "the note was hidden against a record that was cut short").toEqual({
+      keptAt: "note.md",
+      landed: true,
+    });
+    short = false;
+    adapter.fault = undefined;
+
+    // The disk comes back and a fresh plugin tries again, and this time is
+    // interrupted the instant after the note has been moved aside.
+    const second = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    adapter.afterRename = () => {
+      throw new Error("the process went away");
+    };
+    await second
+      .removeExpecting("note.md", { contentId: "whatever", idOf }, "kept.md")
+      .catch(() => undefined);
+    adapter.afterRename = undefined;
+
+    // What a restart sees.
+    const next = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    await next.list();
+    expect(
+      next.stranded,
+      "the interrupted move left the note hidden with nothing pointing at it",
+    ).toHaveLength(1);
+    expect(next.displaced[0]!.from).toBe("note.md");
+    expect(await adapter.read(next.stranded[0]!)).toBe(MINE);
+    // And the older damage is still owned up to, rather than papered over by
+    // the record that came after it.
+    expect(next.recovery.complete).toBe(false);
+  });
+
+  it("refuses to hide a note when the record was written short but not refused", async () => {
+    // The other half of RR6's fix, and the reason it is not enough to check
+    // that the append did not throw (rule 4). An adapter that truncates and
+    // reports success leaves a record nobody can read, and the caller was
+    // about to hide a note on the strength of it. So the record is read back
+    // before it counts as written.
+    //
+    // `shortAppendsSilently` rather than a numeric fault: the numeric one
+    // writes short *and* throws, which the catch already handles, so a test
+    // using it would pass with the readback deleted.
+    const adapter = new FakeAdapter();
+    adapter.seed("note.md", MINE);
+    adapter.shortAppendsSilently = 8;
+
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    const out = await vault.removeExpecting("note.md", { contentId: "whatever", idOf }, "kept.md");
+
+    expect(out, "the note was hidden against a record that cannot be read").toEqual({
+      keptAt: "note.md",
+      landed: true,
+    });
+    expect(await adapter.read("note.md")).toBe(MINE);
+
+    adapter.shortAppendsSilently = undefined;
+    const next = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    await next.list();
+    // Nothing is hidden, so nothing is waiting; but this device wrote a
+    // fragment it cannot read, so it does not claim to know.
+    expect(next.stranded).toEqual([]);
+    expect(next.recovery.complete).toBe(false);
+  });
+
   it("reports an unreadable record as unknown, not as a clean vault", async () => {
     // RR2. Obsidian's index does not list the hidden folder, so this log is
     // the only source there is. A log that cannot be read produces an empty
