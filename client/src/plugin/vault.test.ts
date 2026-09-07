@@ -380,14 +380,32 @@ describe("what a scan costs", () => {
     const listed = await v.list();
     expect(listed.length).toBe(210); // 200 notes and the 10 folders
 
-    // One `exists`, the case-folding probe, and that only on the first
-    // listing. Nothing per file.
+    // Two `exists`: the case-folding probe, which happens only on the first
+    // listing, and the displaced-version log, which is looked at on every one.
+    // Nothing per file, which is the property this is here for -- the cost has
+    // to stay flat as the vault grows, and a constant two is flat.
     expect(
       { stat: counting.stats, list: counting.lists, exists: counting.exists_ },
       `a 200 file vault cost ${counting.stats} stat, ${counting.lists} list and ${counting.exists_} exists calls`,
-    ).toEqual({ stat: 0, list: 0, exists: 1 });
+    ).toEqual({ stat: 0, list: 0, exists: 2 });
     await v.list();
-    expect(counting.exists_).toBe(1);
+    expect(counting.exists_, "the second scan cost more than the log").toBe(3);
+
+    // And the same vault at ten times the size costs the same, which is the
+    // claim. Pinning the number alone would pass on a scan that had become
+    // per-file and cheap per file.
+    const big = new FakeAdapter();
+    for (let i = 0; i < 2000; i++) big.seed(`folder${i % 10}/note-${i}.md`, "x");
+    const bigCount = new CountingAdapter(big);
+    const bigVault = new ObsidianVault(
+      asVault(new FakeVaultIndex(bigCount as unknown as FakeAdapter)),
+      ".obsidian",
+    );
+    await bigVault.list();
+    expect(
+      bigCount.exists_,
+      `ten times the notes cost ${bigCount.exists_} exists calls, so the scan is per file`,
+    ).toBe(2);
   });
 
   it("still reports what the walk did", async () => {

@@ -76,6 +76,7 @@ import {
   saveConfig,
   type Config,
 } from "./config.ts";
+import type { Displaced } from "../core/displaced.ts";
 import { lockVault, unlockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
@@ -1173,7 +1174,14 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
     }
     io.out("");
     io.out("Rebased onto the server's history:");
-    renderReport(report, args, io, client.serverCursor, client.vault.stranded ?? []);
+    renderReport(
+      report,
+      args,
+      io,
+      client.serverCursor,
+      client.vault.stranded ?? [],
+      client.vault.displaced ?? [],
+    );
     io.out(`Nothing was deleted. Where the two sides disagreed, both versions were kept.`);
     return exitCodeFor(report);
   } finally {
@@ -1188,7 +1196,14 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
   const client = await open(config, args, io);
   try {
     const report = await client.settle();
-    renderReport(report, args, io, client.serverCursor, client.vault.stranded ?? []);
+    renderReport(
+      report,
+      args,
+      io,
+      client.serverCursor,
+      client.vault.stranded ?? [],
+      client.vault.displaced ?? [],
+    );
     return exitCodeFor(report);
   } finally {
     await client.close();
@@ -1332,7 +1347,14 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
       ...(await clientOptions(config, args, io)),
       onPass: (report) => {
         if (!settled || !didSomething(report)) return;
-        renderReport(report, args, io, watching?.serverCursor ?? 0, watching?.vault.stranded ?? []);
+        renderReport(
+          report,
+          args,
+          io,
+          watching?.serverCursor ?? 0,
+          watching?.vault.stranded ?? [],
+          watching?.vault.displaced ?? [],
+        );
       },
       onSyncFailed: (err) => {
         io.err(`basalt: a sync failed: ${err.message}. It will try again.`);
@@ -1340,7 +1362,14 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
     },
     {
       onSynced: (report, serverCursor) => {
-        renderReport(report, args, io, serverCursor, watching?.vault.stranded ?? []);
+        renderReport(
+          report,
+          args,
+          io,
+          serverCursor,
+          watching?.vault.stranded ?? [],
+          watching?.vault.displaced ?? [],
+        );
         settled = true;
         if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
       },
@@ -1395,6 +1424,8 @@ async function unsentHere(
   stored: StoredState | undefined,
   /** Filled with any preserved version waiting in staging (R35). */
   stranded?: string[],
+  /** Filled with what is known about each, where a record was written. */
+  displaced?: Displaced[],
 ): Promise<number | "unknown"> {
   try {
     const vault = new NodeVault(args.dir, {
@@ -1406,6 +1437,7 @@ async function unsentHere(
     });
     const onDisk = await vault.list();
     stranded?.push(...vault.stranded);
+    displaced?.push(...vault.displaced);
     // No index is an empty baseline, not a reason to answer zero.
     const known = new Map(Object.entries(stored?.entries ?? {}));
     let unsent = 0;
@@ -1439,6 +1471,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   const stored = validateStoredState(await new JsonIndexStore(indexPath(args.dir)).load());
 
   const stranded: string[] = [];
+  const displaced: Displaced[] = [];
   const local = {
     vault: args.dir,
     device: config.device,
@@ -1460,12 +1493,16 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // and its timestamp is not visible here, and the number is an estimate.
     // Saying which basis it is on is the difference between an estimate and a
     // claim; `unsent: 0` used to be printed as "up to date with the server".
-    unsent: await unsentHere(args, stored, stranded),
+    unsent: await unsentHere(args, stored, stranded, displaced),
     unsentFrom: "size and timestamp" as const,
     // Versions this client took off the disk and could not put back, which
     // nothing reaps and nothing else mentions (R35). Empty on every ordinary
     // vault; when it is not, the notes in it exist nowhere else.
     stranded,
+    // The same versions with what was written down about each at the time:
+    // which note it came off and why it is not at its name. A subset, because
+    // the scan also finds parked files nothing wrote a record for.
+    displaced,
   };
 
   // Reachability is reported, never assumed. "up to date" from a client that
@@ -1561,7 +1598,15 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // of their edit sat under `notes/` with the listing deliberately hiding
     // it. A line that names a place the bytes are not is worse than no line.
     io.out(`kept     ${local.stranded.length} version(s) this client could not put back:`);
-    for (const at of local.stranded) io.out(`  ${join(args.dir, at)}`);
+    // With the reason where there is one. A path on its own says a file is
+    // there and not which note it came off or why, which is a person opening
+    // `note.md..basalt-tmp-keep3f9c` to find out (PRODUCT_READINESS.md 3).
+    const known = new Map(local.displaced.map((d) => [d.at, d]));
+    for (const at of local.stranded) {
+      io.out(`  ${join(args.dir, at)}`);
+      const d = known.get(at);
+      if (d !== undefined) io.out(`    from ${d.from}: ${d.why}`);
+    }
   }
   if (unjoined) {
     io.out(`state    nothing to connect with: ${server.error}`);
@@ -2049,6 +2094,8 @@ export function renderReport(
    * do not clear themselves: they wait for a person.
    */
   stranded: readonly string[] = [],
+  /** What was written down about each, where a record exists. */
+  displaced: readonly Displaced[] = [],
 ): void {
   const outcome = outcomeOf(r);
   if (args.json) {
@@ -2057,7 +2104,14 @@ export function renderReport(
     // non-zero exit was a real divergence, and one field being derived from
     // counters while another was hardcoded is how it happened.
     io.out(
-      JSON.stringify({ ok: exitCodeOf(outcome) === 0, outcome, ...r, serverCursor, stranded }),
+      JSON.stringify({
+        ok: exitCodeOf(outcome) === 0,
+        outcome,
+        ...r,
+        serverCursor,
+        stranded,
+        displaced,
+      }),
     );
     return;
   }
@@ -2116,7 +2170,12 @@ export function renderReport(
   if (stranded.length > 0) {
     io.out("");
     io.out(`  ${stranded.length} version(s) this client could not put back:`);
-    for (const at of stranded) io.out(`    ${at}`);
+    const known = new Map(displaced.map((d) => [d.at, d]));
+    for (const at of stranded) {
+      io.out(`    ${at}`);
+      const d = known.get(at);
+      if (d !== undefined) io.out(`      from ${d.from}: ${d.why}`);
+    }
   }
   if (r.chunksSent > 0)
     io.out(`${String(r.chunksSent).padStart(5)}  chunks sent, ${bytes(r.bytesSent)}`);

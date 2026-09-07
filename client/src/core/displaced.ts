@@ -189,7 +189,11 @@ function parseLine(line: string): Displaced | undefined {
   }
 }
 
-/** The log that belongs beside an index file. */
-export function displacedLogPath(indexFile: string): string {
-  return indexFile.replace(/\.json$/i, "") + ".displaced";
-}
+/**
+ * The name both shells give this log.
+ *
+ * One name rather than two, because somebody looking for it after a crash
+ * should not have to know which client wrote it, and because a support answer
+ * that says "look in `.basalt`" is worth more than one that says "it depends".
+ */
+export const DISPLACED_LOG = "displaced.log";

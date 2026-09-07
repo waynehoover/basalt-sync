@@ -8,12 +8,14 @@
  * disagreeing with itself about the one thing this project says it will not
  * sync.
  */
-import { mkdtemp, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { parseArgs } from "./cli.ts";
+import { STATE_DIR } from "./config.ts";
 import { NodeVault, configFolderName } from "./vault.ts";
 import { removeTree } from "../core/test-server.ts";
 
@@ -102,5 +104,27 @@ describe("the flags", () => {
   it("refuses a flag that swallowed the next flag", () => {
     expect(() => parseArgs(["sync", "--config-dir", "--json"])).toThrow(/needs a value/);
     expect(() => parseArgs(["sync", "--ignore", "--json"])).toThrow(/needs a value/);
+  });
+});
+
+/**
+ * The two spellings of the state folder, checked against each other.
+ *
+ * `vault.ts` cannot import `STATE_DIR` from `config.ts`, because `config.ts`
+ * imports `vault.ts` for its durable writes and a five-character constant is
+ * not worth a module cycle. So there are two copies, and this is what stops
+ * them drifting: a vault writing its lock and index into `.basalt` while its
+ * staging and displaced log went to something else would be two state folders
+ * with nothing saying so.
+ */
+describe("the state folder", () => {
+  it("is spelled the same in both modules that name it", async () => {
+    const source = await readFile(fileURLToPath(new URL("./vault.ts", import.meta.url)), "utf8");
+    const found = /const STATE_FOLDER = "([^"]+)"/.exec(source);
+    expect(
+      found,
+      "vault.ts no longer declares STATE_FOLDER, so this check is checking nothing",
+    ).not.toBeNull();
+    expect(found![1]).toBe(STATE_DIR);
   });
 });

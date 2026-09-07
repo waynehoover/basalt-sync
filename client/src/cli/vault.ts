@@ -40,6 +40,12 @@ import {
 } from "../core/paths.ts";
 import { composite, seam } from "../core/seam.ts";
 import {
+  DISPLACED_LOG,
+  DisplacedLedger,
+  type Displaced,
+  type DisplacedFiles,
+} from "../core/displaced.ts";
+import {
   JournalIndexStore,
   indexLogPath,
   type JournalFiles,
@@ -57,6 +63,16 @@ import type {
   Times,
   Vault,
 } from "../core/vault.ts";
+
+/**
+ * This client's state folder, spelled here rather than imported.
+ *
+ * `config.ts` exports the same string and imports this module for its durable
+ * writes, so importing it back would make a cycle out of a five-character
+ * constant. The two are checked against each other by
+ * `cli/config-dir.test.ts`, which is cheaper than the cycle.
+ */
+const STATE_FOLDER = ".basalt";
 
 /**
  * Where a deletion arriving from another device goes, rather than away.
@@ -446,6 +462,16 @@ export class NodeVault implements Vault {
   private readonly normal: (name: string) => string;
   /** Whether this vault may write while listing. See NodeVaultOptions. */
   private readonly observeOnly: boolean;
+  /**
+   * What this client has taken off a name and could not put back.
+   *
+   * Written when it happens rather than worked out afterwards from the names
+   * on the disk: the disk can say a parked file is there and not which note it
+   * came off or why (`core/displaced.ts`).
+   */
+  private readonly ledger: DisplacedLedger;
+  /** Refreshed by every scan, from the ledger, for anything that reports. */
+  displaced: readonly Displaced[] = [];
 
   constructor(root: string, opts: NodeVaultOptions = {}) {
     this.root = resolve(root);
@@ -463,6 +489,25 @@ export class NodeVault implements Vault {
       configDir,
       ...(opts.alsoIgnore ?? []).map((name) => this.normal(name)),
     ]);
+    this.ledger = new DisplacedLedger(new NodeDisplacedFiles(this.root), (m) =>
+      console.warn(`basalt: ${m}`),
+    );
+  }
+
+  /**
+   * Writes down that a version is somewhere nothing lists.
+   *
+   * Called from the failure paths of the preserving write and the preserving
+   * removal, which is where a version can end up parked with nowhere to go
+   * (R46). Never throws: see `DisplacedLedger.record`.
+   */
+  private async noteDisplaced(at: string, from: string, why: string): Promise<void> {
+    await this.ledger.record({
+      at: relative(this.root, at),
+      from: this.normalPath(relative(this.root, from)),
+      why,
+      when: Date.now(),
+    });
   }
 
   /** A whole path in this vault's normal form, one segment at a time. */
@@ -1220,7 +1265,24 @@ export class NodeVault implements Vault {
       }
       return out;
     };
-    return walk(this.root, "");
+    const listed = await walk(this.root, "");
+
+    // The ledger last, and merged rather than replacing what the walk found.
+    //
+    // Two sources for one list, on purpose. The ledger knows which note a
+    // parked file came off and why, which no walk can work out; the walk finds
+    // parked files nothing wrote a record for, which is what an older build
+    // left and what another process is holding. Reporting only the ledger
+    // would lose the second kind, and only the walk would lose every reason.
+    this.displaced = await this.ledger.waiting();
+    const already = new Set(this.stranded);
+    for (const d of this.displaced) {
+      if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {
+        this.stranded.push(d.at);
+        already.add(d.at);
+      }
+    }
+    return listed;
   }
 
   async read(path: string): Promise<Uint8Array> {
@@ -1316,7 +1378,7 @@ export class NodeVault implements Vault {
 
   /** Where this vault's temporary files live: under its own state folder, never beside a note. */
   private get staging(): string {
-    return join(this.root, ".basalt", "tmp");
+    return join(this.root, STATE_FOLDER, "tmp");
   }
 
   /**
@@ -1523,6 +1585,15 @@ export class NodeVault implements Vault {
           // has nothing to do with a conflict.
           if (moved && !(await this.putBack(parked, full))) {
             const at = await claimPreserved(parked, kept).catch(() => parked);
+            // Where `claimPreserved` also failed, the version is at a parked
+            // name nothing lists and only this record says which note it is.
+            if (at === parked) {
+              await this.noteDisplaced(
+                parked,
+                full,
+                `${path} could not be written and its previous version could not be put back`,
+              );
+            }
             throw new Error(
               `${path} could not be written (${(err as Error).message}) and its previous ` +
                 `version could not be put back; it is at ${relative(this.root, at)}`,
@@ -1557,7 +1628,22 @@ export class NodeVault implements Vault {
       //
       // Claimed rather than taken: the name was free when the caller chose it
       // and a note may have arrived at it since (R43).
-      const at = await claimPreserved(parked, kept);
+      let at: string;
+      try {
+        at = await claimPreserved(parked, kept);
+      } catch (err) {
+        // The displaced version has nowhere to go: the conflict name and every
+        // sibling of it are taken, or that directory cannot be written. The
+        // bytes are safe under the parked name and nothing lists it, so the
+        // record is the only thing between this and a lost note (R46).
+        await this.noteDisplaced(
+          parked,
+          full,
+          `the version replaced at ${path} could not be placed at ${keepAt} ` +
+            `(${(err as Error).message})`,
+        );
+        throw err;
+      }
       this.dirty(at, had);
       this.unflushed.add(dirname(at));
       return { keptAt: relative(this.root, at), landed };
@@ -1686,6 +1772,11 @@ export class NodeVault implements Vault {
       // should find it. `putBack` refuses an occupied name, so a file that
       // arrived while this was deciding keeps it.
       if (await this.putBack(aside, full)) throw err;
+      await this.noteDisplaced(
+        aside,
+        full,
+        `${path} was taken off its name to be identified and could not be put back`,
+      );
       throw new Error(
         `${path} was taken off its name to be identified and could not be put back ` +
           `(${(err as Error).message}); it is at ${relative(this.root, aside)}`,
@@ -2748,5 +2839,58 @@ export async function syncDirectoryIfSupported(
     const code = (err as NodeJS.ErrnoException).code ?? "";
     if (FSYNC_NOT_APPLICABLE.has(code)) return { synced: true };
     return { synced: false, why: `${code || "the filesystem"}: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * The displaced-version log, on a Node filesystem.
+ *
+ * Beside the index in `.basalt`, under the name both shells use, so that a
+ * support answer can say where it is without asking which client wrote it.
+ */
+class NodeDisplacedFiles implements DisplacedFiles {
+  private readonly path: string;
+
+  constructor(private readonly root: string) {
+    this.path = join(root, STATE_FOLDER, DISPLACED_LOG);
+  }
+
+  async read(): Promise<string | undefined> {
+    try {
+      return await readFile(this.path, "utf8");
+    } catch (err) {
+      // Absent is empty; anything else is not, and saying it is would report
+      // nothing waiting for the one reason that most deserves saying (rule 2).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw err;
+    }
+  }
+
+  async append(line: string): Promise<void> {
+    await mkdir(dirname(this.path), { recursive: true });
+    // Durable, and this is not the usual caution about a temporary file: the
+    // record is written because something has already gone wrong with
+    // somebody's note, and the crash that follows is exactly the case it is
+    // for. `appendFile` with a flush is the whole of it, because a torn last
+    // line is skipped on read and the lines before it are the ones naming
+    // notes.
+    const handle = await open(this.path, "a", 0o600);
+    try {
+      await handle.writeFile(line, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async rewrite(text: string): Promise<void> {
+    await mkdir(dirname(this.path), { recursive: true });
+    await writeDurably(this.path, new TextEncoder().encode(text), true, {
+      stageIn: join(this.root, STATE_FOLDER),
+    });
+  }
+
+  async stillThere(at: string): Promise<boolean> {
+    return (await lstat(join(this.root, at)).catch(() => undefined)) !== undefined;
   }
 }

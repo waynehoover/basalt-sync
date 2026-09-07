@@ -12,6 +12,8 @@
  * test with no Obsidian and no disk involved.
  */
 
+import type { Displaced } from "./displaced.ts";
+
 /** What a listing says about one path. */
 export interface FileStat {
   readonly path: string;
@@ -303,6 +305,20 @@ export interface Vault {
    * Refreshed by a scan, because that is when the disk is looked at.
    */
   readonly stranded?: readonly string[];
+  /**
+   * The same versions, with what is known about each (PRODUCT_READINESS.md 3).
+   *
+   * `stranded` is a list of paths and a path is not an explanation: somebody
+   * looking at `note.md..basalt-tmp-keep3f9c` has to guess which note it came
+   * off and why it is not at its name. These are the records the adapter wrote
+   * when it displaced them, so the answer is remembered rather than inferred.
+   *
+   * A subset of `stranded` rather than the whole of it: a scan also finds
+   * parked files nothing wrote a record for, from an older build or another
+   * process, and those are reported with no more said about them than that
+   * they are there.
+   */
+  readonly displaced?: readonly Displaced[];
 
   /**
    * The digest of one path's contents, without holding the whole file (R31).

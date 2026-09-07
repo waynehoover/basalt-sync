@@ -76,10 +76,11 @@ import {
 } from "../core/pairing.ts";
 import { rotateVault } from "../core/rotation.ts";
 import { ProtocolError } from "../core/transport.ts";
+import { DISPLACED_LOG, type Displaced } from "../core/displaced.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
-type State =
+export type State =
   | { kind: "unpaired" }
   | { kind: "connecting" }
   /**
@@ -91,7 +92,22 @@ type State =
    * show the same glyph as a clean one, which is rule 7 with the two
    * conditions that matter most collapsed.
    */
-  | { kind: "synced"; summary: string; at: number; refused: number }
+  | {
+      kind: "synced";
+      summary: string;
+      at: number;
+      refused: number;
+      /**
+       * How many versions this client took off a note and could not put back.
+       *
+       * Different from `refused` and reported apart from it: a refused file is
+       * one that is not syncing and is still where its author left it, and one
+       * of these is a note that exists only under a name Obsidian does not
+       * show. Nothing in this plugin used to say so at all (R46,
+       * PRODUCT_READINESS.md 3).
+       */
+      waiting: number;
+    }
   /**
    * Working, and on what.
    *
@@ -167,7 +183,7 @@ export default class BasaltPlugin extends Plugin {
   /** The pairing in progress, so a second press cannot start another. */
   private pairing: Promise<unknown> | undefined;
   /** What the notices have already said, so they say it once. */
-  private announced = { attention: "" };
+  private announced = { attention: "", waiting: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
   /**
@@ -351,7 +367,7 @@ export default class BasaltPlugin extends Plugin {
     if (!config || this.running) return;
     this.running = true;
     this.everConnected = false;
-    this.announced = { attention: "" };
+    this.announced = { attention: "", waiting: "" };
     // Every run is numbered, and only the newest one may speak. A single
     // boolean was not enough: unlinking cleared it, pairing again set it,
     // and the *previous* run woke from its backoff, read the new run's
@@ -518,8 +534,14 @@ export default class BasaltPlugin extends Plugin {
     const current = () => mine === this.generation;
     const configDir = this.app.vault.configDir;
     const log = (message: string, ...rest: unknown[]) => console.info("Basalt:", message, ...rest);
+    // Held, because the pass callbacks below read what it stranded. The report
+    // cannot carry that: a displaced version is something the adapter did, and
+    // the engine is told only that a path was kept.
+    const vault = new ObsidianVault(this.app.vault, configDir, log, {
+      displacedLog: `${this.pluginDir()}/${DISPLACED_LOG}`,
+    });
     return {
-      vault: new ObsidianVault(this.app.vault, configDir, log),
+      vault,
       store: this.indexStore(),
       // Which key authenticates and what the vault is bound to, worked out in
       // core so that both shells cannot answer it differently.
@@ -542,8 +564,9 @@ export default class BasaltPlugin extends Plugin {
           // needs-attention list holds, through the one helper, so the glyph,
           // the sentence and the notice cannot start counting different things.
           refused: needsAttention(report),
+          waiting: vault.stranded.length,
         });
-        this.announce(report);
+        this.announce(report, vault.displaced);
       },
       // A pass that failed outright, from wherever it was started (F16).
       //
@@ -729,7 +752,26 @@ export default class BasaltPlugin extends Plugin {
    * how the one that matters gets dismissed too. Those are announced when
    * the count or the names change and not otherwise.
    */
-  private announce(report: SyncReport): void {
+  private announce(report: SyncReport, waiting: readonly Displaced[] = []): void {
+    // First, because it is the only one of these that means a note is not
+    // where its author left it. Keyed on the paths rather than the count, for
+    // the reason the attention notice is: one rescued in the same pass as
+    // another appears leaves the number where it was, and the new one would
+    // go unannounced for as long as they matched.
+    const waitingKey = waiting.map((d) => `${d.at} ${d.from}`).join("\n");
+    if (waitingKey !== this.announced.waiting) {
+      this.announced.waiting = waitingKey;
+      if (waiting.length > 0) {
+        const first = waiting[0]!;
+        const rest = waiting.length - 1;
+        new Notice(
+          `Basalt kept ${waiting.length} ${waiting.length === 1 ? "version" : "versions"} ` +
+            `somewhere Obsidian does not show. ${first.from} is at ${first.at}` +
+            `${rest > 0 ? `, and ${rest} more` : ""}. ${first.why}.`,
+          30_000,
+        );
+      }
+    }
     if (report.conflicted > 0) {
       const n = report.conflicted;
       new Notice(
@@ -1950,7 +1992,7 @@ function iconFor(state: State): string {
     case "syncing":
       return "refresh-cw";
     case "synced":
-      return state.refused > 0 ? "alert-circle" : "check";
+      return state.refused > 0 || state.waiting > 0 ? "alert-circle" : "check";
     case "offline":
       return "cloud-off";
     case "failed":
@@ -1978,7 +2020,7 @@ function toneFor(state: State): string {
     case "syncing":
       return "basalt-working";
     case "synced":
-      return state.refused > 0 ? "basalt-attention" : "";
+      return state.refused > 0 || state.waiting > 0 ? "basalt-attention" : "";
   }
 }
 
@@ -3120,9 +3162,23 @@ function longStatus(state: State): string {
       // it after a colon. This is the fourth, and it opens a sentence: the
       // tooltip, and the panel's first line above two proper ones.
       const done = opens(state.summary);
-      return state.refused > 0
-        ? `${done}, as of ${clock(state.at)}. ${state.refused} ${state.refused === 1 ? "file needs" : "files need"} attention.`
-        : `${done}, as of ${clock(state.at)}.`;
+      const parts = [`${done}, as of ${clock(state.at)}.`];
+      if (state.refused > 0) {
+        parts.push(
+          `${state.refused} ${state.refused === 1 ? "file needs" : "files need"} attention.`,
+        );
+      }
+      // Its own sentence, because it is its own problem: these are notes that
+      // exist only under a name Obsidian does not show, and folding them into
+      // the attention count would hide the one thing a person has to go and
+      // rescue by hand.
+      if (state.waiting > 0) {
+        parts.push(
+          `${state.waiting} ${state.waiting === 1 ? "version was" : "versions were"} kept ` +
+            `somewhere Obsidian does not show.`,
+        );
+      }
+      return parts.join(" ");
     }
     case "failed":
       return `Last sync failed at ${clock(state.at)}: ${state.why}. It will try again.`;

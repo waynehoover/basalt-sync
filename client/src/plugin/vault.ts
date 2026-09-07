@@ -70,6 +70,12 @@ import {
 
 import { plainDigest } from "../core/crypto.ts";
 import {
+  DISPLACED_LOG,
+  DisplacedLedger,
+  type Displaced,
+  type DisplacedFiles,
+} from "../core/displaced.ts";
+import {
   configFolderName,
   firstFreeName,
   foldPath,
@@ -335,6 +341,26 @@ export class ObsidianVault implements Vault {
   private fsync: FsyncFs | undefined | null = null;
   private readonly fsOverride: FsyncFs | undefined;
   private saidNoDirSync = false;
+  /**
+   * What this client has taken off a name and could not put back.
+   *
+   * The plugin could strand a version and reported nothing: `removeExpecting`
+   * leaves one in a hidden folder when the bytes cannot be identified, and
+   * `stranded` was never implemented here at all. The headless client answered
+   * the question by walking the vault for parked names, which the hidden
+   * folder is not, so the Obsidian client -- which is the product -- had no
+   * answer (PRODUCT_READINESS.md 3).
+   */
+  private readonly ledger: DisplacedLedger;
+  /** Refreshed by every scan, for anything that reports. */
+  displaced: readonly Displaced[] = [];
+  /**
+   * The same, as bare paths, which is what the engine and both shells read.
+   *
+   * Filled from the ledger by `list`, like the headless client's, so that
+   * "what is waiting" has one answer whichever client is asked.
+   */
+  readonly stranded: string[] = [];
 
   /**
    * @param vault Obsidian's own vault, read for its index of what exists.
@@ -343,17 +369,27 @@ export class ObsidianVault implements Vault {
    *   almost always and catastrophic the rest of the time.
    * @param log Where a non-fatal oddity is reported, such as a staging copy
    *   that could not be removed after the note it staged was verified.
+   * @param opts.displacedLog Where the record of versions this client took off
+   *   a name and could not put back is kept. Inside the plugin's own folder,
+   *   because it is this device's bookkeeping and must not sync.
    */
   constructor(
     private readonly vault: ObsidianVaultApi,
     configDir: string,
     log: (message: string, ...rest: unknown[]) => void = () => undefined,
     /** A stand-in for Node's fs, for tests. Never set in the plugin. */
-    opts: { fs?: FsyncFs } = {},
+    opts: { fs?: FsyncFs; displacedLog?: string } = {},
   ) {
     this.adapter = vault.adapter;
     this.log = log;
     this.fsOverride = opts.fs;
+    this.ledger = new DisplacedLedger(
+      new ObsidianDisplacedFiles(
+        vault.adapter,
+        normalizePath(opts.displacedLog ?? `${configFolderName(configDir)}/${DISPLACED_LOG}`),
+      ),
+      (message) => log(message),
+    );
     // Obsidian's config folder is *not* assumed to be `.obsidian`: the API
     // says plainly that it could be something else, and that folder holds
     // this plugin's `data.json`, which holds this device's credential and the
@@ -536,6 +572,14 @@ export class ObsidianVault implements Vault {
         size: stat.size,
       });
     }
+
+    // What this client has taken off a name and could not put back. From the
+    // ledger only, unlike the headless client: Obsidian's index does not list
+    // a hidden folder, so there is nothing here to walk for and the record is
+    // the whole answer.
+    this.displaced = await this.ledger.waiting();
+    this.stranded.length = 0;
+    for (const d of this.displaced) this.stranded.push(d.at);
     return out;
   }
 
@@ -870,9 +914,22 @@ export class ObsidianVault implements Vault {
       emptied = true;
       this.wrote(kept);
       return { keptAt: keepAt, landed: true };
-    } catch {
+    } catch (err) {
       // The note is still in the hidden folder, so the folder stays and the
       // path is reported. Mislaid is recoverable; unmentioned is not.
+      //
+      // Written down as well as returned. The caller is told once, in the
+      // result of this call, and a person asking tomorrow is not: Obsidian's
+      // index does not list a hidden folder, so without a record there is
+      // nothing left that knows this note is in there (R46).
+      await this.ledger.record({
+        at: aside,
+        from: path,
+        why:
+          `${path} was moved aside to be identified and could not be dealt with ` +
+          `(${(err as Error).message})`,
+        when: Date.now(),
+      });
       return { keptAt: aside, landed: true };
     } finally {
       // Only once it is known to be empty. Obsidian's `rmdir` is `rm -rf`
@@ -1554,4 +1611,57 @@ function parses(text: string): boolean {
 
 function trimLeadingSlash(path: string): string {
   return path.startsWith("/") ? path.slice(1) : path;
+}
+
+/**
+ * The displaced-version log, through Obsidian's adapter.
+ *
+ * Inside the plugin's own folder, which is inside Obsidian's config folder,
+ * which this client never syncs. A record of what went wrong on this device
+ * arriving on another device would be a note nobody wrote about a note nobody
+ * can reach.
+ */
+class ObsidianDisplacedFiles implements DisplacedFiles {
+  constructor(
+    private readonly adapter: DataAdapter,
+    private readonly path: string,
+  ) {}
+
+  async read(): Promise<string | undefined> {
+    // `exists` first, because `read` on a missing file throws and absent is
+    // not the same answer as unreadable (rule 2): the caller treats a throw as
+    // "the log could not be read", which is worth saying, and a log that was
+    // never written is not.
+    if (!(await this.adapter.exists(this.path))) return undefined;
+    return await this.adapter.read(this.path);
+  }
+
+  async append(line: string): Promise<void> {
+    // `DataAdapter` has an append, and it is the only reason this log is lines
+    // rather than a document: a whole-file rewrite on every record would lose
+    // the whole log to one bad write, at the moment something has already gone
+    // wrong with somebody's note.
+    await this.mkdirForIt();
+    await this.adapter.append(this.path, line);
+  }
+
+  async rewrite(text: string): Promise<void> {
+    await this.mkdirForIt();
+    if (text.length === 0) {
+      if (await this.adapter.exists(this.path)) await this.adapter.remove(this.path);
+      return;
+    }
+    await this.adapter.write(this.path, text);
+  }
+
+  async stillThere(at: string): Promise<boolean> {
+    return await this.adapter.exists(at);
+  }
+
+  private async mkdirForIt(): Promise<void> {
+    const cut = this.path.lastIndexOf("/");
+    if (cut <= 0) return;
+    const dir = this.path.slice(0, cut);
+    if (!(await this.adapter.exists(dir))) await this.adapter.mkdir(dir);
+  }
 }

@@ -394,6 +394,57 @@ a note landing and the index being written can leave the two out of step, and
 the next pass repairs it from the server. A crash can leave a staging file
 named `.basalt-tmp-...` beside a note; it is safe to delete.
 
+### Versions kept somewhere Obsidian does not show
+
+Preservation moves a note's bytes aside before writing over them, and
+occasionally there is nowhere to put them: the conflict name is taken, or the
+folder cannot be written. The bytes survive under a hidden name, which is safe
+and useless on its own, so the plugin writes down what happened and the panel
+says so. The record lives in the plugin's own folder and never syncs.
+
+The panel line reads *N versions were kept somewhere Obsidian does not show*,
+and the notice names the note and where it is. The headless client answers the
+same question, from a log of the same shape, so the two clients cannot describe
+one vault two ways.
+
+### Why this does not use `Vault.process()`
+
+Obsidian's API declares `Vault.process(file, fn, options)` as "atomically read,
+modify, and save the contents of a note", which is exactly the shape a
+preserving write wants. It is not used here, and the reason is what the shipped
+code does rather than what the declaration says.
+
+Read out of `obsidian-1.13.7.asar`, both adapters implement it the same way:
+read the file, call `fn`, and if the result differs, write it back **in place**
+with no temporary and no rename. The desktop adapter uses `fsPromises.readFile`
+and `fsPromises.writeFile`; the Capacitor adapter uses its own `fs.read` and
+`fs.write`. `Vault.process` is a thin wrapper that bumps the file's `saving`
+count and clears its cache.
+
+So:
+
+- **It is not atomic on the filesystem.** An in-place write can be interrupted
+  half done, and what is left is a truncated note. What the plugin does instead
+   -- stage beside the note, read it back, then rename -- survives that, and
+  swapping to `process` would be trading a crash-safe write for a shorter one.
+- **The atomicity it does have is Obsidian's operation queue**, a single
+  in-process promise chain shared by every adapter call. That is real and
+  useful, and it is also what the plugin already relies on for `rename`
+  refusing an occupied destination. It says nothing about a second editor, a
+  different sync tool, or the headless client on the same vault.
+- **The desktop queue can abandon an operation.** It races each one against a
+  timeout that rejects with "File system operation timed out", so a rejection
+  from `process` does not establish that the write did not land (rule 4).
+- **It is strings only**, so attachments are excluded, and an attachment is
+  where an interrupted in-place write costs most.
+- **It covers replacement only.** Deletion, the conflict copy and the restore
+  are the rest of the preservation contract and it does nothing for any of
+  them.
+
+If a future Obsidian makes `process` a staged write, this is worth revisiting.
+The facts above come from the artefact, not the documentation, and they were
+checked because the documentation's word for it is "atomically".
+
 ## Unlink
 
 *Unlink this vault* waits for the running pass to finish, removes the plugin's

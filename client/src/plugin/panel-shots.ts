@@ -58,7 +58,7 @@
 
 import { App, type FakeEl, Plugin as StubPlugin, Setting, built, modals } from "./stub.ts";
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
-import BasaltPlugin from "./main.ts";
+import BasaltPlugin, { type State } from "./main.ts";
 import type { TestServer } from "../core/test-server.ts";
 import { INVITE_PREFIX } from "../core/pairing.ts";
 
@@ -289,17 +289,46 @@ function closePanel(): void {
  * of them need a server to break in a particular way, and the thing being
  * captured is what the panel draws for a state, not how the state is reached.
  */
-const STATUSES: { name: string; state: unknown }[] = [
+// Typed, and it was not. `unknown` meant a state gaining a field left every
+// shot here still compiling and still missing it, which is the one thing this
+// table exists to stop: `waiting` was added to the synced state and nothing
+// said the pictures no longer covered it.
+const STATUSES: { name: string; state: State }[] = [
   { name: "unpaired", state: { kind: "unpaired" } },
   { name: "connecting", state: { kind: "connecting" } },
   { name: "syncing", state: { kind: "syncing", path: "Daily/2026-09-04.md", since: Date.now() } },
   {
     name: "synced",
-    state: { kind: "synced", summary: "4 sent, 2 received", at: Date.now(), refused: 0 },
+    state: {
+      kind: "synced",
+      summary: "4 sent, 2 received",
+      at: Date.now(),
+      refused: 0,
+      waiting: 0,
+    },
   },
   {
     name: "synced-needing-attention",
-    state: { kind: "synced", summary: "1 file needs attention", at: Date.now(), refused: 1 },
+    state: {
+      kind: "synced",
+      summary: "1 file needs attention",
+      at: Date.now(),
+      refused: 1,
+      waiting: 0,
+    },
+  },
+  {
+    name: "synced-with-a-version-waiting",
+    state: {
+      kind: "synced",
+      summary: "up to date",
+      at: Date.now(),
+      refused: 0,
+      // A note that exists only under a name Obsidian does not show. Its own
+      // picture, because it is its own problem and reads nothing like the
+      // attention row above it.
+      waiting: 1,
+    },
   },
   {
     name: "failed",
@@ -307,7 +336,15 @@ const STATUSES: { name: string; state: unknown }[] = [
   },
   {
     name: "offline",
-    state: { kind: "offline", why: "connection refused", retryAt: Date.now() + 30_000, refused: 0 },
+    state: {
+      kind: "offline",
+      why: "connection refused",
+      retryAt: Date.now() + 30_000,
+      // A boolean, and these two shots passed 0 and 1 for as long as this
+      // table was typed `unknown`. Both pictures were drawn from a state the
+      // plugin cannot produce.
+      refused: false,
+    },
   },
   {
     name: "offline-origin-refused",
@@ -315,7 +352,7 @@ const STATUSES: { name: string; state: unknown }[] = [
       kind: "offline",
       why: "the server refused this origin",
       retryAt: Date.now() + 30_000,
-      refused: 1,
+      refused: true,
     },
   },
   {
@@ -408,7 +445,13 @@ export async function walkPanelStates(
     ),
   );
   closePanel();
-  setState(laptop, { kind: "synced", summary: "up to date", at: Date.now(), refused: 0 });
+  setState(laptop, {
+    kind: "synced",
+    summary: "up to date",
+    at: Date.now(),
+    refused: 0,
+    waiting: 0,
+  });
 
   // The device list on a vault with one device, which is not loaded until
   // somebody asks for it and has no button on its only row.

@@ -113,28 +113,46 @@ why. The plugin can strand a version (`removeExpecting`, the hidden-folder
 path) and does not implement `stranded` at all, so the Obsidian product, which
 is the actual product, reports nothing.
 
-- [ ] **C1** A displaced-version ledger in core over a small shell-supplied
+- [x] **C1** A displaced-version ledger in core over a small shell-supplied
       file interface, in the shape of `JournalFiles`: everything hard above it,
       one implementation for both shells.
-- [ ] **C2** Records written when a version is displaced and cleared when it is
+- [x] **C2** Records written when a version is displaced and cleared when it is
       resolved, carrying the note it came from and the reason.
-- [ ] **C3** The CLI adapter writes and reads it; the scan reconciles the
+- [x] **C3** The CLI adapter writes and reads it; the scan reconciles the
       ledger against the disk rather than replacing it.
-- [ ] **C4** The plugin adapter implements `stranded` from the same records.
-- [ ] **C5** `status`, the sync report and the plugin panel all read the ledger,
+- [x] **C4** The plugin adapter implements `stranded` from the same records.
+- [x] **C5** `status`, the sync report and the plugin panel all read the ledger,
       so there is one answer to "what is waiting".
-- [ ] **C6** Tests, including across a restart.
+- [x] **C6** Tests, including across a restart.
+
+**What it found.** The plugin could strand a version and reported nothing at
+all: `removeExpecting` leaves one in a hidden folder Obsidian does not list,
+and `stranded` was never implemented there, so the actual product answered a
+question the headless client answered. Typing the panel-shot table, which was
+`unknown`, also found two shots drawn from a state the plugin cannot be in
+(`offline.refused` is a boolean and they passed `0` and `1`). Three mutations,
+all caught.
 
 ## D. Vault.process()
 
 The plugin's safety currently rests on rename behaviour read out of
 `obsidian-1.13.7.asar` rather than a documented contract.
 
-- [ ] **D1** Establish from the shipped artifact what `Vault.process()`
+- [x] **D1** Establish from the shipped artifact what `Vault.process()`
       guarantees. Verify against the artifact; where it cannot answer, say so.
-- [ ] **D2** Use it for text replacement if it is a real read-modify-write, or
+- [x] **D2** Use it for text replacement if it is a real read-modify-write, or
       record why not.
-- [ ] **D3** Record the finding in `docs/plugin.md` either way.
+- [x] **D3** Record the finding in `docs/plugin.md` either way.
+
+**The answer is no, and the artefact is why.** Both shipped adapters implement
+`process` as read, call, and write back **in place** with no temporary and no
+rename. The "atomically" in the declaration means "serialised on Obsidian's own
+operation queue", which is one in-process promise chain, not a filesystem
+guarantee. Adopting it would trade a crash-safe staged write for a truncatable
+one, it is strings only so attachments are out, it covers replacement and none
+of the deletion or conflict-copy paths, and the desktop queue races each
+operation against a timeout so a rejection does not establish that the write
+did not land. Written up in `docs/plugin.md`.
 
 ## E. Narrow the supported environment
 
