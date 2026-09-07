@@ -325,14 +325,15 @@ Basalt is MIT, like LiveSync and like Obsidian's own plugin API declarations.
 
 ## Locking, and why this does not use `flock`
 
-The CLI's vault lock is a file with a holder written into it, taken by `link`,
-and taken over when the holder's process is gone. Every hard part of that is
-staleness: a lock file outlives the process that made it, so somebody has to
-decide when it is safe to remove, and deciding is a read followed by an unlink
-with a gap in between. R03 was that gap.
+The CLI's vault lock is a file with a holder written into it, taken by `link`.
+It is never taken over automatically. A lock left behind by a crash stays there
+until somebody runs `basalt unlock`.
 
-Closing it took five goes, and the first four are worth writing down because
-each looked finished.
+That is not where this started. Every hard part of a lock file is staleness: it
+outlives the process that made it, so somebody has to decide when it is safe to
+remove, and deciding is a read followed by an unlink with a gap in between. R03
+was that gap, and closing it took five goes. All five are written down because
+each looked finished, and four of them handed one vault to two writers.
 
 An eviction marker, a second exclusive `link` naming the holder being evicted,
 moved the problem rather than solving it: a marker whose own evictor died had
@@ -344,31 +345,48 @@ identify what it held, but it still removed a name it did not own, so a third
 contender found the vault free while somebody was in it (R40). Numbering the
 claims fixed that, until a release freed the numbers and a slow caller was
 admitted beside the holder by aiming at one that had come back (R44, R49).
+Generational claims with a fence, where a release marks rather than deletes so
+the numbers never come round again, closed that one. It is 416 lines and it
+might be right.
 
-What is there now: the vault belongs to whoever holds the newest claim naming a
-running process, taking over means adding the next number rather than removing
-anybody's, and a release *marks* its claim instead of deleting it. That last
-part is the whole of it. The fence is what makes "is somebody already in there"
-answerable, because until the numbers stopped coming back, every version of
-that question had an answer that was true and useless.
+Five attempts is enough evidence that nobody here can tell. So the sixth answer
+is not to decide.
 
-None of that is novel and none of it is the standard answer. The standard
-answer is `flock(2)`, where the kernel releases the lock when the process dies:
-there is no staleness, no takeover, and no protocol to get wrong. What is here
-is a lock reimplemented in userspace, and it is more complicated than the thing
-it stands in for. Four of the five attempts above were wrong in a way that
-handed one vault to two writers, and every one of them was found by somebody
-else.
+The reason the decision cannot be made safely is not that the rule is subtle.
+It is that "the holder is dead, so I may have it" is a conclusion drawn from an
+observation, and between the observation and the act the holder can be alive
+again: a recycled pid, a process that had not finished dying, a second
+contender that read the same corpse. Nothing in POSIX offers a
+compare-and-swap on a file to close that. Every one of the five attempts is a
+different arrangement of the same missing primitive.
 
-It is here because Node has no `flock`. `fs-ext` provides one and is a native
-module, which would mean a build step and a per-platform binary for a package
-whose whole shape is "install it and run it". `proper-lockfile` is the pure-JS
-convention and uses a directory plus an mtime heartbeat, which has the same
-staleness problem in a different arrangement and would not have prevented R03.
+The standard answer is `flock(2)`, where the kernel does the whole decision
+atomically and releases the lock when the process dies: no staleness, no
+takeover, no protocol to get wrong. It is not available here. Node has no
+binding for it; `fs-ext` provides one and is a native module, which would mean
+a build step and a per-platform binary for a package whose whole shape is
+"install it and run it"; the packed CLI runs under stock node; and the Obsidian
+plugin could not load a native addon even if one were acceptable.
+`proper-lockfile` is the pure-JS convention and uses a directory plus an mtime
+heartbeat, which is the same staleness problem in a different arrangement and
+would not have prevented R03.
 
-So this is a platform gap worked around, not a design preference, and it should
-be replaced the day Node grows a portable file lock. The Go server has no such
-problem: `internal/dirlock` uses the real thing.
+So the cost is paid where it can be seen. A crashed sync wedges a cron job
+until somebody runs one command, and the refusal says exactly that, naming the
+process and what to type. The alternative was a mechanism nobody could
+demonstrate the correctness of, standing between two writers and the rule this
+project exists for.
+
+`basalt unlock` has one window of its own and it is closed the same way: an
+ordinary refusal, where the holder is running or is on another machine, reads
+the lock and touches nothing at all. Only a lock already read as abandoned is
+taken aside, and if it turns out to be held after all it goes back with `link`
+rather than `rename`, so a lock somebody legitimately took in the meantime is
+not written over. Where even that fails, the command says two processes may
+hold the vault and both should be stopped, because a race that cannot be undone
+can at least be reported (rule 7).
+
+The Go server has no part of this problem: `internal/dirlock` calls `flock`.
 
 Prior art worth naming for the rest of it, because these were re-derived here
 rather than invented: git's object write (temp, fsync, link, fsync the

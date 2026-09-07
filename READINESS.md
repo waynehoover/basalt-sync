@@ -77,19 +77,33 @@ is not available here: Node has no flock binding, the packed CLI runs under
 stock node, and the plugin cannot load a native addon at all. So we take the
 doc's stated fallback.
 
-- [ ] **B1** Delete the generational claim protocol: `lock.<n>`, `liveOwner`,
+- [x] **B1** Delete the generational claim protocol: `lock.<n>`, `liveOwner`,
       `highestGeneration`, `sweepSuperseded`, the fence, both retry loops.
-- [ ] **B2** One `lock` file, created with an exclusive `link`, holding the
+- [x] **B2** One `lock` file, created with an exclusive `link`, holding the
       complete holder record. No automatic stale takeover in any case.
-- [ ] **B3** Refusal names the holder and says what to do, distinguishing a
+- [x] **B3** Refusal names the holder and says what to do, distinguishing a
       holder that is running from one that is not.
-- [ ] **B4** `basalt unlock`: reports the holder, refuses to break a lock a
+- [x] **B4** `basalt unlock`: reports the holder, refuses to break a lock a
       live local process holds, breaks a dead one, `--force` for a holder on
       another host that cannot be checked.
-- [ ] **B5** Compatibility: an older build's `lock` file is the same name and
-      the same shape, so nothing special is needed. Confirm, do not assume.
-- [ ] **B6** Regression tests, each mutation-tested: revert the fix, watch it
+- [x] **B5** Compatibility, confirmed against the shipped artefact rather than
+      inferred: `npm pack basalt-sync@0.4.2` and reading `dist/basalt.mjs`
+      shows the published build uses the plain `lock` file with this holder
+      shape and none of the generational names. The generational protocol
+      never left this machine, so there is nothing to be compatible with.
+- [x] **B6** Regression tests, each mutation-tested: revert the fix, watch it
       fail, restore.
+
+**What the mutation testing found.** Three of four mutations were caught at
+once. The fourth, `link` to `rename` in the put-back, was not, and tracing why
+found a hole `unlock` had opened by itself: taking a *live* holder's lock aside
+to decide about it leaves the vault looking free, so a `basalt sync` starting
+in that instant takes it beside the holder. Two writers, caused by the command
+whose whole job is to prevent them. Fixed by reading first and refusing without
+touching anything, so every ordinary refusal has no window at all; only a lock
+already read as abandoned is moved. The residual race, where the lock changes
+between the read and the rename and a third process acquires in between, is
+reported as `contested` rather than hidden.
 
 ## C. Make displaced versions durable and discoverable
 

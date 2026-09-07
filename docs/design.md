@@ -519,6 +519,14 @@ published from CI over OIDC with no stored token.
   file is valid JSON, and Obsidian drops the edge silently on the next save.
   Telling it from one the ancestor already had would need the validity check to
   see both sides and the ancestor. Pinned as a test.
+- Recovering the CLI's vault lock without being asked. A lock left behind by a
+  `basalt` that crashed stays there, and every command refuses until somebody
+  runs `basalt unlock`. Deciding on its own that a holder was gone was
+  attempted five times and four of those handed one vault to two writers; the
+  decision needs a compare-and-swap on a file, which POSIX does not have and
+  which `flock` would supply if Node had it. `docs/compared.md` has all five
+  attempts. The cost is a wedged cron job and one command to clear it, and it
+  is a decision rather than a gap.
 - Mutual exclusion between a sync pass and the editor, on either client.
   A pass decides from a scan, fetches, and then writes, and the editor is in
   use throughout. Nothing here locks the editor out, and nothing can. What both

@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -18,7 +18,7 @@ import { cleanupBinary, removeTree, serverBinary, TestServer, until } from "../c
 import { run, type Console } from "./cli.ts";
 import { configPath, indexPath, loadConfig, saveConfig } from "./config.ts";
 import { STATE_DIR } from "./config.ts";
-import { alive, currentHolder, lockPath, lockVault } from "./lock.ts";
+import { alive, currentHolder, lockPath, lockVault, unlockVault } from "./lock.ts";
 
 /**
  * `saveConfig` and `loadConfig`, failing when a test says so. The CLI imports
@@ -412,7 +412,7 @@ describe("the vault lock (C12)", () => {
     )();
   });
 
-  it("takes over a lock whose holder on this host is dead", async () => {
+  it("refuses a lock whose holder on this host is dead, until unlock clears it", async () => {
     const dir = await vaultDir("stale");
     await mkdir(join(dir, ".basalt"), { recursive: true });
     // A pid nothing is running under. Found by asking, not assumed.
@@ -427,6 +427,10 @@ describe("the vault lock (C12)", () => {
         since: 1,
       }),
     );
+    // Not taken over. Five attempts at doing that automatically each handed
+    // one vault to two writers; the sixth answer is that a person says so.
+    await expect(lockVault(dir, "basalt sync")).rejects.toThrow(/basalt unlock/);
+    expect(await unlockVault(dir)).toMatchObject({ did: "removed" });
     const release = await lockVault(dir, "basalt sync");
     expect(await currentHolder(dir)).toMatchObject({ pid: process.pid });
     await release();
@@ -467,33 +471,48 @@ describe("the vault lock (C12)", () => {
     const ended = exited(watcher);
     watcher.kill("SIGKILL");
     await ended;
-    // The claim is still on the disk, naming the process that died with it.
-    // Not `currentHolder`: that answers who is *running*, and after a kill the
-    // truthful answer is nobody. What is left is debris for the next run.
-    //
-    // More than one file is expected: `init` left a released fence behind it,
-    // which is what stops a generation ever coming round again (R49). The one
-    // that matters is the watcher's, and it is not marked released.
-    const names = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock."));
-    const records = await Promise.all(
-      names.map(
-        async (n) =>
-          JSON.parse(await readFile(join(dir, STATE_DIR, n), "utf8")) as {
-            pid: number;
-            released?: boolean;
-          },
-      ),
-    );
-    expect(
-      records.filter((r) => r.released !== true),
-      "the kill left no live claim behind, so there is nothing to take over",
-    ).toMatchObject([{ pid: watcher.pid }]);
-    expect(await currentHolder(dir), "a killed watcher still counts as holding it").toBeUndefined();
+    // The lock is still on the disk, naming the process that died with it.
+    // `currentHolder` says who the file names and deliberately not whether
+    // they are running: this client no longer has an opinion on that, because
+    // forming one and acting on it is what went wrong five times.
+    expect(await currentHolder(dir)).toMatchObject({ pid: watcher.pid });
 
-    // The next one recognises a dead holder and gets on with it.
-    const third = await cli("sync", "--dir", dir, "--json");
-    expect(third.code, third.all).toBe(0);
+    // The next one refuses, and the refusal is the whole user interface of
+    // this decision: it has to say the holder is gone and what to type.
+    const third = await cli("sync", "--dir", dir);
+    expect(third.code, third.all).toBe(1);
+    expect(third.all).toMatch(/not running any more/);
+    expect(third.all).toMatch(/basalt unlock/);
+
+    // And that command, typed by a person, is what frees it.
+    const cleared = await cli("unlock", "--dir", dir);
+    expect(cleared.code, cleared.all).toBe(0);
+    expect(cleared.all).toMatch(new RegExp(`pid ${watcher.pid}`));
+    expect(await currentHolder(dir)).toBeUndefined();
+
+    const fourth = await cli("sync", "--dir", dir, "--json");
+    expect(fourth.code, fourth.all).toBe(0);
     expect(await currentHolder(dir), "the vault is still held afterwards").toBeUndefined();
+  }, 120_000);
+
+  it("refuses to unlock a vault whose holder is running", async () => {
+    const dir = await paired("held");
+    const watcher = basalt("sync", "--watch", "--dir", dir);
+    await until(
+      "the watcher to be running",
+      () => /Watching for changes/.test(watcher.stderrText()),
+      30_000,
+    );
+
+    const refused = await cli("unlock", "--dir", dir);
+    expect(refused.code, refused.all).toBe(1);
+    expect(refused.all).toMatch(new RegExp(`pid ${watcher.pid} is still running`));
+    // And the watcher still holds it, which is the point of refusing.
+    expect(await currentHolder(dir)).toMatchObject({ pid: watcher.pid });
+
+    const ended = exited(watcher);
+    watcher.kill("SIGKILL");
+    await ended;
   }, 120_000);
 
   it("lets a reading command through while a watcher holds the vault", async () => {

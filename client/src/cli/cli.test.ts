@@ -729,7 +729,7 @@ describe("arguments", () => {
   });
 
   it("refuses an option it does not know", () => {
-    expect(() => parseArgs(["sync", "--force"])).toThrow(/no such option: --force/);
+    expect(() => parseArgs(["sync", "--brute"])).toThrow(/no such option: --brute/);
   });
 
   it("refuses a timeout that is not a number", () => {

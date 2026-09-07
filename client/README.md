@@ -68,6 +68,7 @@ basalt history PATH                       every version of one note, newest firs
 basalt restore PATH                       put a note back
 basalt repair                             resend bodies the server has lost
 basalt unlink                             forget the pairing, keep the notes
+basalt unlock                             clear a lock left behind by a basalt that crashed
 basalt --version                          which release this is
 ```
 
@@ -77,6 +78,7 @@ basalt --version                          which release this is
 | `--device NAME` | this device's name (default: the hostname plus four random characters, chosen once at pairing) |
 | `--vault-id ID` | which vault on the server, for `init` only (default `default`) |
 | `--json` | machine-readable output, on every command |
+| `--force` | for `unlock`: clear a lock held on another machine, which this one cannot check |
 | `--timeout MS` | how long to wait on the server (default 30000) |
 | `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |
 | `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable; local to this device |
@@ -215,19 +217,28 @@ names them and the engine redoes the pass. `unlink` removes all three files and
 touches no notes.
 
 One process at a time, enforced for every command that writes. The lock is a
-claim file in `.basalt/`, `lock.<n>`, and whoever holds the newest one that
-names a running process holds the vault. Taking over from a process that died
-means adding the next number, never removing anybody's claim: a claim can only
-be removed by the process that made it. A release marks its own claim rather
-than deleting it and sweeps everything under it, so one small file is left
-behind and a number can never come round again. That last part is what stops a
-caller that was slow between reading the directory and writing its claim from
-being admitted beside whoever took the vault meanwhile.
+file in `.basalt/` naming its holder, created with `link` so that creating it
+is the test for whether it exists.
 
-Node has no portable `flock`, which is what this would otherwise be; see
-`docs/compared.md` for what that costs. If something writes the index anyway,
-the next save says so on stderr and replaces both files with a fresh snapshot
-rather than appending this device's changes onto somebody else's.
+It is never taken over automatically. A lock left behind by a `basalt` that
+crashed or was killed stays there, and the next command refuses with the
+holder's name, whether that process is still running, and what to do about it:
+
+    basalt unlock
+
+which says who held the vault before it clears anything, and refuses if that
+process is still running. `--force` is for a lock held on another machine,
+which this one cannot check.
+
+That is less convenient than taking an abandoned lock over, and it is
+deliberate. Taking it over automatically was attempted five times and four of
+those handed one vault to two writers; `docs/compared.md` has all five. Node
+has no portable `flock`, which is what this would otherwise be and which would
+make the whole question the kernel's.
+
+If something writes the index anyway, the next save says so on stderr and
+replaces both files with a fresh snapshot rather than appending this device's
+changes onto somebody else's.
 
 ### Filenames
 

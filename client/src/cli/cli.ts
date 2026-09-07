@@ -76,7 +76,7 @@ import {
   saveConfig,
   type Config,
 } from "./config.ts";
-import { lockVault } from "./lock.ts";
+import { lockVault, unlockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
 import { rotateVault } from "../core/rotation.ts";
@@ -120,6 +120,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
   basalt rebase --backup-taken              rejoin a server restored from an older backup
   basalt unlink                             forget the pairing, keep the notes
+  basalt unlock                             clear a lock left behind by a basalt that crashed
   basalt --version                          which release this is
 
 Options
@@ -130,6 +131,8 @@ Options
   --timeout MS     how long to wait on the server (default: 30000)
   --allow-last     revoke the last device, leaving the vault reachable only by its recovery key.
                    Needs --recovery-key: it is the one revocation a device cannot undo
+  --force          for unlock: clear a lock held on another machine. This one cannot tell whether
+                   that process is still running, so saying it is not is your assertion
   --recovery-key K run devices, revoke or uninvite with the vault's recovery key instead of this
                    device's credential, for the last device and for a vault with no device to ask
   --ttl DURATION   how long an invite lasts, like 10m or 1h (default: 10m, at most 1h)
@@ -166,6 +169,7 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
   try {
     refuseExtras(args);
     refuseRecoveryKey(args);
+    refuseForce(args);
     // Anything that changes the vault, its config or its index takes the
     // vault's lock for as long as it runs. Reading commands do not: they
     // load the index once and talk to the server, and holding a lock for
@@ -204,6 +208,10 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await locked(args, () => cmdRestore(args, io));
       case "unlink":
         return await locked(args, () => cmdUnlink(args, io));
+      // Not under `locked`, which would be asking the lock for permission to
+      // clear the lock.
+      case "unlock":
+        return await cmdUnlock(args, io);
       default:
         io.err(`no such command: ${args.command}`);
         io.err(USAGE);
@@ -274,6 +282,21 @@ function refuseRecoveryKey(args: Args): void {
     `${args.command} does not take --recovery-key, so the key would have been ignored. ` +
       `It is for ${[...TAKES_RECOVERY_KEY].join(", ")}; basalt rotate takes the key as its ` +
       `argument instead.`,
+  );
+}
+
+/**
+ * `--force` means one thing and only `unlock` does it.
+ *
+ * The same reasoning as refuseRecoveryKey: a word that had no effect is worth
+ * an error, because somebody typing it believes it did something, and here
+ * what they believe it did is break a lock.
+ */
+function refuseForce(args: Args): void {
+  if (!args.force || args.command === "unlock") return;
+  throw new Error(
+    `${args.command} does not take --force, so it would have been ignored. It is for ` +
+      `basalt unlock, and only for a lock held on another machine.`,
   );
 }
 
@@ -1841,6 +1864,48 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
  * what `basalt revoke` takes, and a list somebody cannot act on is worse than
  * no list.
  */
+/**
+ * Clears a lock left behind by a basalt that is not running any more.
+ *
+ * This exists because taking a lock over automatically was wrong five times
+ * (R03, R34, R40, R44, R49), each attempt handing one vault to two writers.
+ * The decision "the holder is dead, so I may have it" cannot be made and acted
+ * on atomically without something like `flock`, which Node does not have, so
+ * it is a person who makes it and this reports what they are deciding about.
+ *
+ * Three exit codes, because there are three outcomes and a status that
+ * collapses them is a status that cannot be scripted against (rule 7): 0 it is
+ * clear, 1 it is still held, 2 the arguments were wrong.
+ */
+async function cmdUnlock(args: Args, io: Console): Promise<number> {
+  const outcome = await unlockVault(args.dir, args.force);
+  if (args.json) {
+    io.out(
+      JSON.stringify({
+        ok: outcome.did !== "refused",
+        did: outcome.did,
+        why: outcome.why,
+        ...(outcome.did === "nothing" ? {} : { holder: outcome.was ?? null }),
+      }),
+    );
+    return outcome.did === "refused" ? 1 : 0;
+  }
+  switch (outcome.did) {
+    case "nothing":
+      io.out(outcome.why);
+      return 0;
+    case "removed":
+      io.out(`the lock is clear: ${outcome.why}.`);
+      return 0;
+    case "refused":
+      io.err(`basalt: the lock was not cleared, because ${outcome.why}.`);
+      return 1;
+    case "contested":
+      io.err(`basalt: ${outcome.why}.`);
+      return 1;
+  }
+}
+
 async function cmdUnlink(args: Args, io: Console): Promise<number> {
   const config = await loadConfig(args.dir).catch(() => undefined);
   // `notDurable` is set when the removal happened and could not be made
@@ -2118,6 +2183,14 @@ interface Args {
   ttlMs?: number;
   /** Whether rebase may remove the index, which the person confirms by typing it. */
   backupTaken: boolean;
+  /**
+   * Whether `unlock` may break a lock it cannot prove is abandoned.
+   *
+   * Which is a lock held on another machine: nothing here can ask that machine
+   * whether the process is running, so the only honest answers are to refuse
+   * and to let somebody who does know say so out loud.
+   */
+  force: boolean;
   configDir: string;
   ignore: string[];
 }
@@ -2141,6 +2214,7 @@ export function parseArgs(argv: readonly string[]): Args {
     version: false,
     backupTaken: false,
     allowLast: false,
+    force: false,
     timeout: 30_000,
     configDir: DEFAULT_CONFIG_DIR,
     ignore: [],
@@ -2274,6 +2348,9 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--allow-last":
         args.allowLast = true;
+        break;
+      case "--force":
+        args.force = true;
         break;
       case "--recovery-key":
         args.recoveryKey = value!;
