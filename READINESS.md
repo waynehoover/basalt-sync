@@ -312,3 +312,22 @@ schedule. Reproduced first as the reviewer described it -- two writers, with
 A crashed `unlock` leaves `.basalt/lock.recovering` and wedges recovery until
 somebody removes it. That is a worse experience and a better failure: it stops
 recovery rather than admitting two writers, and the refusal names the file.
+
+## Parked, not scheduled
+
+Two things came out of measuring rather than out of a review, and are in
+[IMPROVEMENTS.md](IMPROVEMENTS.md) as **I25** and **I26** so they are not lost
+and not confused with work that is owed:
+
+- **I25**, a WebAssembly codec. Compression is sixty per cent of the cost of
+  sealing a chunk and `node:zlib` is 2.3x faster than fflate, but it produces
+  different bytes, so taking that win would have a desktop and a phone name the
+  same chunk differently. WASM is the only route that stays one implementation
+  everywhere, and it is a format migration rather than a dependency swap.
+- **I26**, a maintained fork of `diff-match-patch`. Supply chain, not speed,
+  and the acceptance criterion is that merge output does not change.
+
+A native library in the shape of [simdutf](https://simdutf.github.io/simdutf/)
+was considered and is not useful here twice over: UTF-8 work appears nowhere in
+the profile, and a native addon is excluded by the same constraint that rules
+out `flock`.

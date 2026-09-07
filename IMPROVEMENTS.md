@@ -2,6 +2,8 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
+I01 to I24 are from that review and are done. **I25 and I26 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
 ## How to prioritize
@@ -11,6 +13,7 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | During fixes                 | Reuse lifecycle/protocol rules; make errors observable; turn reproduced failures into tests.             | I02–I04, I11, I19         |
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
+| Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I26                  |
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
 
@@ -141,6 +144,37 @@ Consider verified reads with bounded retention or streaming within the protocol'
 [History/deletions](server/internal/store/store.go#L839), [chunk attachment](server/internal/store/store.go#L997), [stats](server/internal/store/store.go#L1141), and [startup reporting](server/cmd/basaltd/main.go#L570) scale with entries, chunk references, or on-disk files. Large chunk lists and unbounded history growth are different workloads from many small current notes.
 
 Measure startup latency, deletion-page queries, backup/verify duration, and sync tail latency with large version histories. Keep health/startup status clear if an expensive scan runs before listening. Add indexes only when a demonstrated query plan benefits, accounting for append and backup costs.
+
+### I25 — A codec that is one implementation everywhere and faster than fflate
+
+- [ ] **Large; only with a format migration.** Investigate a WebAssembly deflate or zstd, and keep byte-for-byte agreement across platforms as the requirement rather than throughput.
+
+Compression is the slowest step in sealing, by some way. Measured on 1 KiB text
+chunks: `compress (fflate) 31 MiB/s`, `encrypt (WebCrypto) 85 MiB/s`,
+`name (WebCrypto) 91 MiB/s`, so deflate is about sixty per cent of the cost and
+the two crypto calls together are the rest. Chunking is not in it at 494 MiB/s.
+
+The obvious swap is the platform codec, and it is not available. `node:zlib` is
+2.3x faster than fflate on the same input **and produces different bytes**:
+over 200 text samples the two agreed on zero, both emitting a raw deflate
+stream that begins the same way and then chooses different matches. Chunks are
+named by their sealed bytes, so a desktop on `node:zlib` and a phone on fflate
+would name the same chunk differently, which is deduplication quietly ending
+and every note re-uploading. `sealChunk` used to claim the two were
+byte-identical; that comment is now the measurement instead.
+
+WebAssembly is the only route that keeps one implementation on every platform,
+because a `.wasm` is not a native addon and loads on Obsidian mobile, unlike
+`fs-ext`, napi-rs bindings, or anything in the shape of
+[simdutf](https://simdutf.github.io/simdutf/). Note that simdutf itself would
+not help whatever it were compiled to: UTF-8 validation and transcoding appear
+nowhere in the profile above.
+
+Treat this as a protocol change, not a dependency swap. It needs a format
+marker, both codecs readable during a migration, `compression-golden` extended
+to cover the new one, and a measurement showing the win survives the WASM
+boundary on a phone. Do not start it for the 2.3x; start it only if sealing
+throughput is shown to matter to somebody.
 
 ## User-facing behavior and operations
 
@@ -380,6 +414,27 @@ Use reusable validation jobs or an explicit successful-check gate. Test the pack
 Workflows use mutable action tags, `bun-version: latest`, and `npm@latest`; the Docker base and build environment also influence outputs. Keep lockfiles and the existing compression golden check, and record the versions used for released artifacts. Changes to compression bytes can affect deduplication and protocol assumptions, so retain cross-runtime compatibility checks when updating libraries.
 
 Add scheduled JavaScript and Go dependency advisory checks with actionable ownership and an update policy. This review did not query vulnerability databases, so it makes no claim that the locked dependency set is vulnerability-free. An advisory result should be triaged for affected code paths, not treated as automatic proof of exploitability.
+
+### I26 — Replace the unmaintained diff-match-patch
+
+- [ ] **Small; supply chain rather than speed.** Evaluate a maintained fork, keeping merge output identical.
+
+`diff-match-patch` 1.0.5 is pinned to an exact version and has been
+unmaintained since 2020, which `docs/compared.md` already records.
+`@sanity/diff-match-patch` is a maintained TypeScript fork of the same
+algorithm and is the obvious candidate.
+
+Not a performance item: merge is not in the sealing path, and I08 already
+bounded the pathological cases. The reason to do it is that an unmaintained
+dependency in the one component that decides what a merged note says is a
+standing risk with no owner, and it pairs with the scheduled advisory checks in
+I22.
+
+The acceptance criterion is that merge output does not change. Two devices
+running different releases must produce the same merge from the same three
+texts, so a fork that improves the diff would be a compatibility break, not an
+improvement. Compare against the existing merge tests and `bench-merge.ts`
+before adopting.
 
 ### I23 — Make release channels, checksums, and version preparation consistent
 
