@@ -196,6 +196,44 @@ describe("a deletion the pass decided about", () => {
   });
 
   /**
+   * And if it cannot be put anywhere, it goes back to its own name.
+   *
+   * `replace` was given a put-back and this was not. A failed `mkdir` for the
+   * conflict path, a destination that refuses containment, or a disk that says
+   * no left the note at the parked name: one `isTemporary` hides from every
+   * listing, in a directory the staging reaper never reads, so `stranded` does
+   * not count it either. The next pass saw the path missing and the server
+   * saying deleted, agreed with it, and an unsent edit was gone from every
+   * surface with no error anywhere.
+   */
+  it("puts it back under its own name when it cannot be kept", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "doomed.md"), "the unsent edit\n");
+
+    // The conflict path cannot be made: a file sits where its folder must go.
+    await writeFile(join(dir, "notes"), "not a folder");
+
+    await expect(
+      v.removeExpecting(
+        "doomed.md",
+        expecting("a digest of something else entirely"),
+        "notes/doomed (kept).md",
+      ),
+    ).rejects.toThrow();
+
+    expect(
+      await readFile(join(dir, "doomed.md"), "utf8"),
+      "the note was left at a name no listing shows and no sweep counts",
+    ).toBe("the unsent edit\n");
+    expect((await readdir(dir)).filter((n) => !n.startsWith(".")).sort()).toEqual([
+      "doomed.md",
+      "notes",
+    ]);
+    // And the scan sees it, which is what the next pass decides from.
+    expect((await v.list()).map((e) => e.path)).toContain("doomed.md");
+  });
+
+  /**
    * The parked name is not a name. A crash between the move and the disposal
    * leaves the note wherever it was put, and if that is a name the scan lists,
    * this pass uploads it: a plain deletion turns into a conflict copy on every

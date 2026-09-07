@@ -338,8 +338,28 @@ export const DEVICE_ID_BYTES = 16;
  * the primary key refusing the second registration.
  */
 export function generateDeviceId(): string {
+  return withoutALeadingDash(DEVICE_ID_BYTES);
+}
+
+/**
+ * A fresh invite id, under the same rule and for the same reason.
+ *
+ * The rule above was written for device ids and applied only to them, so
+ * `basalt uninvite -Y-Ucn...` was refused with "no such option" for about one
+ * invite in sixty-four: an invite nobody could cancel except by waiting out
+ * its expiry. The rule belongs to every id this project hands somebody to type.
+ */
+export function generateInviteId(): Uint8Array {
   for (;;) {
-    const id = base64urlEncode(randomBytes(DEVICE_ID_BYTES));
+    const id = randomBytes(INVITE_ID_LENGTH);
+    if (!base64urlEncode(id).startsWith("-")) return id;
+  }
+}
+
+/** Random bytes whose base64url does not begin with `-`. */
+function withoutALeadingDash(bytes: number): string {
+  for (;;) {
+    const id = base64urlEncode(randomBytes(bytes));
     if (!id.startsWith("-")) return id;
   }
 }

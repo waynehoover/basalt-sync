@@ -58,7 +58,7 @@ import {
   type Schedule,
 } from "./crypto.ts";
 import {
-  INVITE_ID_LENGTH,
+  generateInviteId,
   INVITE_KEY_LENGTH,
   deviceCredential,
   formatInvite,
@@ -810,7 +810,10 @@ export class Client {
    * the day every device is gone.
    */
   async invite(ttlMs?: number): Promise<{ invite: string; expiresAt: number }> {
-    const id = randomBytes(INVITE_ID_LENGTH);
+    // Not `randomBytes` straight: an id whose base64url starts with `-` is a
+    // word the command line reads as an option, and `basalt uninvite` could
+    // not cancel one.
+    const id = generateInviteId();
     const key = randomBytes(INVITE_KEY_LENGTH);
     const sealed = await sealSecret(key, this.opts.dataKey);
     const expiresAt = await this.serial(() =>

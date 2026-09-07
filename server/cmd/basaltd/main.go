@@ -900,17 +900,33 @@ func cmdVerify(args []string, out io.Writer) error {
 	// that opens them and a "0 registry rows" on a shallow one would read as a
 	// registry that was looked at and found empty (rule 7).
 	if *deep {
-		fmt.Fprintf(out, "checked %d chunk references and %d registry rows, %d faults\n",
-			checked.Chunks, checked.Rows, len(checked.Faults))
+		fmt.Fprintf(out, "checked %d entries and %d chunk references and %d registry rows, %d faults\n",
+			checked.Entries, checked.Chunks, checked.Rows, len(checked.Faults))
 	} else {
-		fmt.Fprintf(out, "checked %d chunk references, %d faults\n",
-			checked.Chunks, len(checked.Faults))
+		fmt.Fprintf(out, "checked %d entries and %d chunk references, %d faults\n",
+			checked.Entries, checked.Chunks, len(checked.Faults))
 	}
 	for _, f := range checked.Faults {
 		fmt.Fprintln(out, " ", f)
 	}
 	if len(checked.Faults) > 0 {
 		return fmt.Errorf("%d entries and registry rows cannot be served", len(checked.Faults))
+	}
+	// Nothing checked is not a clean bill of health, and the exit code has to
+	// say so because that is what reads it.
+	//
+	// The line above already distinguished the two and the status did not, so
+	// `basaltd verify -deep -data DIR && rm -rf OLD` -- which is the retention
+	// step docs/server.md documents, and the natural way to write it -- passed
+	// over an empty store: a restore that copied the database before it was
+	// populated, a `VACUUM INTO` that produced a fresh file, a typo that
+	// `serve` created a store at. Rule 3 wants a *verified* copy before the
+	// last one goes, and this is the verification.
+	if checked.Entries == 0 {
+		return fmt.Errorf(
+			"%s holds no entries at all, so this verified nothing. That is a fault in "+
+				"anything that has ever been synced: check the path, and do not treat this "+
+				"as a copy worth keeping", *dataDir)
 	}
 	return nil
 }

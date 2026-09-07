@@ -13,18 +13,27 @@
  * holder next time round; B never looks again, because B had already succeeded.
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  // Only `link`, and only so a put-back can be made to fail for a reason of
+  // its own rather than because the name was taken.
+  return { ...actual, link: vi.fn(actual.link) };
+});
+
+import { link, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { STATE_DIR } from "./config.ts";
 import { lockPath, lockVault, midEvict, type LockHolder } from "./lock.ts";
 
 const vaults: string[] = [];
 afterEach(async () => {
+  vi.mocked(link).mockRestore?.();
   midEvict.pause = async () => {};
+  midEvict.beforeTake = async () => {};
   while (vaults.length) await rm(vaults.pop()!, { recursive: true, force: true });
 });
 
@@ -205,6 +214,72 @@ describe("two contenders for one dead lock", () => {
     expect(won.length, `${won.length} contenders were handed the same vault`).toBe(1);
     expect(await holderOf(dir), "somebody holds the vault and the file names nobody").toBeDefined();
     for (const r of out) if (r.status === "fulfilled") await r.value();
+  });
+
+  /**
+   * A put-back that fails is not a name that was taken.
+   *
+   * The eviction takes the lock file with a rename, and when what it took
+   * turns out to be somebody live it has to go back. `EEXIST` there means a
+   * contender published its own lock at the name, so the copy in hand is a
+   * duplicate. Every other failure means the name is still free and this is
+   * the only copy of a lock somebody is holding.
+   *
+   * One `catch` read both as the first, and the cleanup after it removed the
+   * file. The vault was then unlocked with a live holder still syncing, and
+   * the next contender was handed it with nothing said to either of them.
+   *
+   * Reaching the put-back at all needs the file this takes to be live, which
+   * means a whole eviction by somebody else has to finish between this call's
+   * read and its rename. `beforeTake` is that window.
+   */
+  it("does not throw away a live holder's lock when it cannot put it back", async () => {
+    const { dir } = await vaultWithDeadLock();
+
+    // A has read the dead holder and has not taken the file yet.
+    let resumeA: (() => void) | undefined;
+    const aIsWaiting = new Promise<void>((ready) => {
+      midEvict.beforeTake = async () => {
+        midEvict.beforeTake = async () => {};
+        ready();
+        await new Promise<void>((go) => {
+          resumeA = go;
+        });
+      };
+    });
+
+    const a = lockVault(dir, "A");
+    await aIsWaiting;
+    // B evicts the dead holder itself and takes the vault, so the file A is
+    // about to rename away is B's live lock and not the one A decided about.
+    const release = await lockVault(dir, "B");
+    expect((await holderOf(dir))?.command).toBe("B");
+
+    // And the put-back fails for a reason of its own. Keyed on the source,
+    // because `publish` links to the same destination and failing that would
+    // stop A before it ever reached the put-back.
+    const real = vi.mocked(link).getMockImplementation()!;
+    vi.mocked(link).mockImplementation(async (from, to) => {
+      if (String(from).includes("lock.taken.")) {
+        const err = new Error("ENOSPC: no space left on device, link") as NodeJS.ErrnoException;
+        err.code = "ENOSPC";
+        throw err;
+      }
+      return real(from, to);
+    });
+    resumeA!();
+
+    await expect(a, "A took a vault whose lock it had just failed to put back").rejects.toThrow(
+      /could not put back the lock/,
+    );
+    // And B's lock is still on the disk, under the name the error gave.
+    const left = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock.taken."));
+    expect(left, "the only copy of a lock somebody was holding was thrown away").toHaveLength(1);
+    expect(
+      (JSON.parse(await readFile(join(dir, STATE_DIR, left[0]!), "utf8")) as LockHolder).command,
+    ).toBe("B");
+    vi.mocked(link).mockImplementation(real);
+    await release();
   });
 
   /** And a completed eviction leaves nothing behind for the next one to trip on. */

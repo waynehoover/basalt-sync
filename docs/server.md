@@ -380,8 +380,9 @@ directory that is not the live one:
 
 1. Copy the offsite backup to a fresh directory:
    `rsync -a offsite:/backups/basalt/ /tmp/restore/`.
-2. Check it against itself: `basaltd verify -deep -data /tmp/restore`. It must
-   say `0 faults` over a non-zero number of references.
+2. Check it against itself: `basaltd verify -deep -data /tmp/restore`. It says
+   how many entries and chunk references it looked at, and it refuses a store
+   holding no entries rather than reporting nothing wrong with nothing.
 3. Compare its newest uid with the live server's: `basaltd stats -json` against
    both directories. The difference is what a real restore would lose, and it
    should be one night's work.
@@ -454,9 +455,10 @@ old directory goes, in this order:
 1. Take a backup into the fresh directory and read its `backup.json`. Its
    `purges` must equal the live store's and its `latestUid` must be at least
    the live store's newest uid.
-2. `basaltd verify -deep -data /srv/basalt-backup-new`, and it must say
-   `0 faults` over a non-zero number of chunk references and, on a vault
-   anybody has paired with, a non-zero number of registry rows.
+2. `basaltd verify -deep -data /srv/basalt-backup-new`. It exits non-zero on a
+   store with no entries in it, so `verify && rm -rf` is safe to write; on a
+   vault anybody has paired with, check the registry-row count is non-zero too,
+   which it does not enforce.
 3. Only then delete the old directory whole. A script deciding this compares
    the two `backup.json` files and never has to open a database.
 

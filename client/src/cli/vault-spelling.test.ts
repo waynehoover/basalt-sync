@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { JsonIndexStore, NodeVault } from "./vault.ts";
+import { JsonIndexStore, NodeVault, midRespell } from "./vault.ts";
 import { Client } from "../core/client.ts";
 import { testWrapped } from "../core/test-keys.ts";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
@@ -154,6 +154,64 @@ describe("a name the disk spells its own way", () => {
  * satisfies it; stopping four thousand other notes is not what it asks for,
  * and a vault that syncs nothing is the larger risk to the first rule.
  */
+/**
+ * A re-spelling that fails halfway must not make the note disappear.
+ *
+ * The scan links the normalised name to the same inode and then takes the old
+ * name away, and taking it away can fail. `finishNormalising` used to run
+ * after that, so a failure left `entry.disk` holding the old spelling while
+ * the old name was gone: `list` stat-ed a name that no longer existed and
+ * dropped the path. The note was on the disk under its correct name and
+ * missing from the scan, which the engine reads as a local deletion, and the
+ * next pass deleted it on the server and so on every other device.
+ *
+ * The file is at the normalised name the instant the link succeeds, so that is
+ * where the bookkeeping belongs. Whatever happens to the old name afterwards
+ * is two spellings of one note, which is what the alias report is for.
+ */
+describe("a re-spelling interrupted after the new name exists", () => {
+  it("still lists the note, under the name it now has", async () => {
+    await writeFile(join(root, ON_DISK), "the only copy\n");
+
+    // Retiring the old name throws, which is what a disk saying no looks like
+    // from here. The hook is after the file is already at its new name.
+    midRespell.parked = async () => {
+      midRespell.parked = async () => {};
+      throw new Error("the disk said no");
+    };
+    let listed: string[];
+    try {
+      listed = (await vault().list()).map((e) => e.path);
+    } finally {
+      midRespell.parked = async () => {};
+    }
+
+    expect(
+      listed,
+      `the note vanished from the scan, and the next pass would delete it everywhere. Listed: ${JSON.stringify(listed)}`,
+    ).toContain(NAME);
+    expect(await readFile(join(root, NAME), "utf8")).toBe("the only copy\n");
+  });
+
+  /** And the pair of spellings is reported rather than swallowed. */
+  it("says the note has two spellings", async () => {
+    await writeFile(join(root, ON_DISK), "the only copy\n");
+
+    midRespell.parked = async () => {
+      midRespell.parked = async () => {};
+      throw new Error("the disk said no");
+    };
+    const v = vault();
+    try {
+      await v.list();
+    } finally {
+      midRespell.parked = async () => {};
+    }
+
+    expect(v.ambiguous().map((a) => a.path)).toContain(NAME);
+  });
+});
+
 describe("a vault holding both spellings", () => {
   it("names the pair rather than refusing the whole vault", async () => {
     await writeFile(join(root, ON_DISK), "one");

@@ -746,6 +746,7 @@ export class NodeVault implements Vault {
       if (source.isDirectory()) {
         if (!(await sameFileAt())) return;
         await rename(from, to);
+        this.finishNormalising(path, entry, dir);
       } else {
         try {
           await link(from, to);
@@ -766,14 +767,36 @@ export class NodeVault implements Vault {
         // normalised name still points at the old inode. The review
         // reproduced exactly that.
         //
+        // Recorded here, before the old name is dealt with, because the file
+        // is already at `to` and the listing has to say so whatever happens
+        // next.
+        //
+        // It used to be recorded after. Retiring the old name can throw, and
+        // then `entry.disk` still held the old spelling, the old name was
+        // gone, and `list` stat-ed a name that no longer existed and dropped
+        // the path. A note sitting on the disk under its correct name was
+        // therefore missing from the scan, the engine read that as a local
+        // deletion, and it deleted the note on the server and so on every
+        // other device. The most expensive way this file can be wrong.
+        const wasSpelled = entry.disk;
+        this.finishNormalising(path, entry, dir);
         // So the old name is moved rather than removed. `rename` is atomic:
         // whatever is at `from` at that instant comes out in one piece, and
         // then it can be looked at. Our own inode is debris and is dropped.
         // Anything else is a file somebody saved in the last microsecond, and
         // it goes back where it came from.
-        await this.retireOldSpelling(from, source);
+        try {
+          await this.retireOldSpelling(from, source);
+        } catch (err) {
+          // The file is at its normalised name and the old name may still be
+          // there too, which is two spellings of one note and exactly what the
+          // alias report is for. A version `retireName` could not place is in
+          // staging under `preserved.`, which the next scan counts into
+          // `stranded` and `status` prints, so it is not lost with the throw.
+          void err;
+          this.ambiguousPaths.push({ path, spellings: [entry.name, wasSpelled] });
+        }
       }
-      this.finishNormalising(path, entry, dir);
     } catch {
       // Kept under the spelling the disk has, which is what the map is for.
       // A destination that appeared since the listing lands here too, and
@@ -1483,23 +1506,44 @@ export class NodeVault implements Vault {
     this.unflushed.add(dirname(full));
     await midTrash.parked(aside);
 
-    const digest = await digestOf(aside).catch(() => undefined);
-    if (digest !== undefined && digest === expect.contentId) {
-      // The version the pass decided to delete. It goes where a deletion goes,
-      // which is the trash, under the name it had.
-      await this.intoTrash(path, aside);
-      return { landed: true };
+    // Everything from here can fail, and the note is off its own name until
+    // one of these branches puts it somewhere.
+    //
+    // It used to be unguarded. `replace` was given a put-back and this was
+    // not, so a failed `mkdir`, an `insideForReal` that refused, or a disk
+    // that said no left the note at `aside`: a name `isTemporary` hides from
+    // every listing, in a directory the staging reaper never reads, which
+    // `stranded` therefore never counts. The next pass saw the path missing
+    // and the server saying deleted, agreed, and the unsent edit was gone from
+    // every surface with no error anywhere.
+    try {
+      const digest = await digestOf(aside).catch(() => undefined);
+      if (digest !== undefined && digest === expect.contentId) {
+        // The version the pass decided to delete. It goes where a deletion
+        // goes, which is the trash, under the name it had.
+        await this.intoTrash(path, aside);
+        return { landed: true };
+      }
+      // Something else, so it is not deleted at all. It comes back out under a
+      // name a person will find, and the engine says so.
+      const kept = await this.absolute(keepAt);
+      await this.insideForReal(kept);
+      const had = await this.deepestExisting(kept);
+      await mkdir(dirname(kept), { recursive: true });
+      await rename(aside, kept);
+      this.dirty(kept, had);
+      this.unflushed.add(dirname(kept));
+      return { keptAt: keepAt, landed: true };
+    } catch (err) {
+      // Back under its own name, which is where a caller that sees a failure
+      // should find it. `putBack` refuses an occupied name, so a file that
+      // arrived while this was deciding keeps it.
+      if (await this.putBack(aside, full)) throw err;
+      throw new Error(
+        `${path} was taken off its name to be identified and could not be put back ` +
+          `(${(err as Error).message}); it is at ${relative(this.root, aside)}`,
+      );
     }
-    // Something else, so it is not deleted at all. It comes back out under a
-    // name a person will find, and the engine says so.
-    const kept = await this.absolute(keepAt);
-    await this.insideForReal(kept);
-    const had = await this.deepestExisting(kept);
-    await mkdir(dirname(kept), { recursive: true });
-    await rename(aside, kept);
-    this.dirty(kept, had);
-    this.unflushed.add(dirname(kept));
-    return { keptAt: keepAt, landed: true };
   }
 
   /**

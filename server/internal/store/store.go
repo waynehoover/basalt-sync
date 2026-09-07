@@ -1668,6 +1668,13 @@ type Verification struct {
 	Faults []Fault
 	// Chunks is chunk references checked, repeats included.
 	Chunks int
+	// Entries is live entries walked, folders and deletions included.
+	//
+	// The measure of whether anything was looked at, which `Chunks` is not: a
+	// vault of nothing but folders has no chunk references and is perfectly
+	// healthy. Without this, an empty store and a whole one that came back
+	// clean are the same two numbers.
+	Entries int
 	// Rows is device and invite rows decoded, and zero unless deep, because a
 	// shallow pass does not look at them and must not report that it did.
 	Rows int
@@ -1725,8 +1732,9 @@ func (s *Store) Verify(deep bool) (Verification, error) {
 		return v, err
 	}
 
-	entryFaults, err := s.verifyEntries()
+	entryFaults, entries, err := s.verifyEntries()
 	v.Faults = append(v.Faults, entryFaults...)
+	v.Entries = entries
 	if err != nil || !deep {
 		return v, err
 	}
@@ -1895,19 +1903,19 @@ func (s *Store) verifyRegistry() ([]Fault, int, error) {
 // Both directions are checked, because the invariant is a biconditional and the
 // opposite fault, chunks attached to something that should have none, means a
 // folder or a deletion carrying content nobody will ever read.
-func (s *Store) verifyEntries() ([]Fault, error) {
+func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 	rows, err := s.db.Query(
 		`SELECT e.vault_id, e.uid, e.path, e.size, e.folder, e.deleted, e.mac, e.parent,
 		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid)
 		   FROM entries e
 		  ORDER BY e.vault_id, e.uid`)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
 
-	var faults []Fault
 	for rows.Next() {
+		entries++
 		var f Fault
 		var size int64
 		var folder, deleted bool
@@ -1915,7 +1923,7 @@ func (s *Store) verifyEntries() ([]Fault, error) {
 		var chunkCount int
 		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted,
 			&mac, &parent, &chunkCount); err != nil {
-			return faults, err
+			return faults, entries, err
 		}
 		// The authenticator's shape, on every kind (F20). `Validate` used to
 		// skip it for a folder and a deletion, so a store can already hold
@@ -1950,7 +1958,7 @@ func (s *Store) verifyEntries() ([]Fault, error) {
 			faults = append(faults, f)
 		}
 	}
-	return faults, rows.Err()
+	return faults, entries, rows.Err()
 }
 
 /* ---------------------------------------------------------------- */

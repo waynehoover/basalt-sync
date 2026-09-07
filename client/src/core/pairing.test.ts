@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { SECRET_LENGTH, base64urlDecode, base64urlEncode, generateSecret } from "./crypto.ts";
 import {
+  INVITE_ID_LENGTH,
   INVITE_PREFIX,
   NoCredential,
   PAIRING_PREFIX,
@@ -10,6 +11,8 @@ import {
   encodeConfig,
   formatInvite,
   formatPairing,
+  generateDeviceId,
+  generateInviteId,
   isInvite,
   normaliseUrl,
   parseInvite,
@@ -476,5 +479,46 @@ describe("a config that cannot connect", () => {
     const old = decodeConfig({ ...stored, bootstrap: "TOKEN", wrapped: "WRAP" }, "test");
     expect("bootstrap" in old).toBe(false);
     expect("wrapped" in old).toBe(false);
+  });
+});
+
+/**
+ * No id this project mints begins with `-`.
+ *
+ * Base64url's alphabet includes it, and a word beginning with one is a word a
+ * command line reads as an option. The rule was written for device ids and
+ * applied only to them, so `basalt uninvite -Y-Ucn...` was refused with "no
+ * such option" for about one invite in sixty-four: an invite nobody could
+ * cancel except by waiting out its expiry, found by a test that flaked rather
+ * than by anything asserting it.
+ *
+ * Five thousand of each, because "never" over a random generator is not a
+ * thing one sample can show. Without the rule this fails with certainty for
+ * every practical purpose; with it, it cannot fail at all.
+ */
+describe("ids somebody has to type", () => {
+  const many = 5000;
+
+  it("never mints a device id that a shell reads as an option", () => {
+    const bad: string[] = [];
+    for (let n = 0; n < many; n++) {
+      const id = generateDeviceId();
+      if (id.startsWith("-")) bad.push(id);
+    }
+    expect(bad, `${bad.length} of ${many} device ids began with a dash`).toEqual([]);
+  });
+
+  it("never mints an invite id that a shell reads as an option", () => {
+    const bad: string[] = [];
+    for (let n = 0; n < many; n++) {
+      const id = base64urlEncode(generateInviteId());
+      if (id.startsWith("-")) bad.push(id);
+    }
+    expect(bad, `${bad.length} of ${many} invite ids began with a dash`).toEqual([]);
+  });
+
+  /** And the length is unchanged: the rule costs a retry, not a byte. */
+  it("keeps the invite id the length the wire format requires", () => {
+    expect(generateInviteId()).toHaveLength(INVITE_ID_LENGTH);
   });
 });

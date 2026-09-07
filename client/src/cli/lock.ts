@@ -179,7 +179,19 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
  *
  * Like `midPublish`, it does nothing in every build.
  */
-export const midEvict = { pause: async (): Promise<void> => {} };
+export const midEvict = {
+  pause: async (): Promise<void> => {},
+  /**
+   * The instant after this call has read the lock and before it takes the file.
+   *
+   * The other window, and the one that decides which branch the eviction takes:
+   * a contender completing its own eviction here means the file this is about
+   * to take belongs to somebody live, which is the only way to reach the
+   * put-back. Without a hook there, a test can only ever drive the ordinary
+   * branch and the put-back's failures go unexercised.
+   */
+  beforeTake: async (): Promise<void> => {},
+};
 
 /**
  * Takes a dead holder's lock away, and cannot take a live one (R03, R34).
@@ -214,6 +226,12 @@ export const midEvict = { pause: async (): Promise<void> => {} };
  * `lock.taken.<token>`, so the vault reads as free: the safe direction, and
  * the same debris `publish` already leaves. A hard zero needs `flock`, which
  * Node does not offer portably (docs/compared.md).
+ *
+ * A third thing is *not* left, and used to be: a put-back that failed for a
+ * reason of its own. Every failure read as "somebody took the name", and the
+ * cleanup then removed the only copy of a live holder's lock, so the vault
+ * went unlocked while that holder was still syncing and the next contender
+ * took it. Those two answers are now told apart.
  */
 async function evicting(
   dir: string,
@@ -222,6 +240,7 @@ async function evicting(
   remove: (at: LockState) => boolean,
 ): Promise<void> {
   const taken = join(dir, `lock.taken.${mine.token}`);
+  await midEvict.beforeTake();
   try {
     await rename(path, taken);
   } catch {
@@ -241,14 +260,33 @@ async function evicting(
   }
   // Somebody live, which means this call's earlier read was stale. It goes
   // back exactly as it was.
-  try {
-    await link(taken, path);
-  } catch {
-    // The name is occupied, so a contender has already published its own lock
-    // there. Theirs is the current one and this copy is not put back over it.
-  } finally {
-    await rm(taken, { force: true });
+  //
+  // Every reason the put-back can fail is not the same reason, and reading
+  // them as one was a way to hand the vault to two owners. `EEXIST` means a
+  // contender has published its own lock at the name, so this copy is a
+  // duplicate and goes. Anything else -- a full disk, a quota, a descriptor
+  // limit, an I/O error -- means the name is still *free* and this is the only
+  // copy of a lock somebody is holding. Dropping it there left the vault
+  // unlocked with a live holder still syncing, and the next contender took it.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await link(taken, path);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") break;
+      if (attempt >= 4) {
+        // Out of tries, and the file is not this call's to throw away. It
+        // stays where it is, under a name that says what it is, and the error
+        // names it: a lock nobody can find is a vault nobody can take.
+        throw new Error(
+          `could not put back the lock at ${path} after reading it (${(err as Error).message}); ` +
+            `the holder's lock file is at ${taken} and must be moved back or removed by hand`,
+        );
+      }
+      await pause(5 * (attempt + 1));
+    }
   }
+  await rm(taken, { force: true });
 }
 
 /**

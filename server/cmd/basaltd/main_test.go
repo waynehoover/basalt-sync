@@ -91,6 +91,31 @@ func seeded(t *testing.T) string {
 	return dir
 }
 
+// appendOne adds one more version to an existing store, so a backup taken
+// before it is legitimately behind.
+func appendOne(t *testing.T, dir, path, body string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() {
+		if err := st.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}()
+	name := chunks.Name([]byte(body))
+	if err := st.Chunks().Put("default", name, []byte(body)); err != nil {
+		t.Fatalf("put chunk: %v", err)
+	}
+	if _, err := st.AppendEntry("default", store.Entry{
+		Path: path, Size: int64(len(body)), MTime: 30, Device: "seed",
+		Chunks: []string{name}, Mac: testMac,
+	}); err != nil {
+		t.Fatalf("append %s: %v", path, err)
+	}
+}
+
 // basalt runs a command and returns what it printed.
 func basalt(t *testing.T, args ...string) (string, error) {
 	t.Helper()
@@ -1823,4 +1848,72 @@ func TestARefusedBackupCheckDoesNotKeepTheLock(t *testing.T) {
 		t.Fatalf("a refused check left the directory locked: %v", err)
 	}
 	lock.Release()
+}
+
+// And the same for a refusal that happens *after* the lock has been taken.
+//
+// The test above proves less than it reads: an empty directory is turned away
+// by the `basalt.db` stat, which is several steps before `dirlock.Shared`, so
+// the error-path release the R23 fix added is never reached. Removing that
+// release entirely left the whole suite green. This one refuses on a check
+// that only happens once the backup is open, which is the branch in question.
+func TestABackupRefusedAfterItIsLockedIsStillReleased(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+
+	// One more version in the source than the backup holds, which `purge`
+	// refuses only after opening and reading the backup under its lock.
+	appendOne(t, dir, "later.md", "written after the backup")
+
+	if _, err := basalt(t, "purge", "-data", dir, "-vault", "default",
+		"-confirm", "default", "-backup", dest); err == nil {
+		t.Fatal("purge accepted a backup that is behind the store")
+	}
+	lock, err := dirlock.Exclusive(dest, dirlock.Data, "afterwards")
+	if err != nil {
+		t.Fatalf("a check that refused after taking the lock kept it: %v", err)
+	}
+	lock.Release()
+}
+
+// `verify` reporting no faults over nothing at all is not a clean bill of
+// health, and the exit code is what a retention script reads.
+//
+// The printed line already told the two apart and the status did not, so
+// `basaltd verify -deep -data DIR && rm -rf OLD` -- the step docs/server.md
+// documents, written the natural way -- passed over an empty store and deleted
+// the last copy of the history a purge had just dropped.
+func TestVerifyRefusesAStoreItCheckedNothingIn(t *testing.T) {
+	// A store that exists and holds nothing, which is what a restore that
+	// copied the database before it was populated leaves behind, and what a
+	// path typo produces the first time anything opens it.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.EnsureVault("default", 1); err != nil {
+		t.Fatalf("ensure vault: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	out, verifyErr := basalt(t, "verify", "-deep", "-data", dir)
+	if verifyErr == nil {
+		t.Fatalf("verify passed a store it checked nothing in:\n%s", out)
+	}
+	if !strings.Contains(out, "checked 0 entries") {
+		t.Errorf("the count of what was checked is not in the output:\n%s", out)
+	}
+}
+
+// And it still passes a store that holds something.
+func TestVerifyPassesAStoreWithEntriesInIt(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "verify", "-deep", "-data", dir)
+	if strings.Contains(out, "checked 0 entries") {
+		t.Fatalf("a seeded store reported no entries:\n%s", out)
+	}
 }
