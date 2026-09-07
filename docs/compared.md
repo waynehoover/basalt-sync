@@ -323,11 +323,11 @@ one static binary. **github.com/coder/websocket**.
 
 Basalt is MIT, like LiveSync and like Obsidian's own plugin API declarations.
 
-## Locking, and why this does not use `flock`
+## Locking, and the five ways of getting it wrong first
 
-The CLI's vault lock is a file with a holder written into it, taken by `link`.
-It is never taken over automatically. A lock left behind by a crash stays there
-until somebody runs `basalt unlock`.
+The CLI's vault lock is the operating system's, and the file beside it only
+says who. A crashed basalt releases the vault by dying, and the next one takes
+it.
 
 That is not where this started. Every hard part of a lock file is staleness: it
 outlives the process that made it, so somebody has to decide when it is safe to
@@ -360,34 +360,49 @@ contender that read the same corpse. Nothing in POSIX offers a
 compare-and-swap on a file to close that. Every one of the five attempts is a
 different arrangement of the same missing primitive.
 
-The standard answer is `flock(2)`, where the kernel does the whole decision
-atomically and releases the lock when the process dies: no staleness, no
-takeover, no protocol to get wrong. It is not available here. Node has no
-binding for it; `fs-ext` provides one and is a native module, which would mean
-a build step and a per-platform binary for a package whose whole shape is
-"install it and run it"; the packed CLI runs under stock node; and the Obsidian
-plugin could not load a native addon even if one were acceptable.
+The standard answer is a lock the kernel releases when the process dies: no
+staleness, no takeover, no protocol to get wrong. Every one of the five
+attempts above was trying to synthesise that out of a file, and none of them
+could, because "the holder is dead, so I may have it" is a conclusion and
+acting on a conclusion is two steps.
+
+It was believed unavailable, and that belief is what produced them. `flock(2)`
+has no binding in Node; `fs-ext` provides one and is a native module, which
+would mean a build step and a per-platform binary for a package whose whole
+shape is "install it and run it"; the packed CLI runs under stock node.
 `proper-lockfile` is the pure-JS convention and uses a directory plus an mtime
 heartbeat, which is the same staleness problem in a different arrangement and
 would not have prevented R03.
 
-So the cost is paid where it can be seen. A crashed sync wedges a cron job
-until somebody runs one command, and the refusal says exactly that, naming the
-process and what to type. The alternative was a mechanism nobody could
-demonstrate the correctness of, standing between two writers and the rule this
-project exists for.
+All true, and the conclusion drawn from it was wrong. Both supported platforms
+already hand out a kernel-released exclusion from stock Node, and neither is
+`flock` by that name:
 
-This paragraph used to end by saying it should be replaced "the day Node grows
-a portable file lock". That was wrong, and measuring it is what showed so. Both
-supported CLI platforms already offer a kernel-released exclusion from stock
-Node: `O_EXLOCK` on macOS, passed as the raw flag `0x20` because Node does not
-name it, and an abstract Unix socket on Linux, which has no filesystem entry to
-go stale. Both refuse a second holder and both are released by the kernel when
-the holder is `SIGKILL`ed, which is the property every one of the five attempts
-was trying to synthesise. Neither is a native addon and neither needs a build
-step. `IMPROVEMENTS.md` I27 has the evidence, the two mechanisms being a
-liability of their own, and the part that no local lock covers: a holder on
-another machine.
+- **macOS**: `open()` with `O_EXLOCK`, which takes a `flock`-style lock as part
+  of the open. Node does not put the flag in `fs.constants`, so it is spelled
+  as the number `<sys/fcntl.h>` gives it. A second open refuses with `EAGAIN`.
+- **Linux**: an abstract Unix socket. Its name lives in a kernel namespace
+  rather than on a filesystem, so a killed holder leaves nothing behind to be
+  mistaken for a live one. A second bind refuses with `EADDRINUSE`.
+
+Both were probed with a `SIGKILL`ed holder before anything was built on them,
+and `scripts/kernel-lock.test.ts` kills one on every run of the gate, on Linux
+in CI as well, because a property proven on one of two unrelated mechanisms is
+proven for one of them.
+
+So the lock file is a *record* now rather than a claim: holding the kernel's
+exclusion establishes that no other basalt on this machine is inside the vault,
+which makes whatever the file says either this vault's own debris or a holder
+on another machine. Neither needs a liveness guess, and the whole class of
+defect above has nothing left to attach to. Two things remain deliberately
+unchanged: a holder on another machine is still believed, because a kernel
+answers for one machine; and where the mechanism does not prove itself, which a
+network mount is the likely case of, everything falls back to the file and to
+`basalt unlock`, and says so on stderr rather than quietly.
+
+The cost that is left is paid where it can be seen: on a filesystem where the
+exclusion does not hold, a crashed sync wedges a cron job until somebody runs
+one command, and both the warning and the refusal say exactly that.
 
 `basalt unlock` had two windows of its own, and both are closed rather than
 reported.

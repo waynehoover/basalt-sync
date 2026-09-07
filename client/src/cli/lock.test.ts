@@ -23,12 +23,14 @@
 import { mkdtemp, readFile, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 
 import { STATE_DIR } from "./config.ts";
-import { alive, lockPath, lockVault, midPublish } from "./lock.ts";
+import { forgetProven, pretendThereIsNone } from "./exclusion.ts";
+import { alive, currentHolder, lockPath, lockVault, midPublish } from "./lock.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -106,6 +108,175 @@ describe("taking the vault lock", () => {
     sampling = false;
     await sampler;
     expect(empty, `the lock was readable with no holder in it: ${empty.join(", ")}`).toEqual([]);
+  });
+
+  it("refuses while a holder on this host is alive, and frees on release", async () => {
+    const dir = await vault();
+    const release = await lockVault(dir, "sync --watch");
+    await expect(lockVault(dir, "sync")).rejects.toThrow(/another basalt is using this vault/);
+    await release();
+    // And it is free again afterwards.
+    await (
+      await lockVault(dir, "sync")
+    )();
+  });
+});
+
+/**
+ * What I27 is for: a crashed basalt does not wedge the next one.
+ *
+ * Every one of the five failed takeover attempts was trying to synthesise this
+ * property out of a file, and could not, because "the holder is dead" is a
+ * conclusion and acting on a conclusion is two steps. The kernel does it in
+ * one: the exclusion goes away when the process does.
+ */
+describe("recovering from a basalt that died", () => {
+  it("takes a vault whose holder is gone, with nobody typing anything", async () => {
+    const dir = await vault();
+    await staleLock(dir);
+
+    // No `basalt unlock`. This is the whole change.
+    const release = await lockVault(dir, "after the crash");
+    expect(await currentHolder(dir)).toMatchObject({ pid: process.pid });
+    await release();
+  });
+
+  it("still hands it to exactly one of many contenders", async () => {
+    const dir = await vault();
+    await staleLock(dir);
+    const results = await Promise.allSettled(
+      Array.from({ length: 12 }, (_, i) => lockVault(dir, `after the crash ${i}`)),
+    );
+    const winners = results.filter((r) => r.status === "fulfilled");
+    expect(
+      winners.length,
+      `${winners.length} contenders took over the same dead holder's lock`,
+    ).toBe(1);
+    for (const w of winners) await (w as PromiseFulfilledResult<() => Promise<void>>).value();
+  });
+
+  it("clears debris that names nobody, rather than refusing for ever", async () => {
+    // Holding the kernel's exclusion establishes that no local basalt is
+    // inside, so a file that cannot be read is not a holder: it is litter.
+    // Without the exclusion this has to refuse, because it cannot know.
+    const dir = await vault();
+    await mkdir(join(dir, STATE_DIR), { recursive: true });
+    await writeFile(lockPath(dir), "this is not a holder");
+    const release = await lockVault(dir, "sync");
+    expect(await currentHolder(dir)).toMatchObject({ pid: process.pid });
+    await release();
+  });
+
+  it("does not take one a live process is holding", async () => {
+    const dir = await vault();
+    const release = await lockVault(dir, "sync --watch");
+    await expect(lockVault(dir, "sync")).rejects.toThrow(/another basalt is using this vault/);
+    await release();
+    await (
+      await lockVault(dir, "sync")
+    )();
+  });
+
+  it("still believes a holder on another machine", async () => {
+    // A kernel answers for one machine. A vault on a disk two machines can
+    // reach is outside all of this, and the file is what still answers it.
+    const dir = await vault();
+    await mkdir(join(dir, STATE_DIR), { recursive: true });
+    await writeFile(
+      lockPath(dir),
+      JSON.stringify({
+        pid: process.pid,
+        host: `not-${hostname()}`,
+        command: "sync --watch",
+        since: Date.now(),
+        token: "theirs",
+      }),
+    );
+    await expect(lockVault(dir, "sync")).rejects.toThrow(/different machine/);
+    await expect(lockVault(dir, "sync")).rejects.toThrow(/--force/);
+  });
+
+  it("refuses rather than proceeding when the exclusion disagrees with the file", async () => {
+    // The one failure that would matter: a mechanism that reports success
+    // without excluding. Everything above treats holding it as proof that no
+    // other local process is inside, so a live local pid in the file is a
+    // contradiction, and this believes neither side and stops. Simulated by
+    // writing a live pid that is not ours into a vault nothing holds.
+    const dir = await vault();
+    await mkdir(join(dir, STATE_DIR), { recursive: true });
+    const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], {
+      stdio: "ignore",
+    });
+    try {
+      await writeFile(
+        lockPath(dir),
+        JSON.stringify({
+          pid: child.pid,
+          host: hostname(),
+          command: "sync --watch",
+          since: Date.now(),
+          token: "theirs",
+        }),
+      );
+      await expect(lockVault(dir, "sync")).rejects.toThrow(/still running/);
+      await expect(lockVault(dir, "sync")).rejects.toThrow(/wrong with locking/);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+});
+
+describe("releasing the vault lock", () => {
+  it("removes only its own, not whatever is at the path", async () => {
+    // A lock that is not this release's to remove. Matching on pid and host
+    // let a release take one, because the operating system reuses pids, so
+    // the token is what "still ours" means.
+    const dir = await vault();
+    const release = await lockVault(dir, "sync");
+    const theirs = JSON.stringify({
+      pid: process.pid,
+      host: (await import("node:os")).hostname(),
+      command: "somebody else",
+      since: Date.now(),
+      token: "not our token",
+    });
+    await writeFile(lockPath(dir), theirs);
+
+    await release();
+
+    const after = await readFile(lockPath(dir), "utf8");
+    expect(after, "the release removed a lock that was not its own").toBe(theirs);
+  });
+
+  it("leaves nothing behind when it is its own", async () => {
+    const dir = await vault();
+    const release = await lockVault(dir, "sync");
+    await release();
+    await expect(readFile(lockPath(dir), "utf8")).rejects.toThrow(/ENOENT/);
+  });
+});
+
+/**
+ * The same lock with no kernel exclusion to be had.
+ *
+ * This is what runs on a platform without a mechanism, and on a filesystem
+ * where the mechanism does not actually hold -- a network mount being the case
+ * that matters, since that is where `O_EXLOCK` is most likely to be ignored.
+ * It is the whole of the pre-I27 protocol and it is not dead code, so it is
+ * tested as its own contract rather than left to be exercised by accident.
+ *
+ * What differs is the recovery, and only the recovery. A holder that died
+ * still holds the vault as far as this path can tell, because telling would
+ * mean guessing, and `basalt unlock` is the way out.
+ */
+describe("the vault lock with no kernel exclusion", () => {
+  beforeEach(() => {
+    pretendThereIsNone.on = true;
+    forgetProven();
+  });
+  afterEach(() => {
+    pretendThereIsNone.on = false;
+    forgetProven();
   });
 
   it("does not hand the lock to a competitor that arrives mid-acquisition", async () => {
@@ -199,46 +370,5 @@ describe("taking the vault lock", () => {
     // Absent and unreadable are different states (rule 2). Taking the vault
     // here would mean writing over whatever that is.
     await expect(lockVault(dir, "sync")).rejects.toThrow(/does not name a holder/);
-  });
-
-  it("refuses while a holder on this host is alive, and frees on release", async () => {
-    const dir = await vault();
-    const release = await lockVault(dir, "sync --watch");
-    await expect(lockVault(dir, "sync")).rejects.toThrow(/another basalt is using this vault/);
-    await release();
-    // And it is free again afterwards.
-    await (
-      await lockVault(dir, "sync")
-    )();
-  });
-});
-
-describe("releasing the vault lock", () => {
-  it("removes only its own, not whatever is at the path", async () => {
-    // A lock that is not this release's to remove. Matching on pid and host
-    // let a release take one, because the operating system reuses pids, so
-    // the token is what "still ours" means.
-    const dir = await vault();
-    const release = await lockVault(dir, "sync");
-    const theirs = JSON.stringify({
-      pid: process.pid,
-      host: (await import("node:os")).hostname(),
-      command: "somebody else",
-      since: Date.now(),
-      token: "not our token",
-    });
-    await writeFile(lockPath(dir), theirs);
-
-    await release();
-
-    const after = await readFile(lockPath(dir), "utf8");
-    expect(after, "the release removed a lock that was not its own").toBe(theirs);
-  });
-
-  it("leaves nothing behind when it is its own", async () => {
-    const dir = await vault();
-    const release = await lockVault(dir, "sync");
-    await release();
-    await expect(readFile(lockPath(dir), "utf8")).rejects.toThrow(/ENOENT/);
   });
 });

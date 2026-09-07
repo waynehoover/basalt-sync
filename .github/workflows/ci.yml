@@ -480,6 +480,28 @@ jobs:
         working-directory: client
         run: bun run stress
 
+  # The kernel exclusion, on Linux, which is the mechanism a developer's Mac
+  # never runs. macOS takes a `flock` at `open` and Linux binds an abstract
+  # socket, so `scripts/check.sh` passing on a Mac says nothing whatever about
+  # this one (I27). The property is that the kernel gives the lock back when a
+  # basalt dies, and it is checked by killing one.
+  kernel-lock:
+    name: the kernel lock on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.1
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: the kernel gives the lock back when a basalt dies
+        working-directory: client
+        run: bun run ../scripts/kernel-lock.test.ts
+
   docker:
     name: docker
     runs-on: ubuntu-latest

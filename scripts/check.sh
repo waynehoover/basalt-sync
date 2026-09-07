@@ -110,6 +110,17 @@ fi
 only_in_ci "a filesystem of its own, mounted" \
   "it needs a loopback mount, and this script does not ask for root"
 
+# ---- the kernel exclusion --------------------------------------------------
+#
+# Whether the operating system really takes the lock away when a basalt dies,
+# which is what stops a crashed sync wedging the next one (I27). A unit test
+# cannot establish it -- a process still running to make an assertion has not
+# died -- so this spawns a holder and kills it. macOS and Linux use entirely
+# different mechanisms, so this passing here says nothing about the other one,
+# which is why CI runs it too.
+run "the kernel gives the lock back when a basalt dies" client \
+  bun run "$root/scripts/kernel-lock.test.ts"
+
 # ---- the compose pin -------------------------------------------------------
 run "the pinned image is not behind the newest server release" "" \
   bash "$root/scripts/pin-check.sh"

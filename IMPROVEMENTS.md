@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done. **I25, I26 and I27 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done, as is I27. **I25 and I26 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -14,7 +14,7 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
 | Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I26                  |
-| Open, wanted                 | A product requirement rather than an optimisation: recover from a crash without a person.                | I27                       |
+
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
 
@@ -179,7 +179,7 @@ throughput is shown to matter to somebody.
 
 ### I27 — Recover from a crashed CLI without anybody typing a command
 
-- [ ] **Medium; two small platform paths, and a hybrid to be careful of.** Take an exclusion the kernel releases when the process exits, so there is no staleness to detect. Do **not** revive the claim protocol.
+- [x] **Done.** Two small platform paths, one protocol above them, and the claim protocol was not revived.
 
 `basalt unlock` exists because automatic stale-lock takeover was wrong five
 times (R03, R20, R34, R40, R44/R49), and it is a conservative fallback rather
@@ -224,10 +224,55 @@ What to be careful of, because this is not a drop-in:
   clearing a lock file nothing holds. What it stops being is the thing standing
   between a crashed cron job and the next run.
 
-Keep manual unlock until this is implemented **and** verified on both
-platforms, including the killed-holder case in CI rather than only on a
-developer's Mac. The plugin needs none of it: Obsidian is one process per
-vault, and neither mechanism exists on mobile.
+**Done, and here is what it cost.** `cli/exclusion.ts` is the two mechanisms
+behind one interface; `cli/lock.ts` is one protocol above them. Holding the
+exclusion establishes that no other basalt on this machine is inside the vault,
+so the lock file became a record rather than a claim and the staleness question
+has nothing left to attach to.
+
+Everything the item warned about was real:
+
+- The self-test named its probe after the pid, so two acquisitions in one
+  process probed the same name at once, the second concluded the filesystem
+  does not lock, both fell back to the file, and two callers came back holding
+  one vault. The check for the defect reintroduced the defect. Fixed with a
+  random probe name and one cached answer per state folder.
+- Locking the holder file itself leaves it briefly empty, because `O_CREAT`
+  creates before anything is written -- a window this module had already been
+  wrong in once. The kernel's file is `lock.excl` and nothing ever reads it.
+- The lock's lifetime was tied to a JS object being reachable. A `FileHandle`
+  is closed by a finalizer, so an exclusion whose only reference was a closure
+  the caller discarded could be *collected*, dropping the lock while the holder
+  still ran. Bun's own warning found it. Live exclusions are now held in a
+  module-level set.
+- A live local pid in a file this process holds the exclusion for is a
+  contradiction, and the code refuses rather than believing either side. That
+  is the backstop for an exclusion that reports success without excluding.
+
+A code review afterwards found a fifth, of the same family as the first: the
+comment said the Linux socket was named from the vault's *resolved* path and
+the code used whatever string the caller passed. A symlink to a vault, and the
+same path with a trailing slash, each got their own name and each admitted a
+second writer. macOS was immune because a `flock` is on an inode, so this was a
+fix present on one adapter and absent on the other. Two smaller things came
+with it: two places releasing one exclusion, and a staging copy left behind on
+a failed publish in a directory nothing sweeps.
+
+A fourth thing came out of testing the third. The garbage-collection defect is
+not reproducible by waiting, so the check forces a collection, and until it did
+the guard against it was passing for no reason -- an untested guard, which is
+the shape this project keeps finding. It fails now if the strong reference goes
+away.
+
+Verified rather than assumed: `scripts/kernel-lock.test.ts` spawns a holder,
+kills it with `SIGKILL`, and checks the next basalt takes the vault with
+nothing typed. It runs in `scripts/check.sh` on macOS and in a CI job on Linux,
+because the two mechanisms are unrelated and one passing says nothing about the
+other. The plugin needs none of it: Obsidian is one process per vault, and
+neither mechanism exists on mobile.
+
+What stayed manual, deliberately: a holder on another machine, which no kernel
+can see, and any filesystem where the self-test fails.
 
 #### The alternative: a tiny Rust core behind napi-rs
 

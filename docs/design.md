@@ -205,11 +205,12 @@ being untried:**
   Obsidian is one process per vault. Editing on several devices at once is a
   different thing and is the whole point.
 
-**The headless client is experimental**, and the reason is above: its lock is
-the only part of this project that had to be attempted five times, and the
-sixth answer was to stop deciding. It is a mirror for a machine with no
-Obsidian. Treating it as a general-purpose writable client over arbitrary
-editors and filesystem layouts is a wider promise than has been tested.
+**The headless client is experimental**, and the reason is no longer its lock.
+That was the reason, because exclusion had to be attempted five times; it is
+the operating system's job now and is verified on both platforms by killing a
+holder. What is left is scope. It is a mirror for a machine with no Obsidian,
+and treating it as a general-purpose writable client over arbitrary editors and
+filesystem layouts is a wider promise than has been tested.
 
 ---
 
@@ -556,14 +557,17 @@ published from CI over OIDC with no stored token.
   file is valid JSON, and Obsidian drops the edge silently on the next save.
   Telling it from one the ancestor already had would need the validity check to
   see both sides and the ancestor. Pinned as a test.
-- Recovering the CLI's vault lock without being asked. A lock left behind by a
-  `basalt` that crashed stays there, and every command refuses until somebody
-  runs `basalt unlock`. Deciding on its own that a holder was gone was
-  attempted five times and four of those handed one vault to two writers; the
-  decision needs a compare-and-swap on a file, which POSIX does not have and
-  which `flock` would supply if Node had it. `docs/compared.md` has all five
-  attempts. The cost is a wedged cron job and one command to clear it, and it
-  is a decision rather than a gap.
+- Recovering the CLI's vault lock across two machines, or on a filesystem where
+  the operating system's own lock does not hold. One basalt per vault is
+  enforced by the kernel now -- `O_EXLOCK` on macOS, an abstract socket on
+  Linux -- so a crashed basalt releases the vault by dying and the next one
+  simply takes it. A kernel answers for one machine, though, so a vault on a
+  disk two machines can reach is still a matter of believing the lock file; and
+  the exclusion is checked rather than assumed, so a mount that ignores it
+  falls back to the file and to `basalt unlock`, saying so. Deciding staleness
+  from a file was attempted five times and four of those handed one vault to
+  two writers, which is why it is the kernel's job and not this program's;
+  `docs/compared.md` has all five.
 - Mutual exclusion between a sync pass and the editor, on either client.
   A pass decides from a scan, fetches, and then writes, and the editor is in
   use throughout. Nothing here locks the editor out, and nothing can. What both

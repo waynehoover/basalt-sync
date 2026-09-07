@@ -286,7 +286,19 @@ describe("unlock", () => {
     // The second unlock is what has to be turned away, and it has to say why.
     expect(u2!.did).toBe("refused");
     expect(u2!.why).toContain("already running");
-    expect(u1.did).toBe("removed");
+
+    // What U1 ends up doing depends on whether this platform has a kernel
+    // exclusion, and both answers are right. Without one, A cannot get in
+    // during U1's flight and U1 clears the abandoned lock: `removed`. With
+    // one, A takes the vault legitimately the moment the file stops naming a
+    // live holder, and U1 then finds a *live* lock in its hand and puts it
+    // back: `refused`. What must be true either way is that the vault has at
+    // most one holder and that whoever holds it still has their record.
+    expect(["removed", "refused"]).toContain(u1.did);
+    if (a !== undefined) {
+      const now = JSON.parse(await readFile(lockPath(dir), "utf8")) as { command: string };
+      expect(now.command, "the holder's lock was taken away underneath it").toBe("writer A");
+    }
 
     for (const release of [a, b]) if (release !== undefined) await release();
   });

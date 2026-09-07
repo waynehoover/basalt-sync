@@ -332,7 +332,56 @@ A crashed `unlock` leaves `.basalt/lock.recovering` and wedges recovery until
 somebody removes it. That is a worse experience and a better failure: it stops
 recovery rather than admitting two writers, and the refusal names the file.
 
-## Wanted, and evaluated: automatic recovery after a crash
+## Done: automatic recovery after a crash (I27)
+
+A crashed `basalt` no longer wedges the next one, and the custom claim protocol
+was not revived. One basalt per vault is now the kernel's answer rather than
+this program's: `O_EXLOCK` on macOS, an abstract Unix socket on Linux, both
+released when the holder dies however it dies. The lock file became a record
+rather than a claim, because holding the exclusion establishes that no other
+basalt on this machine is inside, so the staleness question that was answered
+wrongly five times has nothing left to attach to.
+
+Three defects were found building it, all in the new code, all of the shapes
+this project keeps producing:
+
+- The self-test named its probe after the pid, so two acquisitions in one
+  process collided, both concluded the filesystem does not lock, both fell back
+  to the file, and two callers held one vault. The check for the defect caused
+  the defect.
+- Locking the holder file directly left it briefly empty, a window this module
+  had already been wrong in once. The kernel's file is separate now.
+- The lock's lifetime was tied to a JS object being reachable rather than to
+  the process. A `FileHandle` is closed by a finalizer, so a discarded release
+  function could let the lock be *collected* while the holder still ran. Bun's
+  own garbage-collection warning found it.
+
+A code review of the above found a fifth, and it is the shape this project
+keeps producing: the comment said the socket was named from the vault's
+*resolved* path and the code passed whatever the caller typed. On Linux the
+same vault reached through a symlink, or with a trailing slash, therefore got a
+name of its own and admitted a second writer. macOS never had it, because a
+`flock` is on an inode and does not care what the path looked like -- which is
+a fix applied to one adapter and not the other, wearing a different hat. The
+gate check now locks a vault through three spellings of one path, and it has to
+run on Linux to mean anything.
+
+The same review found two smaller things: two places releasing one exclusion,
+now one, and a staging copy left behind on a failed publish, in a directory
+nothing sweeps.
+
+The third of those needed a fourth fix to be testable at all: collection is not
+something a test can wait for, so the check forces one, and until it did the
+guard was passing for no reason.
+
+`scripts/kernel-lock.test.ts` kills a real holder and checks the next basalt
+takes the vault with nothing typed. It is in the gate on macOS and in a CI job
+on Linux, because the two mechanisms are unrelated.
+
+Still a person's job, deliberately: a holder on another machine, which no
+kernel can see, and any filesystem where the self-test fails. Both say so.
+
+## Superseded: the evaluation that led to it
 
 Manual `basalt unlock` was the conservative answer to five failed attempts at
 automatic takeover, and it is not the destination: a crashed sync should not

@@ -75,7 +75,7 @@ basalt history PATH                       every version of one note, newest firs
 basalt restore PATH                       put a note back
 basalt repair                             resend bodies the server has lost
 basalt unlink                             forget the pairing, keep the notes
-basalt unlock                             clear a lock left behind by a basalt that crashed
+basalt unlock                             clear a lock a basalt on another machine left behind
 basalt --version                          which release this is
 ```
 
@@ -223,31 +223,35 @@ its tail loses no note, because notes are made durable before the index that
 names them and the engine redoes the pass. `unlink` removes all three files and
 touches no notes.
 
-One process at a time, enforced for every command that writes. The lock is a
-file in `.basalt/` naming its holder, created with `link` so that creating it
-is the test for whether it exists.
+One process at a time, enforced for every command that writes, and enforced by
+the operating system rather than by this program. On macOS that is a `flock`
+taken as part of opening `.basalt/lock.excl`; on Linux it is an abstract Unix
+socket named after the vault. Both refuse a second basalt, and both are
+released by the kernel when the holder exits, however it exits.
 
-It is never taken over automatically. A lock left behind by a `basalt` that
-crashed or was killed stays there, and the next command refuses with the
-holder's name, whether that process is still running, and what to do about it:
+So a `basalt` that crashes or is killed does not wedge the next one. It leaves
+a record in `.basalt/lock` naming itself, and the next command replaces it,
+because holding the kernel's exclusion is proof that no other basalt on this
+machine is inside the vault. There is no staleness to detect and nothing to
+decide, which matters because deciding it from a file was attempted five times
+and four of those handed one vault to two writers. `docs/compared.md` has all
+five and what replaced them.
 
-    basalt unlock
+Two things are still a person's job:
 
-which says who held the vault before it clears anything, and refuses if that
-process is still running. `--force` is for a lock held on another machine,
-which this one cannot check; it will not break a lock held by a process
-running here, because that one is checkable and stopping it is the answer.
+- **A holder on another machine.** A kernel answers for one machine, so a vault
+  on a disk two machines can reach is outside all of this. The lock file's host
+  is what refuses it, and `basalt unlock --force` is how you say you know that
+  machine is not running.
+- **A filesystem where the exclusion does not hold.** It is checked on every
+  run rather than assumed, against the vault's own state folder, because a
+  network mount may ignore `O_EXLOCK`. Where it does not hold, basalt says so
+  on stderr and falls back to the file, and then a crash does need:
 
-One `unlock` at a time. Two of them overlapping can hand the vault to two
-writers, so the second is refused while the first runs. If one is killed
-part-way it leaves `.basalt/lock.recovering` behind and the next says so:
-remove that file once no basalt is running.
+      basalt unlock
 
-That is less convenient than taking an abandoned lock over, and it is
-deliberate. Taking it over automatically was attempted five times and four of
-those handed one vault to two writers; `docs/compared.md` has all five. Node
-has no portable `flock`, which is what this would otherwise be and which would
-make the whole question the kernel's.
+  which names who held the vault before it clears anything, and refuses while
+  that process is still running.
 
 If something writes the index anyway, the next save says so on stderr and
 replaces both files with a fresh snapshot rather than appending this device's

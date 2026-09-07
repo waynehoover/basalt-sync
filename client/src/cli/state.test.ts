@@ -18,7 +18,7 @@ import { cleanupBinary, removeTree, serverBinary, TestServer, until } from "../c
 import { run, type Console } from "./cli.ts";
 import { configPath, indexPath, loadConfig, saveConfig } from "./config.ts";
 import { STATE_DIR } from "./config.ts";
-import { alive, currentHolder, lockPath, lockVault, unlockVault } from "./lock.ts";
+import { alive, currentHolder, lockPath, lockVault } from "./lock.ts";
 
 /**
  * `saveConfig` and `loadConfig`, failing when a test says so. The CLI imports
@@ -412,7 +412,7 @@ describe("the vault lock (C12)", () => {
     )();
   });
 
-  it("refuses a lock whose holder on this host is dead, until unlock clears it", async () => {
+  it("takes over a lock whose holder on this host is dead", async () => {
     const dir = await vaultDir("stale");
     await mkdir(join(dir, ".basalt"), { recursive: true });
     // A pid nothing is running under. Found by asking, not assumed.
@@ -427,10 +427,10 @@ describe("the vault lock (C12)", () => {
         since: 1,
       }),
     );
-    // Not taken over. Five attempts at doing that automatically each handed
-    // one vault to two writers; the sixth answer is that a person says so.
-    await expect(lockVault(dir, "basalt sync")).rejects.toThrow(/basalt unlock/);
-    expect(await unlockVault(dir)).toMatchObject({ did: "removed" });
+    // Taken over, and by the kernel's answer rather than by this program's
+    // opinion of a pid (I27). Five attempts to do it from a file each handed
+    // one vault to two writers; the exclusion the kernel drops on exit has no
+    // staleness to get wrong.
     const release = await lockVault(dir, "basalt sync");
     expect(await currentHolder(dir)).toMatchObject({ pid: process.pid });
     await release();
@@ -477,21 +477,44 @@ describe("the vault lock (C12)", () => {
     // forming one and acting on it is what went wrong five times.
     expect(await currentHolder(dir)).toMatchObject({ pid: watcher.pid });
 
-    // The next one refuses, and the refusal is the whole user interface of
-    // this decision: it has to say the holder is gone and what to type.
-    const third = await cli("sync", "--dir", dir);
-    expect(third.code, third.all).toBe(1);
-    expect(third.all).toMatch(/not running any more/);
-    expect(third.all).toMatch(/basalt unlock/);
+    // The next one takes it, because the kernel let go of the exclusion when
+    // the watcher died (I27). The record left in the file is debris and is
+    // replaced. `basalt unlock` is still there for a holder on another
+    // machine, and is no longer between a crashed cron job and the next run.
+    const third = await cli("sync", "--dir", dir, "--json");
+    expect(third.code, third.all).toBe(0);
+    expect(await currentHolder(dir), "the vault is still held afterwards").toBeUndefined();
+  }, 120_000);
 
-    // And that command, typed by a person, is what frees it.
-    const cleared = await cli("unlock", "--dir", dir);
-    expect(cleared.code, cleared.all).toBe(0);
-    expect(cleared.all).toMatch(new RegExp(`pid ${watcher.pid}`));
-    expect(await currentHolder(dir)).toBeUndefined();
+  it("frees the vault when a watcher is killed, with nobody typing anything", async () => {
+    // I27, end to end and with real processes, which is the only way this
+    // property means anything: the kernel releases the exclusion when the
+    // holder dies, so the next command simply works.
+    //
+    // Before this, the same schedule needed `basalt unlock` in between, and
+    // the five attempts to avoid that each handed one vault to two writers.
+    const dir = await paired("kernel");
+    await writeFile(join(dir, "note.md"), "a note\n");
 
-    const fourth = await cli("sync", "--dir", dir, "--json");
-    expect(fourth.code, fourth.all).toBe(0);
+    const watcher = basalt("sync", "--watch", "--dir", dir);
+    await until(
+      "the watcher to be running",
+      () => /Watching for changes/.test(watcher.stderrText()),
+      30_000,
+    );
+    // Held, and a second basalt is turned away while it runs.
+    const second = await cli("sync", "--dir", dir);
+    expect(second.code, second.all).toBe(1);
+    expect(second.all).toMatch(/another basalt is using this vault/);
+
+    // Killed outright, as a crash or an OOM would.
+    const ended = exited(watcher);
+    watcher.kill("SIGKILL");
+    await ended;
+
+    const after = await cli("sync", "--dir", dir, "--json");
+    expect(after.code, `a killed watcher left the vault wedged: ${after.all}`).toBe(0);
+    expect(after.all).not.toMatch(/basalt unlock/);
     expect(await currentHolder(dir), "the vault is still held afterwards").toBeUndefined();
   }, 120_000);
 
