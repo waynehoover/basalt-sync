@@ -318,7 +318,14 @@ tests here are necessary and never sufficient.
 ## Libraries
 
 **diff-match-patch** for the merge, unmaintained since 2020 and pinned to an
-exact version. **fflate** for deflate. **modernc.org/sqlite**, so the server is
+exact version. `@sanity/diff-match-patch` is a maintained TypeScript fork and
+was evaluated in September 2026: it is better on every axis except the one that
+decides it, which is that it cannot produce the same diffs this client
+produces. It exports none of the line-mode internals used here, and it has no
+way to express the expired deadline `merge.ts` passes -- its `timeout: 0` means
+unlimited where dmp's `opt_deadline: 0` means expired. Merges would change, and
+a merge that changes between releases is two devices disagreeing about one
+note. IMPROVEMENTS.md I26. **fflate** for deflate. **modernc.org/sqlite**, so the server is
 one static binary. **github.com/coder/websocket**.
 
 Basalt is MIT, like LiveSync and like Obsidian's own plugin API declarations.

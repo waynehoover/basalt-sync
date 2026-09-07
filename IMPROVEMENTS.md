@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done, as is I27. **I25 and I26 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I28 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -13,7 +13,7 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | During fixes                 | Reuse lifecycle/protocol rules; make errors observable; turn reproduced failures into tests.             | I02–I04, I11, I19         |
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
-| Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I26                  |
+| Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I28                  |
 
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
@@ -125,6 +125,44 @@ Benchmark unchanged, one-note-changed, rename-heavy, and catch-up workloads at i
 [merge-regions.ts](client/src/core/merge-regions.ts#L77) disables the diff timeout; [merge.ts](client/src/core/merge.ts) performs several comparisons and span cross-products; [history diff](client/src/plugin/history.ts#L374) runs on the UI path. Valid but repetitive or heavily rewritten notes can consume disproportionate CPU even below file-size ceilings.
 
 Benchmark adversarial text shapes, not just random inputs. Where supported, move costly work into a worker; otherwise yield or stop within a budget and preserve a conflict copy. Include cancellation and output equivalence tests. F28 covers memory safety; this item covers responsive handling of valid workloads.
+
+### I28 — Decide whether the merge diff should be coarse on purpose
+
+- [ ] **Small change, large blast radius.** It costs a third more conflict copies than it needs to, and changing it changes what merges cleanly.
+
+`merge.ts` passes `0` as `diff_main`'s fourth argument, which is an absolute
+deadline and is therefore already expired: any region needing a bisect returns
+a whole-block delete and insert instead of a fine-grained diff. Every other
+call site in this client spells "no limit" the other way, as
+`dmp.Diff_Timeout = 0`, and the same number means the opposite in the two
+places. Nothing says which was meant here.
+
+Both are deterministic, which is the property that matters most: neither
+consults a clock, so two devices compute the same merge. What differs is
+granularity, and granularity decides how often two edits look like they overlap.
+
+Measured over 300 two-sided edits on 20-70 line notes:
+
+| | clean merges | kept both | time |
+|---|---|---|---|
+| as it is, expired deadline | 145 | 155 | 57 ms |
+| `Diff_Timeout = 0`, exact  | 196 | 104 | 77 ms |
+
+So the current behaviour produces about a third more conflict copies for 20 ms
+across 300 merges. Nothing is lost either way -- keeping both versions is the
+safe direction and is what this project prefers when unsure -- but a person
+reading "Conflicted copy" on a note they could have had merged is paying for it.
+
+The reason this is a decision and not a fix: it changes merge output, so two
+devices on different releases would merge the same three texts differently.
+That is exactly the objection that closed I26, and it applies to this whether
+the change comes from a new library or from four characters. If it is done,
+it wants the same care: a version gate, or acceptance that a mixed-version pair
+produces a conflict copy where a matched pair would not.
+
+The existing test `never returns a character merge that has lost a local
+insertion` mirrors the implementation's call rather than pinning it
+independently, so it is not evidence that coarse was intended.
 
 ### I09 — Reduce duplicate chunk I/O without weakening verification
 
@@ -553,7 +591,7 @@ Add scheduled JavaScript and Go dependency advisory checks with actionable owner
 
 ### I26 — Replace the unmaintained diff-match-patch
 
-- [ ] **Small; supply chain rather than speed.** Evaluate a maintained fork, keeping merge output identical.
+- [x] **Evaluated, and no.** Not because the fork is worse. Because it cannot reproduce this client's merges, and a merge that changes between releases is two devices disagreeing about one note.
 
 `diff-match-patch` 1.0.5 is pinned to an exact version and has been
 unmaintained since 2020, which `docs/compared.md` already records.
@@ -569,8 +607,39 @@ I22.
 The acceptance criterion is that merge output does not change. Two devices
 running different releases must produce the same merge from the same three
 texts, so a fork that improves the diff would be a compatibility break, not an
-improvement. Compare against the existing merge tests and `bench-merge.ts`
-before adopting.
+improvement.
+
+**Measured, 2026-09-07.** On maintenance the fork wins outright: 3.2.0 published
+in April 2026 against 1.0.5 last touched in 2022, a real TypeScript rewrite, a
+cleaner functional API. It still fails on both of the things that decide it.
+
+It is not a drop-in. There is no `diff_match_patch` class and none of the
+internals this client uses are exported: `diff_linesToChars_` and
+`diff_charsToLines_` are the whole basis of line mode in `merge-regions.ts`,
+`merge.ts` and `plugin/history.ts`, and the fork has no equivalent.
+
+And it cannot produce the same diffs. `merge.ts` calls
+`diff_main(base, mine, true, 0)`, where that `0` is an **already-expired
+deadline**: dmp treats an explicit `opt_deadline` as an absolute time, so the
+bisect gives up immediately and returns a coarser diff. The fork has no
+deadline parameter at all, only `timeout`, and its `timeout: 0` means the
+opposite -- `createDeadLine` maps anything `<= 0` to `Number.MAX_VALUE`. There
+is no way to ask it for the behaviour this client has.
+
+The two agree exactly, 300 of 300, on inputs that only add text. On a corpus
+that also deletes lines they disagree on about half, raw and after each cleanup
+stage alike, because that is where a bisect is needed and where the expired
+deadline bites. So adopting it would silently change what merges cleanly, which
+is the criterion above.
+
+Worth writing down that the first run of this comparison reported the fork as
+differing everywhere and the second reported it as identical everywhere. Both
+were wrong: the first had mismatched settings, the second had quietly dropped
+deletions from its corpus. The number that stands is from a corpus fixed once
+and shared by every arm.
+
+That leaves the unmaintained dependency where it was, which I22's scheduled
+advisory checks are the answer to rather than this.
 
 ### I23 — Make release channels, checksums, and version preparation consistent
 

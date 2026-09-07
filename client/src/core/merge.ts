@@ -551,6 +551,19 @@ function mergeCore(
   }
 
   const dmp = new diff_match_patch();
+  // That `0` is an absolute deadline, not a timeout, and it is therefore
+  // already expired: any region needing a bisect comes back as a whole-block
+  // delete and insert rather than a fine-grained diff. Deterministic, which is
+  // what matters most here -- no clock is consulted, so two devices merge the
+  // same three texts the same way -- and coarser than it needs to be.
+  //
+  // Every other `diff_main` in this client spells "no limit" the other way,
+  // as `Diff_Timeout = 0`, and the same number means the opposite in the two
+  // places. Whether this one was meant is not recorded anywhere, and measuring
+  // it says it costs about a third more conflict copies for 20 ms across 300
+  // merges. It is left alone because changing it changes what merges cleanly,
+  // and two devices on different releases would then disagree. IMPROVEMENTS.md
+  // I28 has the measurement and what the decision would involve.
   const diff = dmp.diff_main(base, mine, true, 0);
   if (diff.length > 2) {
     // Both passes, as Obsidian does. They do not change what the patch
