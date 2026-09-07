@@ -121,7 +121,7 @@ func OpenMode(dbPath, chunkDir string, mode Mode, sync SyncMode) (*Store, error)
 		}
 	}
 
-	return &Store{db: db, chunks: cs, dbPath: dbPath}, nil
+	return &Store{db: db, chunks: cs, dbPath: dbPath, readOnly: mode == ReadOnly}, nil
 }
 
 // checkSchemaVersion refuses a database this binary is too old to read.

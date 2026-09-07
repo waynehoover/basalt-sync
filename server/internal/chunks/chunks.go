@@ -294,42 +294,6 @@ func (s *Store) Missing(vaultID string, names []string) ([]string, map[string]in
 	return out, held, nil
 }
 
-// Put stores a body under its own name, verifying that the two agree.
-//
-// The write is a temp file, an fsync, a rename, and an fsync of the directory.
-// Every step earns its keep:
-//
-//   - Writing in place would let a crash leave a half-written body that Has
-//     then reports as present, and no later push would ever replace it, because
-//     the client is told the server already holds that chunk.
-//   - Renaming without fsyncing the file means the rename can be durable while
-//     the bytes are not.
-//   - Renaming without fsyncing the *directory* means the bytes can be durable
-//     while the name is not, which is the one server-side fault a client cannot
-//     detect: it acked, so it will never send that chunk again.
-//
-// Put returns once the body is durable. Nothing above it may acknowledge a push
-// before that; the entry commit that follows is what makes the ack truthful.
-// A name is marked unproven before the body can become visible and proven only
-// once the directory flush has succeeded, so nothing anywhere treats a renamed
-// body as a stored one (F05, R06).
-//
-// A body becomes *visible* when it is renamed into place and *durable* when
-// the directory it landed in is flushed, and those are two different moments.
-// placing records that a name is being written and cannot yet be treated as
-// held. Call it before the body can become visible.
-//
-// A name that is already held is left alone, and that is not an optimisation.
-// Withholding it would take a chunk somebody else has already made durable and
-// report it absent for the length of this write, which refuses a concurrent
-// commit that references it perfectly legitimately. Two devices pushing notes
-// that share a chunk do this constantly, and the store's own stress test found
-// it within a hundred pushes.
-//
-// Re-publishing a body that is already durable cannot un-durable it: the bytes
-// are the hash of the name, so whatever is written is what is already there,
-// and the rename is atomic. The worst case is that the same body is written
-// twice.
 func (s *Store) placing(vaultID string, names ...string) {
 	s.unprovenMu.Lock()
 	defer s.unprovenMu.Unlock()
@@ -377,6 +341,42 @@ func (s *Store) held(vaultID, name string) bool {
 	return !waiting
 }
 
+// Put stores a body under its own name, verifying that the two agree.
+//
+// The write is a temp file, an fsync, a rename, and an fsync of the directory.
+// Every step earns its keep:
+//
+//   - Writing in place would let a crash leave a half-written body that Has
+//     then reports as present, and no later push would ever replace it, because
+//     the client is told the server already holds that chunk.
+//   - Renaming without fsyncing the file means the rename can be durable while
+//     the bytes are not.
+//   - Renaming without fsyncing the *directory* means the bytes can be durable
+//     while the name is not, which is the one server-side fault a client cannot
+//     detect: it acked, so it will never send that chunk again.
+//
+// Put returns once the body is durable. Nothing above it may acknowledge a push
+// before that; the entry commit that follows is what makes the ack truthful.
+// A name is marked unproven before the body can become visible and proven only
+// once the directory flush has succeeded, so nothing anywhere treats a renamed
+// body as a stored one (F05, R06).
+//
+// A body becomes *visible* when it is renamed into place and *durable* when
+// the directory it landed in is flushed, and those are two different moments.
+// placing records that a name is being written and cannot yet be treated as
+// held. Call it before the body can become visible.
+//
+// A name that is already held is left alone, and that is not an optimisation.
+// Withholding it would take a chunk somebody else has already made durable and
+// report it absent for the length of this write, which refuses a concurrent
+// commit that references it perfectly legitimately. Two devices pushing notes
+// that share a chunk do this constantly, and the store's own stress test found
+// it within a hundred pushes.
+//
+// Re-publishing a body that is already durable cannot un-durable it: the bytes
+// are the hash of the name, so whatever is written is what is already there,
+// and the rename is atomic. The worst case is that the same body is written
+// twice.
 func (s *Store) Put(vaultID, name string, body []byte) error {
 	if !ValidName(name) {
 		return fmt.Errorf("%w: %q", ErrBadName, name)

@@ -38,6 +38,8 @@ var AllowedOrigins = []string{
 	"http://localhost",
 }
 
+const healthTimeout = 5 * time.Second
+
 // HTTPHandler is everything the server exposes: a health check and the
 // websocket endpoint.
 //
@@ -51,8 +53,6 @@ var AllowedOrigins = []string{
 // what it reports is a network fault rather than the disk. Five seconds is long
 // enough that an ordinary busy moment answers and short enough to be inside any
 // probe interval worth setting.
-const healthTimeout = 5 * time.Second
-
 func HTTPHandler(srv *Server, log *slog.Logger, extraOrigins ...string) http.Handler {
 	origins := append(append([]string{}, AllowedOrigins...), extraOrigins...)
 	mux := http.NewServeMux()

@@ -247,6 +247,8 @@ func requireVault(st *store.Store, vault string) error {
  * serve
  * ---------------------------------------------------------------- */
 
+var afterListening func(addr string)
+
 // cmdServe blocks until the context is cancelled or a signal arrives.
 //
 // The context is how a test stops it. Before it existed, serving could only be
@@ -258,8 +260,6 @@ func requireVault(st *store.Store, vault string) error {
 // A seam for one test, and it is here rather than in the test because the thing
 // under test is an ordering inside this function: that the socket answers while
 // the summary is still to come. Nil everywhere but that test.
-var afterListening func(addr string)
-
 func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
@@ -385,8 +385,6 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	if hashErr != nil {
 		log.Warn("could not tell whether the vault is claimed", "err", hashErr)
 	}
-	printSetup(out, *addr, *vault, token, fresh, *local, hash == "" || hashErr != nil)
-
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -406,6 +404,18 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", hs.Addr, err)
 	}
+
+	// After the bind, because it says "listening on" and hands somebody a
+	// pairing string.
+	//
+	// It used to be seventeen lines earlier. Under systemd both streams land
+	// in one journal, so the line an operator greps said the server was up,
+	// with a setup string to paste, for a server that then exited 1 with
+	// "address already in use" -- and `loadOrCreateToken` had by then written
+	// a fresh auth token for a server that never started. Rule 4: report the
+	// outcome, not the intent. The same argument as the bind-before-the-walk
+	// above, one statement over, and it was applied to only one of them.
+	printSetup(out, *addr, *vault, token, fresh, *local, hash == "" || hashErr != nil)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -1148,6 +1158,13 @@ func cmdPurge(args []string, out io.Writer) error {
 	return nil
 }
 
+var beforePurge = func() {}
+
+// backupCovers checks the backup and hands back the exclusion it took.
+//
+// The release is the caller's to run, after the purge, which is the whole
+// correction: a lock released when this returns protects the check and not the
+// thing the check authorises.
 // backupCovers checks that the backup at dir independently holds every version
 // of the vault this purge could destroy, and returns the backup's latest uid.
 //
@@ -1176,13 +1193,6 @@ func cmdPurge(args []string, out io.Writer) error {
 // beforePurge runs between a successful backup check and the deletion it
 // authorises, and does nothing outside the test that proves the backup is
 // still locked at that moment (R23).
-var beforePurge = func() {}
-
-// backupCovers checks the backup and hands back the exclusion it took.
-//
-// The release is the caller's to run, after the purge, which is the whole
-// correction: a lock released when this returns protects the check and not the
-// thing the check authorises.
 func backupCovers(
 	dir, vault, dataDir string,
 	source *store.Store,

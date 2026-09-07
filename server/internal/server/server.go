@@ -442,13 +442,6 @@ func (s *Server) registrarsOn(vaultID string, except *Session) []*Session {
 	return out
 }
 
-// Sessions is how many connections are being handled, joined or not.
-// Health is what /health answers with (I17).
-//
-// Shutting down is reported as unable to persist, deliberately. A server
-// draining its sessions will refuse new work in a moment, and a checker that
-// keeps calling it healthy is one that keeps sending devices to it: the whole
-// use of a health check during a restart is to stop that.
 func (s *Server) Health(ctx context.Context) store.Health {
 	s.sessMu.Lock()
 	closing := s.closing
@@ -459,6 +452,13 @@ func (s *Server) Health(ctx context.Context) store.Health {
 	return s.st.CheckHealth(ctx)
 }
 
+// Sessions is how many connections are being handled, joined or not.
+// Health is what /health answers with (I17).
+//
+// Shutting down is reported as unable to persist, deliberately. A server
+// draining its sessions will refuse new work in a moment, and a checker that
+// keeps calling it healthy is one that keeps sending devices to it: the whole
+// use of a health check during a restart is to stop that.
 func (s *Server) Sessions() int {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()

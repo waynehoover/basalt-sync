@@ -65,7 +65,15 @@ func cmdService(args []string, out io.Writer) error {
 			return locked(err, *dataDir, "service", stopFirst)
 		}
 		defer lock.Release()
-		st, err := openStore(*dataDir)
+		// Read-only, like every other command that only looks (I15).
+		//
+		// `openStore` creates the directory, runs `migrate`, applies the
+		// schema and stamps `user_version`. This opens the store to run one
+		// `SELECT`, and it was the last inspection command still writing to
+		// what it inspects: `basaltd service` silently migrated an older store
+		// just by being asked to print a unit, and could not print one at all
+		// against read-only media.
+		st, err := openForInspection(*dataDir, "read")
 		if err != nil {
 			return err
 		}

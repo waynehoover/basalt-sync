@@ -123,6 +123,8 @@ run "the image release promotes in order" "" \
   bash "$root/scripts/release-order.test.sh"
 run "the attestation can be started" "" \
   bash "$root/scripts/attest-trigger.test.sh"
+run "every doc comment names what it sits on" "" \
+  bash "$root/scripts/godoc-attached.sh"
 run "every action is pinned to a commit" "" \
   bash "$root/scripts/actions-pinned.sh"
 

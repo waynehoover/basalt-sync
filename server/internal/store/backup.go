@@ -464,6 +464,8 @@ func (s *Store) ChunkRefs(fn func(vaultID, name string) error) error {
 	return rows.Err()
 }
 
+const stagedPrefix = ".basalt.db.snapshot"
+
 // Backup writes everything this store holds into destDir, which becomes a data
 // directory in its own right: restoring is copying it back, and checking it is
 // running verify against it.
@@ -509,8 +511,6 @@ func (s *Store) ChunkRefs(fn func(vaultID, name string) error) error {
 // bit rot in a backup that has been sitting on a disk for a year.
 // stagedPrefix names a snapshot being written but not yet published. Every
 // file under it in a backup directory is this operation's or a dead one's.
-const stagedPrefix = ".basalt.db.snapshot"
-
 func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	rep := BackupReport{Dir: destDir}
 

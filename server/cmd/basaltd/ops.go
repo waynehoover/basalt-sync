@@ -164,6 +164,16 @@ func writeHealth(out io.Writer, h healthJSON) {
 			humanBytes(h.FreeBytes), humanBytes(h.TotalBytes))
 		return
 	}
+	// Not asked is not a fault, and shouting at somebody about a healthy
+	// server is how a real alarm stops being read. This command opens the
+	// store read-only on purpose, so it cannot put the question; `/health` on
+	// the running server can.
+	if h.Reason == string(store.HealthUnchecked) {
+		fmt.Fprintf(out, "can take a note: not checked from here, %s free of %s\n",
+			humanBytes(h.FreeBytes), humanBytes(h.TotalBytes))
+		fmt.Fprintln(out, "  this command reads the store and does not write to it; ask /health")
+		return
+	}
 	// The reason first, because it is the sentence somebody acts on, and the
 	// same word /health puts on the wire so the two cannot be read as
 	// different problems.

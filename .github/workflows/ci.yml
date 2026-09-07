@@ -111,6 +111,13 @@ jobs:
       - name: the attestation can be started
         run: scripts/attest-trigger.test.sh
 
+      # A declaration inserted between a doc comment and its function leaves
+      # the paragraph documenting something else, and the compiler has nothing
+      # to say about it. Eight had accumulated, one of them the durability
+      # contract on `chunks.Store.Put`.
+      - name: every doc comment names what it sits on
+        run: scripts/godoc-attached.sh
+
       # And that no workflow reaches for a mutable tag, here included. A tag is
       # a name somebody else can repoint, and these files are what builds,
       # signs and publishes the project.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -71,6 +72,25 @@ const (
 	// reacts to a disk that is failing. A read-only store is the case a
 	// `SELECT 1` cannot see and the one most likely to be true (R15).
 	HealthUnwritable HealthReason = "store-read-only"
+	// HealthChunksUnwritable is the body directory refusing a write while the
+	// database takes them: permissions gone on that tree, or a separate volume
+	// remounted read-only.
+	//
+	// Its own word, because the two send an operator to different places and
+	// the vocabulary is what a monitor pages on. Both used to answer
+	// `store-read-only`, which says SQLite, and the person woken up would have
+	// inspected a database that was working perfectly (R28).
+	HealthChunksUnwritable HealthReason = "chunks-read-only"
+	// HealthBusy is a store that could not be written to inside the timeout
+	// because something else is writing. Not a fault: a long transaction, a
+	// backup, a purge. It is here because a slow answer used to be reported as
+	// a filesystem that had gone read-only, and an orchestrator restarts a
+	// server over that.
+	HealthBusy HealthReason = "store-busy"
+	// HealthUnchecked is an inspection handle: this process opened the store
+	// read-only on purpose, so it cannot ask whether a write would land and
+	// must not answer as though it had. Everything else in the report is real.
+	HealthUnchecked HealthReason = "not-checked"
 	// HealthClosing is a server draining its sessions. Set by the server rather
 	// than by anything here; it is in this list so the vocabulary is in one
 	// place, which is what a monitor matching on it needs.
@@ -122,21 +142,22 @@ func (s *Store) CheckHealth(ctx context.Context) (h Health) {
 	// asks the real question: SQLite takes the write lock and refuses here if
 	// it cannot, and nothing is committed, so the store is not touched. It
 	// costs no page writes and does not grow the write-ahead log.
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		h.CanPersist = false
-		h.Why = HealthUnreadable
-		return h
-	}
-	// `PRAGMA user_version` is a write to the header and SQLite refuses it on
-	// a read-only connection, which is the refusal being looked for; setting
-	// it to what it already is means the rollback has nothing to undo.
-	_, writeErr := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion))
-	rollbackErr := tx.Rollback()
-	if writeErr != nil || (rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone)) {
-		h.CanPersist = false
-		h.Why = HealthUnwritable
-		return h
+	// Except from a handle that was opened read-only on purpose, where the
+	// answer would be about this process rather than about the store.
+	//
+	// Every inspection command opens that way (I15), and this probe refuses on
+	// exactly such a connection by design (R15), so the two together made
+	// `basaltd stats` say `canPersist: false, reason: store-read-only` about
+	// every healthy server, and return before the statfs, leaving the
+	// free-space numbers that command exists to print at zero. Two correct
+	// changes; one wrong answer. The rest of the report is still worth having,
+	// so the probe is skipped and the reason says which question was not
+	// asked.
+	writable := !s.readOnly
+	if writable {
+		if failed := s.probeWrite(ctx, &h); failed {
+			return h
+		}
 	}
 
 	// The chunk directory, which is on the same filesystem as the database in
@@ -183,9 +204,69 @@ func (s *Store) CheckHealth(ctx context.Context) (h Health) {
 	// tree already skips it. A name of its own would have been counted as a
 	// body by `CountBodies` for as long as it existed, and a backup comparing
 	// its count with the source's would report that file as a discrepancy.
-	if err := s.chunks.CheckWritable(); err != nil {
-		h.CanPersist = false
-		h.Why = HealthUnwritable
+	if writable {
+		if err := s.chunks.CheckWritable(); err != nil {
+			h.CanPersist = false
+			// Its own word (R28). Both sides answering `store-read-only` sent
+			// whoever was paged to inspect a database that was working.
+			h.Why = HealthChunksUnwritable
+		}
+		return h
 	}
+	// Read-only inspection: the space and the chunk directory above are real
+	// answers and the writability question was never put. Saying so is the
+	// difference between "this server cannot take a note" and "this command
+	// did not ask"; `/health` on the running server is what asks.
+	h.CanPersist = false
+	h.Why = HealthUnchecked
 	return h
+}
+
+// isBusy is whether a write failed because something else holds the lock.
+//
+// SQLite says so in the message rather than in a type this driver exposes, so
+// this matches on it. Getting the match wrong costs the more alarming of the
+// two words, which is the safe direction: a busy store reported as read-only
+// is what this exists to stop, and a read-only one reported as busy would be
+// worse.
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "database is locked") || strings.Contains(text, "busy")
+}
+
+// probeWrite takes the write lock and gives it back, and reports whether that
+// failed. It sets the reason on `h` when it did.
+//
+// A transaction that is begun and rolled back is the cheapest thing that asks
+// the real question: SQLite takes the write lock and refuses here if it
+// cannot, and nothing is committed, so the store is not touched. It costs no
+// page writes and does not grow the write-ahead log.
+func (s *Store) probeWrite(ctx context.Context, h *Health) bool {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.CanPersist = false
+		h.Why = HealthUnreadable
+		return true
+	}
+	// `PRAGMA user_version` is a write to the header and SQLite refuses it on
+	// a read-only connection, which is the refusal being looked for; setting
+	// it to what it already is means the rollback has nothing to undo.
+	_, writeErr := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion))
+	rollbackErr := tx.Rollback()
+	if writeErr == nil && (rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone)) {
+		return false
+	}
+	h.CanPersist = false
+	// Busy is not read-only, and the vocabulary is what a monitor pages on. A
+	// long transaction, a backup or a purge holding the write lock past the
+	// timeout answered `store-read-only`, which says the filesystem has gone,
+	// and an orchestrator restarts a server over that.
+	h.Why = HealthUnwritable
+	if isBusy(writeErr) {
+		h.Why = HealthBusy
+	}
+	return true
 }

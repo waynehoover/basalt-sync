@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -1915,5 +1916,106 @@ func TestVerifyPassesAStoreWithEntriesInIt(t *testing.T) {
 	out := mustRun(t, "verify", "-deep", "-data", dir)
 	if strings.Contains(out, "checked 0 entries") {
 		t.Fatalf("a seeded store reported no entries:\n%s", out)
+	}
+}
+
+// `basaltd stats` reports the numbers it exists to report.
+//
+// Two correct changes made it report none of them. Inspection commands open
+// the store read-only (I15); the health probe writes, because a `SELECT 1`
+// cannot see a store that answers reads and refuses them (R15). So the probe
+// refused on every healthy server, and returned before the statfs, leaving
+// `freeBytes` and `totalBytes` at zero under a `canPersist: false` that named
+// the filesystem. The question it cannot ask from here is now said to be
+// unasked, and the answers it can give are given.
+func TestStatsReportsTheDiskItIsAskedAbout(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "stats", "-data", dir, "-json")
+
+	var report struct {
+		Health struct {
+			CanPersist bool   `json:"canPersist"`
+			Reason     string `json:"reason"`
+			FreeBytes  int64  `json:"freeBytes"`
+			TotalBytes int64  `json:"totalBytes"`
+		} `json:"health"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("parse %s: %v", out, err)
+	}
+	if report.Health.FreeBytes <= 0 || report.Health.TotalBytes <= 0 {
+		t.Errorf("no filesystem figures: free=%d total=%d",
+			report.Health.FreeBytes, report.Health.TotalBytes)
+	}
+	// And it says which question it did not put, rather than answering it.
+	if report.Health.Reason != string(store.HealthUnchecked) {
+		t.Errorf("reason was %q, wanted %q", report.Health.Reason, store.HealthUnchecked)
+	}
+	if report.Health.Reason == string(store.HealthUnwritable) {
+		t.Error("a healthy server was reported as a store that refuses writes")
+	}
+
+	// And the text form does not shout about it.
+	text := mustRun(t, "stats", "-data", dir)
+	if strings.Contains(text, "CANNOT TAKE A NOTE") {
+		t.Errorf("stats raised an alarm about a healthy server:\n%s", text)
+	}
+	if !strings.Contains(text, "not checked from here") {
+		t.Errorf("stats does not say the question was not put:\n%s", text)
+	}
+}
+
+// `basaltd service` reads the store and does not write to it.
+//
+// It opens one to run a single `SELECT` and was using the writable open, which
+// creates the directory, runs `migrate`, applies the schema and stamps
+// `user_version`. So printing a unit silently migrated an older store, and
+// could not be done at all against read-only media. It was the last inspection
+// command still writing to what it inspects (I15).
+func TestServicePrintsAUnitAgainstAReadOnlyStore(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, where a mode of 444 stops nothing")
+	}
+	dir := seeded(t)
+	dbPath, _ := store.DataDir(dir)
+	if err := os.Chmod(dbPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dbPath, 0o600) })
+
+	out, err := basalt(t, "service", "-data", dir)
+	if err != nil {
+		t.Fatalf("service could not print a unit against a store it only reads: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "ExecStart=") {
+		t.Errorf("no unit came out:\n%s", out)
+	}
+}
+
+// And `serve` says "listening on" only once it is.
+//
+// The line and the pairing string went out seventeen statements before the
+// bind. Under systemd both streams land in one journal, so the line an
+// operator greps said the server was up, and handed them a setup string, for a
+// server that exited 1 with "address already in use". Rule 4.
+func TestServeSaysNothingAboutListeningWhenItCannotBind(t *testing.T) {
+	dir := seeded(t)
+	// A port somebody else already has.
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Close() }()
+
+	out, err := basalt(t, "serve", "-data", dir, "-addr", held.Addr().String())
+	if err == nil {
+		t.Fatalf("serve started on a port that was taken:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("serve announced a listener it never opened:\n%s", out)
+	}
+	// And it did not hand anybody a pairing string for it either.
+	if strings.Contains(out, "#") && strings.Contains(out, "ws://") {
+		t.Errorf("serve printed a setup string for a server that did not start:\n%s", out)
 	}
 }

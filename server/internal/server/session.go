@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -1477,9 +1478,35 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 		return s.reject(wire.CodeToolarge, fmt.Errorf(
 			"the putmany frame is %d bytes, limit is %d; split the batch", frameLen, s.srv.maxBatchBytes))
 	}
+	// Summed over sizes the peer chose, so a size the peer chose cannot make
+	// the sum smaller.
+	//
+	// `Meta.Size` is an `int64` straight off the wire and is only refused as
+	// negative much later, inside `prepare`. One entry declaring `-(1<<40)`
+	// dragged this total below zero, the cap passed, and the entries that
+	// *were* valid then handed `readBodies` their full combined allowance:
+	// 255 files at the per-file ceiling is about 16 GiB against the 16 MiB
+	// this frame is allowed, read onto the disk before anything is committed.
+	// `MaxInt64` did it by overflow instead. A cap summed from unvalidated
+	// numbers is not a cap.
 	var budgets int64
 	for _, in := range m.Entries {
-		budgets += store.CiphertextBudget(in.Meta.Size, len(in.Chunks))
+		spend := store.CiphertextBudget(in.Meta.Size, len(in.Chunks))
+		// A size the peer chose cannot make the sum smaller. Nothing is
+		// refused here for it: an entry with an impossible size is refused on
+		// its own by `prepare`, and the rest of the batch still commits, which
+		// is the contract this exchange has. What it must not do is *buy*
+		// budget for the entries beside it.
+		if spend < 0 {
+			spend = 0
+		}
+		// And the sum saturates rather than wrapping, for the same reason from
+		// the other end.
+		if budgets > math.MaxInt64-spend {
+			budgets = math.MaxInt64
+			break
+		}
+		budgets += spend
 	}
 	if budgets > s.srv.maxBatchBytes {
 		return s.reject(wire.CodeToolarge, fmt.Errorf(
@@ -1815,6 +1842,17 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 	return uid, nil
 }
 
+// fetchKeepBytes is how much of a fetch's verified bodies the session holds on
+// to between verifying them and sending them (I09).
+//
+// Eight mebibytes because that is most fetches whole. The client asks in sets
+// bounded by its own batching, and a set larger than this is an attachment
+// being fetched in one go, where the double read is a smaller share of the cost
+// than the network is anyway. What this must not become is MaxFetchBytes: 64
+// MiB held per session, for the length of a send over whatever link the device
+// is on, is a worse trade than reading the tail of a large fetch twice.
+const fetchKeepBytes = 8 << 20
+
 // clockSkewTolerance is how far ahead of the server a device's timestamps may
 // be before it is reported as having a wrong clock.
 //
@@ -1828,17 +1866,6 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 // a device with the wrong date, and naming somebody's phone as broken when it
 // is not is worse than saying nothing. A device with a genuinely wrong clock is
 // out by days.
-// fetchKeepBytes is how much of a fetch's verified bodies the session holds on
-// to between verifying them and sending them (I09).
-//
-// Eight mebibytes because that is most fetches whole. The client asks in sets
-// bounded by its own batching, and a set larger than this is an attachment
-// being fetched in one go, where the double read is a smaller share of the cost
-// than the network is anyway. What this must not become is MaxFetchBytes: 64
-// MiB held per session, for the length of a send over whatever link the device
-// is on, is a worse trade than reading the tail of a large fetch twice.
-const fetchKeepBytes = 8 << 20
-
 const clockSkewTolerance = 24 * time.Hour
 
 // noteFutureMTime says so, once, when a device declares a modification time

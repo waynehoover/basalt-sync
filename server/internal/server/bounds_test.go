@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,46 @@ func TestS18ABatchOverTheByteBudgetIsRefused(t *testing.T) {
 	// The same two files one at a time are fine: the cap is per exchange.
 	body := strings.Repeat("x", 100)
 	cl.put("a.bin", body)
+}
+
+// And a size the peer chose cannot make the sum smaller.
+//
+// The cap was summed over `Meta.Size` straight off the wire, and a negative
+// size is only refused much later, inside `prepare`. One entry declaring
+// `-(1<<40)` dragged the total below zero, the cap passed, and the entries
+// that *were* valid handed the body reader their full combined allowance:
+// 255 files at the per-file ceiling against the 16 MiB the frame is allowed,
+// read onto the disk before anything commits. The two entries below are the
+// exact pair the test above refuses, with one more in front of them.
+func TestS18ANegativeSizeCannotBuyBudget(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	name := chunks.Name([]byte("a"))
+	big := wire.PutEntry{Path: "a.bin", Chunks: []string{name}, Mac: testMac,
+		Meta: wire.PutMeta{Size: 9 << 20, MTime: 1}}
+	other := big
+	other.Path = "b.bin"
+	// A batch is not refused for one bad entry -- that entry is, and the rest
+	// commits, which is this exchange's contract. What a bad size must not do
+	// is buy budget for the entries beside it, so the two 9 MiB entries stay
+	// over the cap however the third one is written.
+	for _, size := range []int64{-1 << 40, math.MinInt64, -1, math.MaxInt64} {
+		sneaky := big
+		sneaky.Path = "c.bin"
+		sneaky.Meta.Size = size
+		cl.sendJSON(wire.In{Op: "putmany", Entries: []wire.PutEntry{sneaky, big, other}})
+		// Refused, and refused before any want list goes out.
+		if msg := cl.expectErr(wire.CodeToolarge); msg == "" {
+			t.Fatalf("a batch carrying a size of %d was accepted", size)
+		}
+		cl.sendJSON(wire.In{Op: "ping"})
+		cl.recvInto("pong", &wire.Pong{})
+		if st := r.mustStats(); st.Versions != 0 {
+			t.Fatalf("%d versions committed from a refused batch", st.Versions)
+		}
+	}
 }
 
 /* ---------------------------------------------------------------- *

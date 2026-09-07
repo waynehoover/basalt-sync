@@ -464,6 +464,17 @@ type Store struct {
 	chunks *chunks.Store
 	dbPath string
 
+	// readOnly is whether this handle was opened for inspection.
+	//
+	// The health check writes, deliberately, because a `SELECT 1` cannot see a
+	// store that answers reads and refuses them (R15). Every inspection
+	// command opens read-only, deliberately, because a diagnostic that
+	// modifies what it is diagnosing is not one (I15). Both are right and
+	// together they made `basaltd stats` report every healthy server as unable
+	// to take a note, with the free-space numbers it exists to print left at
+	// zero because the probe returned before reaching them.
+	readOnly bool
+
 	// writeMu serialises writes.
 	//
 	// It does two things that are not interchangeable with a transaction. It
@@ -1120,22 +1131,6 @@ func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
  * Vault-level facts
  * ---------------------------------------------------------------- */
 
-// LatestUID is the newest uid in the vault, or 0 if it holds nothing. This is
-// the server's cursor in the handshake.
-// ReferencedChunks reports which of the given names some committed entry in
-// this vault refers to (I14).
-//
-// The gate on `resend`. A body is content-addressed, so a device cannot put the
-// wrong bytes under a name: `chunks.Put` hashes what arrives and refuses it
-// otherwise. What it could do without this is put *correct* bytes under names
-// nothing refers to, for ever, which is a paired device filling the disk with
-// data no vault will ever read and no purge will ever collect until the grace
-// window passes. Repair is for bodies the vault is missing, and a name no entry
-// mentions is not one of those.
-//
-// Returned as a set rather than checked one at a time, because repair asks
-// about every chunk of every note it holds and a query per name would be one
-// round trip through SQLite per body in the vault.
 func (s *Store) ReferencedChunks(vaultID string, names []string) (map[string]struct{}, error) {
 	found := make(map[string]struct{}, len(names))
 	if len(names) == 0 {
@@ -1180,6 +1175,22 @@ func (s *Store) ReferencedChunks(vaultID string, names []string) (map[string]str
 	return found, nil
 }
 
+// LatestUID is the newest uid in the vault, or 0 if it holds nothing. This is
+// the server's cursor in the handshake.
+// ReferencedChunks reports which of the given names some committed entry in
+// this vault refers to (I14).
+//
+// The gate on `resend`. A body is content-addressed, so a device cannot put the
+// wrong bytes under a name: `chunks.Put` hashes what arrives and refuses it
+// otherwise. What it could do without this is put *correct* bytes under names
+// nothing refers to, for ever, which is a paired device filling the disk with
+// data no vault will ever read and no purge will ever collect until the grace
+// window passes. Repair is for bodies the vault is missing, and a name no entry
+// mentions is not one of those.
+//
+// Returned as a set rather than checked one at a time, because repair asks
+// about every chunk of every note it holds and a query per name would be one
+// round trip through SQLite per body in the vault.
 func (s *Store) LatestUID(vaultID string) (int64, error) {
 	var uid sql.NullInt64
 	if err := s.db.QueryRow(
