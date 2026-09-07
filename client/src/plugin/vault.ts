@@ -709,10 +709,18 @@ export class ObsidianVault implements Vault {
    * the path when the rename happens is what comes out, whenever it was
    * written.
    *
-   * What remains is the instant between the rename and the write, when the
-   * name does not exist. A save landing exactly there is overwritten, because
-   * this adapter cannot create a name exclusively. docs/design.md says so, and
-   * it is a platform limitation rather than a thing this file has closed.
+   * The new bytes are then published with `create` and not with `write`, and
+   * that is not a detail (R32). After the move the name is free, so anything
+   * at it is somebody else's save, and `write` would have truncated it:
+   * `writeThroughStaging` asks whether the destination exists and takes a
+   * `writeBinary` when it does, which is right for replacing a note in place
+   * and wrong here. A save landing between the move and that question was
+   * destroyed, and the version this displaced was removed as a duplicate in
+   * the same call, so the only copy of what somebody had just typed went. What
+   * `create` does instead is rename the staged copy into place, and rename
+   * refuses an occupied destination in both of Obsidian's adapters, so the
+   * competitor keeps the name and the caller is told the incoming version has
+   * nowhere to go.
    */
   async replace(
     path: string,
@@ -757,7 +765,18 @@ export class ObsidianVault implements Vault {
       }
       moved = false;
     }
-    await this.write(path, bytes, times);
+
+    // Exclusively, because the name is supposed to be free by now and anything
+    // at it is a save this must not take (R32).
+    if (!(await this.create(path, bytes, times))) {
+      // Somebody got there first. Theirs is the newest thing anybody wrote and
+      // it stays; the displaced version, if there was one, is already at its
+      // own name and is reported.
+      if (!moved) return { landed: false };
+      this.entryChanged(kept);
+      this.wrote(kept);
+      return { keptAt: keepAt, landed: false };
+    }
     if (!moved) return { landed: true };
 
     this.entryChanged(kept);

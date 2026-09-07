@@ -627,6 +627,92 @@ describe("replacing a note across a mount boundary", () => {
 });
 
 /**
+ * The two halves `docs/design.md` claims for both clients, on the real one.
+ *
+ * A pass decides from a scan and writes seconds later, and nothing locks the
+ * editor out. What is claimed instead is that nothing is destroyed on the
+ * strength of the decision: the bytes are moved aside first, and the incoming
+ * version is published to a name that must be free.
+ *
+ * The plugin's half of each is in plugin/vault.test.ts. This is the headless
+ * client's, because the memory vault can only be *told* that the name was
+ * taken and the claim is about what `link` and `rename` actually do.
+ */
+describe("publishing over somebody who took the name first", () => {
+  it("leaves the name to them and hands back the version it displaced", async () => {
+    const vault = new NodeVault(root);
+    await writeFile(join(root, "note.md"), "the unsent edit\n");
+
+    // A file appears in the instant between the move aside and the link. The
+    // hook is the move itself, which is the only call that happens there.
+    const realRename = vi.mocked(rename).getMockImplementation()!;
+    vi.mocked(rename).mockImplementation(async (from: PathLike, to: PathLike) => {
+      const out = await realRename(from, to);
+      if (String(to).endsWith("note (kept).md")) {
+        vi.mocked(rename).mockImplementation(realRename);
+        await writeFile(join(root, "note.md"), "typed while the name was empty\n");
+      }
+      return out;
+    });
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "a digest of something else", idOf: async () => "not that" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    expect(
+      await readFile(join(root, "note.md"), "utf8"),
+      "the save that took the name was written over",
+    ).toBe("typed while the name was empty\n");
+    expect(out.landed, "a write that lost the name was reported as landed").toBe(false);
+    expect(out.keptAt).toBe("note (kept).md");
+    expect(await readFile(join(root, "note (kept).md"), "utf8")).toBe("the unsent edit\n");
+  });
+
+  /**
+   * And a move aside that fails for a reason other than the file being gone is
+   * reported as a failure.
+   *
+   * The note survives either way here, because publication is exclusive and
+   * the name it would have to take is still occupied by the note itself. What
+   * this pins is the report: reading a refused move as "there was nothing
+   * there" makes a permissions or I/O fault look like an ordinary first
+   * download, and the next thing the caller does with that answer is decide
+   * the path is settled. The plugin, whose publication was not exclusive until
+   * R32, lost the note outright on the same reasoning.
+   */
+  it("reports a move aside it could not make, rather than reading it as absence", async () => {
+    const vault = new NodeVault(root);
+    await writeFile(join(root, "note.md"), "the unsent edit\n");
+
+    const realRename = vi.mocked(rename).getMockImplementation()!;
+    vi.mocked(rename).mockImplementation(async (from: PathLike, to: PathLike) => {
+      if (String(to).endsWith("note (kept).md")) throw errno("EACCES");
+      return realRename(from, to);
+    });
+
+    await expect(
+      vault.replace(
+        "note.md",
+        { contentId: "a digest of something else", idOf: async () => "not that" },
+        enc.encode("the server's version\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      ),
+    ).rejects.toThrow();
+
+    expect(
+      await readFile(join(root, "note.md"), "utf8"),
+      "the write went ahead after the step that protects the note had failed",
+    ).toBe("the unsent edit\n");
+    expect((await readdir(root)).filter((n) => !n.startsWith("."))).toEqual(["note.md"]);
+  });
+});
+
+/**
  * A scan's concurrency is bounded however deep the vault goes (I06).
  *
  * A stat per file was `Promise.all` per directory and the recursion was

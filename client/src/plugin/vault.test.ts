@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { FakeAdapter, FakeVaultIndex, asVault, normalizePath } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
+import { plainDigest } from "../core/crypto.ts";
 
 let adapter: FakeAdapter;
 let vault: ObsidianVault;
@@ -1728,6 +1729,52 @@ describe("writing over a file the pass did not decide about", () => {
     expect(out).toEqual({ landed: true });
     expect(adapter.text("brand-new.md")).toBe("the server's version\n");
     expect(adapter.text("brand-new (kept).md")).toBeUndefined();
+  });
+
+  /**
+   * R32, the half the first fix left open: publication must not truncate.
+   *
+   * After the move aside the name is free, so anything at it is somebody
+   * else's save. `write` was the wrong tool for that: `writeThroughStaging`
+   * asks whether the destination exists and takes a `writeBinary` when it
+   * does, which is right for replacing a note in place and destroys a
+   * competitor here.
+   *
+   * `create` renames the staged copy into place instead, and rename refuses an
+   * occupied destination in both of Obsidian's adapters (see the note on
+   * `FakeAdapter.rename`, read out of the shipped `.asar`).
+   *
+   * The hook is `afterRename`, not `beforeRename`: the latter is awaited, so a
+   * competitor queued from it lands *before* the move and is preserved by it,
+   * which is the opposite of the schedule this is about.
+   */
+  it("keeps a save that takes the name after the move aside", async () => {
+    const was = "the version the pass decided about\n";
+    await adapter.write("note.md", was, { mtime: 1000 });
+
+    adapter.afterRename = async (_from, to) => {
+      if (to !== "note (kept).md") return;
+      adapter.afterRename = undefined;
+      await adapter.write("note.md", "typed while the name was empty\n", { mtime: 1000 });
+    };
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: await plainDigest(enc.encode(was)), idOf: plainDigest },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    expect(
+      adapter.text("note.md"),
+      "the save that took the name was written over by the incoming version",
+    ).toBe("typed while the name was empty\n");
+    expect(out.landed, "a write that lost the name was reported as landed").toBe(false);
+    // And the version it displaced is still where it was put, because the
+    // write it was displaced for never happened.
+    expect(adapter.text("note (kept).md")).toBe(was);
+    expect(out.keptAt).toBe("note (kept).md");
   });
 
   it("says what a removal took away when it was not the expected version", async () => {

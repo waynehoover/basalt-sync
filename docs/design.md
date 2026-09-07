@@ -507,17 +507,27 @@ published from CI over OIDC with no stored token.
   file is valid JSON, and Obsidian drops the edge silently on the next save.
   Telling it from one the ancestor already had would need the validity check to
   see both sides and the ancestor. Pinned as a test.
-- A write landing between the check and the write it guards, on the plugin.
+- Mutual exclusion between a sync pass and the editor, on either client.
   A pass decides from a scan, fetches, and then writes, and the editor is in
-  use throughout. On the headless client the write itself no longer trusts the
-  check: it moves whatever is at the path aside before writing over it and
-  keeps anything that was not what the pass decided about, so an edit in that
-  gap is preserved rather than predicted. Obsidian's adapter has no way to move
-  a file aside atomically, so the plugin reads the bytes it is about to replace
-  and compares them: an edit is *seen* wherever it happens, including one that
-  keeps the file's length and timestamp, and what it displaces is kept. What
-  remains on both is an edit landing between that last look and the write
-  itself, which needs a compare-and-swap no adapter here has.
+  use throughout. Nothing here locks the editor out, and nothing can. What both
+  clients do instead is never destroy on the strength of the decision: the
+  bytes at the path are moved aside first, which takes exactly what was there
+  whenever it was written, and the incoming version is then published to a name
+  that must be free. A save is therefore seen wherever it lands, including one
+  that keeps the file's length and its timestamp, and one that arrives while
+  the name is empty keeps the name, with the incoming version put beside it.
+
+  What that rests on differs. The headless client uses `link`, which creates a
+  name or fails with `EEXIST`. The plugin uses `rename`, which refuses an
+  occupied destination in both of Obsidian's shipped adapters, read out of
+  `obsidian-1.13.7.asar` and pinned in `plugin/fake.ts`; the Capacitor adapter
+  hands the refusal to the platform, so the plugin also looks at the path once
+  more immediately before the rename, which narrows that one rather than
+  closing it. A future Obsidian that made `rename` replace silently would break
+  this, which is why the fake asserts the behaviour rather than assuming it.
+
+  A move aside that fails for any reason other than the file being gone stops
+  the write rather than licensing it, on both clients.
 - The whole-file fallback on mobile. The 64 MiB default came off a desktop
   memory curve, so an older phone syncing a large attachment may be killed
   mid-pass: no note is lost, the file never syncs, and the symptom is a dead

@@ -208,6 +208,18 @@ export class FakeAdapter implements DataAdapter {
    */
   beforeRename: ((from: string, to: string) => Promise<void> | void) | undefined;
 
+  /**
+   * Runs just after a rename, which for a preserving write is the instant the
+   * note's own name is empty (R32).
+   *
+   * `beforeRename` cannot reach it: it is awaited, so anything queued from
+   * there runs before the rename rather than after it, and a test written that
+   * way lands its competitor on the wrong side of the move and proves the
+   * opposite of what it says. The window between the move aside and the
+   * exclusive create that follows needs a hook of its own.
+   */
+  afterRename: ((from: string, to: string) => Promise<void> | void) | undefined;
+
   /** Every operation, in order, for a test that cares about sequence. */
   readonly calls: { op: FaultOp; path: string; to?: string }[] = [];
 
@@ -554,6 +566,11 @@ export class FakeAdapter implements DataAdapter {
    */
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     await this.beforeRename?.(normalizedPath, normalizedNewPath);
+    await this.renaming(normalizedPath, normalizedNewPath);
+    await this.afterRename?.(normalizedPath, normalizedNewPath);
+  }
+
+  private async renaming(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     this.check("rename", normalizedPath, normalizedNewPath);
     if (normalizedPath === normalizedNewPath) return;
     const from = this.real(normalizedPath);
