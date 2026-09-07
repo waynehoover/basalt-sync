@@ -38,6 +38,7 @@ import {
   neverSync,
   splitName,
 } from "../core/paths.ts";
+import { composite, seam } from "../core/seam.ts";
 import {
   JournalIndexStore,
   indexLogPath,
@@ -158,8 +159,8 @@ export interface NodeVaultOptions {
  * meant to be a read-only scan. Too short to hit by racing, so a test stops
  * the world in it. It does nothing in every build.
  */
-export const midRespell = {
-  pause: async (_path: string): Promise<void> => {},
+export const midRespell = composite({
+  pause: seam("cli/vault:respell"),
   /**
    * The instant after the old name has been moved aside and before what came
    * out is put back under it (R21).
@@ -168,7 +169,7 @@ export const midRespell = {
    * and a save that takes it leaves this scan holding a version with nowhere
    * to return it to.
    */
-  beforeGivingBack: async (_path: string): Promise<void> => {},
+  beforeGivingBack: seam("cli/vault:respell.beforeGivingBack"),
   /**
    * The instant the old name's file is in staging and nothing has been decided
    * about it (R35).
@@ -177,8 +178,8 @@ export const midRespell = {
    * edit, and it is at a name in the directory the scan sweeps, so what the
    * sweep believes about that name is the whole question.
    */
-  parked: async (_path: string): Promise<void> => {},
-};
+  parked: seam("cli/vault:respell.parked"),
+});
 
 /**
  * The instant between a trash copy being made durable and the original being
@@ -190,8 +191,8 @@ export const midRespell = {
  * when the tree is one file, so a test stops the world in it. It does nothing
  * in every build.
  */
-export const midTrash = {
-  pause: async (_path: string): Promise<void> => {},
+export const midTrash = composite({
+  pause: seam("cli/vault:trash"),
   /**
    * The instant after a file's copy has been checked and before the original
    * is disposed of (R22).
@@ -201,7 +202,7 @@ export const midTrash = {
    * The hook sits after the comparison on purpose, because that is the only
    * place it can prove anything.
    */
-  afterCompare: async (_path: string): Promise<void> => {},
+  afterCompare: seam("cli/vault:trash.afterCompare"),
   /**
    * The instant a note being removed is parked under a temporary name, before
    * anything has been decided about it (R22).
@@ -209,8 +210,8 @@ export const midTrash = {
    * Where a crash leaves the vault, which is why the name it is parked under
    * matters: a visible one is a note, and this pass would upload it.
    */
-  parked: async (_path: string): Promise<void> => {},
-};
+  parked: seam("cli/vault:trash.parked"),
+});
 
 /**
  * The instant a displaced version is parked and its destination has not been
@@ -221,7 +222,31 @@ export const midTrash = {
  * that path in between is the thing preservation must not destroy, and this is
  * where a test puts one. It does nothing in every build.
  */
-export const midPreserve = { beforeClaim: async (_at: string): Promise<void> => {} };
+export const midPreserve = composite({
+  beforeClaim: seam("cli/vault:preserve.beforeClaim"),
+});
+
+/**
+ * The two instants inside a preserving write.
+ *
+ * Added by the fault driver rather than by a defect, which is the first time
+ * that has happened here: sweeping every scenario across every seam reported
+ * that the whole of `replace` was unreachable, because the seams this file had
+ * were each placed by the test for one earlier defect and none of them was in
+ * the ordinary path. The widest window in the client had no way to stop the
+ * world in it.
+ */
+export const midReplace = composite({
+  /** Staged and durable, with the note still under its own name. */
+  staged: seam("cli/vault:replace.staged"),
+  /**
+   * The note has been moved aside and nothing is at its name yet.
+   *
+   * A save landing here takes the name, and what this operation does about
+   * that is the whole of R43 and half of R18.
+   */
+  nameFree: seam("cli/vault:replace.nameFree"),
+});
 
 /**
  * Takes away a name whose file now has a second, normalised name, without
@@ -1462,6 +1487,9 @@ export class NodeVault implements Vault {
       // nothing lists -- which is the cost of a lock-free `status` and clears
       // itself on the next look.
       liveTemps.add(parked);
+      // Staged and durable, and the note is still under its own name. A save
+      // landing here is one this operation has not looked at yet.
+      await midReplace.staged(path);
       try {
         await rename(full, parked);
       } catch (err) {
@@ -1473,6 +1501,10 @@ export class NodeVault implements Vault {
       }
 
       let landed = true;
+      // The note's name holds nothing at all, and this operation emptied it.
+      // The widest window in this file, and until the fault driver went
+      // looking there was no way to stop the world inside it.
+      await midReplace.nameFree(path);
       try {
         await link(staged, full);
       } catch (err) {

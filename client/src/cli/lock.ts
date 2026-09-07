@@ -19,6 +19,7 @@ import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
+import { seam } from "../core/seam.ts";
 import { STATE_DIR } from "./config.ts";
 import { refuseOutsideVaultAt } from "./vault.ts";
 
@@ -33,7 +34,7 @@ export const lockPath = (vault: string) => join(vault, STATE_DIR, "lock");
  * replaceable `sync` for the same reason. It does nothing in every build; a
  * test replaces `pause`.
  */
-export const midPublish = { pause: async (): Promise<void> => {} };
+export const midPublish = seam("cli/lock:publish");
 
 const pause = (ms: number): Promise<void> => new Promise((go) => setTimeout(go, ms));
 
@@ -113,7 +114,7 @@ export async function lockVault(vault: string, command: string): Promise<() => P
     // The seam sits between reading who holds it and claiming a generation,
     // which is the only interleaving left: a contender that finishes here has
     // taken the vault, and this attempt then finds it and gives its claim up.
-    await midEvict.pause();
+    await midEvict.pause("");
 
     const next = highestGeneration(before) + 1;
     const at = claimPath(dir, next);
@@ -336,7 +337,7 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
   // already existed and was empty; here, nothing is at the path yet. A test
   // stops the world here and runs a competitor, which is the only way to
   // observe the difference: an empty lock leaves no trace once it is written.
-  await midPublish.pause();
+  await midPublish.pause("");
   try {
     await link(temp, path);
     return true;
@@ -354,7 +355,7 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
  *
  * Like `midPublish`, it does nothing in every build.
  */
-export const midEvict = { pause: async (): Promise<void> => {} };
+export const midEvict = seam("cli/lock:evict");
 
 /**
  * What is at the lock's path, keeping absent and unreadable apart.
