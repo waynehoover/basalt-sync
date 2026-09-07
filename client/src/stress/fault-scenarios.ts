@@ -131,4 +131,45 @@ const unplaceable: Scenario = {
   interfere: async (g, token) => await g.save("note.md", `# note\n\n${token}\n`),
 };
 
-export const SCENARIOS: readonly Scenario[] = [overwrite, remove, respell, collide, unplaceable];
+/**
+ * The other half of retiring a name: the file at it is no longer the one the
+ * caller looked at, so it has to come back out.
+ *
+ * Unreachable from the scenario above, and that is why this exists. Only one
+ * seam is held per permutation, so when the hook is on `beforeGivingBack` there
+ * is no competitor earlier in the call, the inode still matches, and the
+ * function returns before it ever gets there. The stale observation has to be
+ * built by the setup instead, which is exactly what a scan holding a stat from
+ * a moment ago is.
+ */
+const giveBack: Scenario = {
+  name: "a retired name turns out to hold somebody else's file",
+  setup: async (g) => {
+    await g.save("old-name.md", MINE);
+    const source = await stat(join(g.dir, "old-name.md"));
+    await link(join(g.dir, "old-name.md"), join(g.dir, "new-name.md"));
+    // The save that happened between the scan looking and this running. The
+    // name now holds a different file, and the version in it is unsent.
+    await g.save("old-name.md", "# note\n\nsaved between the look and the act.\n");
+    g.state.source = { dev: source.dev, ino: source.ino };
+  },
+  run: async (g) =>
+    await retireName(
+      join(g.dir, ".basalt", "tmp"),
+      join(g.dir, "old-name.md"),
+      g.state.source as { dev: number; ino: number },
+    ),
+  interfere: async (g, token) => await g.save("old-name.md", `# note\n\n${token}\n`),
+  // The competitor writes over the same name the setup's save is at, so the
+  // setup's version is the person's own to lose.
+  supersedes: true,
+};
+
+export const SCENARIOS: readonly Scenario[] = [
+  overwrite,
+  remove,
+  respell,
+  giveBack,
+  collide,
+  unplaceable,
+];

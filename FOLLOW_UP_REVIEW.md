@@ -817,3 +817,151 @@ of the recurring bug classes, proposed threat-model and release-scope boundaries
 implementation priorities, and public-beta acceptance criteria. It is a strategic
 recommendation based on these reviews, not another verification or confirmation
 that subsequent fixes are complete.
+
+## Readiness implementation review — 2026-09-07
+
+Reviewed **`e347e024aa79d6374855b8fcea7055a8f86f7c00`**, covering the four readiness
+commits after `01ae785`. The direction is sound: exclusive acquisition without
+automatic takeover, a shared recovery record, and a reusable fault driver address
+the recurring mechanisms. **The readiness guarantees are not yet complete.**
+The four findings below use separate RR identifiers to distinguish them from the
+earlier numbered verification rounds.
+
+### Validation and scope
+
+- The working tree was clean when captured. Review probes ran in an isolated
+  archive of the commit at `/tmp/basalt-readiness-review.AhLn2e/`.
+- **123 existing tests passed** across CLI lock/unlock/displaced-version tests,
+  the core ledger tests, and plugin vault tests.
+- **All 11 new fault-driver stress tests passed** against the original source.
+- **Five additional safety assertions failed**: continuous lock exclusion,
+  recovery after a failed ledger append, recovery with an unreadable ledger,
+  discovery after interruption immediately following preservation, and recovery
+  after a short compaction write. Logs and probes are retained in that directory.
+- Plugin probes use the repository's `FakeAdapter` and the actual `ObsidianVault`
+  implementation. The interrupted-operation probe reconstructs the persisted
+  state at the first preservation rename; it is not a real mobile SIGKILL test.
+- A private mutation of the crash child demonstrated RR4 and was restored before
+  running the original fault-driver tests. No application source was changed in
+  the working repository.
+- The extracted Obsidian 1.13.7 artifact supports the decision about
+  `Vault.process()`: both adapter implementations write in place. The public
+  read-modify-write guarantee does not establish crash-safe replacement.
+- The reported full 27-check gate, all 1,442 client tests, all 21 stress tests,
+  published npm compatibility, and real Obsidian platform acceptance were not
+  independently rerun in this focused assessment.
+
+### RR1 — Manual unlock still admits two active writers
+
+- [x] **P1 · CLI ownership · Reproduced with real filesystem operations and the public lock functions.**
+
+[`unlockVault`](client/src/cli/lock.ts#L227) checks the holder, then moves the
+lock aside. Another unlock can finish and a writer can acquire between those
+steps. Taking that new holder aside exposes an empty lock path again. Returning
+`contested` afterwards does not withdraw either writer's permission to write.
+
+**Observed:** begin with a dead holder. U1 pauses at `beforeTaking`; U2 clears
+the stale lock; A acquires through `lockVault`. Resume U1, which moves A's lock
+aside; B acquires at `taken`. Both acquisitions return before either releases.
+U1 returns `contested`. No fixture rewrites a live lock: after seeding the dead
+holder, this schedule uses only `unlockVault` and `lockVault` calls.
+
+The existing test acknowledges a related residual race but asserts the warning
+and retained lock file rather than continuous mutual exclusion. The new general
+fault sweep never invokes either ownership operation.
+
+**Fix and acceptance:** make recovery depend on an enforced exclusion mechanism,
+or explicitly limit manual recovery to a quiescent maintenance procedure with
+all writers, launchers, and other recovery attempts stopped. A warning after two
+successful admissions is not a completed ownership guarantee. Preserve this
+schedule as an exclusion test if concurrent recovery remains supported.
+
+### RR2 — Plugin discovery still depends on a ledger record that may never exist or be readable
+
+- [x] **P1 · Plugin recovery · Three focused probes fail.**
+
+[`removeExpecting`](client/src/plugin/vault.ts#L881) moves the note into a hidden
+folder before recording anything. It records only if a later operation throws.
+[`record`](client/src/core/displaced.ts#L88) swallows append errors, and
+[`parse`](client/src/core/displaced.ts#L146) returns an empty array on read errors.
+The comments rely on a fallback scan, but the
+[plugin explicitly uses only the ledger](client/src/plugin/vault.ts#L576).
+
+**Observed:** each of these leaves the retained note bytes readable at their
+hidden path while a fresh plugin adapter reports `stranded: []`:
+
+- Preserve a note, collide with an existing conflict destination, and fail the
+  ledger append with `ENOSPC`; restore normal I/O and restart the adapter.
+- Successfully record a stranded note, then fail the ledger read with `EACCES`.
+  The listing succeeds with an empty recovery inventory and only a log message.
+- Reconstruct the persisted state immediately after the first preservation
+  rename, before either the normal continuation or its catch block runs. There
+  is no ledger record, and the fresh listing shows neither the note nor recovery.
+
+**Fix and acceptance:** provide discovery independent of successful after-the-fact
+bookkeeping, for example a recovery-directory scan or durable intent established
+before hiding the note. Propagate an unknown recovery state when inventory cannot
+be established; logging an error and returning an empty inventory is insufficient.
+Test both discovery and user-visible state after restart and I/O recovery.
+
+### RR3 — Plugin ledger compaction can destroy the only recovery inventory
+
+- [x] **P1 · Plugin recovery durability · Reproduced with a short write.**
+
+[`ObsidianDisplacedFiles.rewrite`](client/src/plugin/vault.ts#L1648) replaces the
+ledger through an in-place `adapter.write`. A failed compaction can truncate it,
+although the [catch comment](client/src/core/displaced.ts#L136) assumes the old
+records remain. The next parse skips the damaged content, and the plugin has no
+fallback discovery for the files those records named.
+
+**Observed:** record one live hidden note and 32 resolved records. Let compaction
+write eight bytes and then throw `ENOSPC`, using the existing adapter fault
+mechanism. The current listing still holds the live record in memory. After
+restoring normal I/O and constructing a fresh adapter, the ledger contains only
+`{"at":".`, `stranded` is empty, and the hidden note bytes still exist.
+
+**Fix and acceptance:** use recoverable staged replacement for this inventory, or
+defer compaction. Maintain the previous valid inventory until its replacement is
+durable to the supported platform's guarantees. The same objection used to reject
+in-place `Vault.process()` writes applies to this recovery metadata. Add a
+short-write-and-restart test, checking discovery rather than just a warning.
+
+### RR4 — The crash driver can treat a lost version as an unreached seam
+
+- [x] **P2 · Verification harness · Demonstrated with a private mutation.**
+
+[`crashSweep`](client/src/stress/faults.ts#L309) decides whether the seam fired by
+searching for the version token it is supposed to prove survived. If that token
+is lost, it returns `fired: false` with no faults before checking preservation.
+The sweep requires only one reached seam per scenario, so other reached cases
+can hide this omission.
+
+**Observed:** in the private child only, remove the tracked version after the
+competitor writes at `cli/vault:replace.staged`, then retain the normal SIGKILL.
+The parent reports `faults: []` and `fired: false`. The mutation was restored.
+
+The coverage description also needs narrowing. On this macOS run, only **6 of
+12 registered seams** were reached by the five scenarios. None of the three
+lock seams were reached, nor `respell.beforeGivingBack`, `trash`, or
+`trash.afterCompare`. The sweep drives `NodeVault`, not the plugin or server,
+and contains no general assertion about active lock owners or rendered clean
+status. These are limits of this new sweep, not claims that the entire existing
+test suite lacks coverage of those areas.
+
+**Fix and acceptance:** establish seam reachability independently of the bytes
+being checked, using a separate handshake or the expected child termination
+protocol. A killed run that loses its token must fail. Maintain an explicit
+expected-reachability matrix, and include lock and plugin scenarios before
+claiming those invariants. A seam registry improves reuse but does not enumerate
+all operation boundaries or all schedules by itself.
+
+### Assessment of the design decisions
+
+Keep the simpler acquisition path and shared recovery model. Rejecting
+`Vault.process()` as a drop-in durability fix is supported by the inspected
+artifact. Keeping merge is a reasonable scope decision; filename identity
+normalization and physically renaming files during a scan remain separate design
+questions. The immediate priority is to close RR2/RR3 for the Obsidian product,
+repair RR4 so its tests can expose losses, and resolve or explicitly constrain
+RR1 while the CLI remains experimental. None of these findings calls for a
+wholesale rewrite.

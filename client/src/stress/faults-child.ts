@@ -15,6 +15,7 @@
  * reading: the parent looks at the vault, not at us (rule 4).
  */
 
+import { writeFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -27,11 +28,29 @@ import "../cli/lock.ts";
 import { SCENARIOS } from "./fault-scenarios.ts";
 import type { Ground } from "./faults.ts";
 
-const [dir, wanted, seam, token] = process.argv.slice(2);
-if (!dir || !wanted || !seam || !token) {
-  console.error("usage: faults-child.ts <dir> <scenario> <seam> <token>");
+const [dir, wanted, seam, token, signals] = process.argv.slice(2);
+if (!dir || !wanted || !seam || !token || !signals) {
+  console.error("usage: faults-child.ts <dir> <scenario> <seam> <token> <signal-dir>");
   process.exit(2);
 }
+
+/**
+ * Says out loud what this process did, where the parent can read it after the
+ * kill and where the vault's own walk cannot see it.
+ *
+ * The parent used to work out whether the seam had been reached by looking for
+ * the version it was about to check had survived. A run that lost that version
+ * therefore reported "the seam was never reached" and no fault at all, which
+ * is the exact inversion of what this file is for (RR4). Reachability has to
+ * come from somewhere other than the bytes under test.
+ *
+ * Written synchronously: the next thing to happen is a SIGKILL, and an
+ * unresolved promise is not a signal. `writeFileSync` returns with the bytes in
+ * the page cache, which a killed process does not take with it.
+ */
+const announce = (what: string): void => {
+  writeFileSync(join(signals, what), `${Date.now()}\n`);
+};
 
 const scenario = SCENARIOS.find((s) => s.name === wanted);
 if (scenario === undefined) {
@@ -55,6 +74,7 @@ const ground: Ground = {
     await mkdir(dirname(full), { recursive: true });
     await writeFile(full, body);
   },
+  state: {},
 };
 
 await scenario.setup(ground);
@@ -63,7 +83,14 @@ let done = false;
 seamNamed(seam).pause = async (): Promise<void> => {
   if (done) return;
   done = true;
+  // Before the competitor writes, so the parent can tell "the seam ran and the
+  // competitor could not write" from "the seam never ran".
+  announce("reached");
   await scenario.interfere(ground, token);
+  // And after, so the parent knows the version it is about to look for was
+  // really put there. Only now is its absence a loss rather than a competitor
+  // that failed.
+  announce("wrote");
   // Nothing after this line runs. Not a `finally`, not a flush, not the rest
   // of the operation.
   process.kill(process.pid, "SIGKILL");

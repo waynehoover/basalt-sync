@@ -53,6 +53,22 @@ import { refuseOutsideVaultAt } from "./vault.ts";
 export const lockPath = (vault: string) => join(vault, STATE_DIR, "lock");
 
 /**
+ * Where `unlock` records that it is running.
+ *
+ * One recovery at a time, and this is the whole of what makes manual recovery
+ * safe (RR1). Without it: U1 reads a lock whose holder is gone and pauses; U2
+ * clears that same lock, so the name is free and a writer takes the vault
+ * legitimately; U1 resumes, renames *that* writer's lock aside, and a second
+ * writer walks into the name while the first still holds it. Two writers, and
+ * the `contested` report at the end of U1 arrives after both are already in.
+ *
+ * With it, nothing but another `unlock` can make the lock file absent while
+ * one is deciding -- an acquirer meets the occupied name and is refused -- so
+ * excluding a second `unlock` removes the only way into that schedule.
+ */
+export const recoveryPath = (vault: string) => join(vault, STATE_DIR, "lock.recovering");
+
+/**
  * A seam, and a narrow one: the instant between preparing a lock and putting
  * it at its name.
  *
@@ -227,6 +243,42 @@ export type Unlocked =
 export async function unlockVault(vault: string, force = false): Promise<Unlocked> {
   const path = lockPath(vault);
   await refuseOutsideVaultAt(vault, path);
+  const recovery = recoveryPath(vault);
+  await refuseOutsideVaultAt(vault, recovery);
+  await mkdir(join(vault, STATE_DIR), { recursive: true });
+
+  // One recovery at a time, taken the same way the vault lock is: `link`,
+  // which creates the name or fails, and decides nothing about liveness.
+  const mine: LockHolder = {
+    pid: process.pid,
+    host: hostname(),
+    command: "unlock",
+    since: Date.now(),
+    token: randomBytes(16).toString("hex"),
+  };
+  if (!(await publish(join(vault, STATE_DIR), recovery, mine))) {
+    const other = await readHolder(recovery);
+    return {
+      did: "refused",
+      was: other ?? mine,
+      why:
+        `another basalt unlock is already running against this vault` +
+        (other === undefined ? "" : ` (pid ${other.pid} on ${other.host})`) +
+        `. Two of them at once can hand this vault to two writers, so this one stopped. ` +
+        `If no basalt is running, remove ${recovery} and try again`,
+    };
+  }
+  try {
+    return await breakLock(path, force);
+  } finally {
+    // Ours by token, like every other release here. Not recovery data: a
+    // mutex, and one that must not outlive the process holding it.
+    const now = await readHolder(recovery);
+    if (now?.token === mine.token) await rm(recovery, { force: true }).catch(() => undefined);
+  }
+}
+
+async function breakLock(path: string, force: boolean): Promise<Unlocked> {
   const before = await lockState(path);
   if (before.state === "absent") {
     return { did: "nothing", why: "nothing is holding this vault" };

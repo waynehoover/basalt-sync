@@ -76,7 +76,7 @@ import {
   saveConfig,
   type Config,
 } from "./config.ts";
-import type { Displaced } from "../core/displaced.ts";
+import type { Displaced, Inventory } from "../core/displaced.ts";
 import { lockVault, unlockVault } from "./lock.ts";
 import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
@@ -317,6 +317,21 @@ function refuseExtras(args: Args): void {
 /* ---------------------------------------------------------------- *
  * Commands
  * ---------------------------------------------------------------- */
+
+/**
+ * Why what is waiting could not be established, or undefined when it could.
+ *
+ * One place, because `status`, a single sync and a watch tick all have to give
+ * the same answer, and three copies of "is this complete" is how they stop
+ * doing that.
+ */
+function unknownRecovery(vault: { recovery?: Inventory } | undefined): string | undefined {
+  const at = vault?.recovery;
+  // An adapter with no opinion is not an incomplete one: `recovery` is
+  // optional precisely so an adapter that cannot strand anything says nothing.
+  if (at === undefined || at.complete) return undefined;
+  return at.why ?? "the record of displaced versions could not be established";
+}
 
 /** Runs a command that changes the vault under the vault's lock. */
 async function locked(args: Args, command: () => Promise<number>): Promise<number> {
@@ -1182,6 +1197,7 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
       client.serverCursor,
       client.vault.stranded ?? [],
       client.vault.displaced ?? [],
+      unknownRecovery(client.vault),
     );
     io.out(`Nothing was deleted. Where the two sides disagreed, both versions were kept.`);
     return exitCodeFor(report);
@@ -1204,6 +1220,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
       client.serverCursor,
       client.vault.stranded ?? [],
       client.vault.displaced ?? [],
+      unknownRecovery(client.vault),
     );
     return exitCodeFor(report);
   } finally {
@@ -1355,6 +1372,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
           watching?.serverCursor ?? 0,
           watching?.vault.stranded ?? [],
           watching?.vault.displaced ?? [],
+          unknownRecovery(watching?.vault),
         );
       },
       onSyncFailed: (err) => {
@@ -1370,6 +1388,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
           serverCursor,
           watching?.vault.stranded ?? [],
           watching?.vault.displaced ?? [],
+          unknownRecovery(watching?.vault),
         );
         settled = true;
         if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
@@ -1427,6 +1446,8 @@ async function unsentHere(
   stranded?: string[],
   /** Filled with what is known about each, where a record was written. */
   displaced?: Displaced[],
+  /** Set to what the scan could establish about the recovery inventory. */
+  recovery?: { at: Inventory | undefined },
 ): Promise<number | "unknown"> {
   try {
     const vault = new NodeVault(args.dir, {
@@ -1439,6 +1460,7 @@ async function unsentHere(
     const onDisk = await vault.list();
     stranded?.push(...vault.stranded);
     displaced?.push(...vault.displaced);
+    if (recovery !== undefined) recovery.at = vault.recovery;
     // No index is an empty baseline, not a reason to answer zero.
     const known = new Map(Object.entries(stored?.entries ?? {}));
     let unsent = 0;
@@ -1473,6 +1495,10 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
 
   const stranded: string[] = [];
   const displaced: Displaced[] = [];
+  // A box rather than a value, because the scan that fills it happens inside
+  // `unsentHere` and this is read after it. Left undefined when that scan
+  // never ran, which is itself not a clean answer.
+  const recovery: { at: Inventory | undefined } = { at: undefined };
   const local = {
     vault: args.dir,
     device: config.device,
@@ -1494,7 +1520,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // and its timestamp is not visible here, and the number is an estimate.
     // Saying which basis it is on is the difference between an estimate and a
     // claim; `unsent: 0` used to be printed as "up to date with the server".
-    unsent: await unsentHere(args, stored, stranded, displaced),
+    unsent: await unsentHere(args, stored, stranded, displaced, recovery),
     unsentFrom: "size and timestamp" as const,
     // Versions this client took off the disk and could not put back, which
     // nothing reaps and nothing else mentions (R35). Empty on every ordinary
@@ -1504,6 +1530,16 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // which note it came off and why it is not at its name. A subset, because
     // the scan also finds parked files nothing wrote a record for.
     displaced,
+    // Whether the two lists above are the whole of what is waiting (RR2). An
+    // empty `stranded` with this false is not a clean vault, and this command
+    // had no way to say so.
+    recoveryComplete: recovery.at?.complete ?? false,
+    recoveryUnknown:
+      recovery.at === undefined
+        ? "this vault could not be scanned, so what is waiting is unknown"
+        : recovery.at.complete
+          ? undefined
+          : (recovery.at.why ?? "the record of displaced versions could not be established"),
   };
 
   // Reachability is reported, never assumed. "up to date" from a client that
@@ -1569,7 +1605,16 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // exiting 0 is how a cron job never finds out, which is the same shape as
   // the disagreement above.
   const wrong =
-    !server.reachable || server.refused || local.unsent === "unknown" || local.stranded.length > 0;
+    !server.reachable ||
+    server.refused ||
+    local.unsent === "unknown" ||
+    local.stranded.length > 0 ||
+    // Not knowing is not clean (RR2). A vault whose record of displaced
+    // versions could not be read may have notes sitting where no listing shows
+    // them, and an empty list is the answer it gives either way. Exiting zero
+    // on the difference between "nothing is waiting" and "this could not be
+    // established" is rule 7 with the two cases that matter collapsed.
+    !local.recoveryComplete;
 
   if (args.json) {
     io.out(JSON.stringify({ ok: !wrong, ...local, server }));
@@ -1591,6 +1636,11 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   if (local.pending > 0) io.out(`pending  ${local.pending} files with work outstanding`);
   // Above the state line, because it is about notes and not about the server,
   // and because a person reading "caught up" wants to have seen this first.
+  // Above the list, because it is the sentence that says the list may not be
+  // the whole of it.
+  if (local.recoveryUnknown !== undefined) {
+    io.out(`unknown  ${local.recoveryUnknown}. There may be versions waiting that are not listed.`);
+  }
   if (local.stranded.length > 0) {
     // The paths, not a directory (R50). This said `.basalt/tmp` because that
     // was where the only kind of stranded version lived; a preservation claim
@@ -2097,6 +2147,8 @@ export function renderReport(
   stranded: readonly string[] = [],
   /** What was written down about each, where a record exists. */
   displaced: readonly Displaced[] = [],
+  /** Why what is waiting could not be established, when it could not (RR2). */
+  recoveryUnknown: string | undefined = undefined,
 ): void {
   const outcome = outcomeOf(r);
   if (args.json) {
@@ -2112,6 +2164,7 @@ export function renderReport(
         serverCursor,
         stranded,
         displaced,
+        recoveryUnknown: recoveryUnknown ?? null,
       }),
     );
     return;
@@ -2168,6 +2221,10 @@ export function renderReport(
   // And versions this pass took off a note and could not put anywhere, which
   // `status` reports and a watcher never would have: somebody who runs
   // `basalt sync` on a timer and nothing else was never told (R46, R50).
+  if (recoveryUnknown !== undefined) {
+    io.out("");
+    io.out(`  ${recoveryUnknown}. There may be versions waiting that are not listed.`);
+  }
   if (stranded.length > 0) {
     io.out("");
     io.out(`  ${stranded.length} version(s) this client could not put back:`);

@@ -516,8 +516,25 @@ const CHUNK_DEFLATE = 1;
  * load-bearing here. The same chunk has to seal to the same bytes on a desktop
  * and a phone or the names diverge and dedup silently stops working, and
  * "whatever zlib this runtime shipped" is not a guarantee. fflate is pure
- * JavaScript, so it is the same code everywhere, and its level 6 output is
- * byte-identical to zlib's anyway.
+ * JavaScript, so it is the same code everywhere.
+ *
+ * It is *not* byte-identical to zlib, and this comment used to say it was.
+ * Measured: over 200 text samples, fflate at level 6 and `node:zlib` at level 6
+ * agreed on zero of them. Both emit a raw deflate stream and the first bytes
+ * match, so it is the same format and the same level choosing different
+ * matches, not a framing difference -- on one sample fflate produced 61 bytes
+ * where zlib produced 63. The two are interchangeable for anything that only
+ * has to round-trip, and interchangeable for nothing here, because the sealed
+ * bytes are what the chunk is named by.
+ *
+ * That matters more than the speed does. Compression is the slowest step in
+ * sealing by some way: on 1 KiB text chunks it runs at 31 MiB/s against
+ * 85 MiB/s for the encrypt and 91 MiB/s for the name, so it is about sixty per
+ * cent of the cost, and `node:zlib` is 2.3x faster than fflate on the same
+ * input. Taking that speedup would mean a desktop naming a chunk differently
+ * from a phone, which is dedup quietly ending and every note re-uploading.
+ * `compression-golden` is what holds the format still; this paragraph is what
+ * stops somebody reading a false claim and swapping the codec for a win.
  *
  * A chunk that does not shrink is stored raw. The result is never larger than
  * the plaintext plus 29 bytes.

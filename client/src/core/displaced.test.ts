@@ -115,32 +115,93 @@ describe("the displaced-version ledger", () => {
     expect(waiting.map((d) => d.at)).toEqual(["a..keep", "b..keep"]);
   });
 
-  it("says so when the log cannot be read, rather than reporting nothing waiting", async () => {
-    // Rule 2. "Nothing is waiting" because the log could not be opened is the
-    // exact false clean this is here to prevent, so the empty answer comes
-    // with a complaint and the scan's own walk still finds the files.
+  it("reports an unreadable log as unknown, not as nothing waiting", async () => {
+    // Rule 2, and RR2. An empty list because the log could not be opened reads
+    // exactly like a clean vault, and for the plugin the log is the only
+    // source there is, so that empty list was the whole answer. It now travels
+    // with the reason attached and callers have to render one or the other.
     const files = new Files();
     files.unreadable = true;
     const said: string[] = [];
-    const waiting = await new DisplacedLedger(files, (m) => said.push(m)).waiting();
+    const out = await new DisplacedLedger(files, (m) => said.push(m)).inventory();
 
-    expect(waiting).toEqual([]);
-    expect(said.join(" ")).toContain("could not read");
+    expect(out.waiting).toEqual([]);
+    expect(out.complete, "an unreadable log was reported as a complete inventory").toBe(false);
+    expect(out.why).toContain("could not be read");
+    expect(said.join(" ")).toContain("could not be read");
   });
 
-  it("does not throw out of the failure path it is called from", async () => {
-    // `record` runs after something has already gone wrong with somebody's
-    // note. A bookkeeping error replacing that error would hide what actually
-    // happened to it.
+  it("reports a torn line as unknown, because it named something", async () => {
+    const files = new Files();
+    files.onDisk.add("a..keep");
+    files.text = `${JSON.stringify(record("a..keep", "a.md"))}\n{"at":"b..keep","fro`;
+    const out = await new DisplacedLedger(files).inventory();
+
+    expect(out.waiting.map((d) => d.at)).toEqual(["a..keep"]);
+    // The records before the tear are good and are reported. The tear is not
+    // nothing: whatever that line named is not in the list beside it.
+    expect(out.complete).toBe(false);
+  });
+
+  it("says it failed to record, and stays incomplete afterwards", async () => {
+    // The return value is what a caller about to hide a note checks (RR2): the
+    // record is the only thing that will know where the note went, so a caller
+    // that cannot write one must not hide it. And the failure is sticky,
+    // because no later scan can rediscover a note this process hid and never
+    // named.
     const files = new Files();
     files.append = async () => {
       throw new Error("the disk is full");
     };
     const said: string[] = [];
-    await expect(
-      new DisplacedLedger(files, (m) => said.push(m)).record(record("note.md..keep1")),
-    ).resolves.toBeUndefined();
+    const ledger = new DisplacedLedger(files, (m) => said.push(m));
+
+    await expect(ledger.record(record("note.md..keep1"))).resolves.toBe(false);
     expect(said.join(" ")).toContain("could not write down");
+
+    // Even once the disk comes back, this process cannot claim to know.
+    files.append = async (line) => {
+      files.text = (files.text ?? "") + line;
+    };
+    const out = await ledger.inventory();
+    expect(out.complete, "a failed record left the inventory claiming to be whole").toBe(false);
+    expect(out.why).toContain("could not be written down");
+  });
+
+  it("does not throw out of the failure path it is called from", async () => {
+    // `record` is also called after something has already gone wrong with
+    // somebody's note. A bookkeeping error replacing that error would hide
+    // what actually happened to it.
+    const files = new Files();
+    files.append = async () => {
+      throw new Error("the disk is full");
+    };
+    await expect(new DisplacedLedger(files).record(record("note.md..keep1"))).resolves.toBe(false);
+  });
+
+  it("does not compact when the shell cannot replace the log safely", async () => {
+    // RR3. The plugin writes in place, so a short compaction leaves a log
+    // holding half a record and an inventory of nothing, while the notes those
+    // records named are still hidden. A shell that cannot replace the whole
+    // file or none of it does not offer `rewrite`, and then nothing compacts.
+    // A shell that does not offer it at all, which is how the plugin declares
+    // that it cannot do this safely.
+    const files = new Files();
+    const cannotRewrite: DisplacedFiles = {
+      read: () => files.read(),
+      append: (line) => files.append(line),
+      stillThere: (at) => files.stillThere(at),
+    };
+    const ledger = new DisplacedLedger(cannotRewrite);
+    for (let i = 0; i < 40; i++) await ledger.record(record(`gone-${i}..keep`));
+    files.onDisk.add("here..keep");
+    await ledger.record(record("here..keep"));
+
+    expect((await ledger.inventory()).waiting.map((d) => d.at)).toEqual(["here..keep"]);
+    expect(files.rewrites, "the log was rewritten by a shell that cannot do it safely").toBe(0);
+    // The log keeps every record and the answer is filtered on read, which is
+    // the trade: an unbounded count of a rare event, against losing the lot.
+    expect(files.text!.trim().split("\n")).toHaveLength(41);
   });
 
   it("tidies the log rather than growing it for ever", async () => {

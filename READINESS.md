@@ -231,3 +231,84 @@ name. Four things came out of it.
 
 Each of the first three was a shape from the list. That is the argument for the
 list.
+
+## Independent verification — 2026-09-07
+
+The checked implementation tasks above do not close all of the intended
+guarantees. A focused review of `e347e02` found remaining ownership, plugin
+recovery, and fault-driver defects, recorded as **RR1–RR4** in
+[FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#readiness-implementation-review--2026-09-07).
+The existing focused tests passed; five additional safety assertions failed.
+See that review for reproductions, acceptance criteria, and verification limits.
+
+## Second review: RR1 to RR4
+
+An outside review of `e347e02` found four, recorded at
+[FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#readiness-implementation-review--2026-09-07).
+All four hold. Working order is the reviewer's: repair the instrument, then the
+Obsidian product, then ownership.
+
+- [x] **RR4** The crash driver decides whether a seam fired by looking for the
+      very version it is checking, so a lost version reads as an unreached
+      seam. Establish reachability independently, and state coverage as a
+      checked matrix rather than a claim: five scenarios reached 6 of 12 seams,
+      no lock seam among them.
+- [x] **RR3** Plugin ledger compaction rewrites in place, so a short write
+      destroys the only recovery inventory. The same objection that rejected
+      `Vault.process()`.
+- [x] **RR2** Plugin discovery depends entirely on a record that may never be
+      written (a crash straight after the move aside, a failed append) or never
+      be read (an unreadable log), and each of those reports a clean vault with
+      somebody's note in a hidden folder.
+- [x] **RR1** Two `unlock` calls overlapping admit two writers. `contested`
+      reports it after both are already in, which is not an ownership
+      guarantee.
+
+### What closing them took
+
+**RR4** was the one to do first, because until it was fixed nothing else could
+be measured. The crash driver asked whether the seam had fired by looking for
+the version it was about to check had survived, so a run that lost the version
+reported "the seam was never reached" and no fault. The child now writes two
+marks outside the vault, `reached` before the competitor writes and `wrote`
+after, and the parent reads those: no mark is a skipped permutation, `reached`
+without `wrote` is a competitor that failed rather than a client that lost
+something, and a child that got past its own SIGKILL is itself a fault.
+Reproduced with the reviewer's mutation, which now fails at three seams.
+
+Coverage is a checked matrix rather than a sentence. Six scenarios, with the
+seams each reaches written down and asserted both ways, so reaching *more* than
+it claims fails too. The six seams no scenario reaches are listed with reasons:
+three are the lock, which is exclusion rather than bytes and has its own tests,
+and two are the cross-filesystem trash path, which needs a mount of its own and
+runs only in CI. A seventh scenario was added to reach `respell.beforeGivingBack`,
+which needs a stale observation the setup has to build.
+
+**RR3** Compaction is now opt-in. `DisplacedFiles.rewrite` is optional and the
+plugin does not implement it, because `DataAdapter.write` truncates in place
+and a short write leaves a log holding half a record and an inventory of
+nothing, with the hidden notes still there. That is the same objection that
+rejected `Vault.process()`, and it applies harder to the record of where the
+notes went, because it is the only thing that knows. The log grows instead: one
+record per version that could not be placed, which is rare by construction.
+
+**RR2** Two changes. The plugin records the intent **before** it hides the
+note, and does not hide it at all if that cannot be written -- which turns a
+lost note into a deletion that did not happen, and covers the crash between the
+move and the catch as well as the failed append. And the ledger now answers
+with an `Inventory` rather than a list, so "nothing is waiting" and "this could
+not be established" are different answers: an unreadable log, a torn line, or a
+failed append all make the inventory incomplete, `status` exits non-zero on it,
+and the plugin panel and a notice say the count may be short.
+
+**RR1** Two unlocks may no longer overlap. `unlock` takes a recovery lock of
+its own with the same exclusive `link`, and a second one is refused. That is
+sufficient rather than a narrowing: nothing else can make the lock file absent
+while an unlock is deciding, because an acquirer meets the occupied name and is
+turned away, so removing concurrent unlocks removes the only way into the
+schedule. Reproduced first as the reviewer described it -- two writers, with
+`contested` arriving after both were in -- then fixed, then mutated back.
+
+A crashed `unlock` leaves `.basalt/lock.recovering` and wedges recovery until
+somebody removes it. That is a worse experience and a better failure: it stops
+recovery rather than admitting two writers, and the refusal names the file.

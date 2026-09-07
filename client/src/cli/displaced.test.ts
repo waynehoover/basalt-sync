@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { NodeVault } from "./vault.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "../plugin/fake.ts";
 import { ObsidianVault } from "../plugin/vault.ts";
+import { DISPLACED_LOG } from "../core/displaced.ts";
 import { removeTree } from "../core/test-server.ts";
 
 const enc = new TextEncoder();
@@ -146,6 +147,84 @@ describe("the plugin, when a displaced version has nowhere to go", () => {
     // somebody's note inside a dot-folder.
     expect(vault.stranded).toEqual([out.keptAt]);
     expect(vault.displaced[0]!.from).toBe("note.md");
+  });
+
+  it("refuses to hide a note it cannot write down first", async () => {
+    // RR2. The record used to be written after the move, and only on the path
+    // where something threw. An append that failed therefore left the note in
+    // a folder Obsidian does not list with nothing anywhere naming it. Now the
+    // record comes first and the note is not moved at all if it cannot be
+    // written, which turns a lost note into a deletion that did not happen.
+    const adapter = new FakeAdapter();
+    adapter.seed("note.md", MINE);
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+
+    adapter.fault = (op) => (op === "append" ? new Error("no space left on device") : undefined);
+    const out = await vault.removeExpecting("note.md", { contentId: "whatever", idOf }, "kept.md");
+    adapter.fault = undefined;
+
+    // Left exactly where it was, and said so.
+    expect(out).toEqual({ keptAt: "note.md", landed: true });
+    expect(await adapter.read("note.md")).toBe(MINE);
+
+    // And a fresh adapter agrees: nothing is hidden and nothing is waiting.
+    const next = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    await next.list();
+    expect(next.stranded).toEqual([]);
+    expect(next.recovery.complete).toBe(true);
+  });
+
+  it("survives a crash between the move aside and everything after it", async () => {
+    // RR2. The interrupted case: the note is in the hidden folder and the
+    // process is gone before any of the code that used to do the recording
+    // ran. The intent written before the move is the only thing left, and it
+    // has to be enough.
+    const adapter = new FakeAdapter();
+    adapter.seed("note.md", MINE);
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+
+    // Stop the world immediately after the note has been moved aside, which
+    // is where a phone being suspended lands.
+    const interrupted = new Error("the process went away");
+    adapter.afterRename = () => {
+      throw interrupted;
+    };
+    await vault
+      .removeExpecting("note.md", { contentId: "whatever", idOf }, "kept.md")
+      .catch(() => undefined);
+    adapter.afterRename = undefined;
+
+    const next = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    await next.list();
+    expect(next.stranded, "the interrupted move left nothing pointing at the note").toHaveLength(1);
+    expect(next.displaced[0]!.from).toBe("note.md");
+    // And the bytes really are at the path it names.
+    expect(await adapter.read(next.stranded[0]!)).toBe(MINE);
+  });
+
+  it("reports an unreadable record as unknown, not as a clean vault", async () => {
+    // RR2. Obsidian's index does not list the hidden folder, so this log is
+    // the only source there is. A log that cannot be read produces an empty
+    // list, and an empty list used to be indistinguishable from a vault with
+    // nothing waiting.
+    const adapter = new FakeAdapter();
+    adapter.seed("note.md", MINE);
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    adapter.fault = (op, _path, to) =>
+      op === "rename" && to === "kept.md" ? new Error("the conflict name is taken") : undefined;
+    await vault.removeExpecting("note.md", { contentId: "whatever", idOf }, "kept.md");
+    adapter.fault = undefined;
+
+    const next = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    next.list;
+    adapter.fault = (op, path) =>
+      op === "read" && path.endsWith(DISPLACED_LOG) ? new Error("permission denied") : undefined;
+    await next.list();
+    adapter.fault = undefined;
+
+    expect(next.stranded).toEqual([]);
+    expect(next.recovery.complete, "an unreadable log was reported as a clean vault").toBe(false);
+    expect(next.recovery.why).toContain("could not be read");
   });
 
   it("keeps the record across a restart", async () => {

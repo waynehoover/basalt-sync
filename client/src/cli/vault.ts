@@ -44,6 +44,7 @@ import {
   DisplacedLedger,
   type Displaced,
   type DisplacedFiles,
+  type Inventory,
 } from "../core/displaced.ts";
 import {
   JournalIndexStore,
@@ -472,6 +473,13 @@ export class NodeVault implements Vault {
   private readonly ledger: DisplacedLedger;
   /** Refreshed by every scan, from the ledger, for anything that reports. */
   displaced: readonly Displaced[] = [];
+  /**
+   * And whether that is the whole of it (RR2).
+   *
+   * Starts incomplete, because nothing has looked yet, and a shell that reads
+   * this before the first scan should not be told the vault is clean.
+   */
+  recovery: Inventory = { waiting: [], complete: false, why: "nothing has scanned this vault yet" };
 
   constructor(root: string, opts: NodeVaultOptions = {}) {
     this.root = resolve(root);
@@ -1277,7 +1285,12 @@ export class NodeVault implements Vault {
     // Not tidied when this scan is a question (R12). `status` runs beside a
     // watcher and takes no lock, and rewriting the log would be the one write
     // an observing scan still made.
-    this.displaced = await this.ledger.waiting(!this.observeOnly);
+    const inventory = await this.ledger.inventory(!this.observeOnly);
+    this.displaced = inventory.waiting;
+    // The walk is a second, independent source, so what the ledger could not
+    // establish is not necessarily missing from `stranded`. It is still not
+    // established, and saying so is the point.
+    this.recovery = inventory;
     const already = new Set(this.stranded);
     for (const d of this.displaced) {
       if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {

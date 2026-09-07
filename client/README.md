@@ -238,6 +238,11 @@ process is still running. `--force` is for a lock held on another machine,
 which this one cannot check; it will not break a lock held by a process
 running here, because that one is checkable and stopping it is the answer.
 
+One `unlock` at a time. Two of them overlapping can hand the vault to two
+writers, so the second is refused while the first runs. If one is killed
+part-way it leaves `.basalt/lock.recovering` behind and the next says so:
+remove that file once no basalt is running.
+
 That is less convenient than taking an abandoned lock over, and it is
 deliberate. Taking it over automatically was attempted five times and four of
 those handed one vault to two writers; `docs/compared.md` has all five. Node

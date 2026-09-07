@@ -12,7 +12,7 @@
  * test with no Obsidian and no disk involved.
  */
 
-import type { Displaced } from "./displaced.ts";
+import type { Displaced, Inventory } from "./displaced.ts";
 
 /** What a listing says about one path. */
 export interface FileStat {
@@ -319,6 +319,16 @@ export interface Vault {
    * they are there.
    */
   readonly displaced?: readonly Displaced[];
+  /**
+   * Whether `stranded` and `displaced` are the whole of what is waiting.
+   *
+   * Undefined from an adapter that cannot strand anything. From one that can,
+   * `complete: false` means this could not be established: the record was
+   * unreadable, or something was displaced and could not be written down. An
+   * empty list with `complete: false` is not a clean vault, and a shell that
+   * renders it as one is the defect this field exists for (RR2, rule 2).
+   */
+  readonly recovery?: Inventory;
 
   /**
    * The digest of one path's contents, without holding the whole file (R31).

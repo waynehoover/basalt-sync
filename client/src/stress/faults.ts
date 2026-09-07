@@ -20,6 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -58,6 +59,16 @@ export interface Ground {
    * accident.
    */
   saveInPlace(path: string, body: string): Promise<void>;
+  /**
+   * Somewhere for a scenario to carry what its setup learned into its run.
+   *
+   * Fresh for every permutation, because a permutation that inherited the one
+   * before it would be testing a vault nobody built. Used by the scenarios
+   * that need a *stale* observation: `retireName` takes the identity of the
+   * file its caller looked at, and half its behaviour is only reachable when
+   * what is at the name is no longer that file.
+   */
+  readonly state: Record<string, unknown>;
 }
 
 export interface Scenario {
@@ -171,6 +182,7 @@ export async function permute(scenario: Scenario, it: Seam): Promise<Outcome> {
         await mkdir(dirname(full), { recursive: true });
         await writeFile(full, body);
       },
+      state: {},
     };
     await scenario.setup(g);
 
@@ -268,6 +280,9 @@ export function losses(outcomes: readonly Outcome[]): string[] {
  */
 export async function crashSweep(scenario: Scenario, seamName: string): Promise<Outcome> {
   const dir = await mkdtemp(join(tmpdir(), "basalt-crash-"));
+  // Outside the vault, so the vault's own walk never sees it and so a killed
+  // child can still leave a mark. See `faults-child.ts`.
+  const signals = await mkdtemp(join(tmpdir(), "basalt-crash-signal-"));
   const faults: string[] = [];
   const token = `interloper-${Math.random().toString(36).slice(2, 10)}`;
   try {
@@ -280,6 +295,7 @@ export async function crashSweep(scenario: Scenario, seamName: string): Promise<
         scenario.name,
         seamName,
         token,
+        signals,
       ],
       { stdio: ["ignore", "ignore", "pipe"] },
     );
@@ -306,10 +322,37 @@ export async function crashSweep(scenario: Scenario, seamName: string): Promise<
       );
     }
 
+    // From the child's own signals, never from the bytes under test (RR4).
+    //
+    // This used to ask whether the token was anywhere in the vault, which is
+    // the same question the preservation check below asks. A run that lost the
+    // version therefore reported "the seam was never reached" and no fault,
+    // and the sweep needs only one reached seam per scenario, so a real loss
+    // could sit behind a sibling seam that did fire.
+    const reached = existsSync(join(signals, "reached"));
+    const wrote = existsSync(join(signals, "wrote"));
+    if (!reached) {
+      return { scenario: scenario.name, seam: seamName, faults, refused: undefined, fired: false };
+    }
+    if (!wrote) {
+      // The seam ran and the competitor's own write did not finish. Nothing
+      // was promised to survive, so there is nothing to have lost; it is also
+      // not a permutation that tested anything, so it is not counted as one.
+      return { scenario: scenario.name, seam: seamName, faults, refused: undefined, fired: false };
+    }
+    const fired = true;
+
+    // A child that was killed is one whose seam ran to the end. A child that
+    // signalled and then exited zero got past its own SIGKILL, which means
+    // the seam did not do what this file says it does.
+    if (ended.signal !== "SIGKILL") {
+      faults.push(
+        `the child reached the seam and wrote, then exited with code ${ended.code} instead ` +
+          `of dying in it, so nothing about a crash was tested`,
+      );
+    }
+
     const tree = await everything(dir);
-    const fired = [...tree.values()].some((body) => body.includes(token));
-    if (!fired)
-      return { scenario: scenario.name, seam: seamName, faults, refused: undefined, fired };
 
     const vault = new NodeVault(dir);
     await vault.list().catch(() => undefined);
@@ -342,5 +385,6 @@ export async function crashSweep(scenario: Scenario, seamName: string): Promise<
     return { scenario: scenario.name, seam: seamName, faults, refused: undefined, fired };
   } finally {
     await removeTree(dir).catch(() => undefined);
+    await removeTree(signals).catch(() => undefined);
   }
 }

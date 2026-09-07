@@ -52,10 +52,42 @@ export interface Displaced {
 export interface DisplacedFiles {
   read(): Promise<string | undefined>;
   append(line: string): Promise<void>;
-  /** Replaces the whole log, durably as far as the platform allows. */
-  rewrite(text: string): Promise<void>;
+  /**
+   * Replaces the whole log, and **only** where the shell can do it without a
+   * moment in which neither the old text nor the new one is on the disk.
+   *
+   * Optional, and a shell that cannot leaves it out rather than doing its best
+   * (RR3). The plugin's `DataAdapter.write` truncates in place, so a short
+   * write left a log holding `{"at":".` and an inventory of nothing, with the
+   * hidden notes those records named still sitting there. That is the same
+   * objection this project used to reject `Vault.process()` for replacing
+   * notes, and it applies at least as much to the record of where the notes
+   * went: it is the only thing that knows.
+   *
+   * Without it the log grows. Each record is a couple of hundred bytes and one
+   * is written per version that could not be placed, which is a rare event by
+   * construction, so an unbounded count of a rare thing is the cheaper end of
+   * this trade.
+   */
+  rewrite?(text: string): Promise<void>;
   /** Whether something is still at this vault-relative path. */
   stillThere(at: string): Promise<boolean>;
+}
+
+/**
+ * What is waiting, and whether that is the whole of it.
+ *
+ * Two fields rather than one list, because "nothing is waiting" and "this
+ * could not be established" are different answers, and reporting the second as
+ * the first is a clean vault with somebody's note in a hidden folder (RR2,
+ * rule 2). Everything that renders this has to say which one it got.
+ */
+export interface Inventory {
+  readonly waiting: readonly Displaced[];
+  /** False when something is known to be missing from `waiting`. */
+  readonly complete: boolean;
+  /** Why it is incomplete, for the person who has to go and look. */
+  readonly why?: string;
 }
 
 /**
@@ -77,19 +109,33 @@ export class DisplacedLedger {
   }
 
   /**
-   * Writes down that a version is somewhere nothing lists.
+   * Whether anything is known to be missing from this log.
    *
-   * Never throws. This is called from the failure path of an operation that
-   * has already gone wrong, and a bookkeeping error that replaced the real one
-   * would hide what actually happened to somebody's note. What it costs when
-   * it fails is the reason rather than the bytes: the scan still finds a
-   * parked file and still reports it, with less to say about it.
+   * Sticky for the life of the object. A failed append is a note this process
+   * put somewhere and cannot name afterwards, and no later scan can rediscover
+   * that fact: the only honest thing left is to stop claiming the inventory is
+   * the whole of it.
    */
-  async record(d: Displaced): Promise<void> {
+  private missing: string | undefined;
+
+  /**
+   * Writes down that a version is somewhere nothing lists, and says whether it
+   * managed to.
+   *
+   * Never throws, and the return value is the point (RR2). A caller about to
+   * hide a note must not hide it when this fails, because the record is the
+   * only thing that will know where it went. A caller writing this down
+   * *after* something has already gone wrong cannot un-fail it, and takes the
+   * false answer with the incompleteness noted instead.
+   */
+  async record(d: Displaced): Promise<boolean> {
     try {
       await this.files.append(`${JSON.stringify(d)}\n`);
+      return true;
     } catch (err) {
       this.say(`could not write down that ${d.at} is waiting: ${(err as Error).message}`);
+      this.missing = `${d.from} was displaced to ${d.at} and could not be written down`;
+      return false;
     }
   }
 
@@ -113,10 +159,21 @@ export class DisplacedLedger {
    * same either way: what is dropped from the answer is dropped whether or not
    * the file is rewritten.
    */
-  async waiting(tidy = true): Promise<Displaced[]> {
-    const all = await this.parse();
+  async waiting(tidy = true): Promise<readonly Displaced[]> {
+    return (await this.inventory(tidy)).waiting;
+  }
+
+  /**
+   * The same, with whether it can be trusted to be the whole of it.
+   *
+   * Everything that reports to a person should ask for this one. The
+   * difference between the two answers is a vault that looks clean and is not
+   * (RR2), and a caller handed a bare array has no way to tell.
+   */
+  async inventory(tidy = true): Promise<Inventory> {
+    const read = await this.parse();
     const newest = new Map<string, Displaced>();
-    for (const d of all) newest.set(d.at, d);
+    for (const d of read.records) newest.set(d.at, d);
 
     const live: Displaced[] = [];
     let dead = 0;
@@ -126,45 +183,61 @@ export class DisplacedLedger {
     }
     // Counted against the whole log rather than against the live records: a
     // log of a thousand resolved entries and one live one is what this is for.
-    if (tidy && (all.length - live.length >= COMPACT_AT || (dead > 0 && live.length === 0))) {
+    if (
+      tidy &&
+      (read.records.length - live.length >= COMPACT_AT || (dead > 0 && live.length === 0))
+    ) {
       await this.compact(live);
     }
     live.sort((a, b) => a.when - b.when);
-    return live;
+    const why = read.why ?? this.missing;
+    return why === undefined
+      ? { waiting: live, complete: true }
+      : { waiting: live, complete: false, why };
   }
 
   private async compact(live: readonly Displaced[]): Promise<void> {
+    const rewrite = this.files.rewrite?.bind(this.files);
+    // A shell that cannot replace the log safely does not replace it (RR3).
+    if (rewrite === undefined) return;
     try {
-      await this.files.rewrite(live.map((d) => `${JSON.stringify(d)}\n`).join(""));
+      await rewrite(live.map((d) => `${JSON.stringify(d)}\n`).join(""));
     } catch (err) {
       // The log keeps its dead records, which costs a longer file and nothing
-      // else: `waiting` filters them every time.
+      // else: `waiting` filters them every time. True only because `rewrite`
+      // is all-or-nothing where it exists at all.
       this.say(`could not tidy the displaced-version log: ${(err as Error).message}`);
     }
   }
 
-  private async parse(): Promise<Displaced[]> {
+  private async parse(): Promise<{ records: Displaced[]; why?: string }> {
     let text: string | undefined;
     try {
       text = await this.files.read();
     } catch (err) {
-      // Rule 2: unreadable is not empty. Reporting nothing waiting because the
-      // log could not be read is the exact failure this module exists to stop,
-      // so it says so and the scan's own walk still finds the files.
-      this.say(`could not read the displaced-version log: ${(err as Error).message}`);
-      return [];
+      // Rule 2: unreadable is not empty. Returning an empty list here reported
+      // a clean vault to somebody whose note was in a hidden folder, which is
+      // this module's own failure mode arriving through this module (RR2). The
+      // emptiness now travels with the reason attached, and everything that
+      // renders it has to say which answer it got.
+      const why = `the record of displaced versions could not be read (${(err as Error).message})`;
+      this.say(why);
+      return { records: [], why };
     }
-    if (text === undefined || text.length === 0) return [];
+    if (text === undefined || text.length === 0) return { records: [] };
     const out: Displaced[] = [];
+    let torn: string | undefined;
     for (const line of text.split("\n")) {
       if (line.trim().length === 0) continue;
       const d = parseLine(line);
-      // A torn last line is what a crash mid-append leaves. Skipped rather
-      // than thrown on: the records before it are good, and they are the ones
-      // naming notes.
       if (d !== undefined) out.push(d);
+      // A torn last line is what a crash mid-append leaves, and the records
+      // before it are good. Skipped rather than thrown on, and counted rather
+      // than passed over in silence: a line that cannot be read named
+      // something, and whatever it named is not in the list beside it.
+      else torn = "the record of displaced versions has a line that cannot be read";
     }
-    return out;
+    return torn === undefined ? { records: out } : { records: out, why: torn };
   }
 }
 

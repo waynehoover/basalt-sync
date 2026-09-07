@@ -76,7 +76,7 @@ import {
 } from "../core/pairing.ts";
 import { rotateVault } from "../core/rotation.ts";
 import { ProtocolError } from "../core/transport.ts";
-import { DISPLACED_LOG, type Displaced } from "../core/displaced.ts";
+import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
@@ -107,6 +107,15 @@ export type State =
        * PRODUCT_READINESS.md 3).
        */
       waiting: number;
+      /**
+       * Set when this device cannot say what is waiting (RR2).
+       *
+       * Different from `waiting: 0`, and the difference is the whole reason
+       * the field exists: the plugin's only record of a note it hid is a log
+       * in its own folder, and a log it cannot read produces an empty list
+       * that reads exactly like a clean vault.
+       */
+      recoveryUnknown?: string | undefined;
     }
   /**
    * Working, and on what.
@@ -183,7 +192,7 @@ export default class BasaltPlugin extends Plugin {
   /** The pairing in progress, so a second press cannot start another. */
   private pairing: Promise<unknown> | undefined;
   /** What the notices have already said, so they say it once. */
-  private announced = { attention: "", waiting: "" };
+  private announced = { attention: "", waiting: "", unknown: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
   /**
@@ -367,7 +376,7 @@ export default class BasaltPlugin extends Plugin {
     if (!config || this.running) return;
     this.running = true;
     this.everConnected = false;
-    this.announced = { attention: "", waiting: "" };
+    this.announced = { attention: "", waiting: "", unknown: "" };
     // Every run is numbered, and only the newest one may speak. A single
     // boolean was not enough: unlinking cleared it, pairing again set it,
     // and the *previous* run woke from its backoff, read the new run's
@@ -565,8 +574,9 @@ export default class BasaltPlugin extends Plugin {
           // the sentence and the notice cannot start counting different things.
           refused: needsAttention(report),
           waiting: vault.stranded.length,
+          recoveryUnknown: vault.recovery.complete ? undefined : vault.recovery.why,
         });
-        this.announce(report, vault.displaced);
+        this.announce(report, vault.displaced, vault.recovery);
       },
       // A pass that failed outright, from wherever it was started (F16).
       //
@@ -752,7 +762,26 @@ export default class BasaltPlugin extends Plugin {
    * how the one that matters gets dismissed too. Those are announced when
    * the count or the names change and not otherwise.
    */
-  private announce(report: SyncReport, waiting: readonly Displaced[] = []): void {
+  private announce(
+    report: SyncReport,
+    waiting: readonly Displaced[] = [],
+    recovery: Inventory = { waiting: [], complete: true },
+  ): void {
+    // Before the list, because it is the one that says the list may be short.
+    // Keyed on the reason so a persistent fault is announced once.
+    if (!recovery.complete) {
+      const why = recovery.why ?? "the record could not be established";
+      if (why !== this.announced.unknown) {
+        this.announced.unknown = why;
+        new Notice(
+          `Basalt cannot tell whether any notes are waiting to be recovered: ${why}. ` +
+            `Notes may be sitting in a hidden folder with nothing pointing at them.`,
+          30_000,
+        );
+      }
+    } else {
+      this.announced.unknown = "";
+    }
     // First, because it is the only one of these that means a note is not
     // where its author left it. Keyed on the paths rather than the count, for
     // the reason the attention notice is: one rescued in the same pass as
@@ -1992,7 +2021,9 @@ function iconFor(state: State): string {
     case "syncing":
       return "refresh-cw";
     case "synced":
-      return state.refused > 0 || state.waiting > 0 ? "alert-circle" : "check";
+      return state.refused > 0 || state.waiting > 0 || state.recoveryUnknown !== undefined
+        ? "alert-circle"
+        : "check";
     case "offline":
       return "cloud-off";
     case "failed":
@@ -2020,7 +2051,9 @@ function toneFor(state: State): string {
     case "syncing":
       return "basalt-working";
     case "synced":
-      return state.refused > 0 || state.waiting > 0 ? "basalt-attention" : "";
+      return state.refused > 0 || state.waiting > 0 || state.recoveryUnknown !== undefined
+        ? "basalt-attention"
+        : "";
   }
 }
 
@@ -3177,6 +3210,11 @@ function longStatus(state: State): string {
           `${state.waiting} ${state.waiting === 1 ? "version was" : "versions were"} kept ` +
             `somewhere Obsidian does not show.`,
         );
+      }
+      // Last, and unconditional on the count, because it is the sentence that
+      // says the count may be wrong.
+      if (state.recoveryUnknown !== undefined) {
+        parts.push(`Basalt cannot tell what is waiting: ${state.recoveryUnknown}.`);
       }
       return parts.join(" ");
     }

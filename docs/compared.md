@@ -377,14 +377,29 @@ process and what to type. The alternative was a mechanism nobody could
 demonstrate the correctness of, standing between two writers and the rule this
 project exists for.
 
-`basalt unlock` has one window of its own and it is closed the same way: an
-ordinary refusal, where the holder is running or is on another machine, reads
-the lock and touches nothing at all. Only a lock already read as abandoned is
-taken aside, and if it turns out to be held after all it goes back with `link`
-rather than `rename`, so a lock somebody legitimately took in the meantime is
-not written over. Where even that fails, the command says two processes may
-hold the vault and both should be stopped, because a race that cannot be undone
-can at least be reported (rule 7).
+`basalt unlock` had two windows of its own, and both are closed rather than
+reported.
+
+The first: taking a lock aside to decide about it frees the name for as long as
+the decision takes, so a `sync` starting in that instant joins the holder. An
+ordinary refusal -- the holder is running, or is on a machine this one cannot
+ask -- therefore reads the lock and touches nothing at all, and only a lock
+already read as abandoned is moved.
+
+The second was subtler and was found by review rather than here. Two unlocks
+overlapping admit two writers: U1 reads an abandoned lock and pauses, U2 clears
+that same lock, a writer takes the free name legitimately, and U1 then renames
+*that* writer's lock aside and a second writer walks in. Reporting it
+afterwards is not an exclusion, so `unlock` now takes a recovery lock of its
+own and a second one is refused. Nothing else can empty the lock file while an
+unlock is deciding, because an acquirer meets the occupied name, so removing
+concurrent unlocks removes the only way into that schedule.
+
+What is left after both is a lock somebody deleted by hand at exactly the wrong
+moment. The put-back uses `link` rather than `rename` so it cannot write over a
+lock legitimately taken meanwhile, and where even that fails the command says
+two processes may hold the vault and both should be stopped, because a race
+that cannot be undone can at least be reported (rule 7).
 
 The Go server has no part of this problem: `internal/dirlock` calls `flock`.
 

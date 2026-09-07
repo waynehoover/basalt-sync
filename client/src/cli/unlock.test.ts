@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { STATE_DIR } from "./config.ts";
-import { alive, lockPath, lockVault, midBreak, unlockVault } from "./lock.ts";
+import { alive, lockPath, lockVault, midBreak, unlockVault, type Unlocked } from "./lock.ts";
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -232,6 +232,63 @@ describe("unlock", () => {
     expect(out.did).toBe("contested");
     expect(out.why).toContain("stop both");
     await release!();
+  });
+
+  it("never lets two callers hold the vault, whatever unlock is doing", async () => {
+    // RR1, the reviewer's schedule, using nothing but the public functions.
+    //
+    // U1 reads a lock whose holder is gone and pauses. U2 clears that same
+    // stale lock, so the name is free and A takes the vault legitimately. U1
+    // resumes and renames *A's* lock aside, freeing the name while A still
+    // holds it, and B walks in. Two writers, and the `contested` U1 returns is
+    // a report that arrives after both are already inside.
+    //
+    // The fix is upstream of all of it: two unlocks may not overlap. Nothing
+    // else can make the lock file absent while one is deciding, because an
+    // acquirer meets the occupied name and is refused, so excluding a second
+    // unlock removes the only way into this schedule.
+    //
+    // The phase gate matters. Both unlocks run through the same module-level
+    // seams, and without it U2 fires the hook meant for U1 and the schedule
+    // tests something else that happens to pass.
+    const dir = await vault();
+    await put(dir, stale());
+
+    const held: string[] = [];
+    let phase: "paused" | "insideU2" | "resumed" = "paused";
+    let u2: Unlocked | undefined;
+    let a: (() => Promise<void>) | undefined;
+    let b: (() => Promise<void>) | undefined;
+
+    midBreak.beforeTaking = async () => {
+      if (phase !== "paused") return;
+      phase = "insideU2";
+      u2 = await unlockVault(dir);
+      a = await lockVault(dir, "writer A").catch(() => undefined);
+      if (a !== undefined) held.push("A");
+      phase = "resumed";
+    };
+    midBreak.taken = async () => {
+      if (phase !== "resumed") return;
+      b = await lockVault(dir, "writer B").catch(() => undefined);
+      if (b !== undefined) held.push("B");
+    };
+
+    const u1 = await unlockVault(dir);
+
+    // The schedule has to have been attempted, or this proves nothing.
+    expect(u2, "the second unlock never ran, so the schedule was not exercised").toBeDefined();
+    expect(phase, "the first unlock never reached its pause").toBe("resumed");
+    expect(
+      held.length,
+      `${held.join(" and ")} were both admitted while the other still held the vault`,
+    ).toBeLessThanOrEqual(1);
+    // The second unlock is what has to be turned away, and it has to say why.
+    expect(u2!.did).toBe("refused");
+    expect(u2!.why).toContain("already running");
+    expect(u1.did).toBe("removed");
+
+    for (const release of [a, b]) if (release !== undefined) await release();
   });
 
   it("hands a cleared vault to exactly one of many waiting callers", async () => {

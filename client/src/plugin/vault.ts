@@ -74,6 +74,7 @@ import {
   DisplacedLedger,
   type Displaced,
   type DisplacedFiles,
+  type Inventory,
 } from "../core/displaced.ts";
 import {
   configFolderName,
@@ -355,6 +356,15 @@ export class ObsidianVault implements Vault {
   /** Refreshed by every scan, for anything that reports. */
   displaced: readonly Displaced[] = [];
   /**
+   * And whether that is the whole of it (RR2).
+   *
+   * It matters more here than in the headless client, because here the record
+   * is the *only* source: Obsidian's index does not list the hidden folder a
+   * displaced note goes into, so there is no walk to fall back on. A log this
+   * cannot read is a vault this cannot describe.
+   */
+  recovery: Inventory = { waiting: [], complete: false, why: "nothing has scanned this vault yet" };
+  /**
    * The same, as bare paths, which is what the engine and both shells read.
    *
    * Filled from the ledger by `list`, like the headless client's, so that
@@ -577,7 +587,9 @@ export class ObsidianVault implements Vault {
     // ledger only, unlike the headless client: Obsidian's index does not list
     // a hidden folder, so there is nothing here to walk for and the record is
     // the whole answer.
-    this.displaced = await this.ledger.waiting();
+    const inventory = await this.ledger.inventory();
+    this.displaced = inventory.waiting;
+    this.recovery = inventory;
     this.stranded.length = 0;
     for (const d of this.displaced) this.stranded.push(d.at);
     return out;
@@ -880,6 +892,37 @@ export class ObsidianVault implements Vault {
     // them where it lies would identify one file and dispose of another.
     const folder = await freeRemovalFolder(this.adapter, from);
     const aside = `${folder}/${from.slice(from.lastIndexOf("/") + 1)}`;
+
+    // Written down *before* the note is hidden, and the note is not hidden if
+    // it cannot be (RR2).
+    //
+    // It used to be recorded afterwards, and only on the path where something
+    // threw. Two ways that lost a note: a crash between the rename below and
+    // the catch left no record at all, and an append that failed left none
+    // either, and in both cases Obsidian does not list the folder the note is
+    // now in, so nothing anywhere knew where it had gone. Recording an intent
+    // first is the same rule as the rest of this file -- establish the
+    // recovery before the destructive act, not after it -- and it makes the
+    // failure "the note was not moved" rather than "the note cannot be found".
+    //
+    // The record goes stale on every successful path, because the file it
+    // names stops existing, and `inventory` drops a record whose file is gone.
+    // Nothing has to remember to clear it.
+    if (
+      !(await this.ledger.record({
+        at: aside,
+        from: path,
+        why: `${path} is being moved aside to be identified before a deletion`,
+        when: Date.now(),
+      }))
+    ) {
+      this.log(
+        `not moving ${path} aside to identify it, because that could not be written down ` +
+          `first and nothing would know where it had gone`,
+      );
+      return { keptAt: path, landed: true };
+    }
+
     try {
       await this.adapter.mkdir(folder);
       await this.adapter.rename(from, aside);
@@ -918,10 +961,10 @@ export class ObsidianVault implements Vault {
       // The note is still in the hidden folder, so the folder stays and the
       // path is reported. Mislaid is recoverable; unmentioned is not.
       //
-      // Written down as well as returned. The caller is told once, in the
-      // result of this call, and a person asking tomorrow is not: Obsidian's
-      // index does not list a hidden folder, so without a record there is
-      // nothing left that knows this note is in there (R46).
+      // The intent recorded above already names this file, so the note is
+      // findable whether or not this second record lands. This one only
+      // improves the reason, from "is being moved aside" to what actually
+      // went wrong, and supersedes the first because they share a path.
       await this.ledger.record({
         at: aside,
         from: path,
@@ -1645,14 +1688,14 @@ class ObsidianDisplacedFiles implements DisplacedFiles {
     await this.adapter.append(this.path, line);
   }
 
-  async rewrite(text: string): Promise<void> {
-    await this.mkdirForIt();
-    if (text.length === 0) {
-      if (await this.adapter.exists(this.path)) await this.adapter.remove(this.path);
-      return;
-    }
-    await this.adapter.write(this.path, text);
-  }
+  // No `rewrite`, on purpose (RR3). `DataAdapter.write` truncates in place, so
+  // a short write leaves a log holding the first few bytes of one record and
+  // an inventory of nothing, while the hidden notes those records named are
+  // still there and now unfindable. The ledger compacts only where a shell can
+  // replace the whole file or none of it, and this adapter cannot: it has no
+  // staged write, and remove-then-rename has a moment with no log at all,
+  // which reads as a clean vault. So this log grows instead. See
+  // `core/displaced.ts`.
 
   async stillThere(at: string): Promise<boolean> {
     return await this.adapter.exists(at);
