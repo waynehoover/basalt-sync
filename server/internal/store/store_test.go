@@ -1454,3 +1454,170 @@ func TestDeletedPagesBackwardsPastItsLimit(t *testing.T) {
 		t.Fatalf("walked %d deletions of 12: %v", len(seen), seen)
 	}
 }
+
+// A chunk list that loses its tail is a lost note, and nothing could see it.
+//
+// The ord sequence catches a gap in the middle; the size check catches a list
+// that lost every row. Between them sits the case neither sees: three chunks
+// becoming two passes both, and `verify -deep` reports the vault clean over a
+// version every device refuses, because the client's authenticator covers the
+// chunk list and the assembled size will not match. What was missing was any
+// record of what the writer wrote.
+func TestATruncatedChunkListIsRefused(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("v", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	var names []string
+	for _, body := range []string{"one ", "two ", "three"} {
+		n := chunks.Name([]byte(body))
+		if err := st.Chunks().Put("v", n, []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	uid, err := st.AppendEntry("v", Entry{
+		Path: "note.md", Size: 14, MTime: 1, Device: "d", Chunks: names, Mac: testMac,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The last row goes, which is what a truncated tail is.
+	if _, err := st.db.Exec(
+		`DELETE FROM entry_chunks WHERE vault_id = ? AND uid = ? AND ord = 2`, "v", uid); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := st.EntryByUID("v", uid); err == nil {
+		t.Error("an entry two thirds of a note long was handed out as the note")
+	}
+	// Every read path, because the check is in the one they share.
+	if _, _, err := st.NextBatch("v", 0, 10); err == nil {
+		t.Error("a catch-up batch carried the truncated version")
+	}
+	if err := st.EachEntry("v", func(Entry) error { return nil }); err == nil {
+		t.Error("EachEntry, which the purge's backup check reads the source with, did not see it")
+	}
+}
+
+// And a store written before the count existed is not refused for not having
+// it. Counting the rows that are there now would record whatever state they
+// are in as the truth, so those rows say "unknown" and are left alone.
+func TestAnEntryFromBeforeTheCountIsStillReadable(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("v", 1); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("a note an older build wrote")
+	name := chunks.Name(body)
+	if err := st.Chunks().Put("v", name, body); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := st.AppendEntry("v", Entry{
+		Path: "old.md", Size: int64(len(body)), MTime: 1, Device: "d",
+		Chunks: []string{name}, Mac: testMac,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what the migration leaves on a row written before the column.
+	if _, err := st.db.Exec(
+		`UPDATE entries SET n_chunks = -1 WHERE vault_id = ? AND uid = ?`, "v", uid); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := st.EntryByUID("v", uid)
+	if err != nil || !ok {
+		t.Fatalf("a row from before the column was refused: ok=%v err=%v", ok, err)
+	}
+	if len(got.Chunks) != 1 {
+		t.Errorf("chunks = %v", got.Chunks)
+	}
+}
+
+// A commit cannot be overtaken by a quarantine.
+//
+// `AppendEntry` checks that every chunk is present and then commits, both under
+// `writeMu`, and its comment says that is what makes "committed implies
+// serveable" true rather than likely. The sweep takes the same lock and was
+// treated as the only remover of bodies. `Quarantine` is the second, it took no
+// lock, and unlike the sweep it runs on a live server: a fetch for another
+// device finding a body that fails its hash renames it aside.
+//
+// So the entry committed referencing a body the server no longer holds, and
+// the pushing client -- told the server already had it -- would never send it
+// again. A moment earlier and the presence check would have answered
+// ErrChunkMissing and got the good bytes back.
+func TestAQuarantineCannotOvertakeACommit(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("v", 1); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("a body that fails its own hash later")
+	name := chunks.Name(body)
+	if err := st.Chunks().Put("v", name, body); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fetch, running while the commit is between its presence check and its
+	// transaction. It must not be able to take the body away there.
+	//
+	// The assertion is *inside* that window, because after it proves nothing:
+	// once the commit returns the lock is free and the quarantine may run at
+	// any moment, so a body that is gone by then is gone either way. What has
+	// to be true is that it was still there while the commit was deciding.
+	done := make(chan struct{})
+	st.betweenCheckAndCommit = func() {
+		st.betweenCheckAndCommit = nil
+		go func() {
+			defer close(done)
+			if err := st.Quarantine("v", name); err != nil {
+				t.Errorf("quarantine: %v", err)
+			}
+		}()
+		// Long enough that a quarantine taking no lock would have finished.
+		time.Sleep(50 * time.Millisecond)
+		if _, ok := st.Chunks().Size("v", name); !ok {
+			t.Error("the body was taken away between the presence check and the commit, " +
+				"so this entry commits referencing something the server does not hold")
+		}
+	}
+
+	uid, err := st.AppendEntry("v", Entry{
+		Path: "note.md", Size: int64(len(body)), MTime: 1, Device: "d",
+		Chunks: []string{name}, Mac: testMac,
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	<-done
+
+	// And the quarantine did happen, so the window really was contended.
+	if _, ok := st.Chunks().Size("v", name); ok {
+		t.Error("the quarantine never ran, so nothing was racing the commit")
+	}
+	got, ok, err := st.EntryByUID("v", uid)
+	if err != nil || !ok {
+		t.Fatalf("the committed entry cannot be read back: ok=%v err=%v", ok, err)
+	}
+	if len(got.Chunks) != 1 || got.Chunks[0] != name {
+		t.Errorf("chunks = %v", got.Chunks)
+	}
+}

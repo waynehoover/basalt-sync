@@ -54,6 +54,22 @@ type BackupReport struct {
 	// Verified is chunk references checked in the backup after writing it.
 	Verified int
 
+	// Inherited is faults the finished backup has that the source has too.
+	//
+	// A copy cannot be better than what it copied. An entry whose
+	// authenticator predates F20 keeps the empty string a migration gave it,
+	// because the server holds no key to mint one, and `verifyEntries` reports
+	// it on every pass. Refusing to publish over that vetoed every backup for
+	// ever on any vault old enough to have one, and the message blamed the
+	// backup for a fault in the store it came from: the last good copy was
+	// never refreshed, and `purge -backup` could then never be satisfied
+	// either, so the safety net was cut by the thing holding it.
+	//
+	// So a fault the source has as well is reported and does not block. A
+	// fault the source does not have is the copy being wrong, and that still
+	// refuses.
+	Inherited []Fault
+
 	// Meta is what was written to backup.json beside the database: the uid
 	// range each vault covers and the purge generation it was taken at.
 	Meta BackupMeta
@@ -656,14 +672,26 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 		return rep, err
 	}
 	rep.Verified = checked.Chunks
-	if len(checked.Faults) > 0 {
+	// Told apart before either is acted on: what this copy got wrong, and what
+	// it faithfully copied.
+	//
+	// `Backup`'s own reasoning about rot at the source says to report it
+	// against the source "rather than sending someone to check the wrong
+	// disk", and that was applied to bodies and not to entries.
+	inherited, blocking, err := s.splitInheritedFaults(checked.Faults, deep)
+	if err != nil {
+		dest.Close()
+		return rep, err
+	}
+	rep.Inherited = inherited
+	if len(blocking) > 0 {
 		dest.Close()
 		// Not "missing chunk references": a deep pass also decodes the device
 		// rows and the invites, and a backup that published with a rotted
 		// registry would restore into a vault whose devices are locked out.
 		return rep, fmt.Errorf("the backup has %d faults over %d chunk references and %d "+
 			"registry rows, first: %s",
-			len(checked.Faults), checked.Chunks, checked.Rows, checked.Faults[0])
+			len(blocking), checked.Chunks, checked.Rows, blocking[0])
 	}
 	// What the snapshot covers, read from the snapshot itself so backup.json
 	// describes the file beside it and not the live store, which may have
@@ -886,4 +914,49 @@ const (
 // backup cannot write a layout the server does not read.
 func DataDir(dir string) (dbPath, chunkDir string) {
 	return filepath.Join(dir, dbFileName), filepath.Join(dir, chunkDirName)
+}
+
+// splitInheritedFaults says which of a backup's faults its source has too.
+//
+// Only the metadata ones can be inherited: an entry row and a registry row are
+// copied verbatim by `VACUUM INTO`, so a malformed one in the destination was
+// malformed in the source and no backup can mend it. A missing or corrupt body
+// is this operation's own work and is never excused.
+//
+// Matched on vault, uid and reason rather than on the whole fault, because the
+// path is the only other field and a copy cannot have changed it without the
+// digest check upstream already refusing.
+func (s *Store) splitInheritedFaults(found []Fault, deep bool) (inherited, blocking []Fault, err error) {
+	if len(found) == 0 {
+		return nil, nil, nil
+	}
+	source := map[string]struct{}{}
+	entryFaults, _, err := s.verifyEntries()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, f := range entryFaults {
+		source[faultKey(f)] = struct{}{}
+	}
+	if deep {
+		registryFaults, _, err := s.verifyRegistry()
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, f := range registryFaults {
+			source[faultKey(f)] = struct{}{}
+		}
+	}
+	for _, f := range found {
+		if _, same := source[faultKey(f)]; same {
+			inherited = append(inherited, f)
+			continue
+		}
+		blocking = append(blocking, f)
+	}
+	return inherited, blocking, nil
+}
+
+func faultKey(f Fault) string {
+	return fmt.Sprintf("%s\x00%d\x00%s", f.VaultID, f.UID, f.Reason)
 }

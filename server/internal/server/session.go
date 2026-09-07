@@ -2215,7 +2215,11 @@ func (s *Session) quarantineIfCorrupt(name string, err error) {
 		return
 	}
 	s.srv.log.Error("quarantining a corrupt chunk", "vault", s.vaultID, "chunk", name, "err", err)
-	if qerr := s.srv.st.Chunks().Quarantine(s.vaultID, name); qerr != nil {
+	// Through the store, so this takes the lock a commit holds: a body removed
+	// between `AppendEntry`'s presence check and its commit is an entry
+	// referencing something the server does not have, and the client that was
+	// told to skip the upload will not send it again.
+	if qerr := s.srv.st.Quarantine(s.vaultID, name); qerr != nil {
 		s.srv.log.Error("could not quarantine it", "vault", s.vaultID, "chunk", name, "err", qerr)
 	}
 }

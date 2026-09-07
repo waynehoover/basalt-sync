@@ -1470,6 +1470,18 @@ func cmdBackup(args []string, out io.Writer) error {
 		rep.Vaults, rep.Refs, rep.Copied, humanBytes(rep.Bytes))
 	fmt.Fprintf(out, "  %d bodies at source, %d in the backup\n", rep.SourceBodies, rep.DestBodies)
 	fmt.Fprintf(out, "  verified %d chunk references in the backup, all present\n", rep.Verified)
+	// Faults the copy has because the store it came from has them. They do not
+	// stop a backup, because no backup can mend them and refusing would leave
+	// the last good copy unrefreshed for ever, but they are the operator's to
+	// know about and they are in the *source*: this says so rather than
+	// sending somebody to inspect the disk that is fine.
+	if len(rep.Inherited) > 0 {
+		fmt.Fprintf(out, "  %d fault(s) copied faithfully from %s, which is where they are:\n",
+			len(rep.Inherited), *dataDir)
+		for _, f := range rep.Inherited {
+			fmt.Fprintln(out, "   ", f)
+		}
+	}
 	// Either side can be the larger, and the difference means something
 	// different each way, so it is subtracted in the direction that is
 	// actually positive. Printing source minus destination unconditionally

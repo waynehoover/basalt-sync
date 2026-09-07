@@ -831,3 +831,105 @@ func TestAMalformedDigestIsRefusedRatherThanPanicking(t *testing.T) {
 		})
 	}
 }
+
+// A fault the source already has does not veto a faithful copy of it.
+//
+// `migrate` gives a pre-F20 `entries` table a `mac` column defaulting to the
+// empty string, because the server holds no key to mint one, and
+// `verifyEntries` reports every such row as `nomac` on every pass. `Backup`
+// refused to publish while any fault existed, so on any vault old enough to
+// have one, every backup failed for ever -- and the message blamed the backup
+// for a fault in the store it came from. The last good copy was never
+// refreshed, and `purge -backup` could then never be satisfied either, so the
+// safety net was cut by the thing holding it.
+func TestBackupPublishesOverAFaultItInherited(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("a note from before the authenticator existed")
+	name := chunks.Name(body)
+	if err := st.Chunks().Put("default", name, body); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := st.AppendEntry("default", Entry{
+		Path: "old.md", Size: int64(len(body)), MTime: 1, Device: "d",
+		Chunks: []string{name}, Mac: testMac,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what the migration leaves: a committed row with no authenticator.
+	if _, err := st.db.Exec(`UPDATE entries SET mac = '' WHERE vault_id = ? AND uid = ?`,
+		"default", uid); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(dir, "backup")
+	rep, err := st.Backup(dest, true)
+	if err != nil {
+		t.Fatalf("a backup was refused for a fault in the store it copied: %v", err)
+	}
+	if len(rep.Inherited) != 1 || rep.Inherited[0].Reason != "nomac" {
+		t.Errorf("the inherited fault was not reported: %v", rep.Inherited)
+	}
+	// And it really published: the coverage beside it describes this snapshot.
+	if _, err := ReadBackupMeta(dest); err != nil {
+		t.Fatalf("nothing was published: %v", err)
+	}
+	// A second one works too, which is the property that was actually lost.
+	if _, err := st.Backup(dest, true); err != nil {
+		t.Fatalf("the next backup was refused as well: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// And a fault the source does not have still refuses.
+//
+// That is the whole of the distinction: a missing body in the destination is
+// this operation's own work and no copy of anything.
+func TestBackupStillRefusesAFaultOfItsOwn(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "live")
+	dbPath, chunkDir := DataDir(src)
+	st, err := Open(dbPath, chunkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.EnsureVault("default", 1000); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("a body the backup will lose")
+	name := chunks.Name(body)
+	if err := st.Chunks().Put("default", name, body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendEntry("default", Entry{
+		Path: "note.md", Size: int64(len(body)), MTime: 1, Device: "d",
+		Chunks: []string{name}, Mac: testMac,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(dir, "backup")
+	// The body goes missing from the destination between the copy and the
+	// verification, which is the shape of a copy that did not work.
+	st.afterPublish = nil
+	st.duringBackup = func() {
+		st.duringBackup = nil
+		_, destChunks := DataDir(dest)
+		_ = os.RemoveAll(destChunks)
+	}
+	if _, err := st.Backup(dest, false); err == nil {
+		t.Fatal("a backup missing the body it just copied was published")
+	}
+}

@@ -276,6 +276,16 @@ type Entry struct {
 	Mac    string `json:"mac"`
 	Parent string `json:"parent"`
 
+	// nChunks is how many chunk rows this entry was written with, read back
+	// from the row, or -1 for one written before the column existed.
+	//
+	// Unexported, so it never reaches the wire: it is not the client's
+	// business and it is not covered by the authenticator. It exists so
+	// `attachChunks` can tell a chunk list that lost its tail from one that
+	// was always that long, which neither the ord sequence nor the size check
+	// can see.
+	nChunks int
+
 	// Chunks names the encrypted chunks of this version, in order. Empty for a
 	// folder, a deletion, and a zero-byte file, and empty rather than absent:
 	// there is no omitempty here, and the read paths fill in an empty slice, so
@@ -426,6 +436,20 @@ CREATE TABLE IF NOT EXISTS entries (
   -- holds no key, cannot check either, and stores them so the devices can.
   mac       TEXT    NOT NULL DEFAULT '',
   parent    TEXT    NOT NULL DEFAULT '',
+  -- How many chunk rows this entry was written with.
+  --
+  -- The ord sequence catches a gap in the middle and the size check catches a
+  -- list that lost every row, and between them sits the case neither sees: a
+  -- truncated tail. Three chunks becoming two passes both, and the entry then
+  -- reads as a complete shorter file that every device refuses, because the
+  -- client's authenticator covers the chunk list. Nothing recorded what the
+  -- writer wrote, so nothing could tell.
+  --
+  -- Negative one is "written before this column existed", which the migration
+  -- leaves on every older row and which the read path treats as unknown rather
+  -- than as zero. The same shape as the mac column, and for the same reason:
+  -- the server cannot reconstruct what it never stored.
+  n_chunks  INTEGER NOT NULL DEFAULT -1,
   PRIMARY KEY (vault_id, uid)
 );
 
@@ -485,6 +509,15 @@ type Store struct {
 	// and therefore cannot be one transaction. The chunk sweep takes the same
 	// lock, which is what makes that pair atomic with respect to deletion.
 	writeMu sync.Mutex
+
+	// betweenCheckAndCommit runs inside AppendEntry, after the chunks have been
+	// found and before the transaction opens, and is nil in every non-test
+	// build.
+	//
+	// It exists because that gap is the whole of the "committed implies
+	// serveable" argument and it is a few microseconds wide. A test that tried
+	// to reach it by timing would be one that passes when the machine is busy.
+	betweenCheckAndCommit func()
 
 	// duringBackup runs once per chunk reference while a backup copies bodies,
 	// and is nil in every non-test build.
@@ -714,6 +747,12 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 			ErrOverBudget, len(e.Chunks), stored, e.Size, budget)
 	}
 
+	// The gap the lock exists to cover: the bodies have been found and nothing
+	// is committed yet. Nil in every non-test build.
+	if s.betweenCheckAndCommit != nil {
+		s.betweenCheckAndCommit()
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -732,10 +771,11 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent, n_chunks)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		vaultID, uid, e.Path, e.Size, e.CTime, e.MTime,
-		boolToInt(e.Folder), boolToInt(e.Deleted), e.Device, e.Prev, e.Mac, e.Parent); err != nil {
+		boolToInt(e.Folder), boolToInt(e.Deleted), e.Device, e.Prev, e.Mac, e.Parent,
+		len(e.Chunks)); err != nil {
 		return 0, err
 	}
 
@@ -753,11 +793,31 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 	return uid, nil
 }
 
+// Quarantine sets a corrupt body aside, under the lock a commit holds.
+//
+// `AppendEntry` checks that every chunk is present and then commits, both
+// inside `writeMu`, and its comment says that is what makes "committed implies
+// serveable" true rather than likely. The sweep takes the same lock. It was not
+// the only remover of bodies: `Quarantine` is the second, it took no lock, and
+// it is the one that runs on a live server.
+//
+// Without this, A could hold `writeMu`, stat chunk C and get a yes; B could
+// serve a fetch of C for another device, find it fails its hash, and rename it
+// aside; A would then commit an entry referencing a body the server does not
+// hold, and the pushing client -- told the server already had C -- would never
+// resend it. Half a second earlier and `AppendEntry` would have answered
+// `ErrChunkMissing` and got the good bytes back.
+func (s *Store) Quarantine(vaultID, name string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.chunks.Quarantine(vaultID, name)
+}
+
 /* ---------------------------------------------------------------- *
  * Reading
  * ---------------------------------------------------------------- */
 
-const entryCols = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent`
+const entryCols = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent, n_chunks`
 
 // Batch is a covered range of the uid sequence, in the shape the wire protocol
 // sends it.
@@ -1122,6 +1182,19 @@ func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 		if e.HasBody() && e.Size > 0 && len(e.Chunks) == 0 {
 			return fmt.Errorf("entry %d of vault %q declares size %d and has no chunk rows",
 				e.UID, vaultID, e.Size)
+		}
+		// And as many as it was written with. The ord sequence sees a gap in
+		// the middle and the check above sees a list that lost every row; a
+		// tail that went missing passes both, and the entry then reads as a
+		// complete shorter file that every device refuses, because the
+		// client's authenticator covers the chunk list.
+		//
+		// Skipped where the count is unknown, which is every row written
+		// before the column existed. Counting those now would record whatever
+		// state they are in as the truth.
+		if e.nChunks >= 0 && len(e.Chunks) != e.nChunks {
+			return fmt.Errorf("entry %d of vault %q was written with %d chunks and has %d",
+				e.UID, vaultID, e.nChunks, len(e.Chunks))
 		}
 	}
 	return nil
@@ -1981,7 +2054,8 @@ type scannable interface {
 func scanEntry(r scannable) (Entry, error) {
 	var e Entry
 	var folder, deleted int
-	err := r.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &folder, &deleted, &e.Device, &e.Prev, &e.Mac, &e.Parent)
+	err := r.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &folder, &deleted,
+		&e.Device, &e.Prev, &e.Mac, &e.Parent, &e.nChunks)
 	e.Folder = folder != 0
 	e.Deleted = deleted != 0
 	return e, err
@@ -2114,6 +2188,21 @@ CREATE TABLE IF NOT EXISTS devices (
 			if _, err := db.Exec(`ALTER TABLE entries ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
 				return err
 			}
+		}
+	}
+
+	// The chunk count, which older rows do not have and cannot be given: what
+	// the writer wrote is exactly the thing that was never recorded, and
+	// counting the rows that are there now would record the corruption as the
+	// truth. Minus one says "unknown" and the read path leaves those alone.
+	has, err := hasColumn(db, "entries", "n_chunks")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(
+			`ALTER TABLE entries ADD COLUMN n_chunks INTEGER NOT NULL DEFAULT -1`); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2538,51 +2627,53 @@ func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64
 // restored and moved on. Walking the entries is what turns "a store with a
 // big number in it" into "a store holding these exact versions".
 //
-// A callback rather than a slice because a vault's whole history can be large
-// and the caller only needs one entry at a time.
+// The whole vault is read before the first callback, despite the callback:
+// `attachChunks` works over a set, and doing it a page at a time would give up
+// the checks below for a saving on a command that is already O(versions). The
+// shape stays a callback because that is what the caller wants and because
+// paging it later changes nothing here.
 func (s *Store) EachEntry(vaultID string, fn func(Entry) error) error {
-	rows, err := s.db.Query(
+	// One transaction, and `scanEntry` and `attachChunks` rather than a second
+	// hand-written pair.
+	//
+	// This built its own chunk lists, so it had neither the ord-sequence check
+	// nor the size and count checks that every other read path gets, and it is
+	// the *source* side of the purge's backup check while `EntryByUID` reads
+	// the backup: a source entry with a chunk row missing was reported as the
+	// backup holding a different version, and the operator was sent to inspect
+	// the healthy disk while the damage sat in the store about to be purged.
+	// Reading them separately also let a concurrent purge drop the chunk rows
+	// of an entry already read, which is the reason `NextBatch` uses one.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(
 		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? ORDER BY uid`, vaultID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	var entries []Entry
 	for rows.Next() {
-		var e Entry
-		if err := rows.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &e.Folder,
-			&e.Deleted, &e.Device, &e.Prev, &e.Mac, &e.Parent); err != nil {
+		e, err := scanEntry(rows)
+		if err != nil {
+			rows.Close()
 			return err
 		}
 		entries = append(entries, e)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return err
 	}
-	// The chunk lists after the entry rows, because the first query's rows are
-	// still open until the loop above finishes.
-	byUID := make(map[int64]int, len(entries))
-	for i := range entries {
-		entries[i].Chunks = []string{}
-		byUID[entries[i].UID] = i
-	}
-	chunkRows, err := s.db.Query(
-		`SELECT uid, name FROM entry_chunks WHERE vault_id = ? ORDER BY uid ASC, ord ASC`, vaultID)
-	if err != nil {
+	rows.Close()
+
+	if err := attachChunks(tx, vaultID, entries); err != nil {
 		return err
 	}
-	defer chunkRows.Close()
-	for chunkRows.Next() {
-		var uid int64
-		var name string
-		if err := chunkRows.Scan(&uid, &name); err != nil {
-			return err
-		}
-		if i, ok := byUID[uid]; ok {
-			entries[i].Chunks = append(entries[i].Chunks, name)
-		}
-	}
-	if err := chunkRows.Err(); err != nil {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return err
 	}
 

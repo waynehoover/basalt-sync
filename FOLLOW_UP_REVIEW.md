@@ -629,3 +629,60 @@ The helper correctly [returns no aliases for an entirely prerelease history](scr
 Plugin probes use the repository adapter/stub; real Obsidian desktop/mobile acceptance was not run. The installed Obsidian 1.13.7 desktop adapter's rename ordering was inspected: its existence check and native rename execute in the adapter's queue, which is relevant to its own writes and is not a general filesystem lock. Physical power cuts, Linux mounted-filesystem behavior, and live GitHub scheduling/publication were not independently exercised. F11's authenticated replay protection remains the earlier explicit POC deferral.
 
 R40 is the remaining data-integrity priority. The release issues can be corrected independently while retaining the preservation and draft-gate fixes confirmed above.
+
+## Fifth verification — 2026-09-06
+
+**The fixes are not all complete. R40, R41, and R42 still reproduce, and R43 below is an additional data-loss defect. There are four open findings from this verification: two P1 and two P2.** Earlier sections and their finding numbers are retained.
+
+Reviewed **`33d58b152fdd6d94a7a48d01363282ce4130fb38`** and the working-tree snapshot captured during this pass. The implementer continued changing server code during validation. The isolated snapshot includes the captured backup changes in `server/cmd/basaltd/main.go`, `server/internal/store/backup.go`, and `server/internal/store/backup_test.go`. Subsequent chunk-count/schema changes in `server/internal/store/store.go` and accompanying `store_test.go` changes were outside that snapshot and are **not covered by the passing gate below**. The client code and release files underlying all four findings matched the live checkout when the findings were written.
+
+### Checks and confirmed repairs
+
+`bash scripts/check.sh` completed with **26 passed, 0 failed, 0 skipped** on the isolated snapshot. This includes **1,412 client tests in 74 files**, the separate **16 panel tests and 10 stress tests**, Go race tests/vet, format/type/build checks, packaged CLI checks, and local Docker checks. Actual systemd execution and the Linux mounted-filesystem job remain CI-only on this macOS host.
+
+Independent filesystem probes confirmed that an incoming removal with no baseline now preserves the local file, and failure to create its preservation destination restores the original name. The maintained suite also passed with the new pairing cancellation/retry, normalization bookkeeping, memory-adapter, server budget, and health tests. These repairs are useful, but they do not close the findings below.
+
+Evidence is in `/tmp/basalt-review-round5/`: `check.log`, `lock-probe.ts`/`.log`, `preservation-probe.ts`/`.log`, `workflow-probes.mjs`/`.log`, `source-hashes.json`, and `worktree.patch`. The captured patch has SHA-256 `b09ff9dbdfda7f413afc33971ed5767aa8242f64e9760b1ba070c58231580054`. The lock probe now uses the source's existing scheduling hooks, without editing or copying its implementation. Preservation probes use the real `NodeVault`, including an engine-driven update. Release probes execute the extracted workflow shell with simulated Git/registry/GitHub responses; no external release was changed.
+
+### Status of the three previous findings
+
+| Finding | Result | Current evidence |
+|---|---|---|
+| **R40 · P1 · CLI lock takeover** | **Still open** | A stale evictor takes B's live lock away; C acquires the empty name. B and C both successfully acquire before either releases. |
+| **R41 · P2 · Published-image selection** | **Still open; implementation unchanged** | With tags `0.4.1`, `0.4.2`, `0.5.0`, but images only for the first two, promotion moves `0.4` to `0.4.2`, leaves `latest` at `0.4.1`, and exits 0. |
+| **R42 · P2 · Prerelease-only promotion** | **Still open; implementation unchanged** | With only `server/v0.5.0-rc.1`, reconciliation creates no aliases and exits 1: `no alias resolved to a published image, which cannot be right`. |
+
+### R40 follow-up — Retrying restoration does not preserve exclusion
+
+- [ ] **P1 · CLI locking · Reconfirmed with the current implementation.** Prevent a contender from acquiring while the displaced lock's owner is still active.
+
+The new retry loop distinguishes `EEXIST` from I/O failures, but [`rename(path, taken)`](client/src/cli/lock.ts#L245) still removes a possibly live lock from its authoritative name. The [`EEXIST` branch](client/src/cli/lock.ts#L276) then treats that live lock as a duplicate and [deletes it](client/src/cli/lock.ts#L289). It is a different owner's proof, not a duplicate of C's ownership.
+
+**Reconfirmed schedule:** A reads a dead holder and pauses at `midEvict.beforeTake`; B completes takeover and acquires. A resumes and moves B's live lock aside, then pauses at `midEvict.pause`. C acquires. A resumes, cannot restore over C, deletes B's displaced lock, and refuses. **B and C both remain successful holders.** No injected filesystem error, crash, or clock boundary is involved. The added restoration-error test checks whether B's file survives; it does not establish that other callers are excluded.
+
+**Acceptance remains:** continuous exclusion for a live owner, including this three-contender schedule and interruption after taking a live lock. If safe automatic stale takeover cannot be implemented, fail closed until writers have stopped. Retaining a file under `lock.taken.*` alone does not exclude callers that only consult `lock`.
+
+The commit `3447d9c` uses the label “R40” for a pairing-panel fix. That is a separate issue; it does not close this document's R40 locking finding.
+
+### R41/R42 follow-up — The promotion fixes have not been applied
+
+- [ ] **R41 · P2:** choose alias targets from eligible published images, handling registry uncertainty without an unintended rollback. The current [Git-tag selection](scripts/release-aliases.sh#L40) and [skip-on-lookup-failure branch](.github/workflows/release.yml#L258) still reproduce the failed-newer-build case.
+- [ ] **R42 · P2:** accept a valid empty alias plan as a no-op. The helper's [prerelease-only exit](scripts/release-aliases.sh#L45) still reaches the workflow's [unconditional `checked > 0` requirement](.github/workflows/release.yml#L280).
+
+The original successful backport reconciliation and draft-release guard still passed their probes. The outstanding cases above require their own workflow-level regression coverage.
+
+### R43 — Preservation can overwrite a note at the chosen conflict path
+
+- [ ] **P1 · CLI filesystem adapter/core · Newly identified remaining preservation defect · Reproduced on disk.** Claim preservation destinations without replacing a file that appeared there after selection.
+
+The engine [chooses a currently free conflict name](client/src/core/engine.ts#L2742), then calls the adapter. [`NodeVault.replace`](client/src/cli/vault.ts#L1378) uses ordinary `rename(full, kept)`, which replaces an occupied destination on the tested filesystem. A competing note created after name selection is therefore overwritten by the very operation intended to preserve notes. [`removeExpecting`](client/src/cli/vault.ts#L1540) has the same problem when moving its parked original to `keepAt`. Its new error recovery does not help: this overwrite succeeds.
+
+**Observed through the engine:** sync `note.md = remote one`, then receive `remote two`. After the engine selects its free conflict-copy name, create a distinct unsent note at that name before the adapter moves the original. The update finishes with only `note.md = remote two`. The competing note is gone; the displaced baseline is also removed by the normal matching-baseline cleanup. The report says **`downloaded: 1`, `conflicted: 0`**, with no retry or attention item.
+
+**Observed through removal:** start with an unsent original and no expected baseline. Create a second unsent note at `keepAt` in the existing `midTrash.parked` hook. Removal returns `{ keptAt, landed: true }`, but that path now holds only the original; the second note was overwritten.
+
+**Fix and acceptance:** use a preservation operation that refuses an occupied destination at the actual publication boundary, then safely retry with another name or refuse while retaining both files. A preceding existence check does not reserve the path. Cover both replacement and removal, including a matching baseline where ordinary cleanup follows. Assert that every distinct local version survives when the conflict destination becomes occupied after selection; neither the incoming path's exclusive create nor `placeBeside` protects these separate rename operations.
+
+### Verification limits
+
+This pass confirms the four failures above and the stated repairs in the captured snapshot; it does not certify the additional server schema work being edited concurrently. Real Obsidian desktop/mobile operation, physical power cuts, Linux mounted-filesystem acceptance, and live GitHub publication were not exercised. Application code was not changed by this review.
