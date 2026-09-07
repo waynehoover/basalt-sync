@@ -596,7 +596,7 @@ Evidence is retained in `/tmp/basalt-review-round4/`, including `final-check.log
 
 ### R40 — Taking a live lock aside admits another owner
 
-- [ ] **P1 · CLI locking · Remaining R34 · Reproduced.** Keep a live owner's exclusion continuously visible during stale takeover.
+- [x] **P1 · CLI locking · Remaining R34 · Reproduced.** Keep a live owner's exclusion continuously visible during stale takeover.
 
 [`evicting`](client/src/cli/lock.ts#L226) renames the lock away before identifying the file it actually took. If its earlier observation is stale, that file belongs to a live owner. The authoritative lock path is now absent. A third contender can acquire it before the evictor [tries to restore the live lock](client/src/cli/lock.ts#L245). Restoration then fails because the name is occupied, and `finally` deletes the displaced live holder's lock. The original owner receives no revocation and continues working.
 
@@ -606,7 +606,7 @@ Evidence is retained in `/tmp/basalt-review-round4/`, including `final-check.log
 
 ### R41 — An unpublished newer Git tag prevents promotion of a valid release
 
-- [ ] **P2 · Image release · Remaining R38 · Reproduced with simulated registry state.** Select the newest eligible published image before choosing each alias target.
+- [x] **P2 · Image release · Remaining R38 · Reproduced with simulated registry state.** Select the newest eligible published image before choosing each alias target.
 
 [`release-aliases.sh`](scripts/release-aliases.sh#L40) chooses the highest stable Git tag, without establishing whether its image was successfully published. The promotion job then [skips that alias when image lookup fails](.github/workflows/release.yml#L258), rather than considering the next eligible version. The assumption that the missing version's own promotion will eventually run fails when its build or validation failed.
 
@@ -616,7 +616,7 @@ Evidence is retained in `/tmp/basalt-review-round4/`, including `final-check.log
 
 ### R42 — A valid prerelease-only history makes promotion fail
 
-- [ ] **P2 · Image release · Regression in reconciliation · Reproduced with simulated registry state.** Treat an empty alias plan as a successful no-op when no stable release exists.
+- [x] **P2 · Image release · Regression in reconciliation · Reproduced with simulated registry state.** Treat an empty alias plan as a successful no-op when no stable release exists.
 
 The helper correctly [returns no aliases for an entirely prerelease history](scripts/release-aliases.sh#L45). The workflow nevertheless [requires `checked > 0`](.github/workflows/release.yml#L280), based on the incorrect comment that every release moves a minor alias. Prereleases intentionally move neither a minor alias nor `latest`.
 
@@ -654,7 +654,7 @@ Evidence is in `/tmp/basalt-review-round5/`: `check.log`, `lock-probe.ts`/`.log`
 
 ### R40 follow-up — Retrying restoration does not preserve exclusion
 
-- [ ] **P1 · CLI locking · Reconfirmed with the current implementation.** Prevent a contender from acquiring while the displaced lock's owner is still active.
+- [x] **P1 · CLI locking · Reconfirmed with the current implementation.** Prevent a contender from acquiring while the displaced lock's owner is still active.
 
 The new retry loop distinguishes `EEXIST` from I/O failures, but [`rename(path, taken)`](client/src/cli/lock.ts#L245) still removes a possibly live lock from its authoritative name. The [`EEXIST` branch](client/src/cli/lock.ts#L276) then treats that live lock as a duplicate and [deletes it](client/src/cli/lock.ts#L289). It is a different owner's proof, not a duplicate of C's ownership.
 
@@ -666,14 +666,14 @@ The commit `3447d9c` uses the label “R40” for a pairing-panel fix. That is a
 
 ### R41/R42 follow-up — The promotion fixes have not been applied
 
-- [ ] **R41 · P2:** choose alias targets from eligible published images, handling registry uncertainty without an unintended rollback. The current [Git-tag selection](scripts/release-aliases.sh#L40) and [skip-on-lookup-failure branch](.github/workflows/release.yml#L258) still reproduce the failed-newer-build case.
-- [ ] **R42 · P2:** accept a valid empty alias plan as a no-op. The helper's [prerelease-only exit](scripts/release-aliases.sh#L45) still reaches the workflow's [unconditional `checked > 0` requirement](.github/workflows/release.yml#L280).
+- [x] **R41 · P2:** choose alias targets from eligible published images, handling registry uncertainty without an unintended rollback. The current [Git-tag selection](scripts/release-aliases.sh#L40) and [skip-on-lookup-failure branch](.github/workflows/release.yml#L258) still reproduce the failed-newer-build case.
+- [x] **R42 · P2:** accept a valid empty alias plan as a no-op. The helper's [prerelease-only exit](scripts/release-aliases.sh#L45) still reaches the workflow's [unconditional `checked > 0` requirement](.github/workflows/release.yml#L280).
 
 The original successful backport reconciliation and draft-release guard still passed their probes. The outstanding cases above require their own workflow-level regression coverage.
 
 ### R43 — Preservation can overwrite a note at the chosen conflict path
 
-- [ ] **P1 · CLI filesystem adapter/core · Newly identified remaining preservation defect · Reproduced on disk.** Claim preservation destinations without replacing a file that appeared there after selection.
+- [x] **P1 · CLI filesystem adapter/core · Newly identified remaining preservation defect · Reproduced on disk.** Claim preservation destinations without replacing a file that appeared there after selection.
 
 The engine [chooses a currently free conflict name](client/src/core/engine.ts#L2742), then calls the adapter. [`NodeVault.replace`](client/src/cli/vault.ts#L1378) uses ordinary `rename(full, kept)`, which replaces an occupied destination on the tested filesystem. A competing note created after name selection is therefore overwritten by the very operation intended to preserve notes. [`removeExpecting`](client/src/cli/vault.ts#L1540) has the same problem when moving its parked original to `keepAt`. Its new error recovery does not help: this overwrite succeeds.
 

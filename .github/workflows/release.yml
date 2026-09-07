@@ -82,7 +82,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#server/v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "as things stand, this release would move:"
           ./scripts/release-tags.sh "$GITHUB_REF_NAME" | sed 's/^/  /'
@@ -233,7 +233,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${REPO,,}"
+          # `tr` rather than `${REPO,,}`, which needs bash 4: the runner has
+          # it and the machine this step is tested on does not, and a step
+          # that cannot be run outside CI is a step nothing checks.
+          IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 
           # Worked out here rather than carried from before the build (R17).
           #
@@ -248,40 +251,91 @@ jobs:
           # Every alias, not only this release's (R38).
           : > /tmp/applied-tags
           applied=0
-          checked=0
-          while read -r alias version; do
+          planned=0
+          resolved=0
+          while read -r alias candidates; do
             [ -n "$alias" ] || continue
-            # Only ever at an image that exists and can be resolved. An alias
-            # is a promise that `docker pull` works, and a release whose build
-            # has not finished is not one this may point at yet; its own
-            # promotion will come round.
-            want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-              "$IMAGE:$version" 2>/dev/null) || {
-              echo "  $alias -> $version: not published yet, left alone"
+            planned=$((planned + 1))
+
+            # The newest candidate the registry can actually resolve (R41).
+            #
+            # An alias is a promise that `docker pull` works, so it may only
+            # name a published image. Naming one version and skipping when it
+            # was not there left the alias exactly where it was: with 0.4.1,
+            # 0.4.2 and 0.5.0 tagged and only the first two built, `latest`
+            # stayed at 0.4.1 while 0.4.2 sat published, and the run exited 0.
+            # A rollback by omission, reported as success. Walking the
+            # candidates moves it as far forward as the registry can support,
+            # and 0.5.0's own promotion finishes the job.
+            #
+            # Every candidate is looked up, not just up to the first hit,
+            # because what the others answer is what the guard below needs.
+            want=""
+            target=""
+            unreadable=0
+            seen=""
+            for version in $candidates; do
+              if digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
+                "$IMAGE:$version" 2>/dev/null); then
+                seen="$seen $digest"
+                if [ -z "$want" ]; then
+                  want="$digest"
+                  target="$version"
+                fi
+              else
+                unreadable=$((unreadable + 1))
+              fi
+            done
+            if [ -z "$want" ]; then
+              echo "  $alias: nothing published to point at yet, left alone"
               continue
-            }
-            checked=$((checked + 1))
+            fi
+            resolved=$((resolved + 1))
+
             now=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
               "$IMAGE:$alias" 2>/dev/null) || now=""
             if [ "$now" = "$want" ]; then
-              echo "  $alias -> $version ($want) already"
+              echo "  $alias -> $target ($want) already"
               continue
             fi
+
+            # And never backwards on a lookup that merely failed (R41).
+            #
+            # Absent and unreadable are not the same answer, and `inspect`
+            # gives one word for both. So: if this alias is at a digest that
+            # belongs to none of the versions the registry *did* answer for,
+            # and there were versions it would not answer for, then it is
+            # already at one of those and moving it would be a rollback caused
+            # by a bad minute on the network. The next promotion will get it.
+            if [ -n "$now" ] && [ "$unreadable" -gt 0 ]; then
+              known=""
+              for digest in $seen; do
+                [ "$digest" = "$now" ] && known=yes
+              done
+              if [ -z "$known" ]; then
+                echo "  $alias is at an image none of the readable versions has," \
+                  "and $unreadable could not be read; left alone"
+                continue
+              fi
+            fi
+
             docker buildx imagetools create --tag "$IMAGE:$alias" "$IMAGE@$want"
             applied=$((applied + 1))
-            echo "  $alias -> $version ($want)"
+            echo "  $alias -> $target ($want)"
             printf '%s\n' "$IMAGE:$alias $want" >> /tmp/applied-tags
           done < <(./scripts/release-aliases.sh)
 
-          # Rule 5, in its smallest form. Every release moves at least its own
-          # minor alias, so a reconciliation that resolved nothing at all has
-          # not decided that everything was already right; it has failed to see
-          # the images.
-          [ "$checked" -gt 0 ] || {
-            echo "no alias resolved to a published image, which cannot be right" >&2
+          # Rule 5, in its smallest form, and only where there was something to
+          # do. An empty plan is a valid answer: a repository whose only server
+          # tag is a prerelease has no moving alias to set, and treating that
+          # as a failure made the first such release exit 1 (R42). A plan with
+          # lines in it that resolved none of them is the registry not
+          # answering, which is not the same thing.
+          if [ "$planned" -gt 0 ] && [ "$resolved" -eq 0 ]; then
+            echo "$planned alias(es) planned and none resolved to a published image" >&2
             exit 1
-          }
-          echo "$applied alias(es) moved, $checked checked"
+          fi
+          echo "$applied alias(es) moved, $resolved resolved, $planned planned"
 
       # What a person will actually type. Pulled by name, so this also proves
       # the names were applied and resolve to the manifest that was checked.

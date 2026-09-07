@@ -121,6 +121,8 @@ run "the tags a release may move are the right ones" "" \
   bash "$root/scripts/release-tags.test.sh"
 run "the image release promotes in order" "" \
   bash "$root/scripts/release-order.test.sh"
+run "the image promotion picks published images" "" \
+  bash "$root/scripts/release-promote.test.sh"
 run "the attestation can be started" "" \
   bash "$root/scripts/attest-trigger.test.sh"
 run "every doc comment names what it sits on" "" \

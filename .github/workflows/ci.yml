@@ -108,6 +108,12 @@ jobs:
       # And that the workflow which publishes a release can be started at all.
       # A draft fires no release event, so one listening for `created` sat
       # there with nothing running, on the documented flow.
+      # And that the step which applies them picks an image that exists, moves
+      # an alias no further back than it already is, and treats a repository
+      # with nothing to promote as a no-op.
+      - name: the image promotion picks published images
+        run: scripts/release-promote.test.sh
+
       - name: the attestation can be started
         run: scripts/attest-trigger.test.sh
 

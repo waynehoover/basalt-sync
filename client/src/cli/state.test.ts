@@ -17,7 +17,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { cleanupBinary, removeTree, serverBinary, TestServer, until } from "../core/test-server.ts";
 import { run, type Console } from "./cli.ts";
 import { configPath, indexPath, loadConfig, saveConfig } from "./config.ts";
-import { alive, lockPath, lockVault } from "./lock.ts";
+import { alive, currentHolder, lockPath, lockVault } from "./lock.ts";
 
 /**
  * `saveConfig` and `loadConfig`, failing when a test says so. The CLI imports
@@ -360,8 +360,8 @@ describe("the vault lock (C12)", () => {
       new RegExp(`basalt sync \\(pid ${process.pid} on `),
     );
     await release();
-    // Released, so the next holder gets it, and the file is gone in between.
-    await expect(stat(lockPath(dir))).rejects.toThrow();
+    // Released, so nobody holds it in between and the next holder gets it.
+    expect(await currentHolder(dir)).toBeUndefined();
     await (
       await lockVault(dir, "basalt restore")
     )();
@@ -383,7 +383,7 @@ describe("the vault lock (C12)", () => {
       }),
     );
     const release = await lockVault(dir, "basalt sync");
-    expect(JSON.parse(await readFile(lockPath(dir), "utf8"))).toMatchObject({ pid: process.pid });
+    expect(await currentHolder(dir)).toMatchObject({ pid: process.pid });
     await release();
   });
 
@@ -422,12 +422,14 @@ describe("the vault lock (C12)", () => {
     const ended = exited(watcher);
     watcher.kill("SIGKILL");
     await ended;
-    expect(JSON.parse(await readFile(lockPath(dir), "utf8"))).toMatchObject({ pid: watcher.pid });
+    // Asked of the module, because who holds a vault is the owner of the
+    // highest generation claimed and not whoever is at a path.
+    expect(await currentHolder(dir)).toMatchObject({ pid: watcher.pid });
 
     // The next one recognises a dead holder and gets on with it.
     const third = await cli("sync", "--dir", dir, "--json");
     expect(third.code, third.all).toBe(0);
-    await expect(stat(lockPath(dir))).rejects.toThrow();
+    expect(await currentHolder(dir), "the vault is still held afterwards").toBeUndefined();
   }, 120_000);
 
   it("lets a reading command through while a watcher holds the vault", async () => {

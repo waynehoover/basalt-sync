@@ -30,11 +30,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { NodeVault, STALE_TEMP_MS, TEMP_MARK, midRespell, midTrash, retireName } from "./vault.ts";
+import {
+  NodeVault,
+  STALE_TEMP_MS,
+  TEMP_MARK,
+  midPreserve,
+  midRespell,
+  midTrash,
+  retireName,
+} from "./vault.ts";
 import { plainDigest } from "../core/crypto.ts";
 
 const dirs: string[] = [];
 afterEach(async () => {
+  midPreserve.beforeClaim = async () => {};
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -173,6 +182,75 @@ describe("a write with no baseline at all", () => {
     // And nothing beside it: no conflict copy, no staging left over.
     expect((await readdir(dir)).filter((n) => !n.startsWith("."))).toEqual(["brand-new.md"]);
     expect(await readdir(join(dir, ".basalt", "tmp")).catch(() => [])).toEqual([]);
+  });
+});
+
+/**
+ * R43. Choosing a free name is not claiming it.
+ *
+ * The caller picks a conflict path because nothing is at it, and then durable
+ * staging, a stat or two and a hash happen before the adapter moves anything.
+ * `rename` replaces, so a note created at that name in between was destroyed
+ * by the one operation whose whole job is to preserve notes -- and the report
+ * said `downloaded: 1, conflicted: 0`, so nothing asked anybody to look.
+ *
+ * `link` refuses an occupied name, so the destination is claimed rather than
+ * assumed, and a collision takes the next sibling: the point is to keep both
+ * files, not to keep the name.
+ */
+describe("a note that appears at the conflict path after it was chosen", () => {
+  it("is not written over by the write that displaced another one", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "note.md"), "the unsent edit\n");
+
+    // Created after the name was chosen and before the destination is claimed,
+    // which is the window the caller's choice opens.
+    midPreserve.beforeClaim = async () => {
+      midPreserve.beforeClaim = async () => {};
+      await writeFile(join(dir, "note (kept).md"), "somebody else's unsent note\n");
+    };
+
+    const out = await v.replace(
+      "note.md",
+      expecting("a digest of something else entirely"),
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    midPreserve.beforeClaim = async () => {};
+
+    expect(await readFile(join(dir, "note.md"), "utf8")).toBe("the server's version\n");
+    expect(
+      await readFile(join(dir, "note (kept).md"), "utf8"),
+      "the note that took the conflict path was written over by the preservation",
+    ).toBe("somebody else's unsent note\n");
+    // And the displaced version is somewhere, under a name that is said out
+    // loud rather than guessed at.
+    expect(out.keptAt, "nothing was preserved").toBeDefined();
+    expect(await readFile(join(dir, out.keptAt!), "utf8")).toBe("the unsent edit\n");
+  });
+
+  it("is not written over by a removal either", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "doomed.md"), "the unsent edit\n");
+
+    midTrash.parked = async () => {
+      midTrash.parked = async () => {};
+      await writeFile(join(dir, "doomed (kept).md"), "somebody else's unsent note\n");
+    };
+    let out;
+    try {
+      out = await v.removeExpecting("doomed.md", undefined, "doomed (kept).md");
+    } finally {
+      midTrash.parked = async () => {};
+    }
+
+    expect(
+      await readFile(join(dir, "doomed (kept).md"), "utf8"),
+      "the note that took the conflict path was written over by the removal",
+    ).toBe("somebody else's unsent note\n");
+    expect(out.keptAt, "nothing was preserved").toBeDefined();
+    expect(await readFile(join(dir, out.keptAt!), "utf8")).toBe("the unsent edit\n");
   });
 });
 

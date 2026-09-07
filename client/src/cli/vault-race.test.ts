@@ -576,9 +576,13 @@ describe("replacing a note across a mount boundary", () => {
     await writeFile(join(root, "note.md"), "the unsent edit\n");
     // Publication fails; putting the original back does not. Only the link
     // out of a temporary is refused, which is the failure being modelled.
+    // Only the publication link, whose source is the staged copy. The
+    // put-back and the preservation claim link from the parked original, and
+    // failing those would be modelling a different failure.
     const realLink = vi.mocked(link).getMockImplementation()!;
     vi.mocked(link).mockImplementation(async (from: PathLike, to: PathLike) => {
-      if (String(from).includes(TEMP_MARK) || String(from).includes("replace.")) {
+      const source = String(from);
+      if (source.includes("replace.") || source.includes(`${TEMP_MARK}near`)) {
         throw errno("EIO");
       }
       return realLink(from, to);
@@ -612,17 +616,24 @@ describe("replacing a note across a mount boundary", () => {
       throw errno("EIO");
     });
 
-    await expect(
-      vault.replace(
+    let named: string | undefined;
+    try {
+      await vault.replace(
         "note.md",
         { contentId: "a digest of something else", idOf: async () => "not that" },
         enc.encode("the server's version\n"),
         { mtime: 2000, ctime: 1000 },
         "note (kept).md",
-      ),
-    ).rejects.toThrow(/note \(kept\)\.md/);
+      );
+    } catch (err) {
+      named = /it is at (.+)$/.exec((err as Error).message)?.[1];
+    }
 
-    expect(await readFile(join(root, "note (kept).md"), "utf8")).toBe("the unsent edit\n");
+    // Wherever it ended up, the error says so and the bytes are there. Which
+    // path that is depends on how far the recovery got, and the claim being
+    // made is that it is never nowhere.
+    expect(named, "the error did not say where the note is").toBeDefined();
+    expect(await readFile(join(root, named!), "utf8")).toBe("the unsent edit\n");
   });
 });
 
@@ -648,7 +659,9 @@ describe("publishing over somebody who took the name first", () => {
     const realRename = vi.mocked(rename).getMockImplementation()!;
     vi.mocked(rename).mockImplementation(async (from: PathLike, to: PathLike) => {
       const out = await realRename(from, to);
-      if (String(to).endsWith("note (kept).md")) {
+      // The move aside, which now parks in a temporary of the call's own
+      // before it claims a preservation path (R43).
+      if (String(to).includes(`${TEMP_MARK}keep`)) {
         vi.mocked(rename).mockImplementation(realRename);
         await writeFile(join(root, "note.md"), "typed while the name was empty\n");
       }
@@ -690,7 +703,7 @@ describe("publishing over somebody who took the name first", () => {
 
     const realRename = vi.mocked(rename).getMockImplementation()!;
     vi.mocked(rename).mockImplementation(async (from: PathLike, to: PathLike) => {
-      if (String(to).endsWith("note (kept).md")) throw errno("EACCES");
+      if (String(to).includes(`${TEMP_MARK}keep`)) throw errno("EACCES");
       return realRename(from, to);
     });
 

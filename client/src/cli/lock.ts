@@ -14,7 +14,7 @@
  * waited on for ever.
  */
 
-import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -83,79 +83,182 @@ export async function lockVault(vault: string, command: string): Promise<() => P
     // A short wait between attempts, growing a little.
     //
     // Every reason to go round again is another process part way through
-    // something short: publishing a lock, or holding the eviction right for a
-    // dead one. Without this, eight attempts are spent inside a microsecond
-    // and a contender gives up on a vault that was about to be free, which is
-    // a refusal that reads exactly like a real one.
+    // something short: publishing its own claim, or having just won the
+    // generation this one was aiming at. Without this, eight attempts are
+    // spent inside a microsecond and a contender gives up on a vault that was
+    // about to be free, which is a refusal that reads exactly like a real one.
     if (attempt > 0) await pause(5 * attempt);
-    const taken = await publish(dir, path, mine);
-    if (taken) {
-      return async () => {
-        // Only if it is still ours, by token. A pid is not an identity: it is
-        // reused, and matching on pid and host alone could remove a lock some
-        // unrelated process had taken after ours went.
-        const now = await readHolder(path);
-        if (now?.token === mine.token) await rm(path, { force: true });
-      };
+
+    const current = await newestClaim(dir);
+    const at = current === undefined ? { state: "absent" as const } : current.at;
+
+    if (at.state === "held") {
+      const holder = at.holder;
+      // A holder on another host cannot be checked, so it is believed: a vault
+      // on a shared disk with two machines pointing at it is exactly the case
+      // the lock is for.
+      if (holder.host !== mine.host || alive(holder.pid)) {
+        throw new Error(
+          `another basalt is using this vault: ${holder.command} (pid ${holder.pid} on ` +
+            `${holder.host}, since ${new Date(holder.since).toISOString()}). ` +
+            `Wait for it to finish, or stop it.`,
+        );
+      }
+      // Dead: left behind by a crash or a kill. Superseded below rather than
+      // removed, which is the whole of R40.
     }
 
-    const at = await lockState(path);
-    if (at.state === "absent") {
-      // Gone between the failed link and this read, so there is nothing to
-      // take over and nothing to remove. Straight back to `publish`, which is
-      // atomic and will either create the name or find whoever won.
-      //
-      // Removing here is what handed the lock to two callers. The old code
-      // treated "no holder" as debris and unlinked it, and an absent file plus
-      // an unconditional unlink is a live lock deleted whenever somebody links
-      // between the read and the removal. Twelve contenders on one stale lock
-      // reproduced it on the first run.
-      continue;
-    }
-    if (at.state === "unreadable") {
-      // A file that is there and says nothing. `publish` cannot produce one,
-      // so it is debris from something else, and it has to go or nobody can
-      // ever take this lock again. Under the eviction right, and only while it
-      // is still unreadable: a real lock written in between parses and is left
-      // alone, and nobody else can be removing it at the same time.
-      await evicting(dir, path, mine, (now) => now.state === "unreadable");
-      continue;
-    }
-    const holder = at.holder;
-    if (holder.host === mine.host && !alive(holder.pid)) {
-      // Left behind by a crash or a kill. Taken over under the eviction right
-      // for this exact holder, so no other contender can be removing it, and
-      // only while it is still that holder. The next attempt takes the lock by
-      // linking, which is atomic.
-      await evicting(
-        dir,
-        path,
-        mine,
-        (now) => now.state === "held" && now.holder.token === holder.token,
-      );
-      continue;
-    }
-    throw new Error(
-      `another basalt is using this vault: ${holder.command} (pid ${holder.pid} on ${holder.host}, ` +
-        `since ${new Date(holder.since).toISOString()}). Wait for it to finish, or stop it.`,
-    );
+    // The seam sits between reading who holds it and claiming the next
+    // generation, which is the only interleaving left: a contender that
+    // finishes here has taken the generation this attempt was aiming at, and
+    // this attempt then finds it and refuses.
+    await midEvict.pause();
+
+    const next = (current?.generation ?? 0) + 1;
+    if (!(await publish(dir, claimPath(dir, next), mine))) continue;
+
+    return async () => {
+      // Only this generation's file, by name, and only while it is still ours
+      // by token. Nothing here can reach another holder's claim: superseding
+      // one has never meant unlinking it.
+      const held = claimPath(dir, next);
+      const now = await readHolder(held);
+      if (now?.token !== mine.token) return;
+      await rm(held, { force: true });
+      // And the generations this one superseded, which are dead by
+      // construction: each was observed dead or unreadable before it was
+      // superseded, and no live holder can sit below the current generation.
+      // Done on release rather than on acquisition so it happens at the one
+      // moment this process is certainly the only owner.
+      await sweepSuperseded(dir, next);
+    };
   }
-  throw new Error(`could not take the lock at ${path}: something keeps recreating it`);
+  throw new Error(
+    `could not take the lock at ${path}: something keeps winning the next generation`,
+  );
 }
 
 /**
- * Puts a complete lock file at `path`, or reports that somebody else got there.
+ * Who holds this vault now, or undefined when nobody does.
+ *
+ * The ownership rule in one place. It is the owner of the highest generation
+ * claimed, which is not something a reader can work out by opening a path, and
+ * anything that reimplements it is a second answer to the question this module
+ * exists to answer once.
+ */
+export async function currentHolder(vault: string): Promise<LockHolder | undefined> {
+  const found = await newestClaim(join(vault, STATE_DIR));
+  return found?.at.state === "held" ? found.at.holder : undefined;
+}
+
+/**
+ * Where one generation's claim lives.
+ *
+ * Zero-padded so a listing sorts the way the numbers do, which is only for
+ * somebody reading the directory: every comparison here is numeric.
+ */
+function claimPath(dir: string, generation: number): string {
+  return join(dir, `lock.${String(generation).padStart(10, "0")}`);
+}
+
+/** The generation a claim file names, or undefined if the name is not one. */
+function generationOf(name: string): number | undefined {
+  const rest = name.startsWith("lock.") ? name.slice("lock.".length) : undefined;
+  if (rest === undefined || rest.length === 0 || !/^[0-9]+$/.test(rest)) return undefined;
+  const n = Number(rest);
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * The highest generation claimed, and what it says.
+ *
+ * The holder of a vault is whoever owns the highest generation present, and
+ * that is the whole ownership rule. Nothing supersedes a claim by removing it,
+ * so nothing can remove somebody else's: a process that decides the current
+ * holder is dead creates the *next* generation with `link`, which either makes
+ * that name or fails, and a loser finds the winner on its next look.
+ *
+ * A lock file with no generation is one an older build wrote. It is read, and
+ * a live holder in it still refuses, so an upgrade in the middle of a sync
+ * cannot hand the vault to two processes. It is swept on the first clean
+ * release.
+ */
+async function newestClaim(
+  dir: string,
+): Promise<{ generation: number; at: LockState } | undefined> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    names = [];
+  }
+  let best: number | undefined;
+  for (const name of names) {
+    const n = generationOf(name);
+    if (n !== undefined && (best === undefined || n > best)) best = n;
+  }
+  if (best !== undefined) {
+    return { generation: best, at: await lockState(claimPath(dir, best)) };
+  }
+  // Nothing generational. A bare `lock` is what an older build leaves, and its
+  // holder counts for as long as it is running.
+  const legacy = await lockState(join(dir, "lock"));
+  if (legacy.state === "held") return { generation: 0, at: legacy };
+  return undefined;
+}
+
+/**
+ * Removes every claim below the one this process holds, and the legacy file.
+ *
+ * Safe without asking who owns them, which is why it happens here: a lower
+ * generation was observed dead or unreadable by whoever superseded it, and no
+ * live holder can be below the current generation, because a generation is
+ * only created after the one under it was found dead. Removing by exact name
+ * cannot reach the current one.
+ */
+async function sweepSuperseded(dir: string, held: number): Promise<void> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const n = generationOf(name);
+    if (n !== undefined && n < held) await rm(join(dir, name), { force: true });
+  }
+  // The legacy file, and only while nothing is holding it.
+  //
+  // It is how an older build claims this vault, so removing a live one would
+  // let a newer build hold a generation that build cannot see. A dead one is
+  // debris and stops anybody from ever using an older binary here again.
+  //
+  // Read and then unlinked, which is the shape this module spends its length
+  // avoiding, and it is the best available across versions: an old build
+  // claims that name with `link`, so what is there cannot change while it is
+  // there, and the only race is an old build releasing and another claiming
+  // inside this pair. Cross-version exclusion is one-directional anyway --
+  // nothing an old binary does can see a generation -- so this does not make
+  // it worse, and it is written down rather than implied.
+  const legacy = join(dir, "lock");
+  const at = await lockState(legacy);
+  if (at.state === "held" && (at.holder.host !== hostname() || alive(at.holder.pid))) return;
+  await rm(legacy, { force: true }).catch(() => undefined);
+}
+
+/**
+ * Puts a complete claim at `path`, or reports that somebody else got there.
  *
  * The holder is written to a private name first and then `link`ed into place.
  * `link` either creates the name or fails with EEXIST, and the file it creates
- * already holds everything a reader needs, so there is no moment at which the
- * lock exists and says nothing about who owns it. Creating with `wx` and
+ * already holds everything a reader needs, so there is no moment at which a
+ * claim exists and says nothing about who owns it. Creating with `wx` and
  * writing afterwards had exactly that moment, and it was long enough for a
  * second process to read an empty file, decide it was corrupt, delete it and
  * take a lock somebody was holding.
  */
 async function publish(dir: string, path: string, mine: LockHolder): Promise<boolean> {
-  const temp = join(dir, `lock.${mine.token}`);
+  const temp = join(dir, `claiming.${mine.token}`);
   await writeFile(temp, JSON.stringify(mine), { mode: 0o600 });
   // The moment the old implementation was wrong in. There, the lock file
   // already existed and was empty; here, nothing is at the path yet. A test
@@ -174,120 +277,12 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
 }
 
 /**
- * A seam for the one interleaving this module exists to make impossible: the
- * instant between deciding a lock is dead and removing it.
+ * A seam for the one interleaving this module has left: the instant between
+ * reading who holds the vault and claiming the generation after theirs.
  *
  * Like `midPublish`, it does nothing in every build.
  */
-export const midEvict = {
-  pause: async (): Promise<void> => {},
-  /**
-   * The instant after this call has read the lock and before it takes the file.
-   *
-   * The other window, and the one that decides which branch the eviction takes:
-   * a contender completing its own eviction here means the file this is about
-   * to take belongs to somebody live, which is the only way to reach the
-   * put-back. Without a hook there, a test can only ever drive the ordinary
-   * branch and the put-back's failures go unexercised.
-   */
-  beforeTake: async (): Promise<void> => {},
-};
-
-/**
- * Takes a dead holder's lock away, and cannot take a live one (R03, R34).
- *
- * Removing a stale lock is a read and then an unlink, and no filesystem here
- * offers them as one operation. So: A reads a dead holder and is descheduled;
- * B reads the same dead holder, removes it, and links its own live lock; A
- * resumes and unlinks *B's* lock, then links its own. Both have been handed a
- * release function and neither has been told it lost.
- *
- * A marker naming the holder was the first answer, and it moved the problem
- * rather than closing it. A marker whose evictor died had to be recovered by
- * somebody, and recovering it was another read and another unlink; bucketing
- * the marker by a minute of the clock made that part safe and left the gap
- * between the last look at the clock and the unlink, which is where the same
- * two-holder schedule got back in. Guarding a guard is not a plan.
- *
- * The primitive with no gap is `rename`. It is atomic, and unlike `rm` it
- * hands back what it took: exactly one caller can move the lock file to a name
- * of its own, and can then look at what it is holding at leisure, because
- * nothing else can be holding it. If it is the dead holder this decided about,
- * it is dropped and the name is free. If it is anybody else's, it goes
- * straight back under `link`, which refuses an occupied name, so a contender
- * that took the name meanwhile keeps it. Preservation rather than prediction,
- * which is the same answer this project reaches for everywhere else it cannot
- * compare and swap.
- *
- * Two things are left, and both are the floor rather than an oversight. A
- * third contender can link its own lock in the instant between the take and
- * the put-back, which is one syscall wide and needs the taken lock to have
- * been live. And a process that dies between them leaves the lock at
- * `lock.taken.<token>`, so the vault reads as free: the safe direction, and
- * the same debris `publish` already leaves. A hard zero needs `flock`, which
- * Node does not offer portably (docs/compared.md).
- *
- * A third thing is *not* left, and used to be: a put-back that failed for a
- * reason of its own. Every failure read as "somebody took the name", and the
- * cleanup then removed the only copy of a live holder's lock, so the vault
- * went unlocked while that holder was still syncing and the next contender
- * took it. Those two answers are now told apart.
- */
-async function evicting(
-  dir: string,
-  path: string,
-  mine: LockHolder,
-  remove: (at: LockState) => boolean,
-): Promise<void> {
-  const taken = join(dir, `lock.taken.${mine.token}`);
-  await midEvict.beforeTake();
-  try {
-    await rename(path, taken);
-  } catch {
-    // Gone, or another contender took it first. Either way this attempt does
-    // nothing and the loop looks again.
-    return;
-  }
-  // The seam sits here, holding a process that has the lock file and has not
-  // yet decided about it. That is the whole of the interleaving: whatever a
-  // competitor does from here, it is doing it to a vault with no lock at its
-  // name, and it can never be doing it to this file.
-  await midEvict.pause();
-
-  if (remove(await lockState(taken))) {
-    await rm(taken, { force: true });
-    return;
-  }
-  // Somebody live, which means this call's earlier read was stale. It goes
-  // back exactly as it was.
-  //
-  // Every reason the put-back can fail is not the same reason, and reading
-  // them as one was a way to hand the vault to two owners. `EEXIST` means a
-  // contender has published its own lock at the name, so this copy is a
-  // duplicate and goes. Anything else -- a full disk, a quota, a descriptor
-  // limit, an I/O error -- means the name is still *free* and this is the only
-  // copy of a lock somebody is holding. Dropping it there left the vault
-  // unlocked with a live holder still syncing, and the next contender took it.
-  for (let attempt = 0; ; attempt++) {
-    try {
-      await link(taken, path);
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") break;
-      if (attempt >= 4) {
-        // Out of tries, and the file is not this call's to throw away. It
-        // stays where it is, under a name that says what it is, and the error
-        // names it: a lock nobody can find is a vault nobody can take.
-        throw new Error(
-          `could not put back the lock at ${path} after reading it (${(err as Error).message}); ` +
-            `the holder's lock file is at ${taken} and must be moved back or removed by hand`,
-        );
-      }
-      await pause(5 * (attempt + 1));
-    }
-  }
-  await rm(taken, { force: true });
-}
+export const midEvict = { pause: async (): Promise<void> => {} };
 
 /**
  * What is at the lock's path, keeping absent and unreadable apart.

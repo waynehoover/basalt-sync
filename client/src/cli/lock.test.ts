@@ -160,9 +160,10 @@ describe("taking the vault lock", () => {
 
 describe("releasing the vault lock", () => {
   it("removes only its own, not whatever is at the path", async () => {
-    // What a stale takeover leaves: our lock is gone and somebody else's is
-    // there under the same name. Matching on pid and host let a release
-    // remove it, because the operating system reuses pids.
+    // A claim that is not this release's to remove. Matching on pid and host
+    // let a release take one, because the operating system reuses pids; the
+    // generational names make it structural, and the legacy name below is the
+    // one file a release could still reach and must not.
     const dir = await vault();
     const release = await lockVault(dir, "sync");
     const theirs = JSON.stringify({

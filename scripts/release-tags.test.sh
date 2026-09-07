@@ -160,9 +160,13 @@ want server/v0.4.1      "0.4.1 0.4 latest"
 # it moves neither of the aliases B was going to. B's immutable image is
 # published and nothing ever points at it.
 #
-# So the promotion reconciles every alias from the releases that exist. These
-# cases are that answer, and the last one is the three-release schedule.
-aliases() { # aliases <expected, "alias version" pairs separated by |>
+# So the promotion reconciles every alias from the releases that exist. Each
+# line is an alias and then the versions it may point at, newest first, because
+# which one it takes also depends on what is actually published: a newer
+# release whose build has not finished must not leave the alias behind on an
+# older one (R41). Picking among them is the workflow's job and is checked in
+# `release-promote.test.sh`; what is checked here is the plan.
+aliases() { # aliases <expected, "alias candidates..." lines separated by |>
   local expect=$1 got
   got=$(bash "$here/release-aliases.sh" "$work/tags" | tr '\n' '|')
   got=${got%|}
@@ -181,7 +185,7 @@ server/v0.3.1
 server/v0.4.0
 server/v0.4.1
 TAGS
-aliases "latest 0.4.1|0.2 0.2.0|0.3 0.3.1|0.4 0.4.1"
+aliases "latest 0.4.1 0.4.0 0.3.1 0.3.0 0.2.0|0.2 0.2.0|0.3 0.3.1 0.3.0|0.4 0.4.1 0.4.0"
 
 # A prerelease holds nothing and is pointed at by nothing, on either side.
 cat > "$work/tags" <<'TAGS'
@@ -195,7 +199,7 @@ cat > "$work/tags" <<'TAGS'
 server/v0.9.1
 server/v0.10.1
 TAGS
-aliases "latest 0.10.1|0.9 0.9.1|0.10 0.10.1"
+aliases "latest 0.10.1 0.9.1|0.9 0.9.1|0.10 0.10.1"
 
 # And nothing published yet is not an error, it is no aliases.
 : > "$work/tags"
@@ -218,7 +222,7 @@ want server/v0.3.9      "0.3.9 0.3"
 # without B ever promoting, because B's immutable image was published outside
 # the queue and this is worked out from the releases rather than from whose
 # turn it is.
-aliases "latest 0.5.0|0.3 0.3.9|0.4 0.4.2|0.5 0.5.0"
+aliases "latest 0.5.0 0.4.2 0.4.0 0.3.9 0.3.0|0.3 0.3.9 0.3.0|0.4 0.4.2 0.4.0|0.5 0.5.0"
 
 # And the same malformed list, asked of both, which is the pair that drifted.
 echo "and both scripts read the repository the same way:"
@@ -229,7 +233,7 @@ server/v1.2
 server/v1.2.3.4
 TAGS
 want server/v0.4.1      "0.4.1 0.4 latest"
-aliases "latest 0.4.1|0.4 0.4.1"
+aliases "latest 0.4.1 0.4.0|0.4 0.4.1 0.4.0"
 
 if [ "$fails" != 0 ]; then echo "$fails case(s) failed"; exit 1; fi
 echo "all cases passed"

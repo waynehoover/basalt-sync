@@ -213,6 +213,17 @@ export const midTrash = {
 };
 
 /**
+ * The instant a displaced version is parked and its destination has not been
+ * claimed yet (R43).
+ *
+ * The window the caller's name choice opens: it picked a free path, staging
+ * and hashing happened, and the file only lands there now. A note created at
+ * that path in between is the thing preservation must not destroy, and this is
+ * where a test puts one. It does nothing in every build.
+ */
+export const midPreserve = { beforeClaim: async (_at: string): Promise<void> => {} };
+
+/**
  * Takes away a name whose file now has a second, normalised name, without
  * deleting anything that is not that file (R07).
  *
@@ -294,6 +305,39 @@ export async function retireName(
     });
   }
   await rm(spare, { force: true });
+}
+
+/**
+ * Puts a file this call exclusively owns at a preservation path, without
+ * replacing whatever may have arrived there (R43).
+ *
+ * The caller picked `keepAt` because it was free, and picking is not claiming:
+ * durable staging and a stat or two happen in between, and a note created at
+ * that name in the meantime was destroyed by `rename`, which replaces. The one
+ * operation that preserves notes was the one deleting one.
+ *
+ * `link` creates the name or fails, so the destination is claimed rather than
+ * assumed. On a collision it takes the next sibling name, because the caller
+ * has one name to give and the point is to keep both files, not to keep the
+ * name. Returns where it actually landed, which is what the caller reports.
+ *
+ * `from` must be a path only this call can reach -- a temporary it renamed the
+ * note into -- because the unlink at the end is unconditional.
+ */
+async function claimPreserved(from: string, keepAt: string): Promise<string> {
+  await midPreserve.beforeClaim(keepAt);
+  let at = keepAt;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await link(from, at);
+      await rm(from, { force: true });
+      return at;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (attempt >= 64) throw err;
+      at = await freeSiblingName(keepAt, "kept");
+    }
+  }
 }
 
 /**
@@ -1359,7 +1403,7 @@ export class NodeVault implements Vault {
       // second staging copy beside the destination, where a link always
       // reaches.
       if (!(await sameFilesystem(staged, dirname(full)))) {
-        const near = `${full}.${TEMP_MARK}${randomBytes(4).toString("hex")}`;
+        const near = `${full}.${TEMP_MARK}near${randomBytes(4).toString("hex")}`;
         await writeDurably(near, bytes, true, { mtime: times.mtime });
         await rm(staged, { force: true });
         staged = near;
@@ -1373,9 +1417,19 @@ export class NodeVault implements Vault {
       //
       // A sibling of the file, so this rename is within one directory and
       // cannot meet EXDEV however the vault is mounted.
+      //
+      // Into a temporary of this call's own rather than straight to `keepAt`
+      // (R43). The name the caller chose was free when it chose it, and the
+      // durable staging above happens in between; `rename` replaces, so a note
+      // created at that name meanwhile was destroyed by the operation that
+      // exists to preserve notes. Taking it away from `full` still has to be a
+      // rename, because that is the only atomic way to get exactly the bytes
+      // that are there; where they go afterwards is a `link`, which refuses an
+      // occupied name.
       let moved = true;
+      const parked = `${full}.${TEMP_MARK}keep${randomBytes(4).toString("hex")}`;
       try {
-        await rename(full, kept);
+        await rename(full, parked);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         // Nothing there, which is the ordinary first download and also a
@@ -1401,10 +1455,11 @@ export class NodeVault implements Vault {
           // travels (R37): a caller that sees a failure should find the vault
           // as it was, not a note renamed to a conflict copy for a reason that
           // has nothing to do with a conflict.
-          if (moved && !(await this.putBack(kept, full))) {
+          if (moved && !(await this.putBack(parked, full))) {
+            const at = await claimPreserved(parked, kept).catch(() => parked);
             throw new Error(
               `${path} could not be written (${(err as Error).message}) and its previous ` +
-                `version could not be put back; it is at ${keepAt}`,
+                `version could not be put back; it is at ${relative(this.root, at)}`,
             );
           }
           throw err;
@@ -1420,24 +1475,34 @@ export class NodeVault implements Vault {
         // removing it is the one deletion here that destroys nothing. With no
         // baseline there is nothing to compare it against, so it is kept
         // (R33): unknown is not the same as agreed.
-        const digest = await this.contentDigest(keepAt);
+        //
+        // Read from the parked copy, which nothing else can reach, rather than
+        // from the preservation path: hashing a name and then removing it is
+        // the shape this file spends its length avoiding.
+        const digest = await digestOf(parked).catch(() => undefined);
         if (digest !== undefined && digest === expect.contentId) {
-          await rm(kept, { force: true });
+          await rm(parked, { force: true });
           return { landed: true };
         }
       }
       // Kept: either it was not what this write expected, or the write did not
       // land and the displaced version is all there is. Its path is returned
       // rather than its bytes, so nothing depends on the caller finishing.
-      this.dirty(kept, had);
-      this.unflushed.add(dirname(kept));
-      return { keptAt: keepAt, landed };
+      //
+      // Claimed rather than taken: the name was free when the caller chose it
+      // and a note may have arrived at it since (R43).
+      const at = await claimPreserved(parked, kept);
+      this.dirty(at, had);
+      this.unflushed.add(dirname(at));
+      return { keptAt: relative(this.root, at), landed };
     } finally {
       // Only the staged copy, and only ever the staged copy. `link` leaves it
       // behind by design, so there is always one to remove. The preserved
       // version is a note now and is not this function's to remove; deleting
       // recovery data in a `finally` is how a failure anywhere above used to
-      // take the original with it (R18).
+      // take the original with it (R18). The parked original is not removed
+      // here either, for the same reason: every path above either puts it
+      // somewhere or names it in the error.
       await rm(staged, { force: true });
     }
   }
@@ -1500,7 +1565,7 @@ export class NodeVault implements Vault {
     // trash. Parked at the conflict-copy path it reached the trash *called* a
     // conflict copy, which is a name nobody searches for and a claim that
     // something was in conflict when nothing was.
-    const aside = `${full}.${TEMP_MARK}${randomBytes(4).toString("hex")}`;
+    const aside = `${full}.${TEMP_MARK}keep${randomBytes(4).toString("hex")}`;
     try {
       await rename(full, aside);
     } catch (err) {
@@ -1537,10 +1602,13 @@ export class NodeVault implements Vault {
       await this.insideForReal(kept);
       const had = await this.deepestExisting(kept);
       await mkdir(dirname(kept), { recursive: true });
-      await rename(aside, kept);
-      this.dirty(kept, had);
-      this.unflushed.add(dirname(kept));
-      return { keptAt: keepAt, landed: true };
+      // Claimed, not taken (R43): the caller chose this name because it was
+      // free, and a hash and a trash decision have happened since. `rename`
+      // would replace a note that arrived at it in between.
+      const at = await claimPreserved(aside, kept);
+      this.dirty(at, had);
+      this.unflushed.add(dirname(at));
+      return { keptAt: relative(this.root, at), landed: true };
     } catch (err) {
       // Back under its own name, which is where a caller that sees a failure
       // should find it. `putBack` refuses an occupied name, so a file that
