@@ -564,3 +564,68 @@ The dispatch accepts a tag and checks CI, but neither the [plugin upload](.githu
 Real Obsidian desktop/mobile behavior, physical power cuts, Linux mount behavior, and live GitHub publication were not independently exercised here. In particular, the plugin's documented last-write race remains a limitation even after R32 is corrected. Authenticated replay/rollback protection (F11) remains the earlier explicit POC deferral. These are not newly implemented guarantees.
 
 Prioritize R32–R36, then the cross-filesystem and release issues. Keep regression hooks after the last guard and carry real leftovers into retries: several current tests cover a successful first attempt while the remaining failures happen after preservation or during a second attempt.
+
+## Fourth verification — 2026-09-06
+
+Reviewed **`8ee6db769b1295619da6a88f8ef455d113edf69b`**, including `c51bd6a`, `09f6b68`, and the plugin publication changes completed during this review. The implementation changed while the first checks were running, so final validation used an isolated snapshot. File fingerprints confirmed that its application, tests, configuration, and workflow files match the completed implementation. Earlier review sections remain unchanged.
+
+**Six of R32–R39 are addressed for the reviewed cases. R34 and R38 remain partial.** There are **three open findings below: one P1 locking defect and two P2 release defects**. All have local reproductions; the release reproductions use simulated registry responses rather than a live publication.
+
+### Checks and confirmed repairs
+
+`bash scripts/check.sh` passed **25 checks, with 0 failed and 0 skipped**, on the final isolated snapshot. This included **1,396 client tests in 73 files**, the separate **16 panel tests and 10 stress tests**, Go race tests/vet, format/type/build checks, packaged CLI checks, and local Docker checks. Actual systemd execution and the Linux mounted-filesystem job remain explicitly CI-only on this macOS host.
+
+The initial live-tree run and an intermediate snapshot each had one failing plugin test. The implementer subsequently corrected the test's hook to run after rename and completed the publication change. The final result above applies to that completed version, rather than those intermediate failures.
+
+Independent probes confirmed that failed plugin preservation and an unanswerable presence check leave the original intact; the newer plugin publication preserves a competing save; all three adapters retain files when no baseline was available; current and legacy normalization recovery files survive scans; and a second trash move retains the first attempt's preserved version. Simulated cross-filesystem replacement stages beside the destination, and publication failure restores the original name. The original canceled-promotion/backport scenario now repairs all its aliases. The actual draft-gate shell code accepts a draft and refuses both a public release and an API failure.
+
+Evidence is retained in `/tmp/basalt-review-round4/`, including `final-check.log`, `client-probes.ts`/`.log`, `plugin-probes.ts`/`.log`, `workflow-probes.mjs`/`.log`, and `final-worktree.patch`. The lock probe adds a scheduling pause to a temporary copy of the source; filesystem fixtures are disposable. Workflow probes execute the extracted promotion/gate shell bodies with mocked Git, registry, and GitHub commands. The mock image name and output-file location are fixed for local execution; alias selection and mutation logic are unchanged. No external release or registry was modified.
+
+### Updated status of R32–R39
+
+| Finding | Assessment | Evidence / remaining work |
+|---|---|---|
+| R32: plugin preservation failure | Fixed for reviewed cases | A failed move with an occupied or unknown destination returns `landed: false`. The subsequent plugin change uses `create`, and the after-rename competing-save probe retains both local versions. |
+| R33: missing-baseline overwrite | Fixed for reviewed cases | CLI, plugin, and memory adapters preserve encountered files even without an expected digest. The original first-download engine probe now retains the local edit. |
+| R34: stale-lock takeover | Still open | Moving the lock before identifying it creates an interval in which a live holder appears unlocked. R40. |
+| R35: reaping displaced originals | Fixed for reviewed cases | Current normalization uses `preserved.*`; legacy `keep.*` and `respell.*` survive scans and are reported as stranded. |
+| R36: trash retry destroys previous preservation | Fixed for reviewed case | Each attempt selects a fresh aside; the two-attempt probe retains A after moving B. |
+| R37: replacement across filesystems | Fixed under simulated device/error conditions | Staging moves to the destination filesystem before preservation; failure restores the original name. Actual Linux mounted-filesystem acceptance remains CI-only here. |
+| R38: canceled promotion strands aliases | Partial; original schedule fixed | Reconciliation repairs the canceled backport scenario, but a newer unpublished Git tag can still block eligible published images, and a prerelease-only history fails. R41/R42. |
+| R39: mutation of a public release | Fixed for reviewed workflow | Draft state is checked in the shared prerequisite, and the whole workflow is serialized per tag. Public/error responses refuse before an upload job can run. |
+
+### R40 — Taking a live lock aside admits another owner
+
+- [ ] **P1 · CLI locking · Remaining R34 · Reproduced.** Keep a live owner's exclusion continuously visible during stale takeover.
+
+[`evicting`](client/src/cli/lock.ts#L226) renames the lock away before identifying the file it actually took. If its earlier observation is stale, that file belongs to a live owner. The authoritative lock path is now absent. A third contender can acquire it before the evictor [tries to restore the live lock](client/src/cli/lock.ts#L245). Restoration then fails because the name is occupied, and `finally` deletes the displaced live holder's lock. The original owner receives no revocation and continues working.
+
+**Observed:** A reads the dead lock and pauses before rename. B evicts it and successfully acquires the vault. A resumes, moves B's live lock aside, and pauses at `midEvict`. C now successfully acquires the empty lock path. After A resumes, A refuses, but **B and C both retain successful lock acquisitions**. No clock boundary or process crash is required. A crash after moving B aside would leave the same unsafe absence; the comment calling that the safe direction is incorrect.
+
+**Fix and acceptance:** use an exclusion mechanism whose ownership survives takeover, or fail closed on stale/ambiguous locks until all writers have stopped. A possibly live lock must not be removed from its authoritative name while its owner can still write. Add this three-contender schedule and interruption after taking a live lock to the maintained suite. Checking that only the evictor loses does not establish that the other two contenders are mutually exclusive.
+
+### R41 — An unpublished newer Git tag prevents promotion of a valid release
+
+- [ ] **P2 · Image release · Remaining R38 · Reproduced with simulated registry state.** Select the newest eligible published image before choosing each alias target.
+
+[`release-aliases.sh`](scripts/release-aliases.sh#L40) chooses the highest stable Git tag, without establishing whether its image was successfully published. The promotion job then [skips that alias when image lookup fails](.github/workflows/release.yml#L258), rather than considering the next eligible version. The assumption that the missing version's own promotion will eventually run fails when its build or validation failed.
+
+**Observed:** Git contains `0.4.1`, `0.4.2`, and `0.5.0`; only the first two images exist, and `latest` still points at `0.4.1`. Run the actual reconciliation body. It moves `0.4` to `0.4.2`, skips `latest` because `0.5.0` is absent, and exits **0**. The newest successfully published image remains unavailable through `latest`. Repeating the job does not repair it while the failed tag remains.
+
+**Fix and acceptance:** resolve the validated, published version set before selecting the maximum for each alias. Distinguish an unpublished image from a registry/authentication failure; handle uncertainty without rolling an existing newer alias backward. Test a newer failed build, a valid completed older release, and a transient lookup failure in addition to the three-successful-release case.
+
+### R42 — A valid prerelease-only history makes promotion fail
+
+- [ ] **P2 · Image release · Regression in reconciliation · Reproduced with simulated registry state.** Treat an empty alias plan as a successful no-op when no stable release exists.
+
+The helper correctly [returns no aliases for an entirely prerelease history](scripts/release-aliases.sh#L45). The workflow nevertheless [requires `checked > 0`](.github/workflows/release.yml#L280), based on the incorrect comment that every release moves a minor alias. Prereleases intentionally move neither a minor alias nor `latest`.
+
+**Observed:** with only `server/v0.5.0-rc.1` and its successfully published immutable image, the reconciliation body makes no registry mutation and exits **1** with `no alias resolved to a published image, which cannot be right`. This affects the first prerelease in a repository without stable server tags; it is not a failure of the image build itself.
+
+**Fix and acceptance:** separate “no stable aliases are expected” from “expected aliases could not be resolved.” The first case should succeed without creating moving tags; genuine resolution errors should remain visible. Exercise the workflow body for an initial prerelease, an ordinary stable release, and a nonempty plan whose image lookups all fail.
+
+### Verification limits
+
+Plugin probes use the repository adapter/stub; real Obsidian desktop/mobile acceptance was not run. The installed Obsidian 1.13.7 desktop adapter's rename ordering was inspected: its existence check and native rename execute in the adapter's queue, which is relevant to its own writes and is not a general filesystem lock. Physical power cuts, Linux mounted-filesystem behavior, and live GitHub scheduling/publication were not independently exercised. F11's authenticated replay protection remains the earlier explicit POC deferral.
+
+R40 is the remaining data-integrity priority. The release issues can be corrected independently while retaining the preservation and draft-gate fixes confirmed above.

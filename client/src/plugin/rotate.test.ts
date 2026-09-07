@@ -165,6 +165,20 @@ const tooltips = (): string => {
 };
 
 /**
+ * Waits for a promise that is supposed to settle, and says so when it does not.
+ *
+ * The failure being guarded is a wait left pending, so the symptom is a test
+ * that never finishes, which the suite reports five minutes later as a timeout
+ * with nothing about what was waiting.
+ */
+async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promise<void> {
+  const pending = Symbol("pending");
+  const later = new Promise((r) => setTimeout(() => r(pending), ms));
+  const first = await Promise.race([work.then(() => "done").catch(() => "done"), later]);
+  if (first === pending) throw new Error(what);
+}
+
+/**
  * Whether a promise has already finished, without waiting on it.
  *
  * A macrotask, not a microtask: the thing being asked about awaits a promise
@@ -255,6 +269,48 @@ describe("replacing the vault's secret from the panel", () => {
       () => other.app.vault.adapter.text("kept.md") !== undefined,
     );
     expect(other.app.vault.adapter.text("kept.md")).toBe("written before the rotation\n");
+  }, 300_000);
+
+  /**
+   * The panel closed while the new key is on screen (R40).
+   *
+   * Rotation waits for the acknowledgement before it sends anything, and a
+   * wait needs an answer on every way out of it. Closing the panel left the
+   * promise pending, so the click never returned and the candidate key sat in
+   * a suspended call for the rest of the session. Nothing had been sent, which
+   * is the safe direction and not the same as an outcome: the vault still had
+   * its old secret and nobody had been told the rotation did not happen.
+   */
+  it("gives up the rotation when the panel is closed instead of acknowledged", async () => {
+    const { plugin, key: oldKey } = await started();
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    built.find((s) => s.name === "Replace the vault's secret")!.texts[0]!.setValue(oldKey);
+    const clicking = built
+      .find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!
+      .buttons[0]!.click();
+    await until("the new key to be shown", () =>
+      modals.at(-1)!.contentEl.allText().includes("Write this down"),
+    );
+
+    modals.at(-1)!.close();
+    // Settles rather than hanging on a wait nothing will ever answer. Bounded,
+    // because the way this regresses is by never finishing, and a test that
+    // hangs reports a timeout rather than a reason.
+    await settles(clicking, "the rotation is still waiting for an acknowledgement nobody can give");
+
+    // Nothing was sent, so the key that was typed in is still the vault's.
+    const { devices } = await plugin.devices();
+    expect(devices.length).toBeGreaterThan(0);
+    const other = await load();
+    await other.plugin.pair(oldKey, "other");
+    await synced(other.plugin);
+
+    // And the panel can be used again.
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    expect(built.find((s) => s.name === "Replace the vault's secret")).toBeDefined();
   }, 300_000);
 
   it("finds out that a lost reply committed, and says the key is the vault's", async () => {

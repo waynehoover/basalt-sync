@@ -137,6 +137,20 @@ async function until(what: string, cond: () => boolean, ms = 20_000): Promise<vo
   throw new Error(`timed out waiting for ${what}`);
 }
 
+/**
+ * Waits for a promise that is supposed to settle, and says so when it does not.
+ *
+ * The failure being guarded is a wait left pending, so the symptom is a test
+ * that never finishes. Left to the suite timeout that reads as "timed out
+ * after 300000ms" five minutes later, with nothing about what was waiting.
+ */
+async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promise<void> {
+  const pending = Symbol("pending");
+  const later = new Promise((r) => setTimeout(() => r(pending), ms));
+  const first = await Promise.race([work.then(() => "done").catch(() => "done"), later]);
+  if (first === pending) throw new Error(what);
+}
+
 const synced = (p: Testable) =>
   until("a sync", () => p.currentState.kind === "synced").catch((err: Error) => {
     throw new Error(`${err.message}; the state is ${JSON.stringify(p.currentState)}`);
@@ -2865,6 +2879,58 @@ describe("adding a device from the panel", () => {
     plugin.ribbonIcons[0]!.callback();
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
     await synced(plugin);
+  }, 300_000);
+
+  /**
+   * The panel closed while the key is on screen and nothing has been claimed.
+   *
+   * The handoff is a wait, and a wait needs an answer for every way out of it.
+   * `teardown` cleared the key and emptied the host and left the promise the
+   * pairing is awaiting pending for ever, so `onePairing` never let go: the
+   * plugin refused every later attempt with "a pairing is already in
+   * progress", for the life of the session, and the only way out was reloading
+   * it. Nothing was lost, because the root is on disk before the wait, and
+   * nothing worked either.
+   *
+   * Abandoning has to be an outcome. The pairing ends, says why, and the next
+   * load finds the root in the config and offers the key again.
+   */
+  it("lets go when the panel is closed instead of acknowledged", async () => {
+    await fresh();
+    const { plugin } = await load();
+
+    plugin.ribbonIcons[0]!.callback();
+    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    const starting = built
+      .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
+      .buttons[0]!.click();
+    await until("the recovery key to be shown", () =>
+      built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
+    );
+
+    // Closed rather than acknowledged, which is what somebody does when they
+    // are interrupted or think they are done.
+    modals.at(-1)!.close();
+
+    // The click's promise settles rather than hanging on a wait nothing will
+    // ever answer. Bounded, because the way this regresses is by never
+    // finishing, and a test that hangs reports a timeout rather than a reason.
+    await settles(starting, "the pairing is still waiting for an acknowledgement nobody can give");
+
+    // And the vault can still be paired. This is the assertion that failed:
+    // `onePairing` was still holding the abandoned run.
+    expect(
+      plugin.pendingFirstPairing(),
+      "the root is not on disk, so the interrupted pairing lost the key",
+    ).toBeDefined();
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    await until("the key to be offered again", () =>
+      built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
+    );
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
+      .buttons[0]!.click();
   }, 300_000);
 
   it("says where the recovery key is rather than offering to show it", async () => {

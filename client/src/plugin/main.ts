@@ -2081,6 +2081,15 @@ class BasaltPanel {
 
   teardown(): void {
     this.unwatch?.();
+    // The wait for "I have written it down" needs an answer on every way out
+    // of it, and closing the panel is one of them (R40).
+    //
+    // It used to be left pending. The pairing awaiting it therefore never
+    // returned, `onePairing` never let go, and every later attempt was refused
+    // with "a pairing is already in progress" for the rest of the session:
+    // nothing was lost, because the root reaches the disk before the wait, and
+    // nothing worked either. Abandoning is an outcome and is reported as one.
+    this.abandonRecoveryKey("the panel was closed before the recovery key was acknowledged");
     this.freshRecoveryKey = undefined;
     this.host.empty();
   }
@@ -2746,12 +2755,34 @@ class BasaltPanel {
    */
   private writtenDown: Promise<void> = Promise.resolve();
   private confirmWrittenDown: (() => void) | undefined;
+  private giveUpWrittenDown: ((why: Error) => void) | undefined;
+
+  /**
+   * Ends the wait without an acknowledgement, if one is outstanding.
+   *
+   * Rejecting rather than resolving, because resolving would tell the pairing
+   * that somebody has the key when nobody said so, and the next thing it does
+   * is replace the root that key came from.
+   */
+  private abandonRecoveryKey(why: string): void {
+    const give = this.giveUpWrittenDown;
+    this.confirmWrittenDown = undefined;
+    this.giveUpWrittenDown = undefined;
+    this.writtenDown = Promise.resolve();
+    give?.(new Error(why));
+  }
 
   private renderRecoveryKey(contentEl: HTMLElement, key: string): void {
     if (this.confirmWrittenDown === undefined) {
-      this.writtenDown = new Promise<void>((go) => {
+      this.writtenDown = new Promise<void>((go, stop) => {
         this.confirmWrittenDown = go;
+        this.giveUpWrittenDown = stop;
       });
+      // Nobody is necessarily awaiting this: the key is drawn again on a later
+      // load from `pendingFirstPairing`, with no pairing behind it. Marking it
+      // handled here keeps an abandoned one from surfacing as an unhandled
+      // rejection, and does not stop a real awaiter seeing it.
+      void this.writtenDown.catch(() => undefined);
     }
     contentEl.createEl("h3", { text: "Write this down" });
     const said = contentEl.createEl("p", {
@@ -2770,9 +2801,11 @@ class BasaltPanel {
         this.freshRecoveryKey = undefined;
         // Releases the pairing, which has been holding the vault's claim
         // until now. Cleared so a later key gets a wait of its own.
-        this.confirmWrittenDown?.();
+        const go = this.confirmWrittenDown;
         this.confirmWrittenDown = undefined;
+        this.giveUpWrittenDown = undefined;
         this.writtenDown = Promise.resolve();
+        go?.();
         this.render();
       }),
     );
