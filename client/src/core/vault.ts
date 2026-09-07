@@ -306,7 +306,11 @@ export interface Vault {
    * `expect` described, so the caller can put them back where somebody will
    * see them.
    */
-  removeExpecting?(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced>;
+  removeExpecting?(
+    path: string,
+    expect: ExpectedContent | undefined,
+    keepAt: string,
+  ): Promise<Replaced>;
   /**
    * Watches for changes, returning a function that stops watching.
    *
@@ -437,10 +441,18 @@ interface MemoryFile {
 /**
  * A vault held in memory.
  *
- * Not a mock: it implements the interface completely, and the engine cannot tell
- * the difference. That is what makes it useful, because it lets two engines
- * converge against a real server in a test where the only thing being faked is
- * the disk.
+ * Not a mock: it implements the interface completely, which is what lets two
+ * engines converge against a real server in a test where the only thing being
+ * faked is the disk.
+ *
+ * Where the destructive paths are concerned it models what the two real
+ * adapters *do* rather than what is easy here, and that is a rule rather than
+ * a nicety. This class was wrong in both directions at once: it wrote over a
+ * name a competitor had taken and called it a success, which is the R32 loss
+ * modelled as working, and it identified a file and then deleted it across an
+ * await, which is the R22 loss the shipped clients do not have. A fake wrong
+ * in the first direction lets a defect through; one wrong in the second
+ * teaches the engine to guard something that was never true.
  */
 export class MemoryVault implements Vault {
   private readonly files = new Map<string, MemoryFile>();
@@ -537,6 +549,18 @@ export class MemoryVault implements Vault {
     // Read after the hook, so a write landing in the gap is the version this
     // preserves rather than the one it was told to expect.
     if (was === undefined) {
+      // Both real adapters publish with an exclusive create even when they
+      // displaced nothing, so a save that takes the name first keeps it and
+      // the call reports `landed: false`. This branch used to write anyway,
+      // discard the interloper's bytes and answer `landed: true`, which is
+      // the R32 loss modelled as a success: a test arming the seam on a first
+      // download would have passed while asserting the opposite.
+      const taken = this.nameTakenOnce;
+      this.nameTakenOnce = undefined;
+      if (taken !== undefined) {
+        await this.write(path, taken, times);
+        return { landed: false };
+      }
       await this.write(path, bytes, times);
       return { landed: true };
     }
@@ -562,20 +586,43 @@ export class MemoryVault implements Vault {
   }
 
   /** The deletion half, and the same reasoning. */
-  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
+  async removeExpecting(
+    path: string,
+    expect: ExpectedContent | undefined,
+    keepAt: string,
+  ): Promise<Replaced> {
     await this.midReplace?.(path);
     const was = this.files.get(path);
     if (was === undefined) {
       await this.remove(path);
       return { landed: true };
     }
-    const id = await expect.idOf(was.bytes);
-    if (id === expect.contentId) {
-      await this.remove(path);
+    // Taken off the name first, and identified afterwards, which is what both
+    // real adapters do (R22): the plugin moves the note into a hidden folder
+    // and the headless client renames it beside itself, and only then is it
+    // hashed. This used to identify and then delete across an await, so a save
+    // in that window was destroyed here and kept by both shipped clients --
+    // the fake losing a note the real thing does not, which is the direction
+    // that teaches a test the wrong lesson.
+    // The seams belong here, where the note leaves its name, because that is
+    // the step a real adapter can fail at: a rename-aside that refuses has
+    // moved nothing, and the error travels with the file still in place.
+    await this.beforeRemove?.(path);
+    if (this.failRemoveOnce === path) {
+      this.failRemoveOnce = undefined;
+      throw new Error(`refusing to remove ${path}, as a locked file would`);
+    }
+    this.files.delete(path);
+    this.notify(path);
+    // With no baseline there is nothing it can match, so it is kept (R33).
+    const agreed = expect !== undefined && (await expect.idOf(was.bytes)) === expect.contentId;
+    if (agreed) {
+      // The version the pass decided to delete, disposed of where it is. Not
+      // by putting it back at the path first: the whole point of taking it off
+      // the name is that whatever is at the name now is somebody else's.
       return { landed: true };
     }
     this.files.set(keepAt, was);
-    await this.remove(path);
     this.notify(keepAt);
     return { keptAt: keepAt, landed: true };
   }

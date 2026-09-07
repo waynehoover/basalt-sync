@@ -819,7 +819,11 @@ export class ObsidianVault implements Vault {
    * removal that hashes the path and then deletes it deletes whatever is
    * there at the second step.
    */
-  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
+  async removeExpecting(
+    path: string,
+    expect: ExpectedContent | undefined,
+    keepAt: string,
+  ): Promise<Replaced> {
     const from = this.resolve(path);
     const kept = this.resolve(keepAt);
     if (!(await this.adapter.exists(from))) {
@@ -845,8 +849,13 @@ export class ObsidianVault implements Vault {
 
     let emptied = false;
     try {
-      const was = await readRaw(this.adapter, aside);
-      if (was !== undefined && (await expect.idOf(was)) === expect.contentId) {
+      // With no baseline there is nothing it can match, so it is kept (R33).
+      const was = expect === undefined ? undefined : await readRaw(this.adapter, aside);
+      if (
+        was !== undefined &&
+        expect !== undefined &&
+        (await expect.idOf(was)) === expect.contentId
+      ) {
         // The version the pass decided to delete. It goes where a deletion
         // goes, under the name it had: both trashes read the basename, which
         // is why the move above was into a folder.

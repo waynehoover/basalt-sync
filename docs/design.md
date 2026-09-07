@@ -75,9 +75,18 @@ sentence differently would otherwise "apply" cleanly and produce a sentence
 neither wrote. Two additions at the same point on a line boundary are allowed,
 because that is two devices adding to one daily note.
 
-When both versions are kept, the incoming one takes the conflict name. Obsidian
-puts the local one there and overwrites the file you have open. A sync you did
-not ask for should never rewrite the file you are editing.
+When both versions are kept, the incoming one takes the conflict name and the
+file you have open is left alone. Obsidian does it the other way and overwrites
+the file you are editing. A sync you did not ask for should never do that.
+
+There is one path where the local version takes the conflict name instead, and
+it is worth knowing about because it looks like the opposite rule. When an edit
+lands too late for the scan to see it, the adapter finds out only by moving
+what is at the path aside and looking at it afterwards, and by then the note
+has already moved. Nothing is lost and nothing is overwritten; the two versions
+end up the other way round. Preferring the other order would mean deciding
+which file is which before either has been read, which is the prediction this
+whole mechanism exists to avoid.
 
 ## Fast, because it sends less
 

@@ -796,7 +796,11 @@ export default class BasaltPlugin extends Plugin {
           `and pairing over them would replace the credential they hold. Fix or move that file, then reload the plugin.`,
       );
     }
-    if (this.config) throw new Error("this vault is already paired");
+    if (this.paired) throw new Error("this vault is already paired");
+    // A config holding only a root is a first pairing that was abandoned
+    // before it claimed anything. Pairing again is the way out of it, and it
+    // costs nothing: no vault was made, no device row exists, and the key that
+    // config holds opens nothing anybody has.
     if (this.pairing) throw new Error("a pairing is already in progress");
   }
 
@@ -1759,8 +1763,21 @@ export default class BasaltPlugin extends Plugin {
     return this.state;
   }
 
+  /**
+   * Whether this vault has a device credential and can sync.
+   *
+   * Not "a config exists". `pairFirst` saves the root to disk before it shows
+   * the key, deliberately, so an interrupted first pairing is recoverable; the
+   * config at that point holds a root and no device row, and nothing has been
+   * claimed on any server. Counting that as paired drew the whole synced
+   * interface -- Sync, invites, the device list, Replace the secret -- over a
+   * vault that will never connect, and `refuseUnlessPairable` then answered
+   * every retry with "this vault is already paired", which is untrue and names
+   * no way out. `pendingFirstPairing` recovered the key and nothing recovered
+   * the vault.
+   */
   get paired(): boolean {
-    return this.config !== undefined;
+    return this.config !== undefined && this.pendingFirstPairing() === undefined;
   }
 
   /** Why the saved settings cannot be used, while that is so. */
@@ -2106,6 +2123,17 @@ class BasaltPanel {
       return;
     }
     if (!this.plugin.paired) {
+      // The key first, when there is one.
+      //
+      // A first pairing that was interrupted leaves a config holding the root
+      // and no device row: not paired, and holding the only copy of a key
+      // nothing can reissue. This block used to sit in the paired branch
+      // below, where `paired` meaning "a config exists" happened to reach it,
+      // and moving that definition to the truthful one took the key off the
+      // screen and let the pairing sail past the wait it is supposed to hold
+      // at. It belongs here, which is the state it describes.
+      const unfinished = this.freshRecoveryKey ?? this.plugin.pendingFirstPairing();
+      if (unfinished !== undefined) this.renderRecoveryKey(contentEl, unfinished);
       this.renderPairing(contentEl);
       return;
     }
@@ -2165,13 +2193,12 @@ class BasaltPanel {
     // offer the way out, without anybody opening anything first.
     if (drewRejoin) this.renderRejoin(contentEl);
 
-    // A key this panel has just produced, or one from a pairing that never
-    // finished (R02). The second is what a reload in the middle of starting a
-    // vault leaves behind: the config still holds the root, nothing was
-    // claimed, and the key is recoverable from it. Offering it is the
-    // difference between "shown once and lost" and "shown until you have it".
-    const unfinished = this.freshRecoveryKey ?? this.plugin.pendingFirstPairing();
-    if (unfinished !== undefined) this.renderRecoveryKey(contentEl, unfinished);
+    // A key this panel has just produced, still on screen until somebody says
+    // they have it (R02). The unfinished-pairing case is drawn in the unpaired
+    // branch above, which is the state it is actually in.
+    if (this.freshRecoveryKey !== undefined) {
+      this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
+    }
 
     // Adding a device and recovering a note: the two things somebody comes
     // here to do that are not "is it working".

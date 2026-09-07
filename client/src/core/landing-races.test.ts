@@ -712,6 +712,63 @@ describe("an edit a stat cannot tell apart", () => {
     expect(texts).toContain("the server's version\n");
   });
 
+  /**
+   * And a deletion with no baseline goes through the same door (R33).
+   *
+   * `removedSomethingElse` skipped `removeExpecting` entirely when the digest
+   * was missing and called the plain `remove`, which takes whatever is at the
+   * name. So the one case the R33 contract names -- a baseline that could not
+   * be read -- was the one case the preserving removal was not used, and the
+   * pass reported it as an ordinary deletion rather than as something kept.
+   *
+   * A file is unreadable for a moment more often than it sounds: a backup tool
+   * holding it, an indexer, a permissions blip.
+   */
+  it("keeps an edit under a deletion whose baseline could not be read", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    servingWith(socket, bodies);
+
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "doomed.md", "the original line\n", bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    // The baseline cannot be read when the pass asks for it, so the deletion
+    // is queued with none.
+    vault.contentDigest = async () => undefined;
+    // And the editor saves in the window, keeping the length and the stamp so
+    // the metadata check cannot see it either.
+    const stamped = await vault.stat("doomed.md");
+    vault.midReplace = async (path) => {
+      vault.midReplace = undefined;
+      if (path !== "doomed.md") return;
+      await vault.write("doomed.md", enc.encode("the ORIGINAL line\n"), {
+        mtime: stamped!.mtime,
+        ctime: stamped!.ctime,
+      });
+    };
+
+    socket.raw({
+      op: "batch",
+      from: 2,
+      to: 2,
+      entries: [await entryFor(keys, 2, "doomed.md", "", bodies, { deleted: true, mtime: 9000 })],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const texts = vault.paths().map((p) => vault.text(p));
+    expect(
+      texts,
+      `the edit was deleted on a baseline nothing could read. The vault holds: ${JSON.stringify(vault.paths())}`,
+    ).toContain("the ORIGINAL line\n");
+  });
+
   it("survives a deletion that lands on it, same length and same timestamp", async () => {
     const { engine, socket, vault, keys } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();

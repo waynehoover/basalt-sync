@@ -2757,8 +2757,14 @@ export class Engine {
       // Something else took the name in the instant it was free, and it is
       // newer than this decision. The incoming version needs a home of its own
       // rather than being dropped.
-      const beside = await this.freeConflictPath(path);
-      await vault.write(beside, content, times);
+      //
+      // Through `placeBeside`, like every other copy this puts next to a note.
+      // It claims the name with `create` and looks again if that is refused,
+      // where this branch used to pick a free name and then `write` it: the
+      // same choose-then-truncate the adapters spent two rounds of review
+      // having removed, reintroduced one level up in the code that handles
+      // their answer.
+      const beside = await placeBeside(() => this.freeConflictPath(path), content, times, vault);
       this.landed(beside);
       this.log("kept the incoming version beside", path, { at: beside });
       if (out.keptAt === undefined) report.conflicted++;
@@ -2784,12 +2790,19 @@ export class Engine {
   ): Promise<string | undefined> {
     const vault = this.opts.vault;
     const digest = based === undefined || based.folder ? undefined : baselines.get(path);
-    if (vault.removeExpecting === undefined || digest === undefined) {
+    if (vault.removeExpecting === undefined) {
       await vault.remove(path);
       return undefined;
     }
+    // A missing baseline is a reason to look, not a reason to skip looking
+    // (R33). It used to send the deletion straight to `remove`, which takes
+    // whatever is at the name: the one case R33 names, a baseline that could
+    // not be read, was the one case the preserving removal was not used, and
+    // the pass reported it as an ordinary deletion rather than as a conflict.
+    // A folder has no baseline either and is not a thing an editor rewrites,
+    // but the adapter keeps what it finds and that costs nothing.
     const keepAt = await this.freeConflictPath(path);
-    const out = await vault.removeExpecting(path, { contentId: digest, idOf: plainDigest }, keepAt);
+    const out = await vault.removeExpecting(path, this.expecting(digest), keepAt);
     return out.keptAt;
   }
 

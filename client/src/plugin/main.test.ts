@@ -2917,20 +2917,57 @@ describe("adding a device from the panel", () => {
     // finishing, and a test that hangs reports a timeout rather than a reason.
     await settles(starting, "the pairing is still waiting for an acknowledgement nobody can give");
 
-    // And the vault can still be paired. This is the assertion that failed:
-    // `onePairing` was still holding the abandoned run.
+    // The key is on disk, which is what makes abandoning cost nothing.
     expect(
       plugin.pendingFirstPairing(),
       "the root is not on disk, so the interrupted pairing lost the key",
     ).toBeDefined();
+
+    // And the vault is *pairable*, which is a different claim and the one that
+    // was not being made. `paired` meant "a config exists", and `pairFirst`
+    // writes the root before it shows the key, so an abandoned pairing read as
+    // paired: the panel drew the whole synced interface over a vault that will
+    // never connect, and every retry was answered "this vault is already
+    // paired", which is untrue and names no way out.
+    expect(plugin.paired, "an abandoned first pairing reads as a paired vault").toBe(false);
+    expect(plugin.currentState.kind).toBe("unpaired");
+
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
+    // The key is offered again, from the config, next to the form that lets
+    // somebody start over.
     await until("the key to be offered again", () =>
+      built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
+    );
+    expect(
+      built.some((s) => s.name === "Setup string"),
+      "there is no way to try again: the panel offers no pairing form",
+    ).toBe(true);
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
+      .buttons[0]!.click();
+
+    // And starting over actually works, rather than being refused.
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    const start = built.find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
+      .buttons[0]!;
+    // Cleared here, so what appears below is the render this click causes and
+    // not the one that drew the key from the abandoned attempt. Waiting on the
+    // stale one acknowledges a promise nothing is holding, and the pairing
+    // then waits for ever on the promise it makes a moment later.
+    built.length = 0;
+    const again = start.click();
+    await until("the recovery key of the second attempt", () =>
       built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
     );
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
       .buttons[0]!.click();
+    await settles(again, "the second pairing never finished");
+    expect(plugin.paired, "the vault could not be paired after an abandoned attempt").toBe(true);
+    await synced(plugin);
   }, 300_000);
 
   it("says where the recovery key is rather than offering to show it", async () => {

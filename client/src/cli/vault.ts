@@ -1470,7 +1470,11 @@ export class NodeVault implements Vault {
    * a deletion decided before a fetch does not quietly take an edit made
    * during it and report it as an ordinary removal.
    */
-  async removeExpecting(path: string, expect: ExpectedContent, keepAt: string): Promise<Replaced> {
+  async removeExpecting(
+    path: string,
+    expect: ExpectedContent | undefined,
+    keepAt: string,
+  ): Promise<Replaced> {
     const full = await this.absolute(path);
     await this.insideForReal(full);
     if ((await lstat(full).catch(() => undefined)) === undefined) {
@@ -1517,8 +1521,11 @@ export class NodeVault implements Vault {
     // and the server saying deleted, agreed, and the unsent edit was gone from
     // every surface with no error anywhere.
     try {
-      const digest = await digestOf(aside).catch(() => undefined);
-      if (digest !== undefined && digest === expect.contentId) {
+      // With no baseline there is nothing to compare against, so whatever
+      // this took is kept (R33): unknown is not the same as agreed.
+      const digest =
+        expect === undefined ? undefined : await digestOf(aside).catch(() => undefined);
+      if (digest !== undefined && expect !== undefined && digest === expect.contentId) {
         // The version the pass decided to delete. It goes where a deletion
         // goes, which is the trash, under the name it had.
         await this.intoTrash(path, aside);

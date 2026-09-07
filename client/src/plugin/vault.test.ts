@@ -1689,6 +1689,39 @@ describe("writing over a file the pass did not decide about", () => {
   });
 
   /**
+   * And an adapter that cannot answer counts as occupied.
+   *
+   * The guard's distinct behaviour is here and nowhere else: when the rename
+   * fails *and* `exists` throws, nothing has established absence, and absence
+   * is the only answer that permits writing over the name. Neutering the guard
+   * left every other test in this file passing, because `create` refuses the
+   * occupied path anyway; this is the case where `create` would have gone
+   * ahead, since the adapter cannot say the file is there.
+   */
+  it("refuses when it cannot even find out whether the original is still there", async () => {
+    await adapter.write("note.md", "the unsent edit\n", { mtime: 1000 });
+
+    adapter.fault = (op, path, to) => {
+      if (op === "rename" && to === "note (kept).md") return new Error("EIO: rename");
+      // And the question about the original cannot be answered either.
+      if (op === "exists" && path === "note.md") return new Error("EIO: stat");
+      return undefined;
+    };
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "the-original", idOf: async () => "something else" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    adapter.fault = undefined;
+    expect(out.landed, "a vault that could not answer was treated as an empty path").toBe(false);
+    expect(adapter.text("note.md")).toBe("the unsent edit\n");
+  });
+
+  /**
    * R33. No baseline is not permission to overwrite.
    *
    * The engine has no baseline for a path it has not seen and none for one
