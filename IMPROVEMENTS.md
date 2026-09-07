@@ -229,6 +229,44 @@ platforms, including the killed-holder case in CI rather than only on a
 developer's Mac. The plugin needs none of it: Obsidian is one process per
 vault, and neither mechanism exists on mobile.
 
+#### The alternative: a tiny Rust core behind napi-rs
+
+Considered, and it is a real option rather than a straw man. `fd-lock` or
+`fs2` give `flock` and `LockFileEx` behind one API, napi-rs ships prebuilt
+binaries as optional dependencies so users need no toolchain, and the result
+would be **one** mechanism instead of two, with Windows included.
+
+Not now, for reasons that are about this package rather than about Rust:
+
+- **The two mechanisms above cost nothing.** They are stock Node, about twenty
+  lines each, and both were measured working today. Replacing them with a
+  native dependency is a larger change than the thing being replaced.
+- **The published CLI is two files**, `dist/basalt.mjs` and `README.md`, in a
+  70 KB tarball. napi-rs turns that into a family: darwin-arm64, darwin-x64,
+  linux-x64-gnu, linux-arm64-gnu, and, because this project's own server image
+  is Alpine, linux-x64-musl and linux-arm64-musl. Six artifacts to build, sign
+  and keep in step with every release, plus the musl-versus-glibc resolution
+  bug that catches everybody once.
+- **"Verify against the shipped artifact" gets six times harder.** The gate
+  proves the packed CLI installs and runs under node, on one machine. With
+  per-triple binaries that check only means something if it runs on each
+  triple, and it currently cannot.
+- **It buys the plugin nothing.** Obsidian mobile cannot load a native addon,
+  and the plugin needs no lock anyway.
+
+What would change the answer:
+
+- **Windows.** The two mechanisms above have nothing for it. If the headless
+  client is ever meant to run there, a Rust core stops being the expensive
+  option and becomes the only one.
+- **A shared volume between containers.** `flock` is per inode and would
+  exclude two containers holding one volume; an abstract socket is per network
+  namespace and would not. That layout is on the unsupported list today, and
+  this is the honest argument against the Linux path rather than a detail.
+- **A second thing needing native code.** One native dependency amortises
+  differently from none. Note that I25's codec question wants WebAssembly
+  rather than a native addon, so it does not combine with this.
+
 ## User-facing behavior and operations
 
 ### I11 — Extend existing diagnostics with durable, actionable failure context
