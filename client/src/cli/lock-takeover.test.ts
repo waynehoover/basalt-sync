@@ -53,6 +53,33 @@ async function vaultWithDeadLock(): Promise<{ dir: string; dead: LockHolder }> {
   return { dir, dead };
 }
 
+/**
+ * A vault whose generation `n` is claimed by a holder that is not running.
+ *
+ * `vaultWithDeadLock` writes the legacy name, which is generation zero, so
+ * every contender aims at generation one and `link` settles them against each
+ * other. Reaching the schedule where one caller is aiming *above* another
+ * needs the numbering to have started.
+ */
+async function vaultWithDeadClaim(n: number): Promise<{ dir: string; dead: LockHolder }> {
+  const dir = await mkdtemp(join(tmpdir(), "basalt-lock-"));
+  vaults.push(dir);
+  await mkdir(join(dir, STATE_DIR), { recursive: true });
+  const dead: LockHolder = {
+    pid: 2 ** 22,
+    host: hostname(),
+    command: "sync --watch",
+    since: Date.now() - 60_000,
+    token: "deadtoken00000000000000000000dead",
+  };
+  await writeFile(
+    join(dir, STATE_DIR, `lock.${String(n).padStart(10, "0")}`),
+    JSON.stringify(dead),
+    { mode: 0o600 },
+  );
+  return { dir, dead };
+}
+
 /** Who holds the vault now, asked of the module rather than of a path. */
 const holderOf = currentHolder;
 
@@ -154,6 +181,66 @@ describe("contenders for one dead lock", () => {
       (await holderOf(dir))?.command,
       "the vault changed hands under a holder that was never told",
     ).toBe("B");
+    await release();
+    expect(await holderOf(dir)).toBeUndefined();
+  });
+
+  /**
+   * R44. A generation can be reached twice, and a paused contender is aiming
+   * at a number rather than at a state.
+   *
+   * Releasing clears the claims, so the numbering starts again. A caller that
+   * read the directory long ago is still holding an arithmetic result from it:
+   * generation 1 dead, A reads it meaning to take 2, B takes 2 and finishes
+   * and its release empties the directory, C takes 1 and holds, A resumes and
+   * links 2 against nothing at all. Both C and A were handed a release, and
+   * `currentHolder` named only A, so nothing anywhere said two processes were
+   * writing.
+   *
+   * Winning the name is not owning the vault. Owning it is being the highest
+   * claim there is, which is one read and cannot be true of two callers at
+   * once.
+   */
+  it("refuses a contender whose generation came back after a release", async () => {
+    // A dead *generational* claim, not the legacy name: the schedule needs A
+    // to be aiming one number above what C will end up taking, and that only
+    // happens when the numbering has already started.
+    const { dir } = await vaultWithDeadClaim(1);
+
+    let resumeA: (() => void) | undefined;
+    const aIsInside = new Promise<void>((ready) => {
+      midEvict.pause = async () => {
+        midEvict.pause = async () => {};
+        ready();
+        await new Promise<void>((go) => {
+          resumeA = go;
+        });
+      };
+    });
+
+    // A has read the dead generation and is about to claim the one after it.
+    const a = lockVault(dir, "A");
+    await aIsInside;
+
+    // B takes that generation, finishes, and gives it back. Its release is
+    // what frees the number A is aiming at.
+    await (
+      await lockVault(dir, "B")
+    )();
+
+    // C then takes the vault from the bottom of the numbering again.
+    const release = await lockVault(dir, "C");
+    expect((await holderOf(dir))?.command, "C did not get the vault").toBe("C");
+
+    resumeA!();
+    await expect(a, "A acquired a vault C was holding").rejects.toThrow(
+      /another basalt|could not take the lock/,
+    );
+    expect(
+      (await holderOf(dir))?.command,
+      "the vault changed hands under a holder that was never told",
+    ).toBe("C");
+
     await release();
     expect(await holderOf(dir)).toBeUndefined();
   });

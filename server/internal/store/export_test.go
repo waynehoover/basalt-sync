@@ -9,7 +9,7 @@ import "os"
 // LatestForPath returns the newest version of one encrypted path, if any.
 func (s *Store) LatestForPath(vaultID, path string) (Entry, bool, error) {
 	return s.oneEntry(vaultID,
-		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? AND path = ?
+		`SELECT `+s.entryCols()+` FROM entries WHERE vault_id = ? AND path = ?
 		  ORDER BY uid DESC LIMIT 1`,
 		vaultID, path)
 }

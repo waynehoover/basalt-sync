@@ -2019,3 +2019,161 @@ func TestServeSaysNothingAboutListeningWhenItCannotBind(t *testing.T) {
 		t.Errorf("serve printed a setup string for a server that did not start:\n%s", out)
 	}
 }
+
+// `verify -deep` sees a truncated chunk list, because the reader does (R47).
+//
+// The count and the ord sequence were added to the read path and not to the
+// verifier, so the same binary printed `0 faults` over a row and then refused
+// to serve it. A verifier that knows less than the reader is a clean bill of
+// health nobody should act on, and rule 3 has an operator deleting the last
+// copy on the strength of it.
+func TestVerifyDeepSeesATruncatedChunkList(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		remove int64 // the ord to delete
+		fault  string
+	}{
+		{"a missing tail", 2, "shortchunks"},
+		{"an interior gap", 1, "shortchunks"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath, chunkDir := store.DataDir(dir)
+			st, err := store.Open(dbPath, chunkDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.EnsureVault("default", 1); err != nil {
+				t.Fatal(err)
+			}
+			var names []string
+			for _, body := range []string{"one ", "two ", "three"} {
+				n := chunks.Name([]byte(body))
+				if err := st.Chunks().Put("default", n, []byte(body)); err != nil {
+					t.Fatal(err)
+				}
+				names = append(names, n)
+			}
+			uid, err := st.AppendEntry("default", store.Entry{
+				Path: "note.md", Size: 14, MTime: 1, Device: "d", Chunks: names, Mac: testMac,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// The damage, done to the file rather than through the store,
+			// because the store is what is being asked to notice it.
+			onDisk(t, dbPath, func(db *sql.DB) {
+				if _, err := db.Exec(
+					`DELETE FROM entry_chunks WHERE vault_id = ? AND uid = ? AND ord = ?`,
+					"default", uid, c.remove); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			out, err := basalt(t, "verify", "-deep", "-data", dir)
+			if err == nil {
+				t.Fatalf("verify passed a version it will not serve:\n%s", out)
+			}
+			if !strings.Contains(out, c.fault) {
+				t.Errorf("the fault was not named as %s:\n%s", c.fault, out)
+			}
+		})
+	}
+}
+
+// And an ordinary vault still verifies clean, so the check is not a blanket no.
+func TestVerifyDeepStillPassesAWholeVault(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "verify", "-deep", "-data", dir)
+	if !strings.Contains(out, "0 faults") {
+		t.Fatalf("a healthy vault reported faults:\n%s", out)
+	}
+}
+
+// A backup taken by the previous build is still readable (R48).
+//
+// `n_chunks` arrived with the truncated-tail check, and a read-only open does
+// not migrate: an inspection command must not alter what it inspects. So every
+// entry read against an older backup failed with `no such column`, including
+// the one `purge` uses to establish that a backup covers what it is about to
+// delete. A valid backup became unusable because of a column that did not
+// exist when it was taken.
+func TestPurgeAcceptsABackupFromBeforeTheChunkCount(t *testing.T) {
+	dir := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", dir, "-to", dest)
+
+	// The previous schema, which is this one without the column.
+	dbPath, _ := store.DataDir(dest)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDisk(t, dbPath, func(db *sql.DB) {
+		// The previous schema is this one without the column, rebuilt the way
+		// SQLite makes you: a table without it, the rows copied across, and
+		// the old one dropped.
+		for _, stmt := range []string{
+			`CREATE TABLE entries_old (
+			   vault_id TEXT NOT NULL, uid INTEGER NOT NULL, path TEXT NOT NULL,
+			   size INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0,
+			   mtime INTEGER NOT NULL DEFAULT 0, folder INTEGER NOT NULL DEFAULT 0,
+			   deleted INTEGER NOT NULL DEFAULT 0, device TEXT NOT NULL DEFAULT '',
+			   prev_path TEXT NOT NULL DEFAULT '', mac TEXT NOT NULL DEFAULT '',
+			   parent TEXT NOT NULL DEFAULT '', PRIMARY KEY (vault_id, uid))`,
+			`INSERT INTO entries_old SELECT vault_id, uid, path, size, ctime, mtime,
+			   folder, deleted, device, prev_path, mac, parent FROM entries`,
+			`DROP TABLE entries`,
+			`ALTER TABLE entries_old RENAME TO entries`,
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				t.Fatalf("recreating the previous schema: %v", err)
+			}
+		}
+	})
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) {
+		t.Fatal("the fixture still has the column, so this proves nothing")
+	}
+
+	out := mustRun(t, "purge", "-data", dir, "-vault", "default", "-confirm", "default",
+		"-backup", dest)
+	if strings.Contains(out, "n_chunks") {
+		t.Errorf("the purge tripped over the missing column:\n%s", out)
+	}
+
+	// And inspecting it did not change a byte of it.
+	unchanged, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, unchanged) {
+		t.Error("inspecting the backup modified it")
+	}
+}
+
+// onDisk runs raw SQL against a store's database file, for fixtures that have
+// to be shaped the way a damaged or older store is shaped rather than the way
+// this build would write one.
+func onDisk(t *testing.T, dbPath string, fn func(*sql.DB)) {
+	t.Helper()
+	// Without foreign keys, because these fixtures rebuild tables the schema
+	// cascades from: turning them on would make dropping `entries` delete the
+	// chunk rows the fixture is trying to keep.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	fn(db)
+}

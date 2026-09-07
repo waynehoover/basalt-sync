@@ -270,8 +270,11 @@ protocol it speaks, because the refusal has to name the numbers for an old
 client to know which end to upgrade, and that the port is up, because a
 healthcheck has to say so. Since the healthcheck answers whether the server
 could take a note rather than whether the process replied, it can also say one
-word about why it could not: `store-unreadable`, `disk-full`,
-`chunks-unreachable`, `shutting-down`. That vocabulary is fixed and carries no
+word about why it could not: `store-unreadable`, `store-read-only`,
+`chunks-read-only`, `store-busy`, `disk-full`, `chunks-unreachable`,
+`shutting-down`. The database and the body directory get separate words because
+they are fixed in different places, and a store that is merely busy gets its
+own because it is not broken. That vocabulary is fixed and carries no
 path, no vault name and no number, for the same reason as everything else here,
 and the figures behind it are in `basaltd stats` on the machine.
 

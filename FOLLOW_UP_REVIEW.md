@@ -686,3 +686,74 @@ The engine [chooses a currently free conflict name](client/src/core/engine.ts#L2
 ### Verification limits
 
 This pass confirms the four failures above and the stated repairs in the captured snapshot; it does not certify the additional server schema work being edited concurrently. Real Obsidian desktop/mobile operation, physical power cuts, Linux mounted-filesystem acceptance, and live GitHub publication were not exercised. Application code was not changed by this review.
+
+## Sixth verification — 2026-09-06
+
+Reviewed **`f6eeca23d932eaad54d52d0a219de9ba33386703`**, including the completed server changes in `496f225`. **Not all fixes are complete: five findings remain below, two P1 and three P2.** The original R43 conflict-destination collisions and R42 prerelease-only failure are fixed. R40 still permits concurrent owners under a different schedule, R41 still permits rollback under registry uncertainty, and the new preservation/server paths have three additional defects.
+
+### Validation and status
+
+The checkout was clean when captured. `bash scripts/check.sh` passed **27 checks, 0 failed, 0 skipped**, in an isolated snapshot of this commit: **1,414 client tests in 74 files**, the separate **16 panel tests and 10 stress tests**, Go race tests/vet, format/type/build checks, release-shell tests, packaged CLI checks, and local Docker checks. Systemd execution and the mounted-filesystem job remain CI-only on this macOS host. Unlike the previous pass, this gate includes the completed server schema work.
+
+| Previous finding | Assessment | Evidence |
+|---|---|---|
+| R40: live-lock takeover | Partial; still open as R44 | The original schedule is covered by the new tests, but release cleanup allows generation reuse and a paused contender can acquire alongside a live owner. |
+| R41: unpublished newer image | Original case fixed; uncertainty remains as R45 | `latest` now advances to `0.4.2` when `0.5.0` was never published. A readable existing alias is protected during a version lookup failure, but an unreadable existing alias is not. |
+| R42: prerelease-only promotion | Fixed for reviewed case | With only `server/v0.5.0-rc.1`, the actual promotion body exits 0 and makes no alias mutation. |
+| R43: occupied preservation destination | Fixed for both original collisions | The engine-driven matching-baseline update retains the competing note. Removal selects a different preservation name and retains both local versions. A subsequent preservation failure has the separate recovery defect R46. |
+
+The original backport reconciliation, draft-release guard, unknown-baseline removal, and restoration after a removal error also passed their probes. Evidence is retained in `/tmp/basalt-review-round6/`: `check.log`, `lock-probe.ts`/`.log`, `preservation-probe.ts`/`.log`, `preservation-failure-probe.ts`/`.log`, `preservation-retry-probe.ts`/`.log`, `workflow-probes.mjs`/`.log`, `server-probe/`, `server-probe.log`, and `source-hashes.json`. These use the unchanged implementation, existing scheduling hooks, disposable filesystem/SQLite fixtures, and simulated registry responses. No external release was modified.
+
+### R44 — Reusing lock generations admits a paused contender beside a live owner
+
+- [x] **P1 · CLI locking · Remaining R40 · Reproduced.** Preserve exclusion across release, cleanup, and reacquisition, including contenders paused before publication.
+
+[`lockVault`](client/src/cli/lock.ts#L117) publishes the successor of the generation it read earlier. Release [removes its claim and sweeps older claims](client/src/cli/lock.ts#L127), allowing generation numbering to restart at 1. A paused caller can then publish a higher generation computed before that reset, without checking the live owner of the newly reused lower generation.
+
+**Observed:** begin with a dead generation 1. A reads it and pauses at `midEvict.pause`, intending to claim generation 2. B acquires generation 2, finishes, and releases; cleanup leaves no claim files. C acquires generation 1 and remains active. Resume A: it successfully links generation 2 and returns a release function. **C and A both hold successful acquisitions**, while `currentHolder` reports only A. This uses unmodified source and the existing hook; no filesystem error or clock manipulation is required.
+
+**Fix and acceptance:** make the ownership protocol safe against stale observations across cleanup. Do not recycle ownership generations while an older contender can still publish against them; retaining a monotonically increasing fence needs a complete release/recovery protocol too. An OS-owned lock or conservative refusal is preferable to another unprotected check. Add this exact acquire/release/reacquire schedule and verify that at most one caller may write throughout it, not merely that the highest claim names someone.
+
+### R45 — A failed lookup of the current alias bypasses rollback protection
+
+- [x] **P2 · Image promotion · Remaining R41 · Reproduced with simulated registry failures.** Treat an unreadable alias as unknown, not as an absent alias that may be assigned an older image.
+
+The workflow [converts any alias lookup failure to `now=""`](.github/workflows/release.yml#L295). The rollback guard [runs only when `now` is nonempty](.github/workflows/release.yml#L310). Consequently, simultaneous lookup failures for the newest version and the existing alias bypass the protection added in this commit.
+
+**Observed:** all three immutable images `0.4.1`, `0.4.2`, and `0.5.0` exist; `latest` points at `0.5.0`. Make inspection fail for `0.5.0` and `latest`, while older inspections and alias creation succeed. The actual workflow body resolves `0.4.2`, **moves `latest` backward to it, and exits 0**. When only the version lookup fails and the alias remains readable, the guard works; that narrower case is the one the added test covers.
+
+**Fix and acceptance:** distinguish confirmed absence from authentication/network/registry failure before mutation, or conservatively retain an alias whose current state cannot be established. Test failure of both lookups together, a readable newer alias, a confirmed missing alias, and recovery on a subsequent healthy run.
+
+### R46 — Failed preservation leaves an unsent edit hidden after sync recovers
+
+- [x] **P1 · CLI preservation/recovery · Regression in the R43 implementation · Reproduced through the engine.** Keep displaced originals discoverable across failed claims and subsequent successful retries.
+
+Replacement now parks the original beside the note as `<name>..basalt-tmp-keep<token>`. After publishing the incoming file, [`claimPreserved` can fail](client/src/cli/vault.ts#L1494), leaving that parked original behind. [`isTemporary`](client/src/cli/vault.ts#L2160) excludes it from scans, while the [`stranded` inventory](client/src/cli/vault.ts#L948) only inspects `.basalt/tmp`. The first error includes the hidden path, but no durable recovery state keeps it visible after the engine retries successfully.
+
+**Observed:** during an engine-driven update, save an unsent local edit after the last comparison. At the preservation-claim hook, temporarily make the parent directory unwritable so the real `link` fails with `EACCES`. Restore permissions and let the ordinary retry backoff expire. The next sync reports **`unchanged: 1`, `retrying: 0`, no attention items**. The normal note contains the remote version. The only local edit remains in the hidden sibling; a fresh `NodeVault` lists only the remote note and reports **`stranded: []`**. The bytes survive on disk, but sync and recovery reporting have lost track of them.
+
+**Fix and acceptance:** record or discover every parked original until it is durably handed to a visible recovery path. A transient error string is insufficient. After a failed claim, safely complete preservation, restore without clobbering another version, or maintain a persistent recovery item that prevents a clean status from concealing the stranded edit. Test filesystem failure and interruption between parking and claiming, then retry and restart; assert that both versions remain discoverable and any unresolved recovery is still reported.
+
+### R47 — Deep verification reports a truncated chunk list as healthy
+
+- [x] **P2 · Server verification · Incomplete integration of the new chunk-count check · Reproduced through the CLI.** Apply stored chunk-count and ordering invariants to verification as well as entry reads.
+
+Entry reads now compare the recorded `n_chunks` with the retrieved list. [`verifyEntries`](server/internal/store/store.go#L1990) still checks only whether a content-bearing entry has zero chunks, or a bodyless entry has any; it does not read `n_chunks`. A nonempty truncated list therefore passes deep verification even though the same binary refuses to serve it.
+
+**Observed:** append one entry with three valid stored chunks, then remove only its final `entry_chunks` row. `EntryByUID` refuses with `was written with 3 chunks and has 2`. `Verify(true)` returns no faults, and the current **`basaltd verify -deep` exits 0**, printing `checked 1 entries and 2 chunk references and 0 registry rows, 0 faults`. This is a false clean result for structural information the server now records and can validate.
+
+**Fix and acceptance:** include expected counts and contiguous ordering in the verifier's entry checks, preserving the explicit unknown-count handling for migrated rows. Exercise a missing tail, an interior gap, and an ordinary valid entry through both the library and CLI; a known mismatch must produce a fault and nonzero verification exit.
+
+### R48 — Read-only entry queries cannot inspect a previous-version backup
+
+- [x] **P2 · Server backup compatibility · Regression from `n_chunks` · Reproduced.** Support the immediately preceding schema without modifying a backup during inspection.
+
+The shared [`entryCols`](server/internal/store/store.go#L820) now unconditionally selects `n_chunks`. [`ReadOnly` opening deliberately skips migration](server/internal/store/open.go#L109), and backups written before this commit have no such column. Opening succeeds because the schema version remains supported, but the first entry read fails. [`backupCovers`](server/cmd/basaltd/main.go#L1280) uses this read-only path, so a valid existing backup can no longer establish purge coverage after the upgrade.
+
+**Observed:** create a valid entry, recreate the previous schema by removing only `n_chunks`, and reopen with `OpenMode(..., ReadOnly, ...)`. Opening succeeds and deep verification reports zero faults, but `EntryByUID` fails with **`no such column: n_chunks`**. This is a compatibility failure on inspection; writable opening would migrate it, which is not permission for an inspection command to alter the backup.
+
+**Fix and acceptance:** detect the schema shape on read-only opening and select an explicit unknown count for older rows, or provide another supported inspection path that leaves the backup unchanged. Test coverage against a backup made by the previous schema, verify its bytes are unchanged after inspection, and retain count validation for current-schema backups.
+
+### Verification limits
+
+All five findings concern the captured commit; the previous sections describe their earlier reviewed versions. No application code was changed. Real Obsidian desktop/mobile operation, physical power cuts, Linux mounted-filesystem acceptance, and live GitHub publication were not exercised. The preservation probe restores temporary permissions and waits for the normal retry; the registry probe changes only mock responses; the server probes modify disposable database fixtures.

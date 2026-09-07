@@ -916,6 +916,9 @@ export class NodeVault implements Vault {
    * worse than a temporary that waits.
    */
   private async reapStaleTemps(): Promise<void> {
+    // Cleared here, at the top of the scan that fills it, because the walk
+    // below adds to it too (R46).
+    this.stranded.length = 0;
     // Containment first, and before the directory is even read (R21).
     //
     // This also runs when the vault is observing, and stops before the
@@ -945,7 +948,6 @@ export class NodeVault implements Vault {
     // anything (R35). Recorded on every scan and not only on a reaping one,
     // because `status` observes and a question is exactly when somebody wants
     // to be told.
-    this.stranded.length = 0;
     for (const name of names) {
       if (!disposableTemp(name) && !liveTemps.has(join(this.staging, name))) {
         this.stranded.push(name);
@@ -1044,6 +1046,17 @@ export class NodeVault implements Vault {
       // still land on the file (cli/vault.test.ts, "a name the disk spells in
       // NFD"; cli/vault-spelling.test.ts; cli/normalization.test.ts).
       this.spellingsKnown.add(prefix);
+      // Displaced versions the scan meets on its way past (R46). Not listed,
+      // because they are not notes and syncing one would be publishing a
+      // conflict copy nobody made; recorded, because a version this client
+      // took off a name and could not put anywhere is the one thing in the
+      // vault nobody else knows about.
+      for (const item of items) {
+        if (item.isFile() && isParkedOriginal(item.name)) {
+          const at = join(dir, item.name);
+          if (!liveTemps.has(at)) this.stranded.push(relative(this.root, at));
+        }
+      }
       const found = items
         .map((item) => ({ item, name: this.normal(item.name), disk: item.name }))
         .filter(
@@ -1427,7 +1440,7 @@ export class NodeVault implements Vault {
       // that are there; where they go afterwards is a `link`, which refuses an
       // occupied name.
       let moved = true;
-      const parked = `${full}.${TEMP_MARK}keep${randomBytes(4).toString("hex")}`;
+      const parked = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
       try {
         await rename(full, parked);
       } catch (err) {
@@ -1565,7 +1578,7 @@ export class NodeVault implements Vault {
     // trash. Parked at the conflict-copy path it reached the trash *called* a
     // conflict copy, which is a name nobody searches for and a claim that
     // something was in conflict when nothing was.
-    const aside = `${full}.${TEMP_MARK}keep${randomBytes(4).toString("hex")}`;
+    const aside = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
     try {
       await rename(full, aside);
     } catch (err) {
@@ -2141,6 +2154,26 @@ function disposableTemp(name: string): boolean {
   // the name rather than at the front of it; the rest are staged under a
   // prefix of their own.
   return name.includes(TEMP_MARK) || DISPOSABLE_PREFIXES.some((p) => name.startsWith(p));
+}
+
+/**
+ * The marker a parked original carries, on top of the temporary one (R46).
+ *
+ * A displaced version lives under one of these between being taken off its
+ * name and being claimed at a preservation path, and a claim that fails leaves
+ * it there. It is a temporary by name, so no listing shows it, and it is not in
+ * the staging directory, so the reaper never reads it and `stranded` never
+ * counted it: the bytes survived on disk and every surface said the vault was
+ * settled. The first error names the path, and an error string is not a record
+ * of anything -- the next sync succeeds and the message is gone.
+ *
+ * So the scan looks for these by name wherever it walks, and reports them.
+ */
+const PARKED_MARK = `${TEMP_MARK}keep`;
+
+/** Whether a name is a displaced version waiting for somewhere to go. */
+export function isParkedOriginal(name: string): boolean {
+  return name.includes(PARKED_MARK);
 }
 
 /** Temporaries open in this process, by full path. Exact, so a note is never mistaken for one. */

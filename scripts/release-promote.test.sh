@@ -48,6 +48,15 @@ ref_file() { printf '%s/%s' "$REGISTRY" "$(refname "$1")"; }
 case "$3" in
   inspect)
     # ... inspect --format <fmt> <ref>
+    tag="${6##*:}"
+    while read -r hidden; do
+      [ -n "$hidden" ] || continue
+      [ "$hidden" = "$tag" ] || continue
+      # There and unreadable, which is not the same answer as absent and is
+      # the one `inspect` cannot tell apart.
+      echo "the registry did not answer" >&2
+      exit 1
+    done < "$BLIND"
     f=$(ref_file "$6")
     [ -f "$f" ] || exit 1
     cat "$f"
@@ -98,15 +107,25 @@ exec bash "$root/scripts/release-aliases.sh" "\$TAGS"
 STUB
 chmod +x "$work/scripts/release-aliases.sh"
 
-# run <name> <tags, space separated> <published versions, space separated>
+# run <tags> <published versions> [alias=version ...] [references the registry
+# will not answer for]
 run() {
-  local tags=$1 published=$2
+  local tags=$1 published=$2 aliases=${3:-} blind=${4:-}
   rm -rf "$work/reg"; mkdir -p "$work/reg"
   : > "$work/tags"
   for t in $tags; do echo "server/v$t" >> "$work/tags"; done
   printf '%s\n' $published > "$work/published"
   for v in $published; do publish "$v"; done
-  ( cd "$work" && REGISTRY="$work/reg" TAGS="$work/tags" REPO="Owner/Repo" \
+  # Aliases the last release left behind.
+  local pair
+  for pair in $aliases; do
+    digest_of "${pair#*=}" > "$work/reg/$("$work/refname" "$IMG:${pair%%=*}")"
+  done
+  # And what the registry will not answer for this pass, which is a different
+  # thing from what it does not have: the stub refuses these by name while the
+  # files stay exactly where they are.
+  printf '%s\n' $blind > "$work/blind"
+  ( cd "$work" && REGISTRY="$work/reg" BLIND="$work/blind" TAGS="$work/tags" REPO="Owner/Repo" \
       PATH="$work:$PATH" bash "$work/promote.sh" ) > "$work/out" 2>&1
   echo $? > "$work/code"
 }
@@ -134,35 +153,43 @@ else
 fi
 
 # ---- R41: the newest release has not finished building ----------------------
-run "0.4.1 0.4.2 0.5.0" "0.4.1 0.4.2"
+# `latest` is where the last release left it, which is the realistic state.
+run "0.4.1 0.4.2 0.5.0" "0.4.1 0.4.2" "latest=0.4.1"
 wants 0 "the unbuilt-newer case"
 if [ "$(alias_at latest)" = "0.4.2" ]; then
   ok "latest goes as far forward as the registry can support"
 else
   fail "latest=$(alias_at latest), wanted 0.4.2: an unbuilt newer release left it behind"
 fi
-if [ "$(cat "$work/code")" = "0" ]; then
-  ok "and that is not an error"
+
+# ---- a first release, where the alias does not exist yet --------------------
+run "0.4.1" "0.4.1"
+wants 0 "the first release"
+if [ "$(alias_at latest)" = "0.4.1" ] && [ "$(alias_at 0.4)" = "0.4.1" ]; then
+  ok "a first release creates the aliases it earns"
 else
-  fail "the run exited $(cat "$work/code"): $(cat "$work/out")"
+  fail "latest=$(alias_at latest) 0.4=$(alias_at 0.4) on a first release"
+fi
+
+# ---- R45: the alias lookup fails as well ------------------------------------
+# All three images exist and `latest` is at 0.5.0. The registry will not answer
+# for 0.5.0 or for `latest` this pass. Reading either silence as "absent" moves
+# `latest` back onto 0.4.2, which is the rollback with an extra step.
+run "0.4.1 0.4.2 0.5.0" "0.4.1 0.4.2 0.5.0" "latest=0.5.0" "0.5.0 latest"
+wants 0 "the both-unreadable case"
+if [ "$(alias_at latest)" = "0.5.0" ]; then
+  ok "an alias that cannot be read is left where it is"
+else
+  fail "latest was moved to $(alias_at latest) while nothing could read it"
 fi
 
 # ---- R41: a lookup that fails must not roll an alias back -------------------
-# `latest` is already at 0.5.0, whose tag the registry cannot answer for this
-# pass. Moving it to 0.4.2 would be a rollback caused by a transient failure.
-rm -rf "$work/reg"; mkdir -p "$work/reg"
-: > "$work/tags"
-for t in 0.4.1 0.4.2 0.5.0; do echo "server/v$t" >> "$work/tags"; done
-printf '%s\n' 0.4.1 0.4.2 0.5.0 > "$work/published"
-for v in 0.4.1 0.4.2; do publish "$v"; done
-# `latest` already carries 0.5.0's digest, and 0.5.0's own tag is unreadable
-# this pass. Moving it to 0.4.2 would be a rollback caused by a lookup failing.
-digest_of 0.5.0 > "$work/reg/$("$work/refname" "$IMG:latest")"
-( cd "$work" && REGISTRY="$work/reg" TAGS="$work/tags" REPO="Owner/Repo" \
-    PATH="$work:$PATH" bash "$work/promote.sh" ) > "$work/out" 2>&1
-echo $? > "$work/code"
+# `latest` is readable and already carries 0.5.0's digest, whose own tag the
+# registry will not answer for. Moving it to 0.4.2 would be a rollback caused
+# by a bad minute on the network.
+run "0.4.1 0.4.2 0.5.0" "0.4.1 0.4.2 0.5.0" "latest=0.5.0" "0.5.0"
 wants 0 "the uncertain-registry case"
-if [ "$(cat "$work/reg/$("$work/refname" "$IMG:latest")")" = "$(digest_of 0.5.0)" ]; then
+if [ "$(alias_at latest)" = "0.5.0" ]; then
   ok "an alias already ahead is left alone when its version cannot be read"
 else
   fail "latest was rolled back to $(alias_at latest)"

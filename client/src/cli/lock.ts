@@ -89,53 +89,135 @@ export async function lockVault(vault: string, command: string): Promise<() => P
     // about to be free, which is a refusal that reads exactly like a real one.
     if (attempt > 0) await pause(5 * attempt);
 
-    const current = await newestClaim(dir);
-    const at = current === undefined ? { state: "absent" as const } : current.at;
-
-    if (at.state === "held") {
-      const holder = at.holder;
-      // A holder on another host cannot be checked, so it is believed: a vault
-      // on a shared disk with two machines pointing at it is exactly the case
-      // the lock is for.
-      if (holder.host !== mine.host || alive(holder.pid)) {
-        throw new Error(
-          `another basalt is using this vault: ${holder.command} (pid ${holder.pid} on ` +
-            `${holder.host}, since ${new Date(holder.since).toISOString()}). ` +
-            `Wait for it to finish, or stop it.`,
-        );
-      }
-      // Dead: left behind by a crash or a kill. Superseded below rather than
-      // removed, which is the whole of R40.
+    const before = await readClaims(dir);
+    const holder = liveOwner(before, mine.host);
+    if (holder !== undefined) {
+      throw new Error(
+        `another basalt is using this vault: ${holder.who.command} (pid ${holder.who.pid} on ` +
+          `${holder.who.host}, since ${new Date(holder.who.since).toISOString()}). ` +
+          `Wait for it to finish, or stop it.`,
+      );
     }
 
-    // The seam sits between reading who holds it and claiming the next
-    // generation, which is the only interleaving left: a contender that
-    // finishes here has taken the generation this attempt was aiming at, and
-    // this attempt then finds it and refuses.
+    // The seam sits between reading who holds it and claiming a generation,
+    // which is the only interleaving left: a contender that finishes here has
+    // taken the vault, and this attempt then finds it and gives its claim up.
     await midEvict.pause();
 
-    const next = (current?.generation ?? 0) + 1;
-    if (!(await publish(dir, claimPath(dir, next), mine))) continue;
+    const next = highestGeneration(before) + 1;
+    const at = claimPath(dir, next);
+    if (!(await publish(dir, at, mine))) continue;
+
+    // Won the name. Whether that is the vault is a separate question, and it
+    // is the one R44 was about.
+    //
+    // A generation is a name, not a rank. Releasing frees the numbers below,
+    // so a caller holding an arithmetic result from an older reading can end
+    // up *above* somebody who took the vault after it: generation 1 dead, A
+    // reads it meaning to take 2, B takes 2 and its release clears the
+    // directory, C takes 1 and holds, A resumes and links 2 against nothing at
+    // all. Both were handed a release, and asking who had the highest number
+    // named A. The number is only there to be unique.
+    //
+    // So ownership is "nobody else's claim is live", and it is asked again
+    // after publishing, because the whole gap between reading and publishing
+    // is what a contender fits into.
+    //
+    // Two callers arriving together each see the other, and both giving way
+    // would leave a vault nobody holds, so the lower generation keeps it. That
+    // is a total order and it has to be: an earlier version of this line also
+    // gave way to a smaller token, and with A at generation 3 holding token
+    // "a" against B at 2 holding "b", each rule pointed at the other and both
+    // stepped back. Generations are unique, both callers read the same two
+    // files, so exactly one of them is lower.
+    const after = await readClaims(dir);
+    const rival = liveOwner(
+      after.filter((c) => c.holder?.token !== mine.token),
+      mine.host,
+    );
+    if (rival !== undefined && rival.generation < next) {
+      await rm(at, { force: true });
+      continue;
+    }
 
     return async () => {
       // Only this generation's file, by name, and only while it is still ours
       // by token. Nothing here can reach another holder's claim: superseding
       // one has never meant unlinking it.
-      const held = claimPath(dir, next);
-      const now = await readHolder(held);
+      const now = await readHolder(at);
       if (now?.token !== mine.token) return;
-      await rm(held, { force: true });
+      await rm(at, { force: true });
       // And the generations this one superseded, which are dead by
       // construction: each was observed dead or unreadable before it was
-      // superseded, and no live holder can sit below the current generation.
-      // Done on release rather than on acquisition so it happens at the one
-      // moment this process is certainly the only owner.
+      // superseded. Done on release rather than on acquisition so it happens
+      // at the one moment this process is certainly the only owner.
       await sweepSuperseded(dir, next);
     };
   }
-  throw new Error(
-    `could not take the lock at ${path}: something keeps winning the next generation`,
-  );
+  throw new Error(`could not take the lock at ${path}: something keeps taking it first`);
+}
+
+/** One claim on the vault: a generation, and whoever wrote it. */
+interface Claim {
+  readonly generation: number;
+  readonly holder: LockHolder | undefined;
+}
+
+/**
+ * Every claim in the directory, the legacy name included as generation zero.
+ *
+ * A lock file with no generation is one an older build wrote. It counts as a
+ * claim for as long as its holder runs, so an upgrade in the middle of a sync
+ * cannot hand the vault to two processes.
+ */
+async function readClaims(dir: string): Promise<Claim[]> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const out: Claim[] = [];
+  for (const name of names) {
+    const n = name === "lock" ? 0 : generationOf(name);
+    if (n === undefined) continue;
+    const at = await lockState(join(dir, name));
+    if (at.state === "absent") continue;
+    out.push({ generation: n, holder: at.state === "held" ? at.holder : undefined });
+  }
+  return out;
+}
+
+/**
+ * The claim somebody is still running behind, if there is one.
+ *
+ * A holder on another host cannot be checked, so it is believed: a vault on a
+ * shared disk with two machines pointing at it is exactly the case the lock is
+ * for. An unreadable claim is nobody's: `publish` cannot produce one, so it is
+ * debris from something else, and leaving it would mean nobody could ever take
+ * this vault again.
+ */
+function liveOwner(
+  claims: readonly Claim[],
+  host: string,
+): { generation: number; who: LockHolder } | undefined {
+  let found: { generation: number; who: LockHolder } | undefined;
+  for (const c of claims) {
+    if (c.holder === undefined) continue;
+    if (c.holder.host === host && !alive(c.holder.pid)) continue;
+    // The lowest generation, so two readers of the same directory agree on
+    // which claim they are talking about.
+    if (found === undefined || c.generation < found.generation) {
+      found = { generation: c.generation, who: c.holder };
+    }
+  }
+  return found;
+}
+
+function highestGeneration(claims: readonly Claim[]): number {
+  let top = 0;
+  for (const c of claims) if (c.generation > top) top = c.generation;
+  return top;
 }
 
 /**
@@ -147,8 +229,8 @@ export async function lockVault(vault: string, command: string): Promise<() => P
  * exists to answer once.
  */
 export async function currentHolder(vault: string): Promise<LockHolder | undefined> {
-  const found = await newestClaim(join(vault, STATE_DIR));
-  return found?.at.state === "held" ? found.at.holder : undefined;
+  const dir = join(vault, STATE_DIR);
+  return liveOwner(await readClaims(dir), hostname())?.who;
 }
 
 /**
@@ -167,44 +249,6 @@ function generationOf(name: string): number | undefined {
   if (rest === undefined || rest.length === 0 || !/^[0-9]+$/.test(rest)) return undefined;
   const n = Number(rest);
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
-}
-
-/**
- * The highest generation claimed, and what it says.
- *
- * The holder of a vault is whoever owns the highest generation present, and
- * that is the whole ownership rule. Nothing supersedes a claim by removing it,
- * so nothing can remove somebody else's: a process that decides the current
- * holder is dead creates the *next* generation with `link`, which either makes
- * that name or fails, and a loser finds the winner on its next look.
- *
- * A lock file with no generation is one an older build wrote. It is read, and
- * a live holder in it still refuses, so an upgrade in the middle of a sync
- * cannot hand the vault to two processes. It is swept on the first clean
- * release.
- */
-async function newestClaim(
-  dir: string,
-): Promise<{ generation: number; at: LockState } | undefined> {
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    names = [];
-  }
-  let best: number | undefined;
-  for (const name of names) {
-    const n = generationOf(name);
-    if (n !== undefined && (best === undefined || n > best)) best = n;
-  }
-  if (best !== undefined) {
-    return { generation: best, at: await lockState(claimPath(dir, best)) };
-  }
-  // Nothing generational. A bare `lock` is what an older build leaves, and its
-  // holder counts for as long as it is running.
-  const legacy = await lockState(join(dir, "lock"));
-  if (legacy.state === "held") return { generation: 0, at: legacy };
-  return undefined;
 }
 
 /**

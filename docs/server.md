@@ -613,7 +613,7 @@ job or whatever watches your machines, all readable without a key.
 
 | Signal | How to read it | What it means |
 |---|---|---|
-| Health failing | `basaltd health` exits non-zero | It names which kind. `store-unreadable`, `disk-full` and `chunks-unreachable` mean the server is running and cannot take a note, which is the case that used to look identical to health; `shutting-down` is a restart in progress. No answer at all means it is down, and systemd restarts it, giving up after five failures in five minutes and marking the unit `failed`. `journalctl -u basalt` has the reason either way, and `basaltd stats` has the numbers. |
+| Health failing | `basaltd health` exits non-zero | It names which kind. `store-unreadable`, `store-read-only`, `chunks-read-only`, `disk-full` and `chunks-unreachable` mean the server is running and cannot take a note, which is the case that used to look identical to health; `shutting-down` is a restart in progress. No answer at all means it is down, and systemd restarts it, giving up after five failures in five minutes and marking the unit `failed`. `journalctl -u basalt` has the reason either way, and `basaltd stats` has the numbers. |
 | A note that never finishes downloading | `basaltd verify` reports a fault, or a device reports a path retrying for days | The server has lost the body behind a version. Run `basalt repair` on a device that still holds those notes, and on each of your other devices: one can only offer versions it holds. Anything `basaltd verify` still reports afterwards is history no device has. |
 | Cursor stuck | `latestUid` from `stats -json` unchanged for days while you have been writing | Devices are not reaching the server, or one device's `basalt status` shows a server cursor ahead of its own and nothing arriving. Check the device before the server. |
 | Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, expected after restoring an older backup. `basalt rebase --backup-taken` on the headless client, or *Rejoin this server* in the plugin panel, rejoins without losing what only that device holds. The log names the device. |
@@ -873,8 +873,16 @@ cheapest thing that asks the real question, and adds one `statfs`:
 | `503 store-unreadable` | the database is not answering |
 | `503 store-read-only` | the database answers reads and refuses writes: a filesystem remounted read-only after an I/O error, most likely |
 | `503 disk-full` | less than 64 MiB free, which is not enough for a commit to work in |
+| `503 chunks-read-only` | the body directory refuses writes while the database takes them: permissions on that tree, or a separate volume remounted read-only |
 | `503 chunks-unreachable` | the body directory is gone, usually an unmounted volume |
+| `503 store-busy` | the write lock was held past the timeout: a long transaction, a backup, a purge. Not a fault, and not a reason to restart anything |
 | `503 shutting-down` | draining, so stop sending devices here |
+
+`store-read-only` and `chunks-read-only` are separate words because they send
+you to different places, and they used to be one: whoever was paged for a
+chunk directory whose permissions had gone went and inspected a database that
+was working perfectly. `store-busy` was the same word too, and an orchestrator
+restarts a server over that.
 
 Both checks are cheap enough for a probe every few seconds, and neither writes
 anything: the transaction is rolled back and commits no page. The deep one is
@@ -889,6 +897,13 @@ case an operator most needs to hear about and the one a read cannot see.
 `basaltd stats` prints the numbers behind the word, including how much room is
 left. They are not on the endpoint: it needs no credential, and behind a tunnel
 the port is on the internet.
+
+What `stats` will not tell you is whether a write would land. It opens the
+store read-only, because an inspection command that modifies what it inspects
+is not one, and the writability probe needs to write; so it says `not checked
+from here` and leaves that question to `/health` on the running server. It used
+to answer it anyway, from a handle that refuses every write by construction,
+and reported `store-read-only` about every healthy server there has ever been.
 
 ### Stopping it
 

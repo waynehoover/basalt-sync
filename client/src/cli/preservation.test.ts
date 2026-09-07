@@ -254,6 +254,77 @@ describe("a note that appears at the conflict path after it was chosen", () => {
   });
 });
 
+/**
+ * R46. A displaced version the adapter could not place must stay findable.
+ *
+ * Replacement parks the original beside the note before it claims a
+ * preservation path, and the claim can fail. What was left behind was a file
+ * `isTemporary` hides from every listing, in the note's own directory rather
+ * than in staging, so the reaper never read it and `stranded` never counted
+ * it. The first error names the path and an error string is not a record of
+ * anything: the next sync succeeds, reports `unchanged`, and the only copy of
+ * somebody's edit is in a file no surface mentions.
+ *
+ * The scan looks for them by name now, wherever it walks.
+ */
+describe("a displaced version the adapter could not place", () => {
+  it("is reported by the next scan, and by the one after a restart", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "note.md"), "the unsent edit\n");
+
+    // The claim fails the way a full disk or a permissions fault does.
+    midPreserve.beforeClaim = async () => {
+      midPreserve.beforeClaim = async () => {};
+      throw Object.assign(new Error("EACCES: permission denied, link"), { code: "EACCES" });
+    };
+    let threw: string | undefined;
+    try {
+      await v.replace(
+        "note.md",
+        expecting("a digest of something else entirely"),
+        enc.encode("the server's version\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      );
+    } catch (err) {
+      threw = (err as Error).message;
+    } finally {
+      midPreserve.beforeClaim = async () => {};
+    }
+    expect(threw, "the failed claim was not reported at the time either").toBeDefined();
+
+    // The edit is on the disk somewhere.
+    const parked = (await readdir(dir)).find((n) => n.includes(`${TEMP_MARK}keep`));
+    expect(
+      parked,
+      `nothing was parked. The vault holds: ${JSON.stringify(await readdir(dir))}`,
+    ).toBeDefined();
+    expect(await readFile(join(dir, parked!), "utf8")).toBe("the unsent edit\n");
+
+    // And a scan says so, rather than reporting a settled vault. A fresh
+    // vault object, because the error is long gone by the next sync and a
+    // restart is the case that matters.
+    const later = new NodeVault(dir);
+    const listed = (await later.list()).map((e) => e.path);
+    expect(listed, "a parked version was listed as a note and would sync out").not.toContain(
+      parked,
+    );
+    expect(
+      later.stranded,
+      "the only copy of an unsent edit is on the disk and nothing mentions it",
+    ).toContain(parked);
+  });
+
+  /** And an ordinary vault still reports nothing, so the line means something. */
+  it("says nothing about a vault with no parked versions", async () => {
+    const { dir } = await vault();
+    await writeFile(join(dir, "note.md"), "an ordinary note\n");
+    const scan = new NodeVault(dir);
+    await scan.list();
+    expect(scan.stranded).toEqual([]);
+  });
+});
+
 describe("a deletion the pass decided about", () => {
   it("reaches the trash under the name the note had", async () => {
     const { dir, v } = await vault();

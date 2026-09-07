@@ -9,7 +9,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { cleanupBinary, removeTree, serverBinary, TestServer, until } from "../core/test-server.ts";
 import { run, type Console } from "./cli.ts";
 import { configPath, indexPath, loadConfig, saveConfig } from "./config.ts";
+import { STATE_DIR } from "./config.ts";
 import { alive, currentHolder, lockPath, lockVault } from "./lock.ts";
 
 /**
@@ -422,9 +423,17 @@ describe("the vault lock (C12)", () => {
     const ended = exited(watcher);
     watcher.kill("SIGKILL");
     await ended;
-    // Asked of the module, because who holds a vault is the owner of the
-    // highest generation claimed and not whoever is at a path.
-    expect(await currentHolder(dir)).toMatchObject({ pid: watcher.pid });
+    // The claim is still on the disk, naming the process that died with it.
+    // Not `currentHolder`: that answers who is *running*, and after a kill the
+    // truthful answer is nobody. What is left is debris for the next run.
+    const claims = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock"));
+    expect(claims, "the kill left no claim behind, so there is nothing to take over").toHaveLength(
+      1,
+    );
+    expect(JSON.parse(await readFile(join(dir, STATE_DIR, claims[0]!), "utf8"))).toMatchObject({
+      pid: watcher.pid,
+    });
+    expect(await currentHolder(dir), "a killed watcher still counts as holding it").toBeUndefined();
 
     // The next one recognises a dead holder and gets on with it.
     const third = await cli("sync", "--dir", dir, "--json");

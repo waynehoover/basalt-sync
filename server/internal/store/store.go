@@ -488,6 +488,13 @@ type Store struct {
 	chunks *chunks.Store
 	dbPath string
 
+	// hasChunkCount is whether the entries table has `n_chunks`.
+	//
+	// A writable open migrates one in; a read-only open must not, so an older
+	// backup is read without it. Asked once at open rather than at every
+	// query.
+	hasChunkCount bool
+
 	// readOnly is whether this handle was opened for inspection.
 	//
 	// The health check writes, deliberately, because a `SELECT 1` cannot see a
@@ -817,7 +824,26 @@ func (s *Store) Quarantine(vaultID, name string) error {
  * Reading
  * ---------------------------------------------------------------- */
 
-const entryCols = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent, n_chunks`
+// entryCols names every column an entry is read from, and is a function of
+// the store because one of them may not be there (R48).
+//
+// `n_chunks` arrived with the truncated-tail check. A read-only open does not
+// migrate, deliberately: an inspection command must not alter what it is
+// inspecting. So a backup written by the previous build has no such column,
+// the schema version still says it is readable, and every entry read failed
+// with `no such column` -- including the one `purge` uses to establish that a
+// backup covers what it is about to delete. A valid backup became unusable
+// because of a column that did not exist when it was taken.
+//
+// Absent, it selects the same -1 the migration writes, which the read path
+// already understands as "written before this was recorded".
+func (s *Store) entryCols() string {
+	const shared = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent`
+	if s.hasChunkCount {
+		return shared + `, n_chunks`
+	}
+	return shared + `, -1 AS n_chunks`
+}
 
 // Batch is a covered range of the uid sequence, in the shape the wire protocol
 // sends it.
@@ -857,7 +883,7 @@ func (s *Store) NextBatch(vaultID string, cursor int64, limit int) (Batch, bool,
 	defer tx.Rollback()
 
 	rows, err := tx.Query(
-		`SELECT `+entryCols+` FROM entries
+		`SELECT `+s.entryCols()+` FROM entries
 		  WHERE vault_id = ? AND uid > ? ORDER BY uid ASC LIMIT ?`,
 		vaultID, cursor, limit)
 	if err != nil {
@@ -882,7 +908,7 @@ func (s *Store) NextBatch(vaultID string, cursor int64, limit int) (Batch, bool,
 // EntryByUID returns one version, with its chunk list.
 func (s *Store) EntryByUID(vaultID string, uid int64) (Entry, bool, error) {
 	return s.oneEntry(vaultID,
-		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? AND uid = ?`,
+		`SELECT `+s.entryCols()+` FROM entries WHERE vault_id = ? AND uid = ?`,
 		vaultID, uid)
 }
 
@@ -915,7 +941,7 @@ func (s *Store) HistoryForPath(vaultID, path string, beforeUID int64, limit int)
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	q := `SELECT ` + entryCols + ` FROM entries WHERE vault_id = ? AND path = ?`
+	q := `SELECT ` + s.entryCols() + ` FROM entries WHERE vault_id = ? AND path = ?`
 	args := []any{vaultID, path}
 	if beforeUID > 0 {
 		q += ` AND uid < ?`
@@ -1726,8 +1752,16 @@ type Fault struct {
 	// cannot both be set, and String prints whichever there is: a fault about
 	// a device row has no uid to print, and printing uid 0 for it would send
 	// somebody looking for an entry.
-	Row    string
-	Reason string // "missing", "corrupt", "nochunks", "straychunks", "baddevice", "badinvite" or "novault"
+	Row string
+	// Reason is one of a fixed vocabulary, because things match on it:
+	// "missing", "corrupt", "nochunks", "straychunks", "shortchunks",
+	// "chunkorder", "nomac", "badparent", "baddevice", "badinvite", "novault".
+	//
+	// Kept complete on purpose. It was written as though it were the whole
+	// list and then fell behind the code twice, so anything reading it to
+	// decide what a fault can be was reading a shorter answer than the
+	// verifier gives.
+	Reason string
 	Detail string
 }
 
@@ -1976,6 +2010,15 @@ func (s *Store) verifyRegistry() ([]Fault, int, error) {
 	return faults, checked, rows.Err()
 }
 
+// declaredChunks is the recorded chunk count, or a literal -1 where the column
+// is not there to read (R48).
+func declaredChunks(has bool) string {
+	if has {
+		return "e.n_chunks"
+	}
+	return "-1"
+}
+
 // verifyEntries checks the entries themselves, rather than the bodies they name.
 //
 // The loop above joins entries to their chunk rows, so an entry whose chunk rows
@@ -1990,7 +2033,10 @@ func (s *Store) verifyRegistry() ([]Fault, int, error) {
 func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 	rows, err := s.db.Query(
 		`SELECT e.vault_id, e.uid, e.path, e.size, e.folder, e.deleted, e.mac, e.parent,
-		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid)
+		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid),
+		        (SELECT COALESCE(MAX(c.ord), -1) FROM entry_chunks c
+		          WHERE c.vault_id = e.vault_id AND c.uid = e.uid),
+		        ` + declaredChunks(s.hasChunkCount) + `
 		   FROM entries e
 		  ORDER BY e.vault_id, e.uid`)
 	if err != nil {
@@ -2004,9 +2050,9 @@ func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 		var size int64
 		var folder, deleted bool
 		var mac, parent string
-		var chunkCount int
+		var chunkCount, topOrd, declared int
 		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted,
-			&mac, &parent, &chunkCount); err != nil {
+			&mac, &parent, &chunkCount, &topOrd, &declared); err != nil {
 			return faults, entries, err
 		}
 		// The authenticator's shape, on every kind (F20). `Validate` used to
@@ -2039,6 +2085,29 @@ func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 		case !wantsChunks && chunkCount > 0:
 			f.Reason = "straychunks"
 			f.Detail = fmt.Sprintf("names %d chunks but should have none", chunkCount)
+			faults = append(faults, f)
+		// The two structural checks the read path makes, made here as well
+		// (R47). `EntryByUID` refused a truncated list with "was written with
+		// 3 chunks and has 2" while `verify -deep` printed `0 faults` over the
+		// same row: the same binary calling a vault clean and then declining
+		// to serve it. A verifier that knows less than the reader is a clean
+		// bill of health nobody should act on, and rule 3 has an operator
+		// deleting the last copy on the strength of it.
+		//
+		// Unknown counts are left alone, as the read path leaves them: a row
+		// written before the column existed cannot be checked against
+		// something nobody recorded.
+		case declared >= 0 && chunkCount != declared:
+			f.Reason = "shortchunks"
+			f.Detail = fmt.Sprintf(
+				"was written with %d chunks and has %d, so it would assemble to the wrong "+
+					"bytes and every client would refuse it", declared, chunkCount)
+			faults = append(faults, f)
+		case chunkCount > 0 && topOrd != chunkCount-1:
+			f.Reason = "chunkorder"
+			f.Detail = fmt.Sprintf(
+				"has %d chunk rows whose highest ord is %d, so the list has a gap in it",
+				chunkCount, topOrd)
 			faults = append(faults, f)
 		}
 	}
@@ -2651,7 +2720,7 @@ func (s *Store) EachEntry(vaultID string, fn func(Entry) error) error {
 	defer func() { _ = tx.Rollback() }()
 
 	rows, err := tx.Query(
-		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? ORDER BY uid`, vaultID)
+		`SELECT `+s.entryCols()+` FROM entries WHERE vault_id = ? ORDER BY uid`, vaultID)
 	if err != nil {
 		return err
 	}

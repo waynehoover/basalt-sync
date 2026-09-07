@@ -292,8 +292,18 @@ jobs:
             fi
             resolved=$((resolved + 1))
 
-            now=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
-              "$IMAGE:$alias" 2>/dev/null) || now=""
+            # What the alias is now, and whether that could be established at
+            # all. A failed lookup is not an absent alias (R45): `inspect`
+            # gives one word for "no such tag" and "the registry did not
+            # answer", and reading the second as the first is how an alias
+            # whose state is unknown gets assigned an older image.
+            if now=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
+              "$IMAGE:$alias" 2>/dev/null); then
+              readable=yes
+            else
+              now=""
+              readable=""
+            fi
             if [ "$now" = "$want" ]; then
               echo "  $alias -> $target ($want) already"
               continue
@@ -307,14 +317,29 @@ jobs:
             # and there were versions it would not answer for, then it is
             # already at one of those and moving it would be a rollback caused
             # by a bad minute on the network. The next promotion will get it.
-            if [ -n "$now" ] && [ "$unreadable" -gt 0 ]; then
+            if [ "$unreadable" -gt 0 ]; then
               known=""
               for digest in $seen; do
                 [ "$digest" = "$now" ] && known=yes
               done
               if [ -z "$known" ]; then
-                echo "  $alias is at an image none of the readable versions has," \
-                  "and $unreadable could not be read; left alone"
+                # Either the alias is at an image none of the versions this
+                # pass could read has, or it could not be read at all (R45).
+                # Both mean its state is unestablished while something newer
+                # is unreadable, and assigning it an older image would be a
+                # rollback. Waiting for a healthy run costs one promotion.
+                #
+                # The empty case is the one that used to slip through: a failed
+                # lookup became `now=""`, and the guard only ran when `now` had
+                # something in it, so two silences together were read as an
+                # absent alias and an unbuilt release.
+                if [ -z "$readable" ]; then
+                  echo "  $alias could not be read, and $unreadable version(s) could not" \
+                    "either; left alone"
+                else
+                  echo "  $alias is at an image none of the readable versions has," \
+                    "and $unreadable could not be read; left alone"
+                fi
                 continue
               fi
             fi
