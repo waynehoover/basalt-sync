@@ -185,6 +185,18 @@ lines, and the ignore list. `--ignore` is local to this device, and the plugin
 ignores nothing beyond the dot rule and the config folder, so the list is there
 to make a divergence visible.
 
+It exits 1 when the server cannot be reached or refused this device, when the
+local scan could not run, and when the vault is holding a version this client
+took off a note and could not put back. That last one is the odd member of the
+list: everything else is a condition that may clear itself, and this one waits
+for a person. It is on the list because a stranded version is hidden from every
+listing on purpose, so the only way anybody learns of it is being told, and a
+green exit is how a timer never mentions it. `status` names the paths, and
+`sync` prints them too.
+
+That is a different case from a conflict, which exits 0: both versions of a
+conflict are on the disk under names a person can see and open.
+
 ### State
 
 Everything lives in `.basalt/` inside the vault, which is never synced.
@@ -202,10 +214,20 @@ its tail loses no note, because notes are made durable before the index that
 names them and the engine redoes the pass. `unlink` removes all three files and
 touches no notes.
 
-One process at a time, enforced by the lock in `.basalt/lock` for every command
-that writes. If something else writes the index anyway, the next save says so
-on stderr and replaces both files with a fresh snapshot rather than appending
-this device's changes onto somebody else's.
+One process at a time, enforced for every command that writes. The lock is a
+claim file in `.basalt/`, `lock.<n>`, and whoever holds the newest one that
+names a running process holds the vault. Taking over from a process that died
+means adding the next number, never removing anybody's claim: a claim can only
+be removed by the process that made it. A release marks its own claim rather
+than deleting it and sweeps everything under it, so one small file is left
+behind and a number can never come round again. That last part is what stops a
+caller that was slow between reading the directory and writing its claim from
+being admitted beside whoever took the vault meanwhile.
+
+Node has no portable `flock`, which is what this would otherwise be; see
+`docs/compared.md` for what that costs. If something writes the index anyway,
+the next save says so on stderr and replaces both files with a fresh snapshot
+rather than appending this device's changes onto somebody else's.
 
 ### Filenames
 

@@ -198,7 +198,13 @@ async function readClaims(dir: string): Promise<Claim[]> {
   for (const name of names) {
     const n = name === "lock" ? 0 : generationOf(name);
     if (n === undefined) continue;
-    const at = await lockState(join(dir, name));
+    // A claim that cannot be read is debris rather than an error to give up
+    // on: a directory somebody made under that name, a permissions fault, a
+    // torn file. It counts as nobody's, which lets it be superseded, and its
+    // generation still counts, which keeps the numbering going forwards.
+    // Throwing here would make one unreadable file stop this vault being
+    // locked at all, and the safe answer is available (rule 2).
+    const at = await lockState(join(dir, name)).catch(() => ({ state: "unreadable" }) as LockState);
     if (at.state === "absent") continue;
     out.push({ generation: n, holder: at.state === "held" ? at.holder : undefined });
   }
@@ -285,7 +291,13 @@ async function sweepSuperseded(dir: string, held: number): Promise<void> {
   }
   for (const name of names) {
     const n = generationOf(name);
-    if (n !== undefined && n < held) await rm(join(dir, name), { force: true });
+    if (n === undefined || n >= held) continue;
+    // Tidying, so a failure here is not the release failing. `rm` will not
+    // take a directory without `recursive`, and a stray one under that name
+    // threw out of `release` and past whatever the caller was doing next.
+    // What is left behind is a superseded claim, which the next acquisition
+    // steps over.
+    await rm(join(dir, name), { force: true }).catch(() => undefined);
   }
   // The legacy file, and only while nothing is holding it.
   //

@@ -331,22 +331,34 @@ staleness: a lock file outlives the process that made it, so somebody has to
 decide when it is safe to remove, and deciding is a read followed by an unlink
 with a gap in between. R03 was that gap.
 
-Closing it took two goes. The first was an eviction marker, a second exclusive
-`link` naming the holder being evicted, and it moved the problem rather than
-solving it: a marker whose own evictor died had to be recovered by somebody,
-and recovering it was another read and another unlink (R20, R34). What is
-there now uses `rename`, which is atomic and, unlike `rm`, hands back what it
-took: exactly one caller ends up holding the lock file, under a name of its
-own, and can identify it knowing nothing else can be holding it. A live one
-goes straight back. It is the same preservation-over-prediction move this
-project makes everywhere it cannot compare and swap.
+Closing it took five goes, and the first four are worth writing down because
+each looked finished.
+
+An eviction marker, a second exclusive `link` naming the holder being evicted,
+moved the problem rather than solving it: a marker whose own evictor died had
+to be recovered by somebody, and recovering it was another read and another
+unlink (R20). Bucketing that marker by a minute of the clock made the recovery
+safe and left the boundary (R34). Taking the lock file with `rename` instead --
+atomic, and unlike `rm` it hands back what it took -- meant a caller could
+identify what it held, but it still removed a name it did not own, so a third
+contender found the vault free while somebody was in it (R40). Numbering the
+claims fixed that, until a release freed the numbers and a slow caller was
+admitted beside the holder by aiming at one that had come back (R44, R49).
+
+What is there now: the vault belongs to whoever holds the newest claim naming a
+running process, taking over means adding the next number rather than removing
+anybody's, and a release *marks* its claim instead of deleting it. That last
+part is the whole of it. The fence is what makes "is somebody already in there"
+answerable, because until the numbers stopped coming back, every version of
+that question had an answer that was true and useless.
 
 None of that is novel and none of it is the standard answer. The standard
 answer is `flock(2)`, where the kernel releases the lock when the process dies:
 there is no staleness, no takeover, and no protocol to get wrong. What is here
-is a lock reimplemented in userspace, and it is more complicated and weaker
-than the thing it stands in for: a third contender can still link its own lock
-in the instant between the take and the put-back.
+is a lock reimplemented in userspace, and it is more complicated than the thing
+it stands in for. Four of the five attempts above were wrong in a way that
+handed one vault to two writers, and every one of them was found by somebody
+else.
 
 It is here because Node has no `flock`. `fs-ext` provides one and is a native
 module, which would mean a build step and a per-platform binary for a package

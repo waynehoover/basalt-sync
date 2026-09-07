@@ -1411,6 +1411,8 @@ export class NodeVault implements Vault {
     const kept = await this.absolute(keepAt);
     await this.insideForReal(kept);
     let staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
+    // Named out here so the `finally` can say it is no longer this call's.
+    const parked = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
     try {
       // Durable before anything is moved: a crash after the rename below must
       // not leave the path empty and the new content only in memory.
@@ -1451,7 +1453,15 @@ export class NodeVault implements Vault {
       // that are there; where they go afterwards is a `link`, which refuses an
       // occupied name.
       let moved = true;
-      const parked = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
+      // Declared before it exists, and cleared in the `finally` below. A
+      // parked original is a stranded version to anything that walks past it,
+      // and for the few milliseconds this operation holds one it is not: a
+      // scan in this process would otherwise report a note that is about to be
+      // placed, and `status` exits non-zero on that. Another process still
+      // sees it, and truthfully -- the bytes really are there under a name
+      // nothing lists -- which is the cost of a lock-free `status` and clears
+      // itself on the next look.
+      liveTemps.add(parked);
       try {
         await rename(full, parked);
       } catch (err) {
@@ -1528,6 +1538,9 @@ export class NodeVault implements Vault {
       // here either, for the same reason: every path above either puts it
       // somewhere or names it in the error.
       await rm(staged, { force: true });
+      // And it stops being this process's business, so a later scan reports it
+      // if it is still there.
+      liveTemps.delete(parked);
     }
   }
 
@@ -1590,9 +1603,12 @@ export class NodeVault implements Vault {
     // conflict copy, which is a name nobody searches for and a claim that
     // something was in conflict when nothing was.
     const aside = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
+    // Not a stranded version while this call is holding it; see `replace`.
+    liveTemps.add(aside);
     try {
       await rename(full, aside);
     } catch (err) {
+      liveTemps.delete(aside);
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       return { landed: true }; // gone between the lstat and here
     }
@@ -1642,6 +1658,10 @@ export class NodeVault implements Vault {
         `${path} was taken off its name to be identified and could not be put back ` +
           `(${(err as Error).message}); it is at ${relative(this.root, aside)}`,
       );
+    } finally {
+      // It stops being this call's business either way, so a later scan
+      // reports it if it is still there.
+      liveTemps.delete(aside);
     }
   }
 

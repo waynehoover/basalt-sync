@@ -315,6 +315,47 @@ describe("a displaced version the adapter could not place", () => {
     ).toContain(parked);
   });
 
+  /**
+   * A version the adapter is still holding is not stranded yet.
+   *
+   * There is a moment in every replacement when the displaced bytes are under
+   * the parked name and have not been placed. A scan in this process walking
+   * past it would call that a version nobody can find, which is a false alarm
+   * on a healthy vault -- and `status` exits non-zero on stranded, so it is a
+   * failing check on a vault that is working. Reported once the operation has
+   * let go of it, and not before.
+   */
+  it("is not reported while the operation is still holding it", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "note.md"), "the unsent edit\n");
+
+    let duringScan: readonly string[] | undefined;
+    midPreserve.beforeClaim = async () => {
+      midPreserve.beforeClaim = async () => {};
+      const looking = new NodeVault(dir);
+      await looking.list();
+      duringScan = [...looking.stranded];
+    };
+    await v.replace(
+      "note.md",
+      expecting("a digest of something else entirely"),
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    midPreserve.beforeClaim = async () => {};
+
+    expect(duringScan, "the seam never ran, so this proved nothing").toBeDefined();
+    expect(
+      duringScan,
+      "a version the adapter was about to place was reported as one nobody can find",
+    ).toEqual([]);
+    // And afterwards there is nothing to report either, because it landed.
+    const after = new NodeVault(dir);
+    await after.list();
+    expect(after.stranded).toEqual([]);
+  });
+
   /** And an ordinary vault still reports nothing, so the line means something. */
   it("says nothing about a vault with no parked versions", async () => {
     const { dir } = await vault();

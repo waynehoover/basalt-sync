@@ -396,6 +396,30 @@ describe("contenders for one dead lock", () => {
   });
 
   /**
+   * One unreadable claim does not stop the vault being locked.
+   *
+   * A directory under that name, a permissions fault, a torn file: none of
+   * them is a holder, and none of them is a reason to give up. Reading one
+   * used to throw out of the whole acquisition, so a single stray entry in
+   * `.basalt` would have made every command fail with a message about JSON.
+   * Rule 2, in the small: a file that cannot be read is not a file that says
+   * somebody is in there.
+   */
+  it("takes the vault past a claim it cannot read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "basalt-lock-"));
+    vaults.push(dir);
+    await mkdir(join(dir, STATE_DIR, "lock.0000000003"), { recursive: true });
+
+    const release = await lockVault(dir, "after the debris");
+    expect((await holderOf(dir))?.command).toBe("after the debris");
+    await release();
+
+    // And the numbering went past it rather than round it.
+    const claims = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock."));
+    expect(claims).toContain("lock.0000000004");
+  });
+
+  /**
    * A completed takeover leaves one fence and nothing else.
    *
    * Not nothing at all: a released claim has to stay, because removing it
