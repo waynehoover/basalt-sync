@@ -826,6 +826,19 @@ export class NodeVault implements Vault {
   reaped = 0;
 
   /**
+   * Preserved note versions sitting in staging that nothing will remove (R35).
+   *
+   * Taking `respell.` off the reaper's list closed one hole and could have
+   * opened another: a note parked mid-normalisation and abandoned by a crash
+   * now stays there for ever, which is the right thing to do with it and the
+   * wrong thing to do silently. A version nobody can find is not much better
+   * than one that was deleted, so the scan counts them and `status` says so.
+   *
+   * Filled by every scan, including an observing one: counting is a read.
+   */
+  readonly stranded: string[] = [];
+
+  /**
    * Removes staged temporaries that nothing is writing and that are old.
    *
    * A crash mid-write leaves its temporary behind, and the staging folder is
@@ -837,6 +850,10 @@ export class NodeVault implements Vault {
    */
   private async reapStaleTemps(): Promise<void> {
     // Containment first, and before the directory is even read (R21).
+    //
+    // This also runs when the vault is observing, and stops before the
+    // removals: what it records is what it *will not* take, which is a read
+    // and is the only thing that tells anybody a preserved version is waiting.
     //
     // This walks a directory and deletes things in it, and it did so without
     // ever asking whether the directory is inside the vault. A `.basalt/tmp`
@@ -857,6 +874,18 @@ export class NodeVault implements Vault {
     } catch {
       return;
     }
+    // What is in here that this will not remove, before deciding to remove
+    // anything (R35). Recorded on every scan and not only on a reaping one,
+    // because `status` observes and a question is exactly when somebody wants
+    // to be told.
+    this.stranded.length = 0;
+    for (const name of names) {
+      if (!disposableTemp(name) && !liveTemps.has(join(this.staging, name))) {
+        this.stranded.push(name);
+      }
+    }
+    if (this.observeOnly) return;
+
     const cutoff = Date.now() - STALE_TEMP_MS;
     for (const name of names) {
       // Only what this code makes (R21). It used to delete anything old, and
@@ -902,7 +931,10 @@ export class NodeVault implements Vault {
   async list(): Promise<FileStat[]> {
     // Neither of the two writes a scan normally makes happens in observe-only
     // mode (R12): reaping a crashed run's temporaries, and re-spelling names.
-    if (!this.observeOnly) await this.reapStaleTemps();
+    // The pass over staging still runs, because counting what it will not
+    // remove is a read and is the only thing that tells anybody a preserved
+    // version is sitting there (R35); the removal half is what it skips.
+    await this.reapStaleTemps();
     this.diskName.clear();
     this.spellingsKnown.clear();
     this.ambiguousPaths = [];
@@ -1957,42 +1989,33 @@ async function read(path: string, what: string): Promise<string | undefined> {
 export const TEMP_MARK = ".basalt-tmp-";
 
 /**
- * The names this code gives its own throwaway files, and nothing else (R21).
+ * The one staged name the reaper may delete (R21, R35).
  *
- * The reaper deletes what is in the staging directory, and it decided by age.
- * Age says nothing: a rename keeps the file's timestamp, so anything moved in
- * there is instantly older than the cutoff, and a version of somebody's note
+ * The reaper empties the staging directory, and it decided by age. Age says
+ * nothing here: a rename keeps the file's own timestamp, so anything moved in
+ * is instantly older than the cutoff, and a version of somebody's note
  * preserved from a losing race was deleted as write debris on the next scan.
+ * So it deletes only what it can name.
  *
- * So the reaper deletes only what it can name. Every writer here stages under
- * one of these prefixes; anything else in the directory is somebody's, or
- * something this project has not thought about, and either way it stays.
+ * `replace.` is the whole list, because it names the only thing in here that
+ * is provably a copy: an incoming version staged on its way to a note, which
+ * came from the server, which the server still has, and losing it costs a
+ * re-download.
+ *
+ * `respell.` and `keep.` were on this list and had no business being there.
+ * Both name *displaced originals* while this code works out what they are: an
+ * older `retireName` renamed a note into `respell.<token>` before it could
+ * know whose inode it was, and an older replacement staged unsent edits into
+ * `keep.<token>` before comparing them. Either can be the only copy of
+ * something somebody typed. They stay off for good, so an upgrade does not
+ * sweep what an older client left behind on its first run.
+ *
+ * What this code parks now goes under `preserved.`, which is deliberately
+ * absent and always will be. It is not an oversight that nothing reaps those:
+ * a name for the case this file could not resolve is exactly the case a sweep
+ * must not touch, and `retireName` names the path in the error it throws.
  */
 const DISPOSABLE_PREFIXES = ["replace."];
-
-/**
- * One prefix, and it names the only thing in here that is provably a copy
- * (R35).
- *
- * `replace.` is an incoming version staged on its way to a note: it came from
- * the server, the server still has it, and losing it costs a re-download.
- *
- * `respell.` and `keep.` used to be on this list and had no business being
- * there. Both are names this code gives to *displaced originals* while it
- * works out what they are: `retireName` renames a note into `respell.<token>`
- * before it can know whose inode it is, and the older replacement staged
- * unsent edits into `keep.<token>` before comparing them. Either can be the
- * only copy of something somebody typed, and an interruption anywhere in the
- * middle leaves one behind. Because a rename carries the file's own timestamp,
- * it was over the hour-old cutoff the instant it arrived, and the next
- * ordinary scan deleted it as write debris.
- *
- * They stay off the list for good, so leftovers from an older version of this
- * client survive an upgrade rather than being swept on first run. What is
- * written now goes under `preserved.`, which is also absent and always will
- * be: a name for the case this file could not resolve is exactly the case the
- * sweep must not touch.
- */
 
 function disposableTemp(name: string): boolean {
   // `openTemp` builds `<basename><TEMP_MARK><counter>`, so the mark is inside
@@ -2052,19 +2075,6 @@ async function openTemp(
 }
 
 /**
- * Writes a file so that a crash leaves either the old contents or the new.
- *
- * The same four steps the server uses for a chunk body, and each earns its
- * keep. Writing in place would let a crash leave a half-written note. Renaming
- * without fsyncing the file means the rename can be durable while the bytes are
- * not. Renaming without fsyncing the *directory* means the bytes can be durable
- * while the name is not.
- *
- * Exported for the tests, which can check the outcome of every step except the
- * flushes themselves: whether an fsync really reached the platter is not
- * something a process can observe, on any operating system.
- */
-/**
  * A temporary name beside a file that nothing is using.
  *
  * Random rather than counted, and checked before it is used, because the
@@ -2095,6 +2105,19 @@ async function sameFilesystem(a: string, b: string): Promise<boolean> {
   return one !== undefined && two !== undefined && one.dev === two.dev;
 }
 
+/**
+ * Writes a file so that a crash leaves either the old contents or the new.
+ *
+ * The same four steps the server uses for a chunk body, and each earns its
+ * keep. Writing in place would let a crash leave a half-written note. Renaming
+ * without fsyncing the file means the rename can be durable while the bytes are
+ * not. Renaming without fsyncing the *directory* means the bytes can be durable
+ * while the name is not.
+ *
+ * Exported for the tests, which can check the outcome of every step except the
+ * flushes themselves: whether an fsync really reached the platter is not
+ * something a process can observe, on any operating system.
+ */
 export async function writeDurably(
   full: string,
   bytes: Uint8Array,

@@ -63,9 +63,16 @@ fi
 # it matches neither of the two comparisons below, and gets no moving tag) or
 # one already out (in which case it does not hold `latest` away from the newest
 # stable server, which would be the same mistake from the other side).
+#
+# Exactly three numeric parts, which is the same rule the input tag above is
+# held to and the same one `release-aliases.sh` uses (R38). It was looser here,
+# so a stray `server/v1.2` in the repository counted as a release newer than
+# every real one: this script would deny `latest` to the actual newest server
+# while the promotion, which reconciles from the strict list, would set it.
+# Two answers to one question is how a channel ends up somewhere nobody chose.
 stable=$(
   { echo "$tag"; echo "$existing"; } \
-    | sed -n 's|^server/v\([0-9][0-9.]*\)$|\1|p' \
+    | sed -n 's|^server/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$|\1|p' \
     | sort -u -V
 )
 newest=$(echo "$stable" | tail -1)

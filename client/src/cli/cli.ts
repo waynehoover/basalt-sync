@@ -23,7 +23,7 @@
 
 import { open as openFile, readFile } from "node:fs/promises";
 import { hostname } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { generateSecret, randomBytes } from "../core/crypto.ts";
 import {
@@ -67,6 +67,7 @@ import {
   syncDirectoryIfSupported,
 } from "./vault.ts";
 import {
+  STATE_DIR,
   configPath,
   indexPath,
   loadConfig,
@@ -1370,6 +1371,8 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
 async function unsentHere(
   args: Args,
   stored: StoredState | undefined,
+  /** Filled with any preserved version waiting in staging (R35). */
+  stranded?: string[],
 ): Promise<number | "unknown"> {
   try {
     const vault = new NodeVault(args.dir, {
@@ -1380,6 +1383,7 @@ async function unsentHere(
       observeOnly: true,
     });
     const onDisk = await vault.list();
+    stranded?.push(...vault.stranded);
     // No index is an empty baseline, not a reason to answer zero.
     const known = new Map(Object.entries(stored?.entries ?? {}));
     let unsent = 0;
@@ -1412,6 +1416,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // read out of a file the next sync would refuse.
   const stored = validateStoredState(await new JsonIndexStore(indexPath(args.dir)).load());
 
+  const stranded: string[] = [];
   const local = {
     vault: args.dir,
     device: config.device,
@@ -1433,8 +1438,12 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // and its timestamp is not visible here, and the number is an estimate.
     // Saying which basis it is on is the difference between an estimate and a
     // claim; `unsent: 0` used to be printed as "up to date with the server".
-    unsent: await unsentHere(args, stored),
+    unsent: await unsentHere(args, stored, stranded),
     unsentFrom: "size and timestamp" as const,
+    // Versions this client took off the disk and could not put back, which
+    // nothing reaps and nothing else mentions (R35). Empty on every ordinary
+    // vault; when it is not, the notes in it exist nowhere else.
+    stranded,
   };
 
   // Reachability is reported, never assumed. "up to date" from a client that
@@ -1514,6 +1523,14 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   io.out(`local cursor   ${local.cursor}`);
   if (server.cursor !== undefined) io.out(`server cursor  ${server.cursor}`);
   if (local.pending > 0) io.out(`pending  ${local.pending} files with work outstanding`);
+  // Above the state line, because it is about notes and not about the server,
+  // and because a person reading "caught up" wants to have seen this first.
+  if (local.stranded.length > 0) {
+    io.out(
+      `kept     ${local.stranded.length} version(s) this client could not put back, in ` +
+        `${join(args.dir, STATE_DIR, "tmp")}`,
+    );
+  }
   if (unjoined) {
     io.out(`state    nothing to connect with: ${server.error}`);
     return 1;

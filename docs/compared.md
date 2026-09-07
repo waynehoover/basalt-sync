@@ -329,15 +329,24 @@ The CLI's vault lock is a file with a holder written into it, taken by `link`,
 and taken over when the holder's process is gone. Every hard part of that is
 staleness: a lock file outlives the process that made it, so somebody has to
 decide when it is safe to remove, and deciding is a read followed by an unlink
-with a gap in between. R03 was that gap, and closing it took an eviction
-marker: a second exclusive `link` naming the holder being evicted, so no two
-processes can be evicting the same one.
+with a gap in between. R03 was that gap.
+
+Closing it took two goes. The first was an eviction marker, a second exclusive
+`link` naming the holder being evicted, and it moved the problem rather than
+solving it: a marker whose own evictor died had to be recovered by somebody,
+and recovering it was another read and another unlink (R20, R34). What is
+there now uses `rename`, which is atomic and, unlike `rm`, hands back what it
+took: exactly one caller ends up holding the lock file, under a name of its
+own, and can identify it knowing nothing else can be holding it. A live one
+goes straight back. It is the same preservation-over-prediction move this
+project makes everywhere it cannot compare and swap.
 
 None of that is novel and none of it is the standard answer. The standard
 answer is `flock(2)`, where the kernel releases the lock when the process dies:
 there is no staleness, no takeover, and no protocol to get wrong. What is here
-is a two-phase lock reimplemented in userspace, and it is more complicated and
-weaker than the thing it stands in for.
+is a lock reimplemented in userspace, and it is more complicated and weaker
+than the thing it stands in for: a third contender can still link its own lock
+in the instant between the take and the put-back.
 
 It is here because Node has no `flock`. `fs-ext` provides one and is a native
 module, which would mean a build step and a per-platform binary for a package

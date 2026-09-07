@@ -730,6 +730,11 @@ export class ObsidianVault implements Vault {
     // The pass looked at the start and writes at the end, and a note created
     // in between is what that reasoning destroys. Undefined means the caller
     // cannot say what it decided about, so anything found here is kept.
+    //
+    // A first download therefore costs a failed rename and one `exists` on top
+    // of the write, which over an initial sync of a few thousand notes is two
+    // cheap calls each against a whole file being written. Reinstating the
+    // early write to save them is reinstating the defect.
     let moved = true;
     try {
       await this.adapter.rename(from, kept);

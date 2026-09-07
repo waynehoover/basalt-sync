@@ -140,6 +140,18 @@ TAGS
 # promotion step rather than reusing the one from before the build.
 want server/v0.4.1      "0.4.1"
 
+# A tag that is not a release this project makes counts as nothing, on both
+# sides of the question (R38). It was counted as a version here and not in
+# `release-aliases.sh`, so this script would deny `latest` to the newest real
+# server while the promotion set it: two answers to one question.
+echo "a malformed tag in the repository is not a release:"
+cat > "$work/tags" <<'TAGS'
+server/v0.4.0
+server/v1.2
+server/v1.2.3.4
+TAGS
+want server/v0.4.1      "0.4.1 0.4 latest"
+
 # ---- and what every alias should be, whoever is promoting (R38) ------------
 #
 # `release-tags.sh` answers "what may this release move", which stops being the
@@ -207,6 +219,17 @@ want server/v0.3.9      "0.3.9 0.3"
 # the queue and this is worked out from the releases rather than from whose
 # turn it is.
 aliases "latest 0.5.0|0.3 0.3.9|0.4 0.4.2|0.5 0.5.0"
+
+# And the same malformed list, asked of both, which is the pair that drifted.
+echo "and both scripts read the repository the same way:"
+cat > "$work/tags" <<'TAGS'
+server/v0.4.0
+server/v0.4.1
+server/v1.2
+server/v1.2.3.4
+TAGS
+want server/v0.4.1      "0.4.1 0.4 latest"
+aliases "latest 0.4.1|0.4 0.4.1"
 
 if [ "$fails" != 0 ]; then echo "$fails case(s) failed"; exit 1; fi
 echo "all cases passed"

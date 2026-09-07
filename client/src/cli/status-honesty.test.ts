@@ -20,6 +20,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+const NEWLINE = "\n";
+
 import { STATE_DIR, saveConfig } from "./config.ts";
 import { NodeVault, TEMP_MARK } from "./vault.ts";
 import { generateSecret } from "../core/crypto.ts";
@@ -45,13 +47,23 @@ async function pairedVault(): Promise<string> {
 }
 
 /** Runs `basalt status --json` and returns what it printed. */
-async function status(dir: string): Promise<{ unsent: number | string }> {
+async function status(dir: string): Promise<{ unsent: number | string; stranded: string[] }> {
   const out: string[] = [];
   await run(["status", "--dir", dir, "--json", "--timeout", "300"], {
     out: (l) => out.push(l),
     err: () => {},
   });
-  return JSON.parse(out.join("")) as { unsent: number | string };
+  return JSON.parse(out.join("")) as { unsent: number | string; stranded: string[] };
+}
+
+/** The same, as a person reads it. */
+async function statusText(dir: string): Promise<string> {
+  const out: string[] = [];
+  await run(["status", "--dir", dir, "--timeout", "300"], {
+    out: (l) => out.push(l),
+    err: () => {},
+  });
+  return out.join(NEWLINE);
 }
 
 describe("a vault paired and never synced", () => {
@@ -184,5 +196,52 @@ describe("the exit status", () => {
       text,
       "status claimed the vault is up to date from a comparison of sizes and timestamps",
     ).not.toMatch(/up to date with the server/);
+  });
+});
+
+/**
+ * A version this client took off the disk and could not put back (R35).
+ *
+ * `respell.` came off the reaper's allowlist because it can name the only copy
+ * of an unsent edit, and taking it off means nothing removes it ever. That is
+ * the right thing to do with the file and the wrong thing to do silently: a
+ * note nobody can find is not much better than one that was deleted. So the
+ * scan counts what it declines to remove, and status says so in both formats,
+ * because a cron job and a person have to be told the same thing.
+ */
+describe("a preserved version waiting in staging", () => {
+  it("is reported rather than left for somebody to notice", async () => {
+    const dir = await pairedVault();
+    const staging = join(dir, STATE_DIR, "tmp");
+    await mkdir(staging, { recursive: true });
+    // Exactly what an interrupted normalization leaves.
+    await writeFile(join(staging, "preserved.9f2cab0134ee71bd"), "the unsent edit\n");
+
+    const said = await status(dir);
+    expect(said.stranded, "the only copy of an edit was sitting there unmentioned").toEqual([
+      "preserved.9f2cab0134ee71bd",
+    ]);
+    expect(await statusText(dir)).toMatch(/kept +1 version\(s\) this client could not put back/);
+  });
+
+  it("says nothing about an ordinary vault", async () => {
+    const dir = await pairedVault();
+    await writeFile(join(dir, "note.md"), "a note\n");
+
+    expect((await status(dir)).stranded).toEqual([]);
+    expect(await statusText(dir)).not.toMatch(/could not put back/);
+  });
+
+  /**
+   * And not about this code's own debris, which is a copy of something the
+   * server holds. Reporting that would train somebody to ignore the line.
+   */
+  it("says nothing about a staged download left by a crash", async () => {
+    const dir = await pairedVault();
+    const staging = join(dir, STATE_DIR, "tmp");
+    await mkdir(staging, { recursive: true });
+    await writeFile(join(staging, "replace.4d1e7a3055ff20ac"), "an incoming version\n");
+
+    expect((await status(dir)).stranded).toEqual([]);
   });
 });

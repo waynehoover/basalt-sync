@@ -549,8 +549,9 @@ export class MemoryVault implements Vault {
     await this.write(path, taken ?? bytes, times);
     const landed = taken === undefined;
     // With no baseline there is nothing it can match, so it is kept (R33).
-    const id = expect === undefined ? undefined : await expect.idOf(was.bytes);
-    if (expect !== undefined && id === expect.contentId && landed) {
+    const agreed =
+      landed && expect !== undefined && (await expect.idOf(was.bytes)) === expect.contentId;
+    if (agreed) {
       // A duplicate of what the server already has.
       this.files.delete(keepAt);
       this.notify(keepAt);

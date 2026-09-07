@@ -246,6 +246,7 @@ jobs:
           git fetch --tags --force --quiet
 
           # Every alias, not only this release's (R38).
+          : > /tmp/applied-tags
           applied=0
           checked=0
           while read -r alias version; do
