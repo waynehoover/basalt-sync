@@ -219,9 +219,52 @@ describe("a preserved version waiting in staging", () => {
 
     const said = await status(dir);
     expect(said.stranded, "the only copy of an edit was sitting there unmentioned").toEqual([
-      "preserved.9f2cab0134ee71bd",
+      join(STATE_DIR, "tmp", "preserved.9f2cab0134ee71bd"),
     ]);
-    expect(await statusText(dir)).toMatch(/kept +1 version\(s\) this client could not put back/);
+    // And the text says where, not which directory it used to be (R50).
+    const text = await statusText(dir);
+    expect(text).toMatch(/kept +1 version\(s\) this client could not put back/);
+    expect(text).toContain(join(dir, STATE_DIR, "tmp", "preserved.9f2cab0134ee71bd"));
+  });
+
+  /**
+   * R50. The one that is not in staging at all.
+   *
+   * A failed preservation claim leaves the displaced version beside the note
+   * it came from, and `status` printed `.basalt/tmp` for every entry because
+   * that used to be the only place one could be. Somebody following that path
+   * found an empty directory while their only unsent edit sat under `notes/`,
+   * where the ordinary listing deliberately hides it.
+   */
+  it("names a version parked beside its note, wherever that is", async () => {
+    const dir = await pairedVault();
+    await mkdir(join(dir, "notes"), { recursive: true });
+    const at = join("notes", `note.md.${TEMP_MARK}keep12345678`);
+    await writeFile(join(dir, at), "the unsent edit\n");
+
+    expect((await status(dir)).stranded).toEqual([at]);
+    const text = await statusText(dir);
+    expect(text, "the text sends somebody to a directory the bytes are not in").toContain(
+      join(dir, at),
+    );
+    expect(text).not.toMatch(/could not put back, in /);
+  });
+
+  /** And both kinds at once, which is one list and one convention. */
+  it("names both a staged version and one beside a note", async () => {
+    const dir = await pairedVault();
+    await mkdir(join(dir, STATE_DIR, "tmp"), { recursive: true });
+    await writeFile(join(dir, STATE_DIR, "tmp", "preserved.aaaa1111"), "one\n");
+    await mkdir(join(dir, "notes"), { recursive: true });
+    const beside = join("notes", `other.md.${TEMP_MARK}keepbbbb2222`);
+    await writeFile(join(dir, beside), "two\n");
+
+    const said = await status(dir);
+    expect([...said.stranded].sort()).toEqual(
+      [join(STATE_DIR, "tmp", "preserved.aaaa1111"), beside].sort(),
+    );
+    const text = await statusText(dir);
+    for (const each of said.stranded) expect(text).toContain(join(dir, each));
   });
 
   it("says nothing about an ordinary vault", async () => {

@@ -2029,12 +2029,17 @@ func TestServeSaysNothingAboutListeningWhenItCannotBind(t *testing.T) {
 // copy on the strength of it.
 func TestVerifyDeepSeesATruncatedChunkList(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		remove int64 // the ord to delete
-		fault  string
+		name    string
+		remove  int64 // the ord to delete, or -1 to renumber instead
+		rewrite [2]int64
+		fault   string
 	}{
-		{"a missing tail", 2, "shortchunks"},
-		{"an interior gap", 1, "shortchunks"},
+		{name: "a missing tail", remove: 2, fault: "shortchunks"},
+		{name: "an interior gap", remove: 1, fault: "shortchunks"},
+		// The count and the maximum both still look right here, which is why
+		// checking one end proved nothing (R51).
+		{name: "a negative ordinal in place of zero", remove: -1,
+			rewrite: [2]int64{0, -1}, fault: "chunkorder"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -2066,9 +2071,17 @@ func TestVerifyDeepSeesATruncatedChunkList(t *testing.T) {
 			// The damage, done to the file rather than through the store,
 			// because the store is what is being asked to notice it.
 			onDisk(t, dbPath, func(db *sql.DB) {
+				if c.remove >= 0 {
+					if _, err := db.Exec(
+						`DELETE FROM entry_chunks WHERE vault_id = ? AND uid = ? AND ord = ?`,
+						"default", uid, c.remove); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
 				if _, err := db.Exec(
-					`DELETE FROM entry_chunks WHERE vault_id = ? AND uid = ? AND ord = ?`,
-					"default", uid, c.remove); err != nil {
+					`UPDATE entry_chunks SET ord = ? WHERE vault_id = ? AND uid = ? AND ord = ?`,
+					c.rewrite[1], "default", uid, c.rewrite[0]); err != nil {
 					t.Fatal(err)
 				}
 			})

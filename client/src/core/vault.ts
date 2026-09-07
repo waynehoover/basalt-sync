@@ -291,6 +291,20 @@ export interface Vault {
    */
   create?(path: string, bytes: Uint8Array, times: Times): Promise<boolean>;
   /**
+   * Versions this adapter took off a note and could not put anywhere, as
+   * vault-relative paths (R46, R50).
+   *
+   * Preservation moves the displaced bytes aside before it writes, and the
+   * move can fail to land anywhere: the note is then somewhere no listing
+   * shows, which is safe and useless unless something says where. An adapter
+   * that can strand a version answers this; one that cannot leaves it out, and
+   * the shells treat that as nothing stranded.
+   *
+   * Refreshed by a scan, because that is when the disk is looked at.
+   */
+  readonly stranded?: readonly string[];
+
+  /**
    * The digest of one path's contents, without holding the whole file (R31).
    *
    * Must agree with `ExpectedContent.idOf` over the same bytes, because the two

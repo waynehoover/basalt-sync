@@ -353,6 +353,50 @@ describe("what init prints, and when (F02)", () => {
   }, 300_000);
 });
 
+/**
+ * A version this client could not put back reaches the exit code, not only the
+ * text of one command (R46, R50).
+ *
+ * It was reported by `status` and nothing else, and `wrong` did not include
+ * it, so `status --json` answered `ok: true` and exited 0 over a vault holding
+ * the only copy of an unsent edit. A green exit is how a cron job never finds
+ * out, and this is a fact that does not clear itself: it waits for a person to
+ * look at two files and decide.
+ *
+ * Against a real server, because with an unreachable one every status is
+ * already not-ok and the assertion would hold whatever this code did.
+ */
+describe("a version the client could not put back", () => {
+  it("makes an otherwise settled vault report that it is not", async () => {
+    const dir = await paired("stranded");
+    await writeFile(join(dir, "note.md"), "an ordinary note\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+
+    // Settled first, so the difference below is the stranded version alone.
+    const settled = await cli("status", "--dir", dir, "--json");
+    expect(settled.code, settled.all).toBe(0);
+    expect(settled.json()["ok"]).toBe(true);
+
+    await mkdir(join(dir, STATE_DIR, "tmp"), { recursive: true });
+    await writeFile(
+      join(dir, STATE_DIR, "tmp", "preserved.aaaa1111"),
+      "the only copy of an edit\n",
+    );
+
+    const after = await cli("status", "--dir", dir, "--json");
+    expect(
+      after.json()["ok"],
+      "a vault holding the only copy of an edit reported itself fine",
+    ).toBe(false);
+    expect(after.code, "and exited 0, which is how a cron job never finds out").toBe(1);
+    expect(after.json()["stranded"]).toEqual([join(STATE_DIR, "tmp", "preserved.aaaa1111")]);
+
+    // And the text names the path rather than a directory.
+    const text = await cli("status", "--dir", dir);
+    expect(text.all).toContain(join(dir, STATE_DIR, "tmp", "preserved.aaaa1111"));
+  }, 120_000);
+});
+
 describe("the vault lock (C12)", () => {
   it("refuses a second holder and names the first", async () => {
     const dir = await vaultDir("lock");
@@ -426,13 +470,24 @@ describe("the vault lock (C12)", () => {
     // The claim is still on the disk, naming the process that died with it.
     // Not `currentHolder`: that answers who is *running*, and after a kill the
     // truthful answer is nobody. What is left is debris for the next run.
-    const claims = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock"));
-    expect(claims, "the kill left no claim behind, so there is nothing to take over").toHaveLength(
-      1,
+    //
+    // More than one file is expected: `init` left a released fence behind it,
+    // which is what stops a generation ever coming round again (R49). The one
+    // that matters is the watcher's, and it is not marked released.
+    const names = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock."));
+    const records = await Promise.all(
+      names.map(
+        async (n) =>
+          JSON.parse(await readFile(join(dir, STATE_DIR, n), "utf8")) as {
+            pid: number;
+            released?: boolean;
+          },
+      ),
     );
-    expect(JSON.parse(await readFile(join(dir, STATE_DIR, claims[0]!), "utf8"))).toMatchObject({
-      pid: watcher.pid,
-    });
+    expect(
+      records.filter((r) => r.released !== true),
+      "the kill left no live claim behind, so there is nothing to take over",
+    ).toMatchObject([{ pid: watcher.pid }]);
     expect(await currentHolder(dir), "a killed watcher still counts as holding it").toBeUndefined();
 
     // The next one recognises a dead holder and gets on with it.

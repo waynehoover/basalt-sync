@@ -80,6 +80,9 @@ async function vaultWithDeadClaim(n: number): Promise<{ dir: string; dead: LockH
   return { dir, dead };
 }
 
+/** The one claim a released vault keeps, which is generation one's. */
+const fenceName = "lock.0000000001";
+
 /** Who holds the vault now, asked of the module rather than of a path. */
 const holderOf = currentHolder;
 
@@ -246,6 +249,80 @@ describe("contenders for one dead lock", () => {
   });
 
   /**
+   * R49. Both completion orders, and the assertion is exclusion rather than
+   * whoever `currentHolder` happens to name.
+   *
+   * Two callers are held between reading the directory and publishing, each
+   * with a generation worked out from a different moment. Whichever finishes
+   * first takes the vault; the other must be refused, because a caller that
+   * has been admitted cannot be displaced by one that turns up later. Asking
+   * for the highest number admitted the delayed higher one; giving way to the
+   * lower number admitted the delayed lower one. `currentHolder` answered
+   * confidently in both cases and both callers were writing.
+   *
+   * What settles it is that a released claim stays: neither delayed caller can
+   * publish the number it is aiming at, so both look again and find whoever is
+   * in there.
+   */
+  for (const first of ["the higher", "the lower"] as const) {
+    it(`admits one caller when ${first} generation finishes first`, async () => {
+      const { dir } = await vaultWithDeadClaim(1);
+
+      // A is held meaning to take generation 2.
+      let resumeA: (() => void) | undefined;
+      const aWaiting = new Promise<void>((ready) => {
+        midEvict.pause = async () => {
+          midEvict.pause = async () => {};
+          ready();
+          await new Promise<void>((go) => {
+            resumeA = go;
+          });
+        };
+      });
+      const a = lockVault(dir, "A");
+      await aWaiting;
+
+      // B takes and gives back the generation A is aiming at.
+      await (
+        await lockVault(dir, "B")
+      )();
+
+      // C is held meaning to take whatever the directory says now.
+      let resumeC: (() => void) | undefined;
+      const cWaiting = new Promise<void>((ready) => {
+        midEvict.pause = async () => {
+          midEvict.pause = async () => {};
+          ready();
+          await new Promise<void>((go) => {
+            resumeC = go;
+          });
+        };
+      });
+      const c = lockVault(dir, "C");
+      await cWaiting;
+
+      if (first === "the higher") {
+        resumeA!();
+        await new Promise((r) => setTimeout(r, 30));
+        resumeC!();
+      } else {
+        resumeC!();
+        await new Promise((r) => setTimeout(r, 30));
+        resumeA!();
+      }
+
+      const out = await Promise.allSettled([a, c]);
+      const won = out.filter((r) => r.status === "fulfilled");
+      expect(won.length, `${won.length} callers were writing this vault at once`).toBe(1);
+      // And whoever it is, is the one the vault says holds it.
+      const holder = await holderOf(dir);
+      expect(holder, "somebody was admitted and no claim names them").toBeDefined();
+      for (const r of out) if (r.status === "fulfilled") await r.value();
+      expect(await holderOf(dir), "the winner's release left somebody holding it").toBeUndefined();
+    });
+  }
+
+  /**
    * The same without the hook: many contenders on one dead lock, all at once.
    *
    * Exactly one may come away with a release function. Twelve was enough to
@@ -311,17 +388,35 @@ describe("contenders for one dead lock", () => {
 
     const release = await lockVault(dir, "after the upgrade");
     await release();
-    const left = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock"));
-    expect(left, `claims were left behind: ${JSON.stringify(left)}`).toEqual([]);
+    // The legacy name is gone and one fence is left, which is the whole of the
+    // tidying: a released claim stays so its generation cannot come round
+    // again (R49).
+    expect(await readdir(join(dir, STATE_DIR))).toEqual([fenceName]);
+    expect(await currentHolder(dir), "the fence reads as somebody holding it").toBeUndefined();
   });
 
-  /** And a completed takeover leaves nothing behind for the next one to trip on. */
-  it("clears up after itself", async () => {
+  /**
+   * A completed takeover leaves one fence and nothing else.
+   *
+   * Not nothing at all: a released claim has to stay, because removing it
+   * frees its generation and a delayed caller aiming at that number would
+   * publish against an empty directory and be admitted beside whoever holds
+   * the vault (R49). Everything under it goes, so this is one small file
+   * rather than one per acquisition.
+   */
+  it("leaves one fence behind and nothing else", async () => {
     const { dir } = await vaultWithDeadLock();
     const release = await lockVault(dir, "after");
     await release();
 
-    const left = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock"));
-    expect(left, `the takeover left debris behind: ${JSON.stringify(left)}`).toEqual([]);
+    expect(await readdir(join(dir, STATE_DIR))).toEqual([fenceName]);
+    expect(await currentHolder(dir), "the fence reads as somebody holding it").toBeUndefined();
+
+    // And the next run reuses none of it: a new generation, and the old fence
+    // swept.
+    const again = await lockVault(dir, "later");
+    expect((await holderOf(dir))?.command).toBe("later");
+    await again();
+    expect(await readdir(join(dir, STATE_DIR))).toEqual(["lock.0000000002"]);
   });
 });

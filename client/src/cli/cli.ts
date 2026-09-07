@@ -67,7 +67,6 @@ import {
   syncDirectoryIfSupported,
 } from "./vault.ts";
 import {
-  STATE_DIR,
   configPath,
   indexPath,
   loadConfig,
@@ -1151,7 +1150,7 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
     }
     io.out("");
     io.out("Rebased onto the server's history:");
-    renderReport(report, args, io, client.serverCursor);
+    renderReport(report, args, io, client.serverCursor, client.vault.stranded ?? []);
     io.out(`Nothing was deleted. Where the two sides disagreed, both versions were kept.`);
     return exitCodeFor(report);
   } finally {
@@ -1166,7 +1165,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
   const client = await open(config, args, io);
   try {
     const report = await client.settle();
-    renderReport(report, args, io, client.serverCursor);
+    renderReport(report, args, io, client.serverCursor, client.vault.stranded ?? []);
     return exitCodeFor(report);
   } finally {
     await client.close();
@@ -1310,7 +1309,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
       ...(await clientOptions(config, args, io)),
       onPass: (report) => {
         if (!settled || !didSomething(report)) return;
-        renderReport(report, args, io, watching?.serverCursor ?? 0);
+        renderReport(report, args, io, watching?.serverCursor ?? 0, watching?.vault.stranded ?? []);
       },
       onSyncFailed: (err) => {
         io.err(`basalt: a sync failed: ${err.message}. It will try again.`);
@@ -1318,7 +1317,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
     },
     {
       onSynced: (report, serverCursor) => {
-        renderReport(report, args, io, serverCursor);
+        renderReport(report, args, io, serverCursor, watching?.vault.stranded ?? []);
         settled = true;
         if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
       },
@@ -1503,7 +1502,13 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // cron job and a person looking at the same command were told different
   // things. Whether the exit code is right is a separate argument from
   // whether it is the same in both, and it has to be the same in both.
-  const wrong = !server.reachable || server.refused || local.unsent === "unknown";
+  // A version this client took off a note and could not put back is an
+  // outstanding fact about the vault, and it does not clear itself: it waits
+  // for a person to look at two files and decide. Reporting it in the text and
+  // exiting 0 is how a cron job never finds out, which is the same shape as
+  // the disagreement above.
+  const wrong =
+    !server.reachable || server.refused || local.unsent === "unknown" || local.stranded.length > 0;
 
   if (args.json) {
     io.out(JSON.stringify({ ok: !wrong, ...local, server }));
@@ -1526,10 +1531,14 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // Above the state line, because it is about notes and not about the server,
   // and because a person reading "caught up" wants to have seen this first.
   if (local.stranded.length > 0) {
-    io.out(
-      `kept     ${local.stranded.length} version(s) this client could not put back, in ` +
-        `${join(args.dir, STATE_DIR, "tmp")}`,
-    );
+    // The paths, not a directory (R50). This said `.basalt/tmp` because that
+    // was where the only kind of stranded version lived; a preservation claim
+    // that fails now leaves one beside the note it came from, and somebody
+    // following the printed path found an empty directory while the only copy
+    // of their edit sat under `notes/` with the listing deliberately hiding
+    // it. A line that names a place the bytes are not is worse than no line.
+    io.out(`kept     ${local.stranded.length} version(s) this client could not put back:`);
+    for (const at of local.stranded) io.out(`  ${join(args.dir, at)}`);
   }
   if (unjoined) {
     io.out(`state    nothing to connect with: ${server.error}`);
@@ -1961,14 +1970,30 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
   };
 }
 
-export function renderReport(r: SyncReport, args: Args, io: Console, serverCursor: number): void {
+export function renderReport(
+  r: SyncReport,
+  args: Args,
+  io: Console,
+  serverCursor: number,
+  /**
+   * Versions this vault took off a note and could not put anywhere, as
+   * vault-relative paths.
+   *
+   * Reported here as well as by `status`, because somebody who runs `basalt
+   * sync` on a timer and reads nothing else was never told (R46, R50). These
+   * do not clear themselves: they wait for a person.
+   */
+  stranded: readonly string[] = [],
+): void {
   const outcome = outcomeOf(r);
   if (args.json) {
     // `ok` and `outcome` come from the same conclusion, so a script keying on
     // either gets the same answer as the exit code (I04). `ok: true` beside a
     // non-zero exit was a real divergence, and one field being derived from
     // counters while another was hardcoded is how it happened.
-    io.out(JSON.stringify({ ok: exitCodeOf(outcome) === 0, outcome, ...r, serverCursor }));
+    io.out(
+      JSON.stringify({ ok: exitCodeOf(outcome) === 0, outcome, ...r, serverCursor, stranded }),
+    );
     return;
   }
 
@@ -2019,6 +2044,14 @@ export function renderReport(r: SyncReport, args: Args, io: Console, serverCurso
   if (r.needsAttention.length > 0) {
     io.out("");
     for (const line of attentionLines(r, "  ")) io.out(line);
+  }
+  // And versions this pass took off a note and could not put anywhere, which
+  // `status` reports and a watcher never would have: somebody who runs
+  // `basalt sync` on a timer and nothing else was never told (R46, R50).
+  if (stranded.length > 0) {
+    io.out("");
+    io.out(`  ${stranded.length} version(s) this client could not put back:`);
+    for (const at of stranded) io.out(`    ${at}`);
   }
   if (r.chunksSent > 0)
     io.out(`${String(r.chunksSent).padStart(5)}  chunks sent, ${bytes(r.bytesSent)}`);

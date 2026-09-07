@@ -52,6 +52,17 @@ export interface LockHolder {
    * process on a recycled pid had taken. This is what "still ours" means.
    */
   readonly token: string;
+  /**
+   * Whether this claim has been given back (R49).
+   *
+   * A released claim stays on the disk. Removing it freed its number, and a
+   * number that comes back is a number a delayed caller can still be aiming
+   * at: it publishes against nothing, finds nothing above it, and is admitted
+   * beside whoever took the vault in the meantime. The file left behind is
+   * the fence that stops the counting going backwards, and it is one small
+   * file, because taking the vault sweeps everything under it.
+   */
+  readonly released?: boolean;
 }
 
 /**
@@ -108,49 +119,49 @@ export async function lockVault(vault: string, command: string): Promise<() => P
     const at = claimPath(dir, next);
     if (!(await publish(dir, at, mine))) continue;
 
-    // Won the name. Whether that is the vault is a separate question, and it
-    // is the one R44 was about.
+    // Won the name. Whether that is the vault is a separate question.
     //
-    // A generation is a name, not a rank. Releasing frees the numbers below,
-    // so a caller holding an arithmetic result from an older reading can end
-    // up *above* somebody who took the vault after it: generation 1 dead, A
-    // reads it meaning to take 2, B takes 2 and its release clears the
-    // directory, C takes 1 and holds, A resumes and links 2 against nothing at
-    // all. Both were handed a release, and asking who had the highest number
-    // named A. The number is only there to be unique.
+    // A generation is a name, not a rank, and it stays used for ever: a
+    // release marks its claim rather than removing it, so the counting never
+    // goes backwards and a caller holding an arithmetic result from an older
+    // reading finds the number already taken. That is what makes the check
+    // below sound, and two attempts at this without it were not.
     //
-    // So ownership is "nobody else's claim is live", and it is asked again
-    // after publishing, because the whole gap between reading and publishing
-    // is what a contender fits into.
+    // Without the fence: generation 1 dead, A reads it meaning to take 2, B
+    // takes 2 and its release empties the directory, C reads the empty
+    // directory meaning to take 1. Whichever of A and C publishes second, the
+    // first is already holding the vault and the second finds nothing to stop
+    // it. Asking who had the highest number admitted A; giving way to the
+    // lower generation admitted C. Neither question is "is somebody already
+    // in there", which is the only one worth asking, and neither could be
+    // answered while the numbers came back.
     //
-    // Two callers arriving together each see the other, and both giving way
-    // would leave a vault nobody holds, so the lower generation keeps it. That
-    // is a total order and it has to be: an earlier version of this line also
-    // gave way to a smaller token, and with A at generation 3 holding token
-    // "a" against B at 2 holding "b", each rule pointed at the other and both
-    // stepped back. Generations are unique, both callers read the same two
-    // files, so exactly one of them is lower.
+    // With it, both of them are aiming at a number the tombstone still holds,
+    // so `publish` refuses and they look again. What is left here is the gap
+    // between this call's own reading and its publish, which is what these
+    // two checks cover: nobody else's claim may be live, and this one has to
+    // be the newest there is.
     const after = await readClaims(dir);
     const rival = liveOwner(
       after.filter((c) => c.holder?.token !== mine.token),
       mine.host,
     );
-    if (rival !== undefined && rival.generation < next) {
+    if (rival !== undefined || highestGeneration(after) !== next) {
       await rm(at, { force: true });
       continue;
     }
 
     return async () => {
-      // Only this generation's file, by name, and only while it is still ours
-      // by token. Nothing here can reach another holder's claim: superseding
-      // one has never meant unlinking it.
+      // Marked, not removed. Only this generation's file, by name, and only
+      // while it is still ours by token: nothing here can reach another
+      // holder's claim, and superseding one has never meant unlinking it.
       const now = await readHolder(at);
       if (now?.token !== mine.token) return;
-      await rm(at, { force: true });
-      // And the generations this one superseded, which are dead by
-      // construction: each was observed dead or unreadable before it was
-      // superseded. Done on release rather than on acquisition so it happens
-      // at the one moment this process is certainly the only owner.
+      await writeFile(at, JSON.stringify({ ...mine, released: true }), { mode: 0o600 });
+      // And everything under it goes, which is what keeps the fence to one
+      // file. Each was observed dead, released or unreadable before it was
+      // superseded, and this is the one moment this process is certainly the
+      // only owner.
       await sweepSuperseded(dir, next);
     };
   }
@@ -161,6 +172,12 @@ export async function lockVault(vault: string, command: string): Promise<() => P
 interface Claim {
   readonly generation: number;
   readonly holder: LockHolder | undefined;
+}
+
+/** Whether a claim is somebody's, rather than a fence or debris. */
+function isLive(c: Claim, host: string): boolean {
+  if (c.holder === undefined || c.holder.released === true) return false;
+  return c.holder.host !== host || alive(c.holder.pid);
 }
 
 /**
@@ -203,12 +220,11 @@ function liveOwner(
 ): { generation: number; who: LockHolder } | undefined {
   let found: { generation: number; who: LockHolder } | undefined;
   for (const c of claims) {
-    if (c.holder === undefined) continue;
-    if (c.holder.host === host && !alive(c.holder.pid)) continue;
+    if (!isLive(c, host)) continue;
     // The lowest generation, so two readers of the same directory agree on
     // which claim they are talking about.
     if (found === undefined || c.generation < found.generation) {
-      found = { generation: c.generation, who: c.holder };
+      found = { generation: c.generation, who: c.holder! };
     }
   }
   return found;
@@ -370,6 +386,7 @@ function parseHolder(text: string): LockHolder | undefined {
       // string rather than invented, so it never matches a live token and a
       // release of somebody else's lock cannot be mistaken for our own.
       token: typeof raw.token === "string" ? raw.token : "",
+      released: raw.released === true,
     };
   } catch {
     return undefined;

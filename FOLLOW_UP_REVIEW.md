@@ -757,3 +757,63 @@ The shared [`entryCols`](server/internal/store/store.go#L820) now unconditionall
 ### Verification limits
 
 All five findings concern the captured commit; the previous sections describe their earlier reviewed versions. No application code was changed. Real Obsidian desktop/mobile operation, physical power cuts, Linux mounted-filesystem acceptance, and live GitHub publication were not exercised. The preservation probe restores temporary permissions and waits for the normal retry; the registry probe changes only mock responses; the server probes modify disposable database fixtures.
+
+## Seventh verification — 2026-09-07
+
+Reviewed **`99c47e841f312bc25ae792ea60133546337c65aa`**. **Three defects remain: one P1 locking defect and two P2 reporting/verification defects.** All five original R44–R48 reproductions now pass, but additional schedules and boundary cases below prevent closing the corresponding areas completely.
+
+### Validation and updated status
+
+`bash scripts/check.sh` passed **27 checks, 0 failed, 0 skipped**, on the isolated snapshot: **1,417 client tests in 74 files**, the separate **16 panel tests and 10 stress tests**, Go race tests/vet, formatting/type/build checks, release-shell tests, packaged CLI checks, and local Docker checks. Systemd execution and the Linux mounted-filesystem job remain CI-only on this macOS host.
+
+| Finding | Assessment | Evidence |
+|---|---|---|
+| R44: generation reuse | Original schedule fixed; exclusion still fails as R49 | A higher-numbered contender now yields to an already active lower-numbered owner. Reversing which delayed claimant finishes first still produces two successful owners. |
+| R45: unreadable alias rollback | Fixed for reviewed cases | Simultaneous lookup failures for the newest version and `latest` leave the existing alias unchanged. The normal failed-newer-build case still advances to the newest available image. |
+| R46: hidden parked originals | Discovery fixed; text recovery output incomplete as R50 | After a real preservation failure, permission recovery, normal retry, and a fresh scan, `stranded` retains the parked original's path. Text status nevertheless directs the user to the old staging directory. |
+| R47: missing chunk tail | Original case fixed; ordering check incomplete as R51 | A missing tail produces `shortchunks` and nonzero CLI verification. An invalid list whose count and maximum still match escapes the new check. |
+| R48: previous-schema backups | Fixed for reviewed cases | Read-only entry queries work without `n_chunks`; the maintained purge-coverage test also accepts the previous schema and checks that inspection leaves the backup unchanged. |
+
+Earlier conflict-destination collisions, unknown-baseline removal, restoration after removal failure, backport reconciliation, prerelease-only promotion, and draft-release guard probes still pass. Evidence is in `/tmp/basalt-review-round7/`: `check.log`, `lock-probe.ts`/`.log`, `lock-delayed-lower-probe.ts`/`.log`, `preservation-probe.ts`/`.log`, `preservation-retry-probe.ts`/`.log`, `recovery-status-probe.ts`/`.log`, `workflow-probes.mjs`/`.log`, `server-probe/`, `server-probe.log`, and `source-hashes.json`.
+
+### R49 — A delayed lower claim takes ownership after a higher owner has acquired
+
+- [x] **P1 · CLI locking · Remaining R44 · Reproduced with existing hooks.** A caller that has acquired the vault must remain exclusive until it releases, regardless of later claim numbers.
+
+The new post-publication check [yields only to a lower-generation rival](client/src/cli/lock.ts#L138). This resolves two claims only when both callers are still deciding. If the higher-generation caller has already returned success, a delayed lower-generation caller also returns success: nothing revokes the existing owner's permission to write.
+
+**Observed:** start with dead generation 1. A reads it and pauses, intending to publish generation 2. B acquires generation 2, releases, and sweeps the directory. C reads the now-empty directory and pauses, intending to publish generation 1. Resume A first: it acquires generation 2 and `currentHolder` reports A. Then resume C: its post-publication check sees A but does not yield to a higher generation. **Both A and C return successful acquisitions before either releases**; `currentHolder` merely changes its answer to C. Both files remain on disk. This is the existing R44 schedule with C's publication delayed, not a filesystem failure or artificial clock change.
+
+**Fix and acceptance:** do not let a late claimant displace an owner that has already been admitted. Use an ownership protocol that distinguishes established ownership from competing claims, or conservatively refuse ambiguous acquisition. An extra observation and a numeric tie-break are insufficient without that guarantee. Add both completion orders around release/reacquisition, asserting continuous mutual exclusion rather than only the winner reported by `currentHolder`.
+
+### R50 — Text status sends recovery to an empty directory
+
+- [x] **P2 · CLI recovery reporting · Remaining integration of R46 · Reproduced through `status`.** Print the actual locations of parked originals.
+
+The scan now records parked files beside their original notes, using paths relative to the vault. [`status` still says every stranded version is in `.basalt/tmp`](client/src/cli/cli.ts#L1530), and prints neither the recorded path nor another location. That was correct for the old staging-only inventory and is false for the files this fix newly discovers.
+
+**Observed:** place the recovery fixture at `notes/note.md..basalt-tmp-keep12345678`. JSON status correctly includes that path in `stranded`; text status says `kept 1 version(s) this client could not put back, in <vault>/.basalt/tmp`. That directory is empty. The only unsent edit remains under `notes/`, where the ordinary vault listing deliberately hides it. The probe uses an unreachable loopback endpoint; this local recovery output does not depend on a live server.
+
+**Fix and acceptance:** give all recovery entries an unambiguous path convention, including both old staging entries and new sibling entries, and render their actual locations in text status. Test a staging-only fixture, a nested sibling fixture, and both together. A user following the printed path must reach the retained bytes without guessing or switching to JSON.
+
+### R51 — Matching count and maximum ordinal do not prove a valid chunk sequence
+
+- [x] **P2 · Server verification · Remaining R47 · Reproduced through library and CLI.** Verify the complete zero-based chunk ordering that the reader requires.
+
+The new ordering predicate [compares only `MAX(ord)` with `COUNT(*) - 1`](server/internal/store/store.go#L2106). The schema's primary key prevents duplicate ordinals but does not prohibit negative ones. A list can have the expected count and maximum while omitting ordinal 0 and containing a negative ordinal instead.
+
+**Observed:** append a valid three-chunk entry, then change the first row's ordinal from 0 to -1, preserving all bodies and the declared count. The list is now `[-1, 1, 2]`. `EntryByUID` refuses with `chunk ord -1 out of sequence at position 0`. `Verify(true)` reports no faults, and **`basaltd verify -deep` exits 0**, printing `checked 1 entries and 3 chunk references and 0 registry rows, 0 faults`. The ordinary missing-tail case correctly fails in the same probe.
+
+**Fix and acceptance:** validate a zero-based contiguous sequence, including its lower bound. With distinct integer ordinals, checking both minimum 0 and maximum `count - 1` is sufficient; walking the ordered rows as the reader does is another option. Apply this to current and previous schemas. Add a negative ordinal replacing 0 alongside valid, missing-tail, and interior-gap fixtures; invalid ordering must cause a fault and nonzero CLI exit.
+
+### Verification limits
+
+The worktree was clean when captured, and final source fingerprints were checked against the isolated snapshot. Application code was not changed; this review only appends the document. Filesystem and SQLite mutations were confined to disposable fixtures, and release probes used mocked registry/Git/GitHub commands. Real Obsidian desktop/mobile operation, physical power cuts, Linux mounted-filesystem acceptance, and live GitHub publication were not exercised.
+
+## Product readiness recommendations — 2026-09-07
+
+[PRODUCT_READINESS.md](PRODUCT_READINESS.md) records the architectural assessment
+of the recurring bug classes, proposed threat-model and release-scope boundaries,
+implementation priorities, and public-beta acceptance criteria. It is a strategic
+recommendation based on these reviews, not another verification or confirmation
+that subsequent fixes are complete.

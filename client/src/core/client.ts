@@ -154,6 +154,17 @@ export class Client {
   private endedWith: Error | undefined;
   private notifyEnded: ((cause: Error) => void) | undefined;
 
+  /**
+   * Where this client's files are.
+   *
+   * Exposed so a shell can ask the same vault the pass used what it is still
+   * holding, rather than building a second one and scanning the disk again to
+   * find out (R46, R50).
+   */
+  get vault(): ClientOptions["vault"] {
+    return this.opts.vault;
+  }
+
   constructor(private readonly opts: ClientOptions) {
     let engine!: Engine;
     this.transport = new Transport(opts.url, {

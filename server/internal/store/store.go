@@ -2036,6 +2036,8 @@ func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid),
 		        (SELECT COALESCE(MAX(c.ord), -1) FROM entry_chunks c
 		          WHERE c.vault_id = e.vault_id AND c.uid = e.uid),
+		        (SELECT COALESCE(MIN(c.ord), 0) FROM entry_chunks c
+		          WHERE c.vault_id = e.vault_id AND c.uid = e.uid),
 		        ` + declaredChunks(s.hasChunkCount) + `
 		   FROM entries e
 		  ORDER BY e.vault_id, e.uid`)
@@ -2050,9 +2052,9 @@ func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 		var size int64
 		var folder, deleted bool
 		var mac, parent string
-		var chunkCount, topOrd, declared int
+		var chunkCount, topOrd, lowOrd, declared int
 		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted,
-			&mac, &parent, &chunkCount, &topOrd, &declared); err != nil {
+			&mac, &parent, &chunkCount, &topOrd, &lowOrd, &declared); err != nil {
 			return faults, entries, err
 		}
 		// The authenticator's shape, on every kind (F20). `Validate` used to
@@ -2103,11 +2105,17 @@ func (s *Store) verifyEntries() (faults []Fault, entries int, err error) {
 				"was written with %d chunks and has %d, so it would assemble to the wrong "+
 					"bytes and every client would refuse it", declared, chunkCount)
 			faults = append(faults, f)
-		case chunkCount > 0 && topOrd != chunkCount-1:
+		// Both ends, not just the top (R51). The primary key makes the
+		// ordinals distinct, so distinct integers with the right count, a
+		// maximum of count-1 and a minimum of 0 can only be 0..count-1. One
+		// end alone proves nothing: `[-1, 1, 2]` has three rows and a maximum
+		// of 2, and the reader refuses it with "chunk ord -1 out of sequence
+		// at position 0" while the verifier called the vault clean.
+		case chunkCount > 0 && (topOrd != chunkCount-1 || lowOrd != 0):
 			f.Reason = "chunkorder"
 			f.Detail = fmt.Sprintf(
-				"has %d chunk rows whose highest ord is %d, so the list has a gap in it",
-				chunkCount, topOrd)
+				"has %d chunk rows running from ord %d to %d, and a chunk list is 0 to %d, "+
+					"so this one has a gap in it", chunkCount, lowOrd, topOrd, chunkCount-1)
 			faults = append(faults, f)
 		}
 	}

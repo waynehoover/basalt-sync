@@ -893,13 +893,19 @@ export class NodeVault implements Vault {
   reaped = 0;
 
   /**
-   * Preserved note versions sitting in staging that nothing will remove (R35).
+   * Preserved note versions that nothing will remove, as vault-relative paths.
    *
    * Taking `respell.` off the reaper's list closed one hole and could have
    * opened another: a note parked mid-normalisation and abandoned by a crash
    * now stays there for ever, which is the right thing to do with it and the
    * wrong thing to do silently. A version nobody can find is not much better
    * than one that was deleted, so the scan counts them and `status` says so.
+   *
+   * Two kinds end up here and they are in different places: what an
+   * interrupted normalisation parks in `.basalt/tmp`, and what a failed
+   * preservation claim leaves beside the note it came from (R46). Both are
+   * written the same way, relative to the vault root, because the only thing
+   * anybody does with this list is go and look.
    *
    * Filled by every scan, including an observing one: counting is a read.
    */
@@ -950,7 +956,12 @@ export class NodeVault implements Vault {
     // to be told.
     for (const name of names) {
       if (!disposableTemp(name) && !liveTemps.has(join(this.staging, name))) {
-        this.stranded.push(name);
+        // Relative to the vault, like the ones the walk finds (R50). Two
+        // conventions in one list is a list nothing can print: `status` said
+        // every entry was in `.basalt/tmp` because that used to be the only
+        // place they came from, and sent people to an empty directory for the
+        // ones that are beside their note.
+        this.stranded.push(relative(this.root, join(this.staging, name)));
       }
     }
     if (this.observeOnly) return;
