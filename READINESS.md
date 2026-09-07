@@ -156,22 +156,31 @@ did not land. Written up in `docs/plugin.md`.
 
 ## E. Narrow the supported environment
 
-- [ ] **E1** Say which platforms are tested, and that iOS is not.
-- [ ] **E2** Exclude overlapping sync tools, nested mounts and network
+- [x] **E1** Say which platforms are tested, and that iOS is not.
+- [x] **E2** Exclude overlapping sync tools, nested mounts and network
       filesystems, in writing.
-- [ ] **E3** One Basalt writer per local vault, stated as a rule rather than
+- [x] **E3** One Basalt writer per local vault, stated as a rule rather than
       implied by the lock.
-- [ ] **E4** Mark the CLI experimental, given where the lock stands.
+- [x] **E4** Mark the CLI experimental, given where the lock stands.
 
 ## F. Purge and capacity
 
 Mostly already true; this is verification, not construction.
 
-- [ ] **F1** Confirm purge is manual only: `-confirm`, `-backup` or
+- [x] **F1** Confirm purge is manual only: `-confirm`, `-backup` or
       `-no-backup-check`, exclusive dirlock. Nothing automatic.
-- [ ] **F2** Confirm storage usage is exposed and that a full store refuses
+- [x] **F2** Confirm storage usage is exposed and that a full store refuses
       with `nospace` rather than failing some other way.
-- [ ] **F3** Record both, so the next reader does not have to rediscover it.
+- [x] **F3** Record both, so the next reader does not have to rediscover it.
+
+**Both already held, and neither was written down.** `Store.Purge` has exactly
+one caller, the subcommand; `serve` cannot reach it; there is no retention
+setting and no scheduled sweep. `stats` already prints what a purge would give
+back, and the `ENOSPC`/`EDQUOT` to `nospace` mapping already has a test. So
+this item was verification, and what it produced is a paragraph in
+`docs/server.md` saying so, because "nothing purges on its own" is exactly the
+kind of fact that gets rediscovered by reading the source every time somebody
+asks.
 
 ## Not doing
 
@@ -191,3 +200,34 @@ to avoid a fixed one.
 now covered by `scripts/release-promote.test.sh` and
 `scripts/release-order.test.sh` and costs nothing to keep. Low stakes either
 way; not worth the churn.
+
+## Review of the above
+
+Done last, against the defect shapes these seven rounds kept producing: a seam
+placed before the check rather than after it, a test that passes vacuously, a
+`finally` that deletes recovery data, a comment that overstates the code, a fix
+applied to one of two adapters, and a check followed by a destructive act on a
+name. Four things came out of it.
+
+- **An observing scan could write.** `status` takes no lock and may run beside
+  a watcher, so its scan reaps nothing and re-spells nothing (R12). The ledger
+  compacts its log when enough records are dead, and `status` reaches it
+  through the same `list`, so the one write an observing scan still made was
+  mine. `waiting(tidy)` now takes the caller's word for it.
+- **`--force` broke more than its own documentation said.** It was written for
+  the case this machine *cannot check*, a holder on another host, and the code
+  let it break a running local process too. That is checkable, so there is
+  nothing to assert about it, and allowing it put the two-step read-and-unlink
+  in the release back within reach of removing somebody else's lock. Narrowed,
+  which closes that race rather than documenting it.
+- **`resolve()` was dead code.** Written with a justification and called by
+  nothing. Removed: `waiting` already drops a record whose file is gone, which
+  is the whole mechanism.
+- **Nothing checked that the usage text and the dispatch agree.** Two hand-kept
+  lists of the same commands, one of which is the only thing most people read.
+  The guard found `recovery-key`, which is dispatched on purpose and
+  undocumented on purpose, so that is now named as an exception rather than
+  drift. Mutation-tested both directions.
+
+Each of the first three was a shape from the list. That is the argument for the
+list.

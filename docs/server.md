@@ -476,6 +476,18 @@ bodies nothing references any more. It is the only command that destroys
 something no device holds, so it wants the vault's name typed again and proof
 of a backup already holding everything it is about to drop.
 
+**Nothing purges on its own.** There is no retention setting, no age limit and
+no scheduled sweep, and a running server never deletes a chunk body: `serve`
+cannot reach this code, and `Store.Purge` has exactly one caller, which is the
+subcommand below. History grows until somebody types this command. That is a
+decision rather than an omission, and the two things that make it liveable are
+that `basaltd stats` prints what a purge would give back, and that a full store
+refuses uploads with `nospace` rather than failing in some way an operator has
+to diagnose. Both are checked: `Reclaimable` is on the line `stats` already
+prints, and the `ENOSPC` and `EDQUOT` mapping has a test, because before it
+existed a full disk arrived as an unexplained internal fault while `nospace`
+sat in the protocol's code list and was sent by nothing.
+
 ```bash
 systemctl stop basalt
 basaltd backup -data /var/lib/basalt -to /srv/basalt-backup

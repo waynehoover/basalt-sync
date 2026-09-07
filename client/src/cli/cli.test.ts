@@ -13,6 +13,7 @@
 
 import { mkdtemp, readFile, readdir, rm, stat, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -20,7 +21,15 @@ import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/tes
 import { PAIRING_PREFIX, parseInvite } from "../core/pairing.ts";
 import { redeemInvite } from "../core/client.ts";
 import type { SyncReport } from "../core/engine.ts";
-import { run, exitCodeFor, normaliseUrl, parseArgs, renderReport, type Console } from "./cli.ts";
+import {
+  run,
+  exitCodeFor,
+  normaliseUrl,
+  parseArgs,
+  renderReport,
+  USAGE,
+  type Console,
+} from "./cli.ts";
 import { NodeVault } from "./vault.ts";
 
 beforeAll(async () => {
@@ -2083,5 +2092,57 @@ describe("what needs attention looks like on the way out", () => {
     );
     const parsed = JSON.parse(text.trim()) as { needsAttention: { why: string }[] };
     expect(parsed.needsAttention[0]!.why).toBe(CLASH);
+  });
+});
+
+/**
+ * The usage text and the dispatch, checked against each other.
+ *
+ * Two lists of the same commands, written by hand, one of which is the only
+ * thing most people ever read. A command in the switch and not in the usage is
+ * one nobody can find; a command in the usage and not in the switch prints
+ * "no such command" at somebody who typed exactly what they were told to. This
+ * caught neither when it was written, which is the point of adding it before
+ * one of them happens.
+ */
+describe("the commands", () => {
+  it("are the same in the usage text and in the dispatch", async () => {
+    const source = await readFile(fileURLToPath(new URL("./cli.ts", import.meta.url)), "utf8");
+
+    // The dispatch, between `switch (args.command) {` and its `default:`.
+    const from = source.indexOf("switch (args.command) {");
+    const to = source.indexOf("default:", from);
+    expect(from, "the dispatch switch has moved, so this is checking nothing").toBeGreaterThan(0);
+    expect(to).toBeGreaterThan(from);
+    const dispatched = new Set(
+      [...source.slice(from, to).matchAll(/case "([a-z-]+)":/g)].map((m) => m[1]!),
+    );
+
+    // The usage, from the lines that begin `  basalt <word>`, minus the
+    // options that are listed among them because that is where somebody looks
+    // for them.
+    const documented = new Set(
+      [...USAGE.matchAll(/^ {2}basalt (--?[a-z-]+|[a-z][a-z-]*)/gm)]
+        .map((m) => m[1]!)
+        .filter((word) => !word.startsWith("-")),
+    );
+
+    // The one command that is dispatched on purpose and documented on
+    // purpose. `recovery-key` exists only to explain that it does not exist:
+    // no device holds the vault's recovery key, and printing "no such command"
+    // at somebody looking for it would send them hunting for a typo instead of
+    // telling them why. Naming it here is what keeps that a decision rather
+    // than the drift this test is for.
+    const explainsItsOwnAbsence = new Set(["recovery-key"]);
+    for (const word of explainsItsOwnAbsence) {
+      expect(dispatched, `${word} is no longer dispatched, so this exception is stale`).toContain(
+        word,
+      );
+      dispatched.delete(word);
+    }
+
+    expect([...documented].sort()).toEqual([...dispatched].sort());
+    // And there really are some, so an empty pair of sets cannot pass.
+    expect(dispatched.size).toBeGreaterThan(10);
   });
 });

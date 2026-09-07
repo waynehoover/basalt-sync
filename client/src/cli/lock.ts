@@ -140,6 +140,16 @@ export async function lockVault(vault: string, command: string): Promise<() => P
         // Ours by token or not at all. A pid and a host are not an identity,
         // and this is the one place that matters: a release that matched on
         // those could remove the lock of whoever holds the vault now.
+        //
+        // Reading and then unlinking is two steps on one name, which is the
+        // shape this project spends its length avoiding. It is sound here
+        // because nothing can replace a live holder's lock while it runs:
+        // `link` refuses an occupied name, and `unlock` will not break a local
+        // process it can see running, `--force` included. Taking the file
+        // aside to identify it, as `unlock` does, would be worse rather than
+        // better -- it would leave the vault looking free for the instant it
+        // took to decide, and a third process could take it while this one
+        // still held it.
         const now = await readHolder(path);
         if (now?.token !== mine.token) return;
         await rm(path, { force: true });
@@ -231,7 +241,7 @@ export async function unlockVault(vault: string, force = false): Promise<Unlocke
   // is two writers on one vault caused by the command that exists to prevent
   // them. Every ordinary refusal -- somebody's watcher is running, the lock is
   // on another machine -- now ends here, with no window at all.
-  if (before.state === "held" && !force && mustKeep(before.holder)) {
+  if (before.state === "held" && !mayBreak(before.holder, force)) {
     return { did: "refused", was: before.holder, why: whyKept(before.holder) };
   }
   await midBreak.beforeTaking(path);
@@ -268,7 +278,7 @@ export async function unlockVault(vault: string, force = false): Promise<Unlocke
   }
 
   const who = at.holder;
-  if (force || !mustKeep(who)) {
+  if (mayBreak(who, force)) {
     await rm(aside, { force: true });
     return { did: "removed", was: who, why: describeGone(who) };
   }
@@ -298,16 +308,27 @@ export async function unlockVault(vault: string, force = false): Promise<Unlocke
   };
 }
 
-/** Whether a holder is one this machine may not break without being told to. */
-function mustKeep(who: LockHolder): boolean {
-  return who.host !== hostname() || alive(who.pid);
+/**
+ * Whether this lock may be cleared.
+ *
+ * `force` is narrower than "break anything", and deliberately: it covers the
+ * one case where this machine *cannot know*, which is a holder on another
+ * host. A process running here is checkable, so there is nothing for a person
+ * to assert about it and no reason to let them. The first version of this let
+ * `--force` break a running local process, which its own documentation did not
+ * say and which reopened the release race in `lockVault`.
+ */
+function mayBreak(who: LockHolder, force: boolean): boolean {
+  if (who.host === hostname()) return !alive(who.pid);
+  return force;
 }
 
 function whyKept(who: LockHolder): string {
   return who.host !== hostname()
     ? `it is held on ${who.host}, and this machine cannot tell whether that process is ` +
         `still running. Use --force if you know it is not.`
-    : `pid ${who.pid} is still running`;
+    : `pid ${who.pid} is still running, and --force does not break a lock this machine ` +
+        `can see is held. Stop it instead.`;
 }
 
 function describeGone(who: LockHolder): string {

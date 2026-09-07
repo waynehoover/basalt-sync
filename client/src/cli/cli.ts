@@ -133,7 +133,8 @@ Options
   --allow-last     revoke the last device, leaving the vault reachable only by its recovery key.
                    Needs --recovery-key: it is the one revocation a device cannot undo
   --force          for unlock: clear a lock held on another machine. This one cannot tell whether
-                   that process is still running, so saying it is not is your assertion
+                   that process is still running, so saying it is not is your assertion. It will
+                   not break a lock held by a process on this machine that is still running
   --recovery-key K run devices, revoke or uninvite with the vault's recovery key instead of this
                    device's credential, for the last device and for a vault with no device to ask
   --ttl DURATION   how long an invite lasts, like 10m or 1h (default: 10m, at most 1h)
@@ -2243,11 +2244,13 @@ interface Args {
   /** Whether rebase may remove the index, which the person confirms by typing it. */
   backupTaken: boolean;
   /**
-   * Whether `unlock` may break a lock it cannot prove is abandoned.
+   * Whether `unlock` may break a lock it *cannot check*.
    *
    * Which is a lock held on another machine: nothing here can ask that machine
    * whether the process is running, so the only honest answers are to refuse
-   * and to let somebody who does know say so out loud.
+   * and to let somebody who does know say so out loud. It is not permission to
+   * break a lock held by a process on this machine that is running, because
+   * that one is checkable and there is nothing to assert about it.
    */
   force: boolean;
   configDir: string;

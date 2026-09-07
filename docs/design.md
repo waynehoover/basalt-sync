@@ -174,6 +174,43 @@ anything, storage they already pay for, or a vault that is mostly large binary
 files. [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)
 does all of that and is a better answer.
 
+## Where this is supported
+
+Narrower than "wherever it happens to run", and deliberately. Every durability
+rule below rests on what a particular filesystem does with `link`, `rename` and
+a directory flush, and a rule tested on one arrangement is tested on that
+arrangement.
+
+**Tested, and in daily use:** Obsidian on macOS and Linux desktops, Obsidian on
+Android, and the headless client on macOS and Linux, over a local filesystem.
+
+**Should work, never run:** iOS. It is not claimed until somebody has run it.
+
+**Not supported, and these are the ones that break the rules rather than merely
+being untried:**
+
+- **Another sync tool over the same vault.** Dropbox, iCloud Drive, Syncthing,
+  Self-hosted LiveSync. Preservation works by moving bytes aside atomically and
+  identifying them afterwards, and a second sync engine moving the same bytes
+  underneath that turns every one of those steps into a guess. There is no way
+  to make this safe from inside one of the two.
+- **A network filesystem.** NFS and SMB do not offer `link` and `rename` with
+  the guarantees the preservation paths are built on, and an `fsync` on them
+  means something between "flushed" and nothing.
+- **A vault assembled out of several mounts.** Handled where it is detectable:
+  a cross-device staging copy is noticed and worked around (R37). It is still
+  not a layout anybody here runs.
+- **Two Basalt writers on one local vault.** One at a time, and the headless
+  client enforces it with a lock. The plugin does not need one, because
+  Obsidian is one process per vault. Editing on several devices at once is a
+  different thing and is the whole point.
+
+**The headless client is experimental**, and the reason is above: its lock is
+the only part of this project that had to be attempted five times, and the
+sixth answer was to stop deciding. It is a mirror for a machine with no
+Obsidian. Treating it as a general-purpose writable client over arbitrary
+editors and filesystem layouts is a wider promise than has been tested.
+
 ---
 
 ## What the server can and cannot do

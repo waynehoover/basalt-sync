@@ -105,8 +105,15 @@ export class DisplacedLedger {
    * Order is oldest first, and duplicates by path are collapsed to the newest
    * record: the same name can be displaced twice, and the second time is the
    * one that describes the bytes now there.
+   *
+   * `tidy` is false for a caller that is only asking. `status` takes no lock
+   * and may run beside a watcher, so its scan reaps nothing and re-spells
+   * nothing (R12); rewriting this log would have been the one write it still
+   * made, and a question is not a reason to change anything. The answer is the
+   * same either way: what is dropped from the answer is dropped whether or not
+   * the file is rewritten.
    */
-  async waiting(): Promise<Displaced[]> {
+  async waiting(tidy = true): Promise<Displaced[]> {
     const all = await this.parse();
     const newest = new Map<string, Displaced>();
     for (const d of all) newest.set(d.at, d);
@@ -119,24 +126,11 @@ export class DisplacedLedger {
     }
     // Counted against the whole log rather than against the live records: a
     // log of a thousand resolved entries and one live one is what this is for.
-    if (all.length - live.length >= COMPACT_AT || (dead > 0 && live.length === 0)) {
+    if (tidy && (all.length - live.length >= COMPACT_AT || (dead > 0 && live.length === 0))) {
       await this.compact(live);
     }
     live.sort((a, b) => a.when - b.when);
     return live;
-  }
-
-  /**
-   * Forgets one record, when the caller knows the version has been placed.
-   *
-   * Nothing depends on this being called: `waiting` drops a record whose file
-   * is gone anyway, and a caller that forgets is one scan behind rather than
-   * wrong. It exists so that a version put somewhere in the same breath as
-   * being displaced does not appear in a report between the two.
-   */
-  async resolve(at: string): Promise<void> {
-    const live = (await this.waiting()).filter((d) => d.at !== at);
-    await this.compact(live);
   }
 
   private async compact(live: readonly Displaced[]): Promise<void> {

@@ -216,7 +216,7 @@ export async function permute(scenario: Scenario, it: Seam): Promise<Outcome> {
       // Anything under `.basalt` is this client's own bookkeeping and is only
       // findable if something says where it is.
       if (!at.startsWith(".basalt/") && !isParked(at)) return true;
-      return reported.has(at) || reported.has(at.replace(/\\/g, "/"));
+      return reported.has(at);
     });
     if (!findable) {
       faults.push(

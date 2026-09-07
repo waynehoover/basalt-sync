@@ -1,5 +1,12 @@
 # Basalt client
 
+> **Experimental.** This is a mirror for a machine with no Obsidian, not a
+> general-purpose writable client. One Basalt writer per vault, a local
+> filesystem, and no other sync tool over the same directory:
+> [docs/design.md](../docs/design.md#where-this-is-supported) has the whole
+> list and the reasons. The plugin is the supported client.
+
+
 The Obsidian plugin and the headless client are one sync engine with two
 adapters, Obsidian's Vault API or the filesystem. This directory holds both.
 The headless client is what npm installs.
@@ -78,7 +85,7 @@ basalt --version                          which release this is
 | `--device NAME` | this device's name (default: the hostname plus four random characters, chosen once at pairing) |
 | `--vault-id ID` | which vault on the server, for `init` only (default `default`) |
 | `--json` | machine-readable output, on every command |
-| `--force` | for `unlock`: clear a lock held on another machine, which this one cannot check |
+| `--force` | for `unlock`: clear a lock held on another machine, which this one cannot check. It does not break a lock held by a process running here |
 | `--timeout MS` | how long to wait on the server (default 30000) |
 | `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |
 | `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable; local to this device |
@@ -228,7 +235,8 @@ holder's name, whether that process is still running, and what to do about it:
 
 which says who held the vault before it clears anything, and refuses if that
 process is still running. `--force` is for a lock held on another machine,
-which this one cannot check.
+which this one cannot check; it will not break a lock held by a process
+running here, because that one is checkable and stopping it is the answer.
 
 That is less convenient than taking an abandoned lock over, and it is
 deliberate. Taking it over automatically was attempted five times and four of

@@ -113,6 +113,24 @@ describe("unlock", () => {
     )();
   });
 
+  it("will not break a running local process, --force or not", async () => {
+    // `--force` is for the one case this machine cannot check: a holder on
+    // another host. A process running here is checkable, so there is nothing
+    // to assert about it. The first version let --force through regardless,
+    // which its own help text did not say, and which put the two-step read
+    // and unlink in `lockVault`'s release back in reach of removing somebody
+    // else's lock.
+    const dir = await vault();
+    const release = await lockVault(dir, "sync --watch");
+
+    const out = await unlockVault(dir, true);
+    expect(out.did).toBe("refused");
+    expect(out.why).toContain("--force does not break");
+    const still = JSON.parse(await readFile(lockPath(dir), "utf8")) as { command: string };
+    expect(still.command).toBe("sync --watch");
+    await release();
+  });
+
   it("clears something at the path that names nobody", async () => {
     const dir = await vault();
     await mkdir(join(dir, STATE_DIR), { recursive: true });

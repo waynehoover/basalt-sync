@@ -72,9 +72,13 @@ basalt sync --watch
 - Conflicts keep both versions, and never rewrite the file you have open
 - Full version history and deleted-note recovery, inside Obsidian
 - A credential per device, so a lost one is revoked without touching the others
-- A headless client for a machine with no Obsidian
+- A headless client for a machine with no Obsidian (experimental)
 
-Desktop and Android are in daily use. Not yet: iOS, which should work and has never been run; a memory measurement on an older phone; the community directory; and syncing themes and snippets.
+**Where it is supported.** Obsidian on macOS and Linux desktops and on Android, over a local filesystem, one Basalt writer per vault. Not iOS, which should work and has never been run. Not a vault another sync tool also has (Dropbox, iCloud Drive, Syncthing, LiveSync): keeping your edits works by moving bytes aside and identifying them afterwards, and a second engine moving the same bytes turns every step of that into a guess. Not a network filesystem. [docs/design.md](docs/design.md#where-this-is-supported) has the whole list and the reasons.
+
+The headless client is experimental. It is a mirror for a machine with no Obsidian, not a general-purpose writable client.
+
+Also not yet: a memory measurement on an older phone, the community directory, and syncing themes and snippets.
 
 ## Security
 

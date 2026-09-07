@@ -1274,7 +1274,10 @@ export class NodeVault implements Vault {
     // parked files nothing wrote a record for, which is what an older build
     // left and what another process is holding. Reporting only the ledger
     // would lose the second kind, and only the walk would lose every reason.
-    this.displaced = await this.ledger.waiting();
+    // Not tidied when this scan is a question (R12). `status` runs beside a
+    // watcher and takes no lock, and rewriting the log would be the one write
+    // an observing scan still made.
+    this.displaced = await this.ledger.waiting(!this.observeOnly);
     const already = new Set(this.stranded);
     for (const d of this.displaced) {
       if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {
