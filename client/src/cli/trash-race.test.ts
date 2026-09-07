@@ -16,7 +16,15 @@
  * places rather than in none.
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename as renameFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -73,6 +81,60 @@ describe("copying a note away and then removing it", () => {
       `${stillThere}|${inTrash}`,
       "the edit written after the copy was verified is gone",
     ).toContain("the unsent edit, written after the copy\n");
+  });
+
+  /**
+   * R36. The second attempt must not destroy what the first one kept.
+   *
+   * A move that cannot put a displaced version back leaves it beside the note
+   * and reports the move as incomplete, which is the whole of the preservation
+   * here. The parking name was one fixed string, so the retry a person then
+   * runs renamed the next file straight onto it: `rename` replaces, and the
+   * cleanup afterwards took what was left. One attempt, tested on a pristine
+   * directory, passed; the pair lost a note.
+   */
+  it("does not overwrite the previous attempt's preserved version", async () => {
+    const dir = await scratch();
+    const source = join(dir, "note.md");
+    await mkdir(join(dir, "trash"), { recursive: true });
+    await writeFile(source, "the version that was copied\n");
+
+    // A save lands before the original is taken away, so what gets moved
+    // aside is that save and not the version in the trash.
+    midTrash.pause = async (at) => {
+      midTrash.pause = async () => {};
+      await writeFile(`${at}.tmp`, "save A, never sent anywhere\n");
+      await renameFile(`${at}.tmp`, at);
+    };
+    // And another takes the name back before the walk can put A there, so A
+    // stays parked and the move reports itself incomplete.
+    midTrash.afterCompare = async (at) => {
+      midTrash.afterCompare = async () => {};
+      await writeFile(`${at}.tmp`, "save B, also never sent\n");
+      await renameFile(`${at}.tmp`, at);
+    };
+
+    await expect(copyVerifiedThenRemove(source, join(dir, "trash", "note.md"))).rejects.toThrow();
+
+    // A is parked somewhere beside the note. Found rather than assumed, so
+    // this uses the real leftover and not a fixture that resembles one.
+    const parked = (await readdir(dir)).find((n) => n.startsWith("note.md."));
+    expect(
+      parked,
+      `save A was not kept. The directory holds: ${JSON.stringify(await readdir(dir))}`,
+    ).toBeDefined();
+    expect(await readFile(join(dir, parked!), "utf8")).toBe("save A, never sent anywhere\n");
+
+    // The retry, which is what somebody actually does next.
+    await copyVerifiedThenRemove(source, join(dir, "second", "note.md"));
+
+    expect(await readFile(join(dir, "second", "note.md"), "utf8")).toBe(
+      "save B, also never sent\n",
+    );
+    expect(
+      await readFile(join(dir, parked!), "utf8").catch(() => undefined),
+      "the retry wrote over the version the first attempt had kept",
+    ).toBe("save A, never sent anywhere\n");
   });
 
   it("keeps a changed file inside a folder and removes the rest", async () => {

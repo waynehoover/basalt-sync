@@ -711,7 +711,8 @@ export class ObsidianVault implements Vault {
    *
    * What remains is the instant between the rename and the write, when the
    * name does not exist. A save landing exactly there is overwritten, because
-   * this adapter cannot create a name exclusively. docs/design.md says so.
+   * this adapter cannot create a name exclusively. docs/design.md says so, and
+   * it is a platform limitation rather than a thing this file has closed.
    */
   async replace(
     path: string,
@@ -720,19 +721,35 @@ export class ObsidianVault implements Vault {
     times: Times,
     keepAt: string,
   ): Promise<Replaced> {
-    if (expect === undefined) {
-      await this.write(path, bytes, times);
-      return { landed: true };
-    }
     const from = this.resolve(path);
     const kept = this.resolve(keepAt);
+
+    // No baseline is not permission to overwrite (R33).
+    //
+    // It used to be: a path the pass had not seen holds nothing worth keeping.
+    // The pass looked at the start and writes at the end, and a note created
+    // in between is what that reasoning destroys. Undefined means the caller
+    // cannot say what it decided about, so anything found here is kept.
     let moved = true;
     try {
       await this.adapter.rename(from, kept);
-    } catch {
-      // Nothing there, or the rename refused. Either way there is nothing this
-      // can promise about what it is replacing, so it writes and says nothing
-      // was preserved; the stat check above the caller is what is left.
+    } catch (err) {
+      // Absent, or refused, and the two are not the same answer (R32).
+      //
+      // Both used to fall through to the write. A rename refused for
+      // permissions or I/O left the original exactly where it was and then
+      // wrote over it, reporting `landed: true` and no preserved version: the
+      // failure of the step that exists to protect the note became the reason
+      // it was destroyed.
+      if (await this.stillThere(from)) {
+        // Nothing was moved and nothing may be written. The caller is told the
+        // incoming version has nowhere to go, and places it beside.
+        this.log(
+          `could not move ${path} aside before writing over it, so it was left alone: ` +
+            `${(err as Error).message}`,
+        );
+        return { landed: false };
+      }
       moved = false;
     }
     await this.write(path, bytes, times);
@@ -740,7 +757,12 @@ export class ObsidianVault implements Vault {
 
     this.entryChanged(kept);
     const was = await this.readIfThere(keepAt);
-    if (was !== undefined && (await expect.idOf(was)) === expect.contentId) {
+    // With no baseline there is nothing it can match, so it is kept (R33).
+    if (
+      expect !== undefined &&
+      was !== undefined &&
+      (await expect.idOf(was)) === expect.contentId
+    ) {
       // The version this write was decided about: the copy is a duplicate of
       // something the server already holds.
       await this.adapter.remove(kept).catch(() => undefined);
@@ -748,6 +770,21 @@ export class ObsidianVault implements Vault {
     }
     this.wrote(kept);
     return { keptAt: keepAt, landed: true };
+  }
+
+  /**
+   * Whether a path is still occupied, when a rename off it has just failed.
+   *
+   * The conservative direction is "yes". An adapter that cannot answer cannot
+   * establish absence either, and absence is the only answer that permits
+   * writing over the name (R32).
+   */
+  private async stillThere(normalized: string): Promise<boolean> {
+    try {
+      return await this.adapter.exists(normalized);
+    } catch {
+      return true;
+    }
   }
 
   /**

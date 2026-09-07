@@ -14,10 +14,10 @@
  * waited on for ever.
  */
 
-import { link, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 
 import { STATE_DIR } from "./config.ts";
 import { refuseOutsideVaultAt } from "./vault.ts";
@@ -118,7 +118,7 @@ export async function lockVault(vault: string, command: string): Promise<() => P
       // ever take this lock again. Under the eviction right, and only while it
       // is still unreadable: a real lock written in between parses and is left
       // alone, and nobody else can be removing it at the same time.
-      await evicting(dir, path, "unreadable", mine, (now) => now.state === "unreadable");
+      await evicting(dir, path, mine, (now) => now.state === "unreadable");
       continue;
     }
     const holder = at.holder;
@@ -130,7 +130,6 @@ export async function lockVault(vault: string, command: string): Promise<() => P
       await evicting(
         dir,
         path,
-        holder.token,
         mine,
         (now) => now.state === "held" && now.holder.token === holder.token,
       );
@@ -183,128 +182,72 @@ async function publish(dir: string, path: string, mine: LockHolder): Promise<boo
 export const midEvict = { pause: async (): Promise<void> => {} };
 
 /**
- * Takes the exclusive right to evict one holder, does the work, and gives it
- * back (R03).
+ * Takes a dead holder's lock away, and cannot take a live one (R03, R34).
  *
- * This is the whole of the fix, and the reason the obvious version is not
- * enough. Removing a stale lock is a read and then an unlink, and no
- * filesystem here offers them as one operation. So: A reads a dead holder and
- * is descheduled; B reads the same dead holder, removes it, and links its own
- * live lock; A resumes and unlinks *B's* lock, then links its own. Both A and
- * B have been handed a release function and neither has been told it lost.
- * Re-reading the token immediately before the unlink narrows that to a few
- * instructions and does not close it, which the previous comment here admitted
- * to and then reasoned away: it said the loser would find a live holder next
- * time round, and B never looks again, because B had already succeeded.
+ * Removing a stale lock is a read and then an unlink, and no filesystem here
+ * offers them as one operation. So: A reads a dead holder and is descheduled;
+ * B reads the same dead holder, removes it, and links its own live lock; A
+ * resumes and unlinks *B's* lock, then links its own. Both have been handed a
+ * release function and neither has been told it lost.
  *
- * The marker closes it. Its name carries the token being evicted and it is
- * created with `link`, which either makes the name or fails, so exactly one
- * process may be evicting a given holder at a time. Under it, the lock is read
- * again: if it is still that holder, nobody else can have replaced it, because
- * replacing it means evicting it and that right is held here. If it is
- * anything else, somebody got there first and this does nothing at all.
+ * A marker naming the holder was the first answer, and it moved the problem
+ * rather than closing it. A marker whose evictor died had to be recovered by
+ * somebody, and recovering it was another read and another unlink; bucketing
+ * the marker by a minute of the clock made that part safe and left the gap
+ * between the last look at the clock and the unlink, which is where the same
+ * two-holder schedule got back in. Guarding a guard is not a plan.
  *
- * A marker outlives its evictor only if the process dies inside these few
- * operations. Nothing goes looking at who held it: it stops being anybody's
- * exclusion when its window passes, and the sweep takes it then (R20).
+ * The primitive with no gap is `rename`. It is atomic, and unlike `rm` it
+ * hands back what it took: exactly one caller can move the lock file to a name
+ * of its own, and can then look at what it is holding at leisure, because
+ * nothing else can be holding it. If it is the dead holder this decided about,
+ * it is dropped and the name is free. If it is anybody else's, it goes
+ * straight back under `link`, which refuses an occupied name, so a contender
+ * that took the name meanwhile keeps it. Preservation rather than prediction,
+ * which is the same answer this project reaches for everywhere else it cannot
+ * compare and swap.
+ *
+ * Two things are left, and both are the floor rather than an oversight. A
+ * third contender can link its own lock in the instant between the take and
+ * the put-back, which is one syscall wide and needs the taken lock to have
+ * been live. And a process that dies between them leaves the lock at
+ * `lock.taken.<token>`, so the vault reads as free: the safe direction, and
+ * the same debris `publish` already leaves. A hard zero needs `flock`, which
+ * Node does not offer portably (docs/compared.md).
  */
 async function evicting(
   dir: string,
   path: string,
-  who: string,
   mine: LockHolder,
   remove: (at: LockState) => boolean,
 ): Promise<void> {
-  const epoch = evictionEpoch();
-  const marker = `${path}.evicting.${who}.${epoch}`;
-  if (!(await publish(dir, marker, mine))) {
-    // Somebody else is evicting this holder in this window. This attempt does
+  const taken = join(dir, `lock.taken.${mine.token}`);
+  try {
+    await rename(path, taken);
+  } catch {
+    // Gone, or another contender took it first. Either way this attempt does
     // nothing and the loop looks again.
     return;
   }
-  try {
-    // Read again, under the right, and then act on that read.
-    //
-    // Acting on an earlier read is the exact shape of the bug this closes, and
-    // it is safe here for one reason: nothing can replace this holder while
-    // the marker is held, because replacing it means evicting it. The seam
-    // sits in the gap on purpose, so a test can hold a process there and prove
-    // that a second one cannot get in front of it.
-    const still = await lockState(path);
-    await midEvict.pause();
-    // Still this window's. An eviction that has run past the boundary no
-    // longer has the name to itself: the next window is a different name and
-    // `link` will hand it to somebody else. Checked rather than assumed, so
-    // straddling one costs an abandoned attempt and not an exclusion two
-    // processes both believe they hold.
-    if (evictionEpoch() !== epoch) return;
-    if (remove(still)) await rm(path, { force: true });
-  } finally {
-    await rm(marker, { force: true });
-  }
-  // Markers from earlier windows, cleared on the way out. Never the current
-  // one, and never anybody's live one: see the note on `evictionEpoch`.
-  await sweepOldMarkers(path);
-}
+  // The seam sits here, holding a process that has the lock file and has not
+  // yet decided about it. That is the whole of the interleaving: whatever a
+  // competitor does from here, it is doing it to a vault with no lock at its
+  // name, and it can never be doing it to this file.
+  await midEvict.pause();
 
-/**
- * The window an eviction marker belongs to (R20).
- *
- * The marker gives one process the exclusive right to evict one dead holder,
- * and the first version of it had the same shape as the bug it was closing: a
- * marker left behind by an evictor that died had to be removed by somebody,
- * and removing it was a read followed by an unlink with a gap in between, so
- * two contenders could each end up believing they held the right. Guarding
- * that with a further marker only moves the problem up a level, for ever.
- *
- * So no live marker is ever removed. The name carries a coarse time window,
- * and contenders in the same window contend for the same name, which `link`
- * settles exclusively. A marker from an earlier window is not a name anybody
- * is using now, so deleting it cannot take anybody's exclusion away: it is
- * debris by construction rather than by judgement.
- *
- * Straddling a boundary is the residual, and it is worth naming rather than
- * waving at: an eviction that starts just before one and finishes after it
- * shared its right with the next window's evictor. So the window is checked
- * again immediately before the unlink and a straddling attempt gives up,
- * which leaves the gap between that check and the unlink: a couple of
- * syscalls that also have to land across a one-minute boundary. That is not
- * zero. It is a hard zero only with `flock`, which Node does not offer
- * portably (docs/compared.md), and it is several orders below the read-then-
- * unlink this replaced.
- *
- * This is one machine's clock compared only with itself, and takeover is
- * already host-scoped: a holder on another host is believed and never evicted.
- */
-const EVICTION_WINDOW_MS = 60_000;
-
-function evictionEpoch(): number {
-  return Math.floor(Date.now() / EVICTION_WINDOW_MS);
-}
-
-/**
- * Removes eviction markers from windows that have passed.
- *
- * Safe without asking who holds them, which is the whole point: a marker from
- * an earlier window is not a name any current evictor can be using, so this
- * cannot remove a live exclusion. Anything from the current window or a later
- * one is left alone whatever it says about itself.
- */
-async function sweepOldMarkers(path: string): Promise<void> {
-  const dir = dirname(path);
-  const prefix = `${basename(path)}.evicting.`;
-  const now = evictionEpoch();
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
+  if (remove(await lockState(taken))) {
+    await rm(taken, { force: true });
     return;
   }
-  for (const name of names) {
-    if (!name.startsWith(prefix)) continue;
-    const epoch = Number(name.slice(name.lastIndexOf(".") + 1));
-    if (!Number.isInteger(epoch) || epoch >= now) continue;
-    await rm(join(dir, name), { force: true }).catch(() => undefined);
+  // Somebody live, which means this call's earlier read was stale. It goes
+  // back exactly as it was.
+  try {
+    await link(taken, path);
+  } catch {
+    // The name is occupied, so a contender has already published its own lock
+    // there. Theirs is the current one and this copy is not put back over it.
+  } finally {
+    await rm(taken, { force: true });
   }
 }
 

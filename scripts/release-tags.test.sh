@@ -140,5 +140,73 @@ TAGS
 # promotion step rather than reusing the one from before the build.
 want server/v0.4.1      "0.4.1"
 
+# ---- and what every alias should be, whoever is promoting (R38) ------------
+#
+# `release-tags.sh` answers "what may this release move", which stops being the
+# right question the moment a promotion is dropped. The queue keeps one pending
+# run: A running, B pending and C arriving discards B, and if C is a backport
+# it moves neither of the aliases B was going to. B's immutable image is
+# published and nothing ever points at it.
+#
+# So the promotion reconciles every alias from the releases that exist. These
+# cases are that answer, and the last one is the three-release schedule.
+aliases() { # aliases <expected, "alias version" pairs separated by |>
+  local expect=$1 got
+  got=$(bash "$here/release-aliases.sh" "$work/tags" | tr '\n' '|')
+  got=${got%|}
+  if [ "$got" = "$expect" ]; then
+    printf '  ok   %s\n' "$got"
+  else
+    printf '  FAIL wanted "%s", got "%s"\n' "$expect" "$got"; fails=$((fails + 1))
+  fi
+}
+
+echo "every moving alias, from the releases that exist:"
+cat > "$work/tags" <<'TAGS'
+server/v0.2.0
+server/v0.3.0
+server/v0.3.1
+server/v0.4.0
+server/v0.4.1
+TAGS
+aliases "latest 0.4.1|0.2 0.2.0|0.3 0.3.1|0.4 0.4.1"
+
+# A prerelease holds nothing and is pointed at by nothing, on either side.
+cat > "$work/tags" <<'TAGS'
+server/v0.4.1
+server/v0.5.0-rc.1
+TAGS
+aliases "latest 0.4.1|0.4 0.4.1"
+
+# Versions are numbers, so 0.10 is after 0.9 here as everywhere else.
+cat > "$work/tags" <<'TAGS'
+server/v0.9.1
+server/v0.10.1
+TAGS
+aliases "latest 0.10.1|0.9 0.9.1|0.10 0.10.1"
+
+# And nothing published yet is not an error, it is no aliases.
+: > "$work/tags"
+aliases ""
+
+# The three-release schedule, which two releases marching up one line never
+# reaches. A (0.4.2) is promoting, B (0.5.0) is queued behind it, and C (0.3.9)
+# arrives and takes B's place in the queue. B is never promoted.
+echo "a backport promoting after a dropped release repairs it:"
+cat > "$work/tags" <<'TAGS'
+server/v0.3.0
+server/v0.4.0
+server/v0.4.2
+server/v0.5.0
+server/v0.3.9
+TAGS
+# What C itself may move, which is the point: neither of the two B needed.
+want server/v0.3.9      "0.3.9 0.3"
+# And what C's promotion sets, which is all of them. `latest` reaches 0.5.0
+# without B ever promoting, because B's immutable image was published outside
+# the queue and this is worked out from the releases rather than from whose
+# turn it is.
+aliases "latest 0.5.0|0.3 0.3.9|0.4 0.4.2|0.5 0.5.0"
+
 if [ "$fails" != 0 ]; then echo "$fails case(s) failed"; exit 1; fi
 echo "all cases passed"

@@ -443,3 +443,124 @@ This helper runs when queuing downloads and local deletions, adding that memory 
 Close the destructive preservation/cleanup and ownership gaps first: R18–R23. Complete rotation handoff through R24, then align status/resource/health behavior and repair the release flow. Add regression schedules at the **last destructive boundary**, including errors and recovery of abandoned recovery state; several new tests pause before an added check and therefore miss the race immediately after it.
 
 The positive repairs above should be retained. The new section records remaining defects and regressions, rather than resetting the earlier work or treating every original finding as still unchanged. F11's authenticated replay protection and real Obsidian/platform acceptance remain the previously documented scope limitations.
+
+## Third verification — 2026-09-06
+
+Reviewed **`370a1b5cd5383985829e25f4a5fe9043b5f36baa`**, including `82fa0f3` and the subsequent “eight defects in the fixes themselves” commit. This section supersedes the completion claims for R18–R31; the earlier sections and their checkboxes are retained as history.
+
+**Not all fixes are complete.** Seven previous findings are addressed within the checks described here; seven remain partial, including regressions in their replacements. The **eight open findings below are 5 P1 and 3 P2 items**. Six have direct local reproductions, including fault/scheduling injection. One combines a local release-tag reproduction with documented GitHub scheduling behavior; one is a workflow inspection finding.
+
+### Verification and confirmed fixes
+
+`bash scripts/check.sh` completed with **25 passed, 0 failed, 0 skipped**: **1,377 client tests across 73 files**, the separate **16 panel tests and 10 stress tests**, Go race tests/vet, formatting/type/build checks, packaged CLI checks, and local Docker checks. Actual systemd execution and the Linux mounted-filesystem job remain explicitly CI-only on this macOS host.
+
+Independent probes confirmed that CLI publication failure now leaves the original at a visible sibling; a competing destination preserves both local versions; local chunk reuse retains a same-stamp edit; staging cleanup leaves an external symlink target alone; and a save after the final trash comparison survives the original race. An oversized handshake was capped to 16 MiB per batch and 64 MiB per fetch. Against a real local server, an unreadable local directory now makes both text and JSON status exit 1, with JSON `ok: false` and `unsent: "unknown"`.
+
+Source inspection and the maintained tests confirm the purge caller now holds the backup lock through deletion, malformed digests return errors, an unwritable chunk root fails health, rotation waits for the panel acknowledgement, and the CLI baseline digest hashes incrementally. The draft-release instructions now include an explicit workflow dispatch. Immutable image version tags are published outside the promotion concurrency group.
+
+Evidence and runnable probes are in `/tmp/basalt-review-round3/`: `check.log`, `client-probes.ts`/`.log`, `plugin-probes.ts`/`.log`, `status-probe.ts`/`.log`, `release-probe.log`, and the small current-source instrumentation script `prepare.mjs`. Filesystem probes used disposable directories; plugin probes used the repository's Obsidian adapter/stub. The epoch race uses a controlled clock and a pause immediately before unlink. The cross-filesystem replacement probe injects `EXDEV`; it is not a claim that the Linux mount job ran locally. No release was published or altered.
+
+### Updated status of R18–R31
+
+| Finding | Assessment at `370a1b5` | Evidence / remaining work |
+|---|---|---|
+| R18: durable replacement preservation | Partial | Publication errors and a competing destination retain local originals. Publishing into a different filesystem still fails after moving the original. R37. |
+| R19: all destructive landing paths | Partial | Local reuse and merge now use `writePreserving`. Plugin preservation errors still permit overwrite, and an absent/unreadable baseline bypasses preservation. R32/R33. |
+| R20: stale-lock takeover | Partial | Recursive marker recovery was removed. Time buckets still permit overlapping owners at the final unlink boundary. R34. |
+| R21: staging containment and recovery | Partial | External staging symlinks are refused; the ordinary two-save normalization case gets a visible sibling. Interrupted `respell.*` and legacy `keep.*` recovery files are still reaped. R35. |
+| R22: final trash removal race | Partial; original schedule fixed | Rename-aside protects the original final-comparison race. A retry can overwrite the previous attempt's preserved file. R36. |
+| R23: backup lock through purge | Fixed for reviewed case | Caller defers the returned release; maintained tests exercise exclusion before deletion and release afterward. |
+| R24: rotation acknowledgement | Fixed for reviewed case | The actual panel callback awaits `writtenDown`; the panel test checks that rotation waits before acknowledging. |
+| R25: status honesty and exit codes | Fixed by explicit estimate | Size/timestamp comparison is labeled in both formats. The reachable-server probe confirms consistent failure for an unknown local scan. This is still an estimate, not a content audit. |
+| R26: client-owned receive limits | Fixed for reviewed cases | Negotiated limits are clamped locally and notifications have a byte budget as well as a count limit; tests cover both. |
+| R27: malformed backup digest | Fixed for reviewed cases | Digest shape is validated before comparison/formatting; short, nonhex, and wrong-length values are covered. |
+| R28: unwritable chunk-root health | Fixed for reviewed case | Health attempts a chunk-root write; the nonroot permission test and probe-cleanup tests passed. |
+| R29: draft-release start and publication gate | Partial; trigger fixed | Explicit dispatch replaces the inactive draft event. Neither upload job establishes that the target release is still a draft. R39. |
+| R30: canceled queued image release | Partial; immutable tag fixed | Builds publish their own version tags independently. A canceled promotion can still strand `latest` and minor aliases. R38. |
+| R31: whole-file baseline buffering | Fixed for reviewed case | CLI uses an incremental digest; the engine no longer retains blocks and concatenates a second full buffer. Obsidian retains its whole-file adapter limitation. |
+
+### R32 — A failed plugin preservation rename still permits destructive overwrite
+
+- [x] **P1 · Plugin · Remaining R19 · Reproduced.** Abort replacement when the preservation move fails for a reason other than confirmed absence.
+
+[ObsidianVault.replace](client/src/plugin/vault.ts#L716) catches every failure of `adapter.rename(from, kept)`, sets `moved = false`, and immediately calls `write` on the original path. Permission, I/O, and destination errors are treated like a nonexistent original. The method then returns `landed: true` without reporting any preserved version.
+
+**Observed:** begin with an unsent local edit, supply an older expected digest, and make only the preservation rename fail. The incoming write succeeds, the local edit disappears, and the result is `{ landed: true }`. This is a failure-handling defect independent of the documented plugin write race.
+
+**Fix and acceptance:** propagate/refuse an unsuccessful preservation move; only use a missing-file path after establishing absence, and give that path safe creation semantics. Inject preservation rename failures while allowing ordinary writes to succeed. Assert that the original remains and the engine cannot record the incoming version as successfully landed.
+
+The separate plugin rename-to-publication gap also remains reproducible: an editor save after rename is overwritten while only the earlier edit survives at the sibling. The source acknowledges that platform limitation; it should remain visible in completion claims rather than being counted as closed by moving the race boundary.
+
+### R33 — Missing content baselines still select an unconditional overwrite
+
+- [x] **P1 · Core/CLI/plugin · Remaining R19 · Reproduced.** Separate confirmed absence from unknown content, and preserve any file encountered at publication.
+
+[The engine's baseline](client/src/core/engine.ts#L2230) is undefined for a new path and when content cannot be read. That reaches [`NodeVault.replace`](client/src/cli/vault.ts#L1268), [the plugin adapter](client/src/plugin/vault.ts#L723), and the memory adapter as an ordinary overwrite. The last metadata check precedes several awaited operations, including conflict-name selection and staging; it cannot establish that the destination is still absent when the write lands.
+
+**Observed:** during an incoming file's first download, create `fresh.md` with `unsent local` at the existing `midReplace` hook, after the engine's last check. Sync finishes with only `fresh.md = remote`; there is no preserved copy. The production adapters contain the same undefined-baseline branch. A failed digest must not be permission to take that branch either.
+
+**Fix and acceptance:** represent “expected absent” and “could not establish content” separately. Use exclusive creation for an absent destination where supported; otherwise preserve/refuse an occupied destination. An unreadable baseline must cause conservative preservation or a retry. Test creation after the final stat and temporary baseline-read failure, including the real filesystem adapter.
+
+### R34 — An eviction that crosses a minute boundary can delete a new owner's lock
+
+- [x] **P1 · CLI locking · Remaining R20 · Reproduced.** Keep exclusion valid through the destructive syscall.
+
+[The epoch check](client/src/cli/lock.ts#L240) and `rm(path)` remain separate. After the check succeeds, execution or the filesystem operation can pause across the minute boundary. A contender in the next epoch owns a different marker and can evict the old lock and acquire its own. The earlier eviction then removes that new live lock using its stale observation.
+
+**Observed:** pause A immediately after its final epoch check, advance the controlled clock to the next bucket, and let B acquire the stale lock. Resume A. Both `lockVault` calls return successfully, and the lock changes from B to A while B still believes it owns the vault. The source comment acknowledges the residual gap; a smaller probability is not mutual exclusion.
+
+**Fix and acceptance:** use an ownership mechanism that remains exclusive through takeover on the supported platform, or refuse ambiguous automatic takeover. Do not substitute another time/read check for that ownership. Retain a regression paused after the last guard and exercise delayed filesystem completion and process suspension.
+
+### R35 — The staging allowlist still deletes displaced edits after interruption
+
+- [x] **P1 · CLI normalization/recovery · Remaining R21 · Reproduced.** Classify preservation files as recovery data from the moment the original is moved.
+
+[The disposable prefixes](client/src/cli/vault.ts#L1907) include `respell.` and `keep.`. Those names can contain the only local version of a note. Current [`retireName`](client/src/cli/vault.ts#L237) renames the source into `respell.<token>` before it knows whether the bytes belong to the original inode. An interruption before restoration/sibling publication leaves that name in staging. The legacy `keep.*` comment also incorrectly assumes those files are server duplicates: the previous implementation moved unsent edits into them before comparing content.
+
+**Observed:** interrupt current normalization just after moving an old-timestamp unsent edit aside. A new `NodeVault.list()` removes the sole `respell.*` file. A separate legacy `keep.*` crash fixture is also deleted. Because rename preserves mtime, the original edit can already exceed the one-hour threshold when preservation starts.
+
+**Fix and acceptance:** use names that are never reaped for potentially displaced originals, and dispose of them only after verified duplication or a completed recovery handoff. Retain old `keep.*`/`respell.*` files conservatively on upgrade. Test interruption immediately after rename, an old source timestamp, restart/scan, and upgrade leftovers—not only successful restoration.
+
+### R36 — A trash-move retry overwrites the previous attempt's preserved file
+
+- [x] **P1 · CLI filesystem adapter · Regression in R22 fix · Reproduced.** Never reuse an occupied preservation name.
+
+[`removeMatching`](client/src/cli/vault.ts#L2186) always parks a given source at `<source>..basalt-tmp-moving`. When the displaced version differs from the copied bytes and another save takes the source name, the function leaves that aside file and reports an incomplete move. The next attempt uses `rename(from, aside)` with the same destination; rename replaces the preserved file.
+
+**Observed:** the first copy holds `old`; a later save A is moved aside, then save B occupies the original path. The first call correctly fails and retains A. Retry `copyVerifiedThenRemove` on B. It succeeds, but A is overwritten and then deleted during cleanup. Only `old` and B remain in the two destinations.
+
+**Fix and acceptance:** allocate a fresh, nonoverwriting preservation path for every attempt, retain/report unresolved versions, and make subsequent retries/restart recover them safely. Add a two-attempt regression that uses the first attempt's actual leftover rather than a pristine fixture. Also test interruption before the aside is identified.
+
+### R37 — Replacement still cannot publish an existing note across filesystems
+
+- [x] **P2 · CLI filesystem adapter · Remaining R18 · Fault-injection reproduction.** Stage publication on the destination filesystem or refuse before moving the existing note.
+
+The original now moves to a sibling, which avoids the earlier rename `EXDEV`. However, [the incoming file is still staged under root `.basalt/tmp`](client/src/cli/vault.ts#L1279), then [hard-linked into the note's directory](client/src/cli/vault.ts#L1305). That link cannot span filesystems. Only `EEXIST` is handled; the ordinary write helper's cross-device fallback is not used here.
+
+**Observed:** inject `EXDEV` at that publication link after preservation succeeds. The operation throws, the original note name is missing, the original bytes remain at the sibling, and the incoming version does not land. This preserves bytes but breaks updating an existing note under a mounted subdirectory.
+
+**Fix and acceptance:** choose staging compatible with the destination before moving the original, or use a verified, nonoverwriting fallback with equivalent preservation. Exercise an existing-note replacement in the Linux mount job, as well as an injected publication failure. Success must leave the incoming note at its intended name; refusal should not needlessly remove the original name.
+
+### R38 — A canceled promotion can still strand `latest` and minor aliases
+
+- [x] **P2 · Image release · Remaining R30 · Local tag reproduction plus documented scheduling.** Preserve required promotions or reconcile every affected alias.
+
+[The promotion job](.github/workflows/release.yml#L213) still uses the default one-pending concurrency queue. Moving immutable publication outside that group fixes the lost version tag. The comment that the next promotion will repair any canceled aliases is incorrect when releases belong to different minor lines or arrive out of version order.
+
+**Reproduced decision:** with A running, B (`0.5.0`) pending, and C (`0.3.9`) arriving, the default queue cancels B. Running the actual `release-tags.sh` against those tags shows B would set `0.5` and `latest`; C sets neither. B's immutable image exists, but its moving aliases remain missing or stale. This is a local decision/scheduling reproduction, not an observed live Actions run. [GitHub documents pending-run replacement and the optional `queue: max` setting](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+
+**Fix and acceptance:** retain queued promotions with an explicit bounded queue and an overflow policy, or make a surviving job reconcile all eligible aliases from validated published images. Test three overlapping releases including a backport, not just two releases advancing one minor line. Keep immutable builds independent.
+
+### R39 — Attestation assumes its target is private without checking
+
+- [x] **P2 · Release publication · Remaining R29/R16 gate · Source inspection.** Establish draft state before mutating release assets.
+
+The dispatch accepts a tag and checks CI, but neither the [plugin upload](.github/workflows/attest.yml#L133) nor [server upload](.github/workflows/attest.yml#L216) checks the release's draft state before `gh release upload --clobber`. A manual rerun against an already public release therefore replaces public assets before the final “publish” step. If rebuilt/uploaded bytes differ or an upload fails partway, the public release can expose a partially replaced asset set or mismatched checksums. This was not exercised against a live release.
+
+**Fix and acceptance:** reject an already published target before the first asset mutation, and serialize work for the same release so another run cannot publish it during replacement. If public re-attestation is intentionally supported, give it a separate policy that does not replace public bytes under the draft-only guarantee. Test draft and public release responses and assert that the public case makes no upload/delete/edit calls.
+
+### Remaining verification limits
+
+Real Obsidian desktop/mobile behavior, physical power cuts, Linux mount behavior, and live GitHub publication were not independently exercised here. In particular, the plugin's documented last-write race remains a limitation even after R32 is corrected. Authenticated replay/rollback protection (F11) remains the earlier explicit POC deferral. These are not newly implemented guarantees.
+
+Prioritize R32–R36, then the cross-filesystem and release issues. Keep regression hooks after the last guard and carry real leftovers into retries: several current tests cover a successful first attempt while the remaining failures happen after preservation or during a second attempt.

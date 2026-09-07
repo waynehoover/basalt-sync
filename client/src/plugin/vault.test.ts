@@ -1654,6 +1654,82 @@ describe("writing over a file the pass did not decide about", () => {
     expect(everywhere, "the edit made during the write is gone").toContain("the unsent edit\n");
   });
 
+  /**
+   * R32. A preservation that fails is not a preservation that was unnecessary.
+   *
+   * Every failure of the rename-aside used to be read as "there was nothing
+   * there", and the write went ahead. A rename refused for permissions or I/O
+   * leaves the original exactly where it was, so the step that exists to
+   * protect the note became the reason it was destroyed, and the call reported
+   * `landed: true` with nothing preserved: the engine then recorded the
+   * incoming version as synced over a note nobody has a copy of.
+   */
+  it("refuses to write when it could not move the original out of the way", async () => {
+    await adapter.write("note.md", "the unsent edit\n", { mtime: 1000 });
+
+    // Only the preservation move fails. Ordinary writes still work, which is
+    // what separates this from a vault that is simply broken.
+    adapter.fault = (op, _path, to) =>
+      op === "rename" && to === "note (kept).md"
+        ? new Error("EACCES: permission denied, rename")
+        : undefined;
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "the-original", idOf: async () => "something else" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    expect(adapter.text("note.md"), "the unsent edit was written over").toBe("the unsent edit\n");
+    expect(out.landed, "a write that never happened was reported as landed").toBe(false);
+    expect(out.keptAt, "nothing was moved, so nothing was kept anywhere").toBeUndefined();
+  });
+
+  /**
+   * R33. No baseline is not permission to overwrite.
+   *
+   * The engine has no baseline for a path it has not seen and none for one
+   * whose content it could not read. Both used to reach the adapter as a plain
+   * write, so a note created after the pass's last look at the path, which is
+   * the only reason this mechanism exists, was destroyed by the download that
+   * was queued while the name was free.
+   */
+  it("keeps a file that appears at a path it was told nothing about", async () => {
+    adapter.beforeRename = async () => {
+      adapter.beforeRename = undefined;
+      await adapter.write("fresh.md", "unsent local\n", { mtime: 1000 });
+    };
+
+    const out = await vault.replace(
+      "fresh.md",
+      undefined,
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "fresh (kept).md",
+    );
+
+    expect(out.keptAt, "a file created after the pass looked was overwritten").toBe(
+      "fresh (kept).md",
+    );
+    expect(adapter.text("fresh (kept).md")).toBe("unsent local\n");
+    expect(adapter.text("fresh.md")).toBe("the server's version\n");
+  });
+
+  it("writes straight into a path that really is free", async () => {
+    const out = await vault.replace(
+      "brand-new.md",
+      undefined,
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "brand-new (kept).md",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(adapter.text("brand-new.md")).toBe("the server's version\n");
+    expect(adapter.text("brand-new (kept).md")).toBeUndefined();
+  });
+
   it("says what a removal took away when it was not the expected version", async () => {
     await adapter.write("gone.md", "the edit nobody sent\n", { mtime: 1000 });
 

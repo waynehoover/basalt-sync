@@ -83,11 +83,21 @@ else
 fi
 
 # The decision is made inside the step that applies it.
-promote=$(printf '%s\n' "$promotion" | awk '/name: give the checked image its names/,/^      - name: the published/')
-if printf '%s' "$promote" | grep -q "release-tags.sh"; then
-  ok "the tags are worked out inside the promotion step"
+promote=$(printf '%s\n' "$promotion" | awk '/name: point every moving alias/,/^      - name: the published/')
+if printf '%s' "$promote" | grep -q "release-aliases.sh"; then
+  ok "the aliases are worked out inside the promotion step"
 else
   fail "the promotion step applies a decision made somewhere earlier, which can be stale"
+fi
+
+# And it reconciles all of them rather than appending this release's (R38).
+# The queue keeps one pending run, so a dropped promotion must cost nothing
+# that another release will not set right; that is only true if every
+# promotion fixes every alias.
+if printf '%s' "$promote" | grep -q "release-tags.sh"; then
+  fail "the promotion applies only this release's tags, so a dropped one strands its aliases"
+else
+  ok "the promotion reconciles every alias rather than appending its own"
 fi
 if printf '%s' "$promote" | grep -q "git fetch --tags"; then
   ok "it refreshes the tags before deciding"

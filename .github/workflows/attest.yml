@@ -39,6 +39,16 @@ on:
         description: The release tag to build, attest and publish
         required: true
 
+# One run per release, and a later one waits rather than interleaving (R39).
+#
+# Both upload steps use `--clobber`, so two runs against one tag can replace
+# each other's assets while a third step publishes: a public release whose
+# checksums describe files it does not have. The group is per tag, because two
+# different releases have nothing to do with each other.
+concurrency:
+  group: attest-${{ inputs.tag }}
+  cancel-in-progress: false
+
 permissions:
   contents: write # replaces the release assets with the attested build
   id-token: write # OIDC, which is what the attestation is signed against
@@ -63,6 +73,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci-passed.sh "${{ github.repository }}" "${{ inputs.tag }}"
+
+      # And that the release is still private, before anything touches an asset
+      # (R39).
+      #
+      # Everything below rebuilds the files and replaces them with `--clobber`.
+      # That is safe against a draft, which nobody can download, and it is not
+      # safe against anything else: a rerun against a published release swaps
+      # the bytes people are downloading right now, and a rebuild that differs
+      # or an upload that fails partway leaves a public release whose checksums
+      # describe files it does not have. The draft-only ordering was the whole
+      # of R16 and nothing established it.
+      #
+      # In this job, which both upload jobs need, so it is one question asked
+      # once and asked before the first mutation rather than beside it.
+      - name: refuse a release that is already public
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          [ "$draft" = "true" ] || {
+            echo "$TAG is already published, and this replaces a release's files before it" >&2
+            echo "publishes them. Re-attesting public bytes is not something this does: make a" >&2
+            echo "new release, or delete this one and create it again as a draft." >&2
+            exit 1
+          }
+          echo "$TAG is a draft, so nothing below is downloadable until the last step"
 
   plugin:
     name: plugin

@@ -13,7 +13,7 @@
  * holder next time round; B never looks again, because B had already succeeded.
  */
 
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -128,137 +128,92 @@ describe("two contenders for one dead lock", () => {
     expect(await holderOf(dir), "the winner's release left the lock behind").toBeUndefined();
   });
 
-  /** And an eviction marker left behind by a dead evictor does not wedge it. */
-  it("recovers from an eviction marker whose own holder is gone", async () => {
+  /**
+   * R34. Whoever took the vault while an eviction was in flight keeps it.
+   *
+   * This is the schedule no marker could stop. A decides the holder is dead
+   * and pauses inside the eviction. B finds no lock at all and publishes its
+   * own, which is a live lock belonging to a running process. A resumes
+   * holding a stale observation, and under the old code its unlink took B's
+   * lock away and A acquired: the file changed from B to A while B went on
+   * believing it owned the vault, with no error anywhere.
+   *
+   * A cannot do that now, because A is not holding an observation. It is
+   * holding the file. Whatever it removes is the file it took, and the file it
+   * took is the dead holder's.
+   */
+  it("leaves the vault with whoever took it while an eviction was in flight", async () => {
     const { dir, dead } = await vaultWithDeadLock();
-    const stale: LockHolder = {
-      pid: 2 ** 22,
-      host: hostname(),
-      command: "an evictor that died",
-      since: Date.now() - 60_000,
-      token: "markertoken000000000000000marker",
-    };
-    await writeFile(`${lockPath(dir)}.evicting.${dead.token}`, JSON.stringify(stale), {
-      mode: 0o600,
+
+    let resumeA: (() => void) | undefined;
+    const aIsInside = new Promise<void>((ready) => {
+      midEvict.pause = async () => {
+        midEvict.pause = async () => {};
+        ready();
+        await new Promise<void>((go) => {
+          resumeA = go;
+        });
+      };
     });
 
-    const release = await lockVault(dir, "after");
-    expect((await holderOf(dir))?.command).toBe("after");
+    const a = lockVault(dir, "A");
+    await aIsInside;
+    // A is holding the dead lock's bytes and has decided nothing about them.
+    // From B's point of view the vault is simply free, which is the truth.
+    const release = await lockVault(dir, "B");
+    expect((await holderOf(dir))?.command, "B did not get the vault").toBe("B");
+
+    resumeA!();
+    await expect(a, "A acquired a vault B was already holding").rejects.toThrow(
+      /another basalt|could not take the lock/,
+    );
+
+    const after = await holderOf(dir);
+    expect(after?.command, "the lock changed hands under a holder that was never told").toBe("B");
+    expect(after?.token, "the dead holder was put back over a live one").not.toBe(dead.token);
     await release();
+    expect(await holderOf(dir)).toBeUndefined();
   });
 
   /**
-   * The recovery of the recovery mechanism (R20).
-   *
-   * The eviction marker gives one process the exclusive right to remove one
-   * dead lock. The first version of it had the same shape as the bug it was
-   * closing: a marker left behind by an evictor that died had to be cleaned up
-   * by somebody, and cleaning it up was a read followed by an unlink, so two
-   * contenders could each end up believing they held the right and both go on
-   * to take the vault.
-   *
-   * The schedule the review used: a dead lock and an abandoned marker; A
-   * pauses having decided; B removes the old marker, takes its own, and pauses
-   * having read the dead lock; A resumes, deletes B's marker, evicts and
-   * acquires; B resumes its stale unlink and acquires too.
-   *
-   * No marker is removed by judgement now: the name carries a time window, so
-   * an abandoned one from an earlier window is not a name anybody is using and
-   * removing it takes nobody's exclusion away.
+   * An evictor that dies mid-eviction leaves the lock file under a name of its
+   * own, so the vault reads as free. That is the safe direction, and it is
+   * debris nobody has to make a judgement about: takeover is not wedged behind
+   * deciding whether some other process is still alive.
    */
-  it("hands the vault to one contender even when an evictor died mid-eviction", async () => {
-    const { dir, dead } = await vaultWithDeadLock();
-
-    // An abandoned marker from an earlier window, exactly as a crash leaves.
-    const earlier = Math.floor(Date.now() / 60_000) - 5;
-    const abandoned: LockHolder = {
-      pid: 2 ** 22,
-      host: hostname(),
-      command: "an evictor that died",
-      since: Date.now() - 600_000,
-      token: "markertoken000000000000000marker",
-    };
+  it("is not wedged by an eviction a crash interrupted", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "basalt-lock-"));
+    vaults.push(dir);
+    await mkdir(join(dir, STATE_DIR), { recursive: true });
+    // Exactly what a kill between the take and the put-back leaves.
     await writeFile(
-      `${lockPath(dir)}.evicting.${dead.token}.${earlier}`,
-      JSON.stringify(abandoned),
-      {
-        mode: 0o600,
-      },
-    );
-
-    // Several contenders at once, against that state.
-    const out = await Promise.allSettled(
-      Array.from({ length: 6 }, (_, i) => lockVault(dir, `c${i}`)),
-    );
-    const won = out.filter((r) => r.status === "fulfilled");
-    expect(
-      won.length,
-      `${won.length} contenders were handed the same vault past an abandoned marker`,
-    ).toBe(1);
-
-    const holder = await holderOf(dir);
-    expect(holder, "somebody holds the vault and the file names nobody").toBeDefined();
-    for (const r of out) if (r.status === "fulfilled") await r.value();
-
-    // And the debris is gone, so takeover is not wedged for the next run.
-    const left = (await readdir(join(dir, STATE_DIR))).filter((n) => n.includes(".evicting."));
-    expect(left, `eviction markers were left behind: ${JSON.stringify(left)}`).toEqual([]);
-  });
-
-  /**
-   * A marker somebody may still be holding is never removed by judgement
-   * (R20).
-   *
-   * This is the invariant that makes the eviction right worth having, and the
-   * one the first version broke. Recovering an abandoned marker meant reading
-   * who held it and then unlinking its path, which is a check followed by a
-   * destructive act on a name: two contenders could each remove what they took
-   * to be stale, each end up holding "the" right, and both go on to take the
-   * vault.
-   *
-   * So nothing decides whether a marker is alive. A marker in the current
-   * window is left alone whatever it says about itself, which costs at most
-   * one window of waiting after a crash, and one from a window that has passed
-   * is not a name anybody can be using.
-   *
-   * The cost is asserted here too, because it is the price of the safety and
-   * somebody should be able to see it: while such a marker exists, takeover
-   * does not happen and every contender is refused.
-   */
-  it("does not remove an eviction marker from the window in progress", async () => {
-    const { dir, dead } = await vaultWithDeadLock();
-    const now = Math.floor(Date.now() / 60_000);
-    const marker = `${lockPath(dir)}.evicting.${dead.token}.${now}`;
-    // A marker whose holder is plainly gone. Under the old rule that was
-    // enough to remove it; under this one it is not, because "plainly gone"
-    // is a judgement and two processes can make it at once.
-    await writeFile(
-      marker,
+      join(dir, STATE_DIR, "lock.taken.abandonedtoken0000000000000"),
       JSON.stringify({
         pid: 2 ** 22,
         host: hostname(),
-        command: "an evictor that died a moment ago",
-        since: Date.now(),
-        token: "markertoken000000000000000marker",
+        command: "an evictor that died",
+        since: Date.now() - 600_000,
+        token: "deadtoken00000000000000000000dead",
       }),
       { mode: 0o600 },
     );
 
     const out = await Promise.allSettled(
-      Array.from({ length: 4 }, (_, i) => lockVault(dir, `c${i}`)),
+      Array.from({ length: 6 }, (_, i) => lockVault(dir, `c${i}`)),
     );
     const won = out.filter((r) => r.status === "fulfilled");
+    expect(won.length, `${won.length} contenders were handed the same vault`).toBe(1);
+    expect(await holderOf(dir), "somebody holds the vault and the file names nobody").toBeDefined();
     for (const r of out) if (r.status === "fulfilled") await r.value();
+  });
 
-    expect(
-      won.length,
-      "somebody evicted past a marker that another process could still be holding",
-    ).toBe(0);
-    expect(
-      await readFile(marker, "utf8").catch(() => undefined),
-      "a marker from the window in progress was removed on somebody's judgement",
-    ).toBeDefined();
-    // And the vault is still held by the dead holder, untouched.
-    expect((await holderOf(dir))?.token).toBe(dead.token);
+  /** And a completed eviction leaves nothing behind for the next one to trip on. */
+  it("clears up after itself", async () => {
+    const { dir } = await vaultWithDeadLock();
+    const release = await lockVault(dir, "after");
+    await release();
+
+    const left = (await readdir(join(dir, STATE_DIR))).filter((n) => n.startsWith("lock"));
+    expect(left, `the eviction left debris behind: ${JSON.stringify(left)}`).toEqual([]);
   });
 });

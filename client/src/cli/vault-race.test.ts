@@ -12,7 +12,8 @@
 
 import { mkdtemp, mkdir, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
+import type { PathLike, StatOptions } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NodeVault } from "./vault.ts";
@@ -37,10 +38,13 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     rmdir: vi.fn(actual.rmdir),
     // F25 injects the EXDEV a mounted subdirectory produces.
     link: vi.fn(actual.link),
+    // And R37 makes the device numbers say so, which is what a separate mount
+    // actually is and what `replace` now asks before it moves anything.
+    lstat: vi.fn(actual.lstat),
   };
 });
 
-import { access, cp, link, open, readdir, rename, stat, utimes } from "node:fs/promises";
+import { access, cp, link, lstat, open, readdir, rename, stat, utimes } from "node:fs/promises";
 import { JsonIndexStore, TEMP_MARK, copyVerifiedThenRemove, writeDurably } from "./vault.ts";
 import { loadConfig, saveConfig } from "./config.ts";
 
@@ -49,7 +53,7 @@ beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "basalt-race-"));
 });
 afterEach(async () => {
-  for (const fn of [stat, open, rename, access, readdir, cp]) {
+  for (const fn of [stat, open, rename, access, readdir, cp, link, lstat]) {
     const m = vi.mocked(fn as unknown as (...a: unknown[]) => unknown);
     m.mockRestore?.();
   }
@@ -493,6 +497,132 @@ describe("creating a file across a mount boundary", () => {
     const again = await vault.create("restored.md", enc.encode("a second copy"), times);
     expect(again, "the fallback replaced a file that was already there").toBe(false);
     expect(await readFile(join(root, "restored.md"), "utf8")).toBe("brought back");
+  });
+});
+
+/**
+ * R37. Replacing an existing note under a mounted subdirectory.
+ *
+ * The preserving write stages the incoming version under the vault's own
+ * `.basalt/tmp` and hard-links it into the note's directory, and a link cannot
+ * cross a filesystem. On a vault assembled out of several mounts that link
+ * failed *after* the original had been moved aside: the note's own name was
+ * empty, its bytes were at a conflict path, and the incoming version had
+ * nowhere to go. Every byte survived and the vault was still wrong.
+ *
+ * Which filesystem the staging is on is now asked before anything moves.
+ */
+describe("replacing a note across a mount boundary", () => {
+  /** Makes everything under `.basalt/tmp` report a device of its own. */
+  function stagingOnAnotherMount(): void {
+    const staging = `${sep}.basalt${sep}tmp`;
+    const realStat = vi.mocked(lstat).getMockImplementation()!;
+    vi.mocked(lstat).mockImplementation((async (path: PathLike, opts?: StatOptions) => {
+      const info = (await realStat(path, opts)) as unknown as { dev: number };
+      return String(path).includes(staging) ? { ...info, dev: info.dev + 1 } : info;
+    }) as typeof lstat);
+    // And a link out of it fails the way the kernel would, so a fix that only
+    // reordered the stats and still linked from staging is caught here.
+    const realLink = vi.mocked(link).getMockImplementation()!;
+    vi.mocked(link).mockImplementation(async (from: PathLike, to: PathLike) => {
+      if (String(from).includes(staging)) throw errno("EXDEV");
+      return realLink(from, to);
+    });
+  }
+
+  it("lands the incoming version and keeps the one it displaced", async () => {
+    const vault = new NodeVault(root);
+    await writeFile(join(root, "note.md"), "the unsent edit\n");
+    stagingOnAnotherMount();
+
+    const out = await vault.replace(
+      "note.md",
+      { contentId: "a digest of something else", idOf: async () => "not that" },
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+
+    expect(out.landed, "the replacement never reached the note's own name").toBe(true);
+    expect(await readFile(join(root, "note.md"), "utf8")).toBe("the server's version\n");
+    expect(out.keptAt).toBe("note (kept).md");
+    expect(await readFile(join(root, "note (kept).md"), "utf8")).toBe("the unsent edit\n");
+  });
+
+  it("creates a note it has never seen there too", async () => {
+    const vault = new NodeVault(root);
+    stagingOnAnotherMount();
+
+    const out = await vault.replace(
+      "fresh.md",
+      undefined,
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "fresh (kept).md",
+    );
+
+    expect(out).toEqual({ landed: true });
+    expect(await readFile(join(root, "fresh.md"), "utf8")).toBe("the server's version\n");
+  });
+
+  /**
+   * And when publication fails for a reason of its own, the note goes back
+   * under its own name. A failure should leave the vault as it was, not a note
+   * renamed to a conflict copy for a reason that has nothing to do with a
+   * conflict.
+   */
+  it("puts the original back when the write cannot be published at all", async () => {
+    const vault = new NodeVault(root);
+    await writeFile(join(root, "note.md"), "the unsent edit\n");
+    // Publication fails; putting the original back does not. Only the link
+    // out of a temporary is refused, which is the failure being modelled.
+    const realLink = vi.mocked(link).getMockImplementation()!;
+    vi.mocked(link).mockImplementation(async (from: PathLike, to: PathLike) => {
+      if (String(from).includes(TEMP_MARK) || String(from).includes("replace.")) {
+        throw errno("EIO");
+      }
+      return realLink(from, to);
+    });
+
+    await expect(
+      vault.replace(
+        "note.md",
+        { contentId: "a digest of something else", idOf: async () => "not that" },
+        enc.encode("the server's version\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      ),
+    ).rejects.toThrow();
+
+    expect(
+      await readFile(join(root, "note.md"), "utf8"),
+      "a failed write left the note under a conflict name",
+    ).toBe("the unsent edit\n");
+    expect((await readdir(root)).filter((n) => !n.startsWith("."))).toEqual(["note.md"]);
+  });
+
+  /**
+   * And when it cannot even be put back, the error says where it is. Bytes
+   * that survive somewhere nobody is told about are bytes nobody finds.
+   */
+  it("names the path it left the original at when it cannot put it back", async () => {
+    const vault = new NodeVault(root);
+    await writeFile(join(root, "note.md"), "the unsent edit\n");
+    vi.mocked(link).mockImplementation(async () => {
+      throw errno("EIO");
+    });
+
+    await expect(
+      vault.replace(
+        "note.md",
+        { contentId: "a digest of something else", idOf: async () => "not that" },
+        enc.encode("the server's version\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      ),
+    ).rejects.toThrow(/note \(kept\)\.md/);
+
+    expect(await readFile(join(root, "note (kept).md"), "utf8")).toBe("the unsent edit\n");
   });
 });
 

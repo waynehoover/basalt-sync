@@ -30,15 +30,15 @@ echo "starting the attestation:"
 
 # Settings only. Every one of these is quoted in the paragraph above it, so a
 # plain grep would find the explanation with the setting itself deleted.
-settings() { grep -v '^ *#' "$workflow"; }
+settings() { grep -v '^ *#' "$@"; }
 
-if settings | grep -q "workflow_dispatch:"; then
+if settings "$workflow" | grep -q "workflow_dispatch:"; then
   ok "it can be started by hand"
 else
   fail "there is no workflow_dispatch, so a draft release starts nothing"
 fi
 
-if settings | grep -qE "^ *release:"; then
+if settings "$workflow" | grep -qE "^ *release:"; then
   fail "it listens for a release event, which a draft does not fire"
 else
   ok "it does not wait for an event a draft will never send"
@@ -47,7 +47,7 @@ fi
 # And nothing still reads the tag off an event that no longer arrives: those
 # expressions evaluate to empty, which checks out the default branch and
 # attests the wrong bytes rather than failing.
-if settings | grep -q "github.event.release"; then
+if settings "$workflow" | grep -q "github.event.release"; then
   fail "something still reads github.event.release, which is empty under a dispatch"
 else
   ok "the tag comes from the dispatch input everywhere"
@@ -57,6 +57,34 @@ if grep -q "gh workflow run attest.yml" "$release"; then
   ok "release.sh prints the command that starts it"
 else
   fail "release.sh tells nobody to start the workflow, so the draft just sits there"
+fi
+
+# ---- and that its target is still private (R39) ----------------------------
+#
+# Both upload steps replace assets with `--clobber`, which is safe against a
+# draft and against nothing else: a rerun against a published release swaps the
+# bytes people are downloading, and a rebuild that differs or an upload that
+# fails partway leaves a public release whose checksums describe files it does
+# not have. Being draft-only was the whole of the ordering and nothing asked.
+#
+# The gate belongs in `checked`, which both upload jobs need, so it is asked
+# once and asked before the first mutation. Asserted by job, because a check
+# placed beside the upload instead would read the same to a grep of the file.
+checked=$(
+  awk '/^  checked:/ { inside = 1; next } inside && /^  [^ #]/ { inside = 0 } inside' "$workflow"
+)
+if printf '%s\n' "$checked" | settings | grep -q "isDraft"; then
+  ok "it establishes the release is a draft before anything is uploaded"
+else
+  fail "nothing checks the draft state, so a rerun replaces a public release's files"
+fi
+
+# And two runs against one release do not interleave: one replacing assets
+# while the other publishes is the same exposure by another route.
+if settings "$workflow" | grep -q "group: attest-"; then
+  ok "one run per release at a time"
+else
+  fail "two runs on one tag can clobber each other's assets while a third step publishes"
 fi
 
 if [ "$fails" != 0 ]; then

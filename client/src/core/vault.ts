@@ -108,6 +108,14 @@ export type ContentDigest = (path: string) => Promise<string | undefined>;
  * returns, and says where: it is on the disk, it is a note like any other, and
  * nothing has to remember to save it.
  *
+ * An `expect` of `undefined` does not mean "write over whatever is there"
+ * (R33). It means the caller could not say what it decided about: either the
+ * path was new when the pass looked, or its baseline could not be read. Both
+ * are reasons to keep what is found rather than reasons to destroy it, so an
+ * adapter given no baseline preserves anything at all that it displaces. The
+ * ordinary first download costs nothing for that, because there is nothing
+ * there to displace.
+ *
  * `landed` says whether the new content reached the path it was meant for.
  * False means something else took the name in the instant it was free, and
  * that file is newer than this write's decision, so it was left alone; the
@@ -505,12 +513,17 @@ export class MemoryVault implements Vault {
 
   /**
    * Writes over a file, keeping what was there when it is not what the caller
-   * expected (R01).
+   * expected (R01, R33).
    *
    * The in-memory equivalent of the real adapter's rename-aside: read what is
    * there, write, and hand back what was displaced if it was a surprise. It
    * reads *after* the hook above, so a write landing in the gap is the version
    * this preserves rather than the one it was told to expect.
+   *
+   * No baseline is a surprise too. It used to be a plain overwrite, on the
+   * reasoning that a path the pass had not seen has nothing worth keeping; a
+   * file created in the same gap was then destroyed by the download that was
+   * queued while the name was free.
    */
   async replace(
     path: string,
@@ -523,7 +536,7 @@ export class MemoryVault implements Vault {
     const was = this.files.get(path);
     // Read after the hook, so a write landing in the gap is the version this
     // preserves rather than the one it was told to expect.
-    if (expect === undefined || was === undefined) {
+    if (was === undefined) {
       await this.write(path, bytes, times);
       return { landed: true };
     }
@@ -535,8 +548,9 @@ export class MemoryVault implements Vault {
     this.nameTakenOnce = undefined;
     await this.write(path, taken ?? bytes, times);
     const landed = taken === undefined;
-    const id = await expect.idOf(was.bytes);
-    if (id === expect.contentId && landed) {
+    // With no baseline there is nothing it can match, so it is kept (R33).
+    const id = expect === undefined ? undefined : await expect.idOf(was.bytes);
+    if (expect !== undefined && id === expect.contentId && landed) {
       // A duplicate of what the server already has.
       this.files.delete(keepAt);
       this.notify(keepAt);

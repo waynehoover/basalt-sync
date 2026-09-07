@@ -169,6 +169,15 @@ export const midRespell = {
    * to return it to.
    */
   beforeGivingBack: async (_path: string): Promise<void> => {},
+  /**
+   * The instant the old name's file is in staging and nothing has been decided
+   * about it (R35).
+   *
+   * The crash point. Whatever is parked here may be the only copy of an unsent
+   * edit, and it is at a name in the directory the scan sweeps, so what the
+   * sweep believes about that name is the whole question.
+   */
+  parked: async (_path: string): Promise<void> => {},
 };
 
 /**
@@ -234,10 +243,14 @@ export async function retireName(
   // spellings on the disk with nothing said, which is the divergence the
   // re-spelling exists to end.
   await mkdir(staging, { recursive: true });
-  const spare = join(staging, `respell.${randomBytes(8).toString("hex")}`);
+  // `preserved.`, not `respell.`, and the difference is the whole of R35: this
+  // name holds a note that has been taken off the disk and not yet put
+  // anywhere, so it must be one the sweep never claims.
+  const spare = join(staging, `preserved.${randomBytes(8).toString("hex")}`);
   const there = await lstat(from).catch(() => undefined);
   if (there === undefined) return; // already gone: two passes racing
   await rename(from, spare);
+  await midRespell.parked(spare);
 
   const moved = await lstat(spare).catch(() => undefined);
   if (moved !== undefined && moved.dev === source.dev && moved.ino === source.ino) {
@@ -270,15 +283,13 @@ export async function retireName(
     // which is a separate mount on any vault assembled out of several. The
     // copy is verified and refuses an occupied name, so it keeps both halves
     // of what `link` was chosen for.
-    await copyVerifiedThenRemove(spare, kept).catch(async (err: unknown) => {
-      // Out of options that do not risk the file, so the file wins. It is
-      // renamed to something the reaper will not take, because `respell.` is
-      // a name this code gives its own debris and the sweep believes it.
-      const held = join(staging, `preserved.${randomBytes(8).toString("hex")}`);
-      await rename(spare, held).catch(() => undefined);
+    await copyVerifiedThenRemove(spare, kept).catch((err: unknown) => {
+      // Out of options that do not risk the file, so the file wins: it stays
+      // in staging under the name it was parked at, which the sweep does not
+      // claim, and the message says where.
       throw new Error(
         `two versions of ${from} were saved at once and the one this scan moved could not be ` +
-          `put beside the other (${(err as Error).message}); it is at ${held}`,
+          `put beside the other (${(err as Error).message}); it is at ${spare}`,
       );
     });
   }
@@ -1265,22 +1276,39 @@ export class NodeVault implements Vault {
     await this.matchCase(full);
     await this.checkStaging();
 
-    if (expect === undefined) {
-      // Nothing was expected at the path, so there is nothing to preserve and
-      // this is an ordinary write. `create` is the exclusive variant when a
-      // caller must not land on an occupied name.
-      await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
-      this.dirty(full, had);
-      return { landed: true };
-    }
-
+    // No early exit for a caller with no baseline (R33).
+    //
+    // It used to be an ordinary overwrite, on the reasoning that a path the
+    // pass had not seen holds nothing worth keeping. The pass saw the path at
+    // the start and writes at the end, and a note created in between is
+    // exactly what that reasoning destroys. Undefined means "I cannot say what
+    // I decided about", which is a reason to keep what is found and not a
+    // licence to write over it. Where the path really is free this costs one
+    // failed rename.
     const kept = await this.absolute(keepAt);
     await this.insideForReal(kept);
-    const staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
+    let staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
     try {
       // Durable before anything is moved: a crash after the rename below must
       // not leave the path empty and the new content only in memory.
       await writeDurably(staged, bytes, true, { mtime: times.mtime, stageIn: this.staging });
+
+      // On the destination's filesystem, decided before the original moves
+      // (R37).
+      //
+      // `link` cannot cross a filesystem, and `.basalt/tmp` is a separate
+      // mount on any vault assembled out of several. The old order staged
+      // there, moved the note aside, and only then found out: the note's own
+      // name was empty, the bytes were at a conflict path, and the incoming
+      // version had nowhere to go. Asking two stats first turns that into a
+      // second staging copy beside the destination, where a link always
+      // reaches.
+      if (!(await sameFilesystem(staged, dirname(full)))) {
+        const near = `${full}.${TEMP_MARK}${randomBytes(4).toString("hex")}`;
+        await writeDurably(near, bytes, true, { mtime: times.mtime });
+        await rm(staged, { force: true });
+        staged = near;
+      }
 
       // The displaced version goes to a real path in the vault, not to staging
       // (R18, R21). Staging is swept by the scan's reaper, which cannot tell a
@@ -1295,8 +1323,9 @@ export class NodeVault implements Vault {
         await rename(full, kept);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-        // Nothing there. The caller expected content and found none, which is
-        // itself a change, and there is nothing to preserve.
+        // Nothing there, which is the ordinary first download and also a
+        // caller who expected content and found none. Either way there is
+        // nothing to preserve.
         moved = false;
       }
 
@@ -1304,21 +1333,38 @@ export class NodeVault implements Vault {
       try {
         await link(staged, full);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        // Somebody created a file in the instant the name was free. Theirs
-        // stays: it is the newest thing anybody wrote, and this write is
-        // acting on a decision older than it. The caller is told the incoming
-        // version has nowhere to go.
-        landed = false;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") {
+          // Somebody created a file in the instant the name was free. Theirs
+          // stays: it is the newest thing anybody wrote, and this write is
+          // acting on a decision older than it. The caller is told the
+          // incoming version has nowhere to go.
+          landed = false;
+        } else {
+          // Publication failed for a reason of its own, and the note's name is
+          // empty because this emptied it. Put it back before the error
+          // travels (R37): a caller that sees a failure should find the vault
+          // as it was, not a note renamed to a conflict copy for a reason that
+          // has nothing to do with a conflict.
+          if (moved && !(await this.putBack(kept, full))) {
+            throw new Error(
+              `${path} could not be written (${(err as Error).message}) and its previous ` +
+                `version could not be put back; it is at ${keepAt}`,
+            );
+          }
+          throw err;
+        }
       }
       this.dirty(full, had);
       this.unflushed.add(dirname(full));
 
       if (!moved) return { landed };
-      if (landed) {
+      if (landed && expect !== undefined) {
         // Was what was displaced the version this write was decided about? If
         // so the copy is a duplicate of something the server already has, and
-        // removing it is the one deletion here that destroys nothing.
+        // removing it is the one deletion here that destroys nothing. With no
+        // baseline there is nothing to compare it against, so it is kept
+        // (R33): unknown is not the same as agreed.
         const digest = await this.contentDigest(keepAt);
         if (digest !== undefined && digest === expect.contentId) {
           await rm(kept, { force: true });
@@ -1339,6 +1385,24 @@ export class NodeVault implements Vault {
       // take the original with it (R18).
       await rm(staged, { force: true });
     }
+  }
+
+  /**
+   * Puts a preserved version back under its own name, if the name is free.
+   *
+   * `link` rather than `rename`, so a file that arrived at the name while this
+   * was deciding is not written over: the note stays where it was preserved
+   * and the caller says so.
+   */
+  private async putBack(from: string, to: string): Promise<boolean> {
+    try {
+      await link(from, to);
+    } catch {
+      return false;
+    }
+    await rm(from, { force: true });
+    this.unflushed.add(dirname(to));
+    return true;
   }
 
   /**
@@ -1904,15 +1968,30 @@ export const TEMP_MARK = ".basalt-tmp-";
  * one of these prefixes; anything else in the directory is somebody's, or
  * something this project has not thought about, and either way it stays.
  */
-const DISPOSABLE_PREFIXES = ["replace.", "respell.", "keep."];
+const DISPOSABLE_PREFIXES = ["replace."];
 
 /**
- * `keep.` is here for what an older version of this code left behind: it
- * staged displaced note versions under that prefix, and those are duplicates
- * of what the server holds. Nothing writes one now. `preserved.` is
- * deliberately absent, and is what a version that could not be put beside its
- * note is renamed to, so that the one case this file cannot resolve is the one
- * case the sweep will not touch.
+ * One prefix, and it names the only thing in here that is provably a copy
+ * (R35).
+ *
+ * `replace.` is an incoming version staged on its way to a note: it came from
+ * the server, the server still has it, and losing it costs a re-download.
+ *
+ * `respell.` and `keep.` used to be on this list and had no business being
+ * there. Both are names this code gives to *displaced originals* while it
+ * works out what they are: `retireName` renames a note into `respell.<token>`
+ * before it can know whose inode it is, and the older replacement staged
+ * unsent edits into `keep.<token>` before comparing them. Either can be the
+ * only copy of something somebody typed, and an interruption anywhere in the
+ * middle leaves one behind. Because a rename carries the file's own timestamp,
+ * it was over the hour-old cutoff the instant it arrived, and the next
+ * ordinary scan deleted it as write debris.
+ *
+ * They stay off the list for good, so leftovers from an older version of this
+ * client survive an upgrade rather than being swept on first run. What is
+ * written now goes under `preserved.`, which is also absent and always will
+ * be: a name for the case this file could not resolve is exactly the case the
+ * sweep must not touch.
  */
 
 function disposableTemp(name: string): boolean {
@@ -1985,6 +2064,37 @@ async function openTemp(
  * flushes themselves: whether an fsync really reached the platter is not
  * something a process can observe, on any operating system.
  */
+/**
+ * A temporary name beside a file that nothing is using.
+ *
+ * Random rather than counted, and checked before it is used, because the
+ * caller is about to `rename` onto it and `rename` replaces whatever is there
+ * (R36). A fixed name is fine exactly once, and these operations are retried.
+ */
+async function freeTempName(full: string): Promise<string> {
+  for (let n = 0; n < 64; n++) {
+    const at = `${full}.${TEMP_MARK}${randomBytes(4).toString("hex")}`;
+    if (!(await lstat(at).catch(() => undefined))) return at;
+  }
+  throw new Error(`no free temporary name beside ${full}`);
+}
+
+/**
+ * Whether two paths are on one filesystem, which is what `link` requires.
+ *
+ * Asked rather than discovered: finding out from an `EXDEV` means finding out
+ * after the destructive step, with the note's own name already empty (R37).
+ * An unanswerable stat reads as "not the same", which costs one extra staging
+ * copy and never costs a wrong link.
+ */
+async function sameFilesystem(a: string, b: string): Promise<boolean> {
+  const [one, two] = await Promise.all([
+    lstat(a).catch(() => undefined),
+    lstat(b).catch(() => undefined),
+  ]);
+  return one !== undefined && two !== undefined && one.dev === two.dev;
+}
+
 export async function writeDurably(
   full: string,
   bytes: Uint8Array,
@@ -2183,7 +2293,15 @@ async function removeMatching(source: string, target: string): Promise<string[]>
     // name only this walk knows. Then it can be hashed at leisure: if it
     // matches the copy already in the trash it is a duplicate and goes, and if
     // it does not it is put back where it came from.
-    const aside = `${from}.${TEMP_MARK}moving`;
+    // A name of its own for every attempt (R36).
+    //
+    // It used to be the one fixed `<source>..basalt-tmp-moving`. When the walk
+    // cannot put a displaced version back it leaves it at that name and
+    // reports the move as incomplete, and the retry a person then runs renamed
+    // the next file straight onto it: `rename` replaces, so attempt two
+    // destroyed what attempt one had gone to the trouble of keeping, and the
+    // cleanup afterwards took what was left.
+    const aside = await freeTempName(from);
     try {
       await rename(from, aside);
     } catch (err) {

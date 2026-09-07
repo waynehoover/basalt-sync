@@ -15,12 +15,22 @@
  * not something anybody has to remember to save.
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { NodeVault, STALE_TEMP_MS, TEMP_MARK, midTrash } from "./vault.ts";
+import { NodeVault, STALE_TEMP_MS, TEMP_MARK, midRespell, midTrash, retireName } from "./vault.ts";
 import { plainDigest } from "../core/crypto.ts";
 
 const dirs: string[] = [];
@@ -122,6 +132,50 @@ describe("a write that displaces something unexpected", () => {
  * conflict copy. Nothing was in conflict, and `doomed.md` is what somebody
  * looks for.
  */
+/**
+ * R33. No baseline is not permission to overwrite.
+ *
+ * The engine has no baseline for a path it has not seen and none for one whose
+ * content it could not read, and both used to reach this adapter as an
+ * ordinary write. The pass looked at the path at the start and writes at the
+ * end; a note created in between is exactly what that destroyed, and it is the
+ * one copy nobody else has.
+ */
+describe("a write with no baseline at all", () => {
+  it("keeps a file that appeared at the path anyway", async () => {
+    const { dir, v } = await vault();
+    await writeFile(join(dir, "fresh.md"), "unsent local\n");
+
+    const out = await v.replace(
+      "fresh.md",
+      undefined,
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "fresh (kept).md",
+    );
+
+    expect(out.keptAt, "a file the pass had not seen was written over").toBe("fresh (kept).md");
+    expect(await readFile(join(dir, "fresh (kept).md"), "utf8")).toBe("unsent local\n");
+    expect(await readFile(join(dir, "fresh.md"), "utf8")).toBe("the server's version\n");
+  });
+
+  it("writes straight into a path that really is free", async () => {
+    const { dir, v } = await vault();
+    const out = await v.replace(
+      "brand-new.md",
+      undefined,
+      enc.encode("the server's version\n"),
+      { mtime: 2000, ctime: 1000 },
+      "brand-new (kept).md",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(await readFile(join(dir, "brand-new.md"), "utf8")).toBe("the server's version\n");
+    // And nothing beside it: no conflict copy, no staging left over.
+    expect((await readdir(dir)).filter((n) => !n.startsWith("."))).toEqual(["brand-new.md"]);
+    expect(await readdir(join(dir, ".basalt", "tmp")).catch(() => [])).toEqual([]);
+  });
+});
+
 describe("a deletion the pass decided about", () => {
   it("reaches the trash under the name the note had", async () => {
     const { dir, v } = await vault();
@@ -185,6 +239,86 @@ describe("a deletion the pass decided about", () => {
     );
     expect(await readdir(join(dir, ".trash")).catch(() => [])).toEqual([]);
     expect(await readdir(dir)).toEqual(["doomed (kept).md"]);
+  });
+});
+
+/**
+ * R35. A displaced original in staging is recovery data from the moment it
+ * moves, not from the moment somebody finishes deciding about it.
+ *
+ * `retireName` renames a note into staging before it can know whose inode it
+ * is. An interruption there, which is a crash or a kill or a laptop lid, left
+ * that name behind, and the name was on the reaper's allowlist. Because a
+ * rename carries the file's own timestamp, an edit written an hour ago was
+ * over the cutoff the instant it was parked: the next ordinary scan deleted
+ * the only copy of it as write debris.
+ */
+describe("a preservation interrupted halfway", () => {
+  it("leaves the note where the next scan will not sweep it", async () => {
+    const { dir, v } = await vault();
+    const from = join(dir, "old-name.md");
+    const to = join(dir, "new-name.md");
+    await writeFile(from, "the unsent edit\n");
+    // Written an hour ago, which is ordinary and is also what makes the age
+    // rule fatal: the rename carries this forward into staging.
+    const long = (Date.now() - STALE_TEMP_MS - 60_000) / 1000;
+    await utimes(from, long, long);
+    const source = await lstat(from);
+    await link(from, to);
+
+    // Stopped immediately after the move, before anything has been decided.
+    midRespell.parked = async () => {
+      midRespell.parked = async () => {};
+      throw new Error("the process went away here");
+    };
+    try {
+      await expect(
+        retireName(join(dir, ".basalt", "tmp"), from, { dev: source.dev, ino: source.ino }),
+      ).rejects.toThrow(/went away/);
+    } finally {
+      midRespell.parked = async () => {};
+    }
+
+    const staging = join(dir, ".basalt", "tmp");
+    const parked = (await readdir(staging)).filter((n) => !n.startsWith("."));
+    expect(parked, "the note was not parked anywhere").toHaveLength(1);
+
+    // The next ordinary scan, which is where it used to go.
+    await v.list();
+
+    expect(
+      await readFile(join(staging, parked[0]!), "utf8"),
+      "an ordinary scan swept away the only copy of an unsent edit",
+    ).toBe("the unsent edit\n");
+  });
+
+  /**
+   * And the same for what an older version of this client left behind. Those
+   * files are on disk right now on any vault that ran it, and an upgrade that
+   * sweeps them on first run is the same loss with a version number on it.
+   */
+  it("leaves an older version's leftovers alone", async () => {
+    const { dir, v } = await vault();
+    const staging = join(dir, ".basalt", "tmp");
+    await mkdir(staging, { recursive: true });
+    const leftovers = {
+      "respell.9f2cab01": "an unsent edit an older client parked\n",
+      "keep.4d1e7a30": "another one, from the older replacement\n",
+    };
+    const long = (Date.now() - STALE_TEMP_MS - 60_000) / 1000;
+    for (const [name, text] of Object.entries(leftovers)) {
+      await writeFile(join(staging, name), text);
+      await utimes(join(staging, name), long, long);
+    }
+
+    await v.list();
+
+    for (const [name, text] of Object.entries(leftovers)) {
+      expect(
+        await readFile(join(staging, name), "utf8").catch(() => undefined),
+        `upgrading swept away ${name}, which an older client used for displaced originals`,
+      ).toBe(text);
+    }
   });
 });
 

@@ -185,22 +185,26 @@ jobs:
           }
           echo "$IMAGE:$VERSION -> $got"
 
-      - name: pass the digest to the promotion
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "$DIGEST" > digest.txt
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
-        with:
-          name: image-digest
-          path: digest.txt
 
-  # The moving aliases, one release at a time (R17, R30).
+  # The moving aliases, one release at a time (R17, R30, R38).
   #
-  # `latest` and the minor alias are the only things whose value depends on
+  # `latest` and the minor aliases are the only things whose value depends on
   # what else has been released, so they are the only things that need an
   # order. Keeping this job small is what makes the queue's one-pending limit
-  # harmless: a promotion that is dropped costs an alias that the next release
-  # will set correctly anyway, and never an immutable tag.
+  # survivable: a promotion that is dropped costs no immutable tag.
+  #
+  # It costs nothing else either, and that took a second go. This job used to
+  # apply the aliases *this* release had earned, and the note beside it said a
+  # dropped promotion would be repaired by the next one. True while releases
+  # march up one line, false the first time they do not: A promoting, B
+  # (0.5.0) queued, C (0.3.9) arriving discards B, and C is a backport that
+  # moves neither `0.5` nor `latest`. B's image is published under its own
+  # version tag for ever and nothing points at it (R38).
+  #
+  # So this reconciles rather than appends. It works out what every alias
+  # should be from the releases that exist and fixes the ones that are wrong,
+  # which makes a dropped promotion cost nothing at all: the next one, from any
+  # line, in any order, repairs it.
   promote:
     name: moving tags
     needs: image
@@ -223,50 +227,70 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: image-digest
 
-      - name: give the checked image its names
+      - name: point every moving alias at the release it belongs to
         env:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           IMAGE="ghcr.io/${REPO,,}"
-          REF="$IMAGE@$(cat digest.txt)"
-          # Worked out again, here, rather than reusing the decision from
-          # before the build (R17).
+
+          # Worked out here rather than carried from before the build (R17).
           #
-          # The concurrency group above means no other release is promoting
-          # right now, and the tags that were pushed while this one was
-          # building are visible to git by the time it gets here. Deciding
-          # once at the start and applying that answer at the end is how a
-          # release that started first moved `latest` back onto an older
-          # server: the answer was true when it was worked out and stale when
-          # it was used.
+          # The concurrency group means no other release is promoting right
+          # now, and the tags pushed while this one was building are visible to
+          # git by the time it gets here. Deciding once at the start and
+          # applying that answer at the end is how a release that started first
+          # moved `latest` back onto an older server: the answer was true when
+          # it was worked out and stale when it was used.
           git fetch --tags --force --quiet
-          mapfile -t names < <(./scripts/release-tags.sh "$GITHUB_REF_NAME")
-          [ ${#names[@]} -gt 0 ] || { echo "no tags to apply" >&2; exit 1; }
-          args=()
-          for name in "${names[@]}"; do
-            echo "  $IMAGE:$name"
-            args+=(--tag "$IMAGE:$name")
-          done
-          docker buildx imagetools create "${args[@]}" "$REF"
-          # Recorded for the check below, which must look at what was applied
-          # and not at what was planned.
-          printf '%s\n' "${names[@]}" | sed "s|^|$IMAGE:|" > /tmp/applied-tags
+
+          # Every alias, not only this release's (R38).
+          applied=0
+          checked=0
+          while read -r alias version; do
+            [ -n "$alias" ] || continue
+            # Only ever at an image that exists and can be resolved. An alias
+            # is a promise that `docker pull` works, and a release whose build
+            # has not finished is not one this may point at yet; its own
+            # promotion will come round.
+            want=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
+              "$IMAGE:$version" 2>/dev/null) || {
+              echo "  $alias -> $version: not published yet, left alone"
+              continue
+            }
+            checked=$((checked + 1))
+            now=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' \
+              "$IMAGE:$alias" 2>/dev/null) || now=""
+            if [ "$now" = "$want" ]; then
+              echo "  $alias -> $version ($want) already"
+              continue
+            fi
+            docker buildx imagetools create --tag "$IMAGE:$alias" "$IMAGE@$want"
+            applied=$((applied + 1))
+            echo "  $alias -> $version ($want)"
+            printf '%s\n' "$IMAGE:$alias $want" >> /tmp/applied-tags
+          done < <(./scripts/release-aliases.sh)
+
+          # Rule 5, in its smallest form. Every release moves at least its own
+          # minor alias, so a reconciliation that resolved nothing at all has
+          # not decided that everything was already right; it has failed to see
+          # the images.
+          [ "$checked" -gt 0 ] || {
+            echo "no alias resolved to a published image, which cannot be right" >&2
+            exit 1
+          }
+          echo "$applied alias(es) moved, $checked checked"
 
       # What a person will actually type. Pulled by name, so this also proves
       # the names were applied and resolve to the manifest that was checked.
-      - name: the published tags resolve to what was checked
+      - name: the published aliases resolve to what they were set to
         run: |
           set -euo pipefail
-          DIGEST=$(cat digest.txt)
-          REFS=$(cat /tmp/applied-tags)
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$t")
-            [ "$got" = "$DIGEST" ] || { echo "$t is $got, not $DIGEST" >&2; exit 1; }
-            echo "  $t -> $got"
-          done <<< "$REFS"
+          [ -s /tmp/applied-tags ] || { echo "nothing was moved"; exit 0; }
+          while read -r ref want; do
+            [ -n "$ref" ] || continue
+            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+            [ "$got" = "$want" ] || { echo "$ref is $got, not $want" >&2; exit 1; }
+            echo "  $ref -> $got"
+          done < /tmp/applied-tags

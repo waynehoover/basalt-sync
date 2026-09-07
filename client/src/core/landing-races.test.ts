@@ -670,6 +670,48 @@ describe("an edit a stat cannot tell apart", () => {
     expect(texts).toContain("the original line\n");
   });
 
+  /**
+   * R33. A path the pass has never seen still has to be looked at when the
+   * write lands.
+   *
+   * There is no baseline for a first download, and no baseline for a file
+   * whose content could not be read. Both reached the adapters as "write over
+   * whatever is there", which is the one thing this whole mechanism exists to
+   * stop: the pass looked at the start, the fetch took seconds, and the note
+   * created in between was the only copy anybody had.
+   */
+  it("keeps a note created at a path the pass had never seen", async () => {
+    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+
+    // Created inside the adapter, which is the only place left after the
+    // engine's last look at the path. Putting it in the fetch instead proves
+    // nothing: the metadata check that follows the fetch sees the new file and
+    // stops the write on its own, so the test would pass with the adapter
+    // writing over it. This hook runs after that check.
+    servingWith(socket, bodies);
+    vault.midReplace = async (path) => {
+      vault.midReplace = undefined;
+      if (path !== "fresh.md") return;
+      await vault.write("fresh.md", enc.encode("unsent local\n"), { mtime: 5000, ctime: 5000 });
+    };
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "fresh.md", "the server's version\n", bodies)],
+    });
+    await accepted(engine, 1);
+    await engine.sync({ coalesceWrites: false });
+
+    const texts = vault.paths().map((p) => vault.text(p));
+    expect(
+      texts,
+      `the note created under the write is gone. The vault holds: ${JSON.stringify(vault.paths())}`,
+    ).toContain("unsent local\n");
+    expect(texts).toContain("the server's version\n");
+  });
+
   it("survives a deletion that lands on it, same length and same timestamp", async () => {
     const { engine, socket, vault, keys } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();
