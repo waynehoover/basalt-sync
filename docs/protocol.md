@@ -396,25 +396,25 @@ ID. Unsolicited errors describe why a connection is closing. `retryable` says
 whether reconnecting later may help; clients retain defaults for malformed
 frames missing that field.
 
-| Code | Meaning | Retry / session behavior |
-|---|---|---|
-| `proto` | Unsupported wire/crypto version or incompatible vault format. | No; ends at hello. |
-| `auth` | Invalid credentials or an operation not allowed to this session. | No; ends at hello, otherwise rejects the operation. |
-| `cursor` | Client is ahead of server history. | No; ends. |
-| `rotated` | Registrar credential was retired. | No; ends. |
-| `busy` | Connection capacity or shutdown. | Yes; ends with a delay hint. |
-| `protostate` | Unexpected message/state or invalid framing. | No; generally ends. Unknown ops and invalid history pagination reject that request. |
-| `badchunk` | Invalid name or body hash. | No; ends for bad bodies mid-upload, otherwise rejects the request. |
-| `badentry` | Invalid entry or request incompatible with current state. | No; rejects the request, or ends for malformed claims at hello. |
-| `badname` | Invalid name or device ID. | No; ends at hello, otherwise rejects the request. |
-| `toolarge` | A limit or declared size was exceeded. | No; ends if upload framing cannot continue, otherwise rejects the request. |
-| `nospace` | Storage capacity exhausted. | Yes; ends during upload. |
-| `nouid` | Version does not exist. | No; request rejected. |
-| `nocontent` | Requested version is a folder or deletion. | No; request rejected. |
-| `nochunk` | Content unavailable. | No; request rejected without partial fetch bodies. |
-| `nodevice` | Device ID no longer exists. | No; request rejected. |
-| `full` | Registration limit reached. | No; remove a device before retrying. |
-| `internal` | Server fault; put not committed. | Yes; ends during handshake/catch-up, otherwise rejects the request. |
+| code | meaning | retryable | session |
+|---|---|---|---|
+| `proto` | Unsupported wire/crypto version or incompatible vault format. | no | ends at hello. |
+| `auth` | Invalid credentials or an operation not allowed to this session. | no | ends at hello, otherwise rejects the operation. |
+| `cursor` | Client is ahead of server history. | no | ends. |
+| `rotated` | Registrar credential was retired. | no | ends. |
+| `busy` | Connection capacity or shutdown. | yes | ends with a delay hint. |
+| `protostate` | Unexpected message/state or invalid framing. | no | generally ends. Unknown ops and invalid history pagination reject that request. |
+| `badchunk` | Invalid name or body hash. | no | ends for bad bodies mid-upload, otherwise rejects the request. |
+| `badentry` | Invalid entry or request incompatible with current state. | no | rejects the request, or ends for malformed claims at hello. |
+| `badname` | Invalid name or device ID. | no | ends at hello, otherwise rejects the request. |
+| `toolarge` | A limit or declared size was exceeded. | no | ends if upload framing cannot continue, otherwise rejects the request. |
+| `nospace` | Storage capacity exhausted. | yes | ends during upload. |
+| `nouid` | Version does not exist. | no | request rejected. |
+| `nocontent` | Requested version is a folder or deletion. | no | request rejected. |
+| `nochunk` | Content unavailable. | no | request rejected without partial fetch bodies. |
+| `nodevice` | Device ID no longer exists. | no | request rejected. |
+| `full` | Registration limit reached. | no | remove a device before retrying. |
+| `internal` | Server fault; put not committed. | yes | ends during handshake/catch-up, otherwise rejects the request. |
 
 `busy` suggests 30 seconds at connection capacity and 5 seconds during shutdown.
 It remains one code because both cases require reconnecting later. `full` is

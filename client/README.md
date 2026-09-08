@@ -15,7 +15,8 @@ editing, use the
 ## Set up a mirror
 
 Create an invite on an existing device, using **Add another device** in the
-plugin or `basalt invite`. Then, on the mirror machine:
+plugin or `basalt invite`. An invite works once and expires after ten minutes;
+`--ttl` raises that to at most one hour. Then, on the mirror machine:
 
 ```bash
 npm install -g basalt-sync
