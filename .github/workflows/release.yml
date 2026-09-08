@@ -155,6 +155,17 @@ jobs:
         run: |
           set -euo pipefail
           for arch in amd64 arm64; do
+            # The local copy goes first, every time.
+            #
+            # `$REF` names a manifest list by digest, and one digest can only
+            # be stored once locally. Running amd64 caches that digest as the
+            # amd64 image, and the arm64 run then tries to store a different
+            # image under the same name: newer Docker refuses with "cannot
+            # overwrite digest" and exits 125. The first architecture had
+            # already passed, so this looked like an arm64 failure and was a
+            # cache collision. Removing it between the two makes each pull the
+            # only one for that digest.
+            docker image rm -f "$REF" >/dev/null 2>&1 || true
             got=$(docker run --rm --platform "linux/$arch" "$REF" version)
             echo "linux/$arch: $got"
             case "$got" in
@@ -162,6 +173,7 @@ jobs:
               *) echo "linux/$arch does not say it is $WANT" >&2; exit 1 ;;
             esac
           done
+          docker image rm -f "$REF" >/dev/null 2>&1 || true
 
       # Now, and not before: same digest, so this name points at the manifest
       # the step above ran.
