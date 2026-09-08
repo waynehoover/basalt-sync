@@ -315,6 +315,14 @@ other.
 Sync's protocol came from. Every bug found in it was silent, which is why unit
 tests here are necessary and never sufficient.
 
+**obsidian-headless**, Obsidian's own command-line client, contributed the
+comparison above: its lock is the lease design this project rejected, and
+reading it turned that rejection from a judgement about a category into two
+named failures in a specific implementation. It also settled two questions
+about scope, in `IMPROVEMENTS.md` I29 and I30: it is fully bidirectional rather
+than a mirror, and it offers a `--conflict-strategy` switch, which is a thing
+this client does not have and arguably should.
+
 ## Libraries
 
 **diff-match-patch** for the merge, unmaintained since 2020 and pinned to an
@@ -436,6 +444,66 @@ two processes may hold the vault and both should be stopped, because a race
 that cannot be undone can at least be reported (rule 7).
 
 The Go server has no part of this problem: `internal/dirlock` calls `flock`.
+
+### What Obsidian's own headless client does
+
+Read out of `obsidian-headless` 0.0.3 (`obsidianmd/obsidian-headless`, published
+as `ob`), because it is the closest thing to a reference implementation of this
+exact problem and it reached the opposite answer.
+
+It takes a `.sync.lock` **directory** per vault, with a heartbeat:
+
+```js
+try { mkdirSync(lockPath) }                        // exclusive create
+catch (r) {
+  if (r.code !== "EEXIST") throw r;
+  const n = statSync(lockPath).mtimeMs;
+  if (Date.now() - n < 5000) throw new LockError(); // fresh: refuse
+  // older than five seconds: fall through and take it
+}
+this.lockTime = now(); this.touch();
+if (!this.verify()) throw new LockError();
+setInterval(() => { this.lockTime = now(); this.touch() }, 1000);
+```
+
+`mkdir` is the atomic primitive, the holder stamps the directory's mtime every
+second, and a contender treats a lock older than five seconds as abandoned.
+After taking one over it writes its own mtime and re-reads it, so two
+contenders that both found it stale should not both win.
+
+This is the design this project evaluated and turned down, and having the
+source rather than the package description makes the reason concrete rather
+than theoretical. Two ways it hands one vault to two writers:
+
+- **The lease.** A holder paused for more than five seconds -- a laptop
+  suspended, a long garbage collection, a stalled disk, `SIGSTOP`, a virtual
+  machine migrating, an `fsync` on a large attachment -- is declared abandoned
+  while it is still running and still writing. `verify()` is called at acquire
+  and at release and never in between, so the displaced holder never learns it
+  has been displaced.
+- **The tie-break's own fallback.** `verify()` accepts
+  `Math.floor(e / 1000) === Math.floor(this.lockTime / 1000)`, which is there
+  because many filesystems keep mtime to the second. Two contenders that both
+  find a stale lock and both stamp it inside one wall-clock second therefore
+  *both* verify, and both proceed. That is R03's shape with a stopwatch
+  attached.
+
+`touch()` also swallows every error, so a failed `utimes` stops the heartbeat
+under a live holder and the lock goes stale while somebody is using it, with
+nothing said.
+
+Against that, what is here holds a lock the kernel drops when the process dies:
+there is no lease to expire, no clock, and nothing to decide.
+`scripts/kernel-lock.test.ts` establishes it by killing a holder, on macOS in
+the gate and on Linux in CI.
+
+Two caveats, because a comparison that only flatters is not worth writing down.
+Obsidian Sync is a hosted service with server-side conflict handling and a
+`--conflict-strategy` switch, so two writers cost them a conflict where they
+would cost this project rule 1; their tolerance is reasonably different from
+ours. And their client supports Windows, which neither mechanism here does, and
+a lease is at least portable. The lease is the wrong answer for Basalt, not a
+mistake in the abstract.
 
 Prior art worth naming for the rest of it, because these were re-derived here
 rather than invented: git's object write (temp, fsync, link, fsync the

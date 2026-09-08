@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I28 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25, I28, I29 and I30 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -13,7 +13,8 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | During fixes                 | Reuse lifecycle/protocol rules; make errors observable; turn reproduced failures into tests.             | I02–I04, I11, I19         |
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
-| Open, unscheduled            | Investigate when there is a reason to. Neither is work anybody is waiting on.                            | I25, I28                  |
+| Open, unscheduled            | Investigate when there is a reason to. None is work anybody is waiting on.                               | I25, I28                  |
+| Open, from Obsidian's client | Scope questions their headless client answers differently. I29 is the one with a safety argument.        | I29, I30                  |
 
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
@@ -377,6 +378,69 @@ for two timestamps that answer a question `status` already answers better by
 looking at the disk. A diagnostic export does not exist to redact, and building
 one to give it a redaction policy would be inventing the thing the policy is
 about.
+
+### I29 — A read-only headless client
+
+- [ ] **Small, and worth it for safety rather than for simplicity.** A mirror that cannot write to the server, so a misconfigured backup box cannot delete notes on every device.
+
+`basalt sync --read-only`: apply everything the server has, send nothing. The
+vault is still written, because that is what a mirror is; what stops is this
+device ever originating an upload, a deletion or a conflict copy.
+
+The case for it is blast radius, and it is a real one. A headless client on a
+NAS exists to hold a copy. Today a bad scan on that machine -- a mount that came
+up empty, a path typo, a half-restored disk -- is an ordinary local change, and
+ordinary local changes propagate: the mirror can delete notes everywhere. There
+is nothing wrong with the code that would do it; it would be doing its job. A
+device that cannot push is a device that cannot make that mistake, and no
+amount of care in the sync engine substitutes for not having the capability.
+
+**It does not simplify the client, and an earlier version of this item claimed
+it would.** The thought was that a read-only mode makes the preservation
+machinery in `cli/vault.ts` unnecessary and deletes most of it. It does not:
+`Engine.land` applies every download through `writePreserving`, because the
+bytes still land on a local disk that a person may have edited and rule 1 still
+applies. Read-only removes the *upload* path, which is not where the defects
+were. The 2,900 lines stay.
+
+The only version that would remove them is a client told that nothing else ever
+writes this vault, so an incoming version can be written without moving
+anything aside first. That is a promise a person cannot reliably make, and
+being wrong about it loses a note, so it is not on the table.
+
+Worth doing, then, as a safety property rather than a refactor. Points to
+settle: whether it refuses to start when the vault has local changes or just
+ignores them and says so on every pass; whether it belongs in the config rather
+than a flag, so a cron job cannot forget it; and what `status` reports, since
+"unsent" is not a problem on a device that never sends.
+
+### I30 — Let a person turn merging off
+
+- [ ] **Small.** Obsidian's own client has `--conflict-strategy merge|conflict`. This one always merges when it can, and there is no way to say don't.
+
+Merging is the only thing this client does that produces content neither device
+wrote. It is careful -- it refuses anything it cannot do safely and keeps both
+versions instead -- and it has produced exactly one finding in sixty. But
+somebody who does not want it has no way to say so, and
+[PRODUCT_READINESS.md](PRODUCT_READINESS.md) reached for exactly this when it
+suggested deferring automatic merging, with "keeping both versions is a
+defensible initial experience".
+
+The answer to that suggestion was to keep merging, because removing a feature
+that is not producing failures buys no safety and costs the product. A switch
+is the version of the suggestion that does not cost the product anything.
+
+It pairs with I28. That item is stuck because making the merge diff finer
+changes what merges cleanly, and two devices on different releases would then
+disagree; a person who has turned merging off is not exposed to that at all.
+
+Two devices set differently converge on content but not on shape: one merges
+and uploads the merged note, the other keeps both and uploads a conflict copy.
+Nothing is lost, and the vault ends up with both outcomes, which is untidy and
+worth saying out loud in whatever documents the switch. Local to the device,
+like `--ignore`, and reported by `status` for the same reason `--ignore` is: a
+setting that changes what a device does with your notes and is invisible is how
+somebody spends an afternoon confused.
 
 ### I12 — Support secret input without shell history or process arguments
 

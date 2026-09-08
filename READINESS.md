@@ -425,3 +425,29 @@ ignore incomplete recovery; and RR6, a torn ledger tail can make the next intent
 unreadable. Reproductions, acceptance criteria, and limits are in
 [FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#readiness-re-verification--2026-09-07).
 I25/I26 remain the deliberately deferred improvements described above.
+
+## What reading Obsidian's own headless client settled
+
+`obsidian-headless` 0.0.3 is the closest thing to a reference implementation of
+this problem, and it answers three questions this project had open.
+
+**Its lock is the design we rejected**, and reading the source turned that from
+a judgement about a category into two named failures: a five-second lease that
+declares a suspended holder abandoned while it is still writing, and a
+`verify()` that falls back to second-granularity mtime comparison, so two
+contenders stamping inside one wall-clock second both win. Written up in
+`docs/compared.md`, with the caveats that Obsidian Sync is a hosted service
+whose tolerance for two writers is reasonably different from ours, and that a
+lease is at least portable to Windows where neither of our mechanisms is.
+
+**It is not read-only**, so the one-way-mirror idea has no precedent there: it
+is fully bidirectional with a watch mode. Filed as I29 anyway, because it has a
+safety argument of its own -- and with a correction, because the claim that it
+would delete most of `cli/vault.ts` was wrong. `Engine.land` applies every
+download through `writePreserving`, so the preservation machinery stays whether
+or not this device uploads.
+
+**It has `--conflict-strategy merge|conflict`**, which is a thing this client
+does not have. Filed as I30. It is the version of PRODUCT_READINESS's
+"defer automatic merging" suggestion that costs the product nothing, and it
+gives I28 a way out for anyone who wants one.
