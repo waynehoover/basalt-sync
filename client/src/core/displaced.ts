@@ -21,7 +21,7 @@
  *
  * So the fact is written down when it happens, and the scan reconciles against
  * it rather than replacing it. Both shells write the same records and both
- * read them, so "what is waiting" has one answer (PRODUCT_READINESS.md 3).
+ * read them, so "what is waiting" has one answer (C5).
  *
  * The shape is `JournalFiles`: a small interface the shell implements and
  * everything hard above it. Append-only lines, because that is the only shape

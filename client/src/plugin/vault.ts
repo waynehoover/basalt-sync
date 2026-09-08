@@ -350,7 +350,7 @@ export class ObsidianVault implements Vault {
    * `stranded` was never implemented here at all. The headless client answered
    * the question by walking the vault for parked names, which the hidden
    * folder is not, so the Obsidian client -- which is the product -- had no
-   * answer (PRODUCT_READINESS.md 3).
+   * answer (C4).
    */
   private readonly ledger: DisplacedLedger;
   /** Refreshed by every scan, for anything that reports. */

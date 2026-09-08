@@ -306,7 +306,7 @@ export interface Vault {
    */
   readonly stranded?: readonly string[];
   /**
-   * The same versions, with what is known about each (PRODUCT_READINESS.md 3).
+   * The same versions, with what is known about each (C5).
    *
    * `stranded` is a list of paths and a path is not an explanation: somebody
    * looking at `note.md..basalt-tmp-keep3f9c` has to guess which note it came

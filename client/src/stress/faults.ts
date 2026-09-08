@@ -2,9 +2,9 @@
  * Fault injection across every seam, rather than one ordering per test.
  *
  * The seven verification rounds found the same defect four times in the lock
- * and about ten times across the preservation paths, and the reason is in
- * PRODUCT_READINESS.md in one sentence: "fixing one ordering and testing that
- * ordering has repeatedly left another ordering broken."
+ * and about ten times across the preservation paths, and the reason fits in one
+ * sentence: fixing one ordering and testing that ordering has repeatedly left
+ * another ordering broken.
  *
  * Each of those fixes came with a regression test, and each test named one
  * hook. The hook next to it got nothing. So this does not take a scenario and

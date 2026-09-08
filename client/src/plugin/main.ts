@@ -103,8 +103,7 @@ export type State =
        * Different from `refused` and reported apart from it: a refused file is
        * one that is not syncing and is still where its author left it, and one
        * of these is a note that exists only under a name Obsidian does not
-       * show. Nothing in this plugin used to say so at all (R46,
-       * PRODUCT_READINESS.md 3).
+       * show. Nothing in this plugin used to say so at all (R46, C4).
        */
       waiting: number;
       /**

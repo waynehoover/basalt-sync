@@ -1723,7 +1723,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     io.out(`kept     ${local.stranded.length} version(s) this client could not put back:`);
     // With the reason where there is one. A path on its own says a file is
     // there and not which note it came off or why, which is a person opening
-    // `note.md..basalt-tmp-keep3f9c` to find out (PRODUCT_READINESS.md 3).
+    // `note.md..basalt-tmp-keep3f9c` to find out (C2).
     const known = new Map(local.displaced.map((d) => [d.at, d]));
     for (const at of local.stranded) {
       io.out(`  ${join(args.dir, at)}`);

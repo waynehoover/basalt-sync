@@ -317,7 +317,7 @@ None of their code. Ideas, parameters and bug reports.
 | **Obsidian Sync** | `synchash`, one field per file remembering the content as of the last sync, which turns a three-way merge into something needing no version history; and the merge construction | the step discarding which hunks applied |
 | **[Sync Engine](https://github.com/hesprs/sync-engine)** | reporting correctness beside speed, the benchmark vault shape, the 400 ms environment, and their issue 232 (`rm` where the platform should trash), a live defect here too | |
 | **[Fast Note Sync](https://github.com/haierkeys/obsidian-fast-note-sync)** | issue 257: a path that is a file on one side and a folder on the other, which Basalt retried forever one way and ignored the other | |
-| **obsidian-headless** | the lock comparison below, and two settled scope questions (`IMPROVEMENTS.md` I29 and I30): it is fully bidirectional rather than a mirror, and it offers a `--conflict-strategy` switch this client does not have and arguably should | its lease |
+| **obsidian-headless** | the lock comparison below, and two settled scope questions ([I29 and I30](findings.md)): it is fully bidirectional rather than a mirror, and it offers a `--conflict-strategy` switch this client does not have and arguably should | its lease |
 
 Prior art re-derived here rather than invented: git's object write (temp, fsync,
 link, fsync the directory) is the shape of the chunk store's publication
@@ -331,7 +331,7 @@ came round to.
 
 | | |
 |---|---|
-| **diff-match-patch** | the merge. Unmaintained since 2020, pinned to an exact version. `@sanity/diff-match-patch` is a maintained TypeScript fork, evaluated September 2026: better on every axis except the one that decides it, which is that it cannot produce the same diffs. It exports none of the line-mode internals used here, and cannot express the expired deadline `merge.ts` passes, since its `timeout: 0` means unlimited where dmp's `opt_deadline: 0` means expired. Merges would change, and a merge that changes between releases is two devices disagreeing about one note. `IMPROVEMENTS.md` I26 |
+| **diff-match-patch** | the merge. Unmaintained since 2020, pinned to an exact version. `@sanity/diff-match-patch` is a maintained TypeScript fork, evaluated September 2026: better on every axis except the one that decides it, which is that it cannot produce the same diffs. It exports none of the line-mode internals used here, and cannot express the expired deadline `merge.ts` passes, since its `timeout: 0` means unlimited where dmp's `opt_deadline: 0` means expired. Merges would change, and a merge that changes between releases is two devices disagreeing about one note. [I26](findings.md) |
 | **fflate** | deflate |
 | **modernc.org/sqlite** | so the server is one static binary |
 | **github.com/coder/websocket** | the transport |
