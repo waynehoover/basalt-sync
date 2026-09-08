@@ -473,9 +473,9 @@ jobs:
 
   # Its own job so that "the stress suite failed" is a sentence CI can say.
   #
-  # Unit tests are necessary here and never sufficient: every real defect in the
-  # predecessor was a silent one that only appeared when the system ran, and the
-  # four found the week this was written were all of that kind. These kill the
+  # Unit tests are necessary here and never sufficient: every real defect this
+  # project has had was a silent one that only appeared when the system ran, and
+  # the four found the week this was written were all of that kind. These kill the
   # server mid-commit, let two devices disagree, and write the filenames people
   # actually have. Linux as well as a laptop, which matters: the server's fsync
   # behaviour is not the same on the two.

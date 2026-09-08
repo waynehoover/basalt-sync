@@ -69,18 +69,18 @@ tests pass" was true and meant much less than it sounded. A guard inside the
 script fails when CI grows a step the script does not run, so the two cannot
 drift apart again.
 
-Unit tests are necessary and never sufficient here. Every real bug found in the
-predecessor was a *silent* failure that only appeared when the system ran. A fix
+Unit tests are necessary and never sufficient here. Every real bug this project
+has had was a *silent* failure that only appeared when the system ran. A fix
 without a test that failed before it is not finished: revert the fix, watch the
 test fail, restore it.
 
 ## Prior art
 
 `docs/compared.md` credits every project this one learned from. Add to it when
-reading someone else's code changes something here. The two that come up most:
+reading someone else's code changes something here. The one that comes up most
+is [obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync), MIT: source
+of the content-defined chunking idea and the confirmation that text merging is
+solved. Considerably broader in scope; see the philosophy doc on why we are not.
 
-- `~/code/obionesync`, the predecessor, which piggybacks Obsidian's own engine.
-  Its README and CLAUDE.md hold the verified protocol facts about Obsidian Sync.
-- [obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync), MIT. Source
-  of the content-defined chunking idea and the confirmation that text merging is
-  solved. Considerably broader in scope; see the philosophy doc on why we are not.
+Facts about Obsidian Sync's own protocol come from reading the shipped app, and
+are recorded in `docs/protocol.md` rather than inferred again.

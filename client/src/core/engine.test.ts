@@ -1,10 +1,10 @@
 /**
  * Two engines, two vaults, one real server.
  *
- * This is the test the whole client exists to pass, and the one the predecessor's
- * notes warn about: rule 10 of docs/design.md records a conflict test that
- * asserted the two devices *agreed*, and passed while one side's edit had
- * silently vanished. Agreement is not the property. Not losing an edit is.
+ * This is the test the whole client exists to pass, and the one rule 10 of
+ * docs/design.md warns about: it records a conflict test that asserted the two
+ * devices *agreed*, and passed while one side's edit had silently vanished.
+ * Agreement is not the property. Not losing an edit is.
  *
  * So the assertions here are about edits, by name, and where they ended up. The
  * vaults are in memory and everything else is real: real sealing, real chunking,

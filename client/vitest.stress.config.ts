@@ -5,7 +5,7 @@ import { defineConfig } from "vitest/config";
  *
  * These are the tests that found four defects the 560 unit tests did not, all
  * of them silent. CLAUDE.md puts it plainly: unit tests are necessary here and
- * never sufficient, because every real bug in the predecessor only appeared
+ * never sufficient, because every real bug this project has had only appeared
  * when the system ran. So this exists, and it is the gate before a release
  * rather than a thing to remember to do.
  *

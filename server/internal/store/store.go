@@ -1302,9 +1302,9 @@ func (s *Store) LatestUID(vaultID string) (int64, error) {
 // Stats describes what the vault holds.
 //
 // Every count is separate on purpose. "Fully synced" has twice meant something
-// other than synced in the predecessor, once at cursor 0 against a vault of
-// 4,030 files and once with files silently excluded, so this type refuses to
-// collapse into a single number or a boolean. A caller that wants a headline
+// other than synced, once at cursor 0 against a vault of 4,030 files and once
+// with files silently excluded, so this type refuses to collapse into a single
+// number or a boolean. A caller that wants a headline
 // figure has to choose which of these it means.
 type Stats struct {
 	Files   int64 // live, non-deleted, non-folder
@@ -1804,8 +1804,8 @@ type Verification struct {
 // A dangling reference makes a client retry one download forever, which presents
 // as a sync that never finishes rather than as an error, so it is surfaced
 // explicitly. The corollary of chunk names being hashes of ciphertext is that
-// deep verification is complete for the bytes: there is no equivalent of the
-// predecessor's size-mismatch check, and none is needed. What the server still
+// deep verification is complete for the bytes: no separate size-mismatch check
+// is possible here, and none is needed. What the server still
 // cannot verify is Entry.Size, the *plaintext* size the client declared, because
 // it never sees plaintext. That is a deliberate consequence of the server
 // holding no key, not an omission here.

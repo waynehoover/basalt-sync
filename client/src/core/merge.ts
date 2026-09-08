@@ -162,7 +162,7 @@
  * carries knowingly, and one that regions reduce rather than remove: the fuzzy
  * matcher now searches a few lines instead of a note.
  *
- * ## Where this sits between the two predecessors
+ * ## Where this sits, against Obsidian and LiveSync
  *
  * Obsidian merges silently and drops what does not fit. LiveSync mostly opens a
  * dialog and asks (`ModuleConflictResolver`), falling back to newest-wins for
