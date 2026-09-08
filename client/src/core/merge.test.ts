@@ -1296,26 +1296,15 @@ describe("choosing an exact diff or a coarse one", () => {
     expect(fitsExactDiff(under, under, over)).toBe(false);
   });
 
-  it("withholds the exact diff from markup, which cannot check its own merge", () => {
-    // Found by markup.test.ts rather than reasoned out. `.svg` is not on the
-    // `stillValid` list because it was *measured* not to produce markup a
-    // reader refuses -- measured with the coarse diff. Making the diff exact
-    // took that corpus from zero malformed merges in 20,923 to one.
-    //
-    // A finer diff merges more, and merging more is only safe where a broken
-    // result would be noticed. So markup keeps the coarse path until it has a
-    // validity gate of its own.
+  it("no longer withholds it from markup, now that markup has a gate", () => {
+    // It did, for one release: `.svg` had no validity gate, an exact diff
+    // merges more, and merging more is only safe where a broken result would
+    // be noticed. The gate exists now (I31, `core/markup.ts`), so a drawing
+    // gets the finer diff like anything else and a merge that unbalances the
+    // tags is refused rather than written.
     const svg = '<svg xmlns="http://www.w3.org/2000/svg"><g id="a"/></svg>\n';
     expect(svg.length).toBeLessThanOrEqual(EXACT_DIFF_CEILING);
-    expect(fitsExactDiff(svg, svg, svg)).toBe(false);
-    // Any one of the three is enough, the same as the ceiling.
-    const prose = "- a note about the plumber\n";
-    expect(fitsExactDiff(prose, prose, prose)).toBe(true);
-    expect(fitsExactDiff(svg, prose, prose)).toBe(false);
-    expect(fitsExactDiff(prose, svg, prose)).toBe(false);
-    expect(fitsExactDiff(prose, prose, svg)).toBe(false);
-    // Leading whitespace does not smuggle it past.
-    expect(fitsExactDiff(`\n  ${svg}`, prose, prose)).toBe(false);
+    expect(fitsExactDiff(svg, svg, svg)).toBe(true);
   });
 
   it("gives the same answer every time it is asked", () => {

@@ -43,6 +43,7 @@
 
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
 import { drawingGate, looksLikeExcalidraw } from "./excalidraw.ts";
+import { looksLikeMarkupPath, wellFormedMarkup } from "./markup.ts";
 import {
   deriveSchedule,
   entryIsOurs,
@@ -3241,12 +3242,7 @@ export class Engine {
     // rather than named by extension alone, because it has to abstain on a
     // `.excalidraw.md` whose drawing it cannot read instead of turning every
     // merge of it into a conflict copy; the reasoning is in that module.
-    const stillValid = looksLikeJson(path)
-      ? parsesAsJson
-      : looksLikeExcalidraw(path)
-        ? drawingGate(base, mine, theirs)
-        : undefined;
-    const outcome = mergeText(base, mine, theirs, stillValid);
+    const outcome = mergeText(base, mine, theirs, validityGateFor(path, base, mine, theirs));
     if (outcome.kind === "conflict") {
       this.log("merge refused", path, outcome.why);
       await this.conflict(path, entry, remote, report, outcome.why);
@@ -3651,6 +3647,40 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     inTheWay: b.inTheWay,
     needsAttention: b.needsAttention,
   };
+}
+
+/**
+ * The predicate that says whether a merged file is still the kind of thing it
+ * was, or undefined where there is nothing to ask.
+ *
+ * Its own function because it is the wiring, and wiring is the part that goes
+ * untested: every gate here can exist, read correctly and be asked of nothing.
+ * Unwiring this passed the whole suite before it was pulled out where a test
+ * could reach it.
+ *
+ * For prose there is nothing to ask -- any arrangement of lines is a valid
+ * note. For a structured file there is, and a line-wise merge does not know
+ * it: two edits to different parts of a canvas can each apply cleanly and
+ * leave JSON that does not parse, which Obsidian then refuses to open.
+ *
+ * Three kinds have one. JSON and canvas parse or they do not. An Excalidraw
+ * drawing is a JSON scene inside a `.md`, so it is recognised by its content
+ * rather than its extension and abstains where it cannot read the drawing
+ * (`core/excalidraw.ts`). Markup is the newest: `.svg` was measured not to
+ * need a gate, that measurement was taken with the coarse diff, and making the
+ * diff exact for ordinary notes took the corpus in `markup.test.ts` from zero
+ * malformed merges in 20,923 to one (I28, I31).
+ */
+export function validityGateFor(
+  path: string,
+  base: string,
+  mine: string,
+  theirs: string,
+): ((text: string) => boolean) | undefined {
+  if (looksLikeJson(path)) return parsesAsJson;
+  if (looksLikeExcalidraw(path)) return drawingGate(base, mine, theirs);
+  if (looksLikeMarkupPath(path)) return wellFormedMarkup;
+  return undefined;
 }
 
 /**

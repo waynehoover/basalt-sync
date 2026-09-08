@@ -47,9 +47,19 @@ in ours inverts a specific defect in theirs, six of which fail silently.
 
 ## Testing
 
-**Run `scripts/check.sh` before pushing, and believe nothing else.** It runs
-every check CI runs and nothing less. Exit 0 means all of them passed here;
-exit 2 means some could not run, which is not the same thing and is not green.
+**Run `scripts/check.sh` before pushing.** It runs every check CI runs and
+nothing less. Exit 0 means all of them passed *here*; exit 2 means some could
+not run, which is not the same thing and is not green.
+
+Exit 0 is not the same as CI being green, and it was once written here as
+though it were. The drift guard compares CI's step names against the script, so
+it catches a step CI grows that the script does not run; it cannot catch a step
+that runs in both places and fails in only one. Four consecutive CI failures
+were that: a request timer that fires only on a machine slow enough to still be
+running a second later, a default device name too long because the runner's
+hostname is, and a systemd version wording an error differently. All three
+passed locally every time. So: run the script before pushing, and read CI
+before believing a release is green.
 
 This exists because of a shipped regression. `bun run test` is one of nine
 checks, and the stress suite is a separate command in a separate job. A release

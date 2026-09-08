@@ -210,36 +210,7 @@ export function fitsExactDiff(base: string, mine: string, theirs: string): boole
   ) {
     return false;
   }
-  // And not markup, which is the part that had to be found rather than
-  // reasoned out.
-  //
-  // A finer diff merges more, and merging more is only safe where a broken
-  // result would be noticed. `stillValid` is asked of `.canvas` and `.json`
-  // and of nothing else, because `.svg`, `.xml` and `.csv` were *measured* not
-  // to have that failure -- and measured with the coarse diff. Making the diff
-  // exact invalidated the measurement: markup.test.ts went from zero malformed
-  // merges in 20,923 to one, which is the corpus doing exactly the job it was
-  // built for.
-  //
-  // So the finer diff is withheld from the one kind of file where this cannot
-  // check its own work. That is the same instinct as `stillValid` itself: be
-  // less willing to merge where a bad merge cannot be seen, not more.
-  //
-  // The better answer is to give markup a validity gate like the one JSON has
-  // -- `wellFormedMarkup` already exists in markup.test.ts and would only have
-  // to move into core -- and then let it merge finely under that gate.
-  return !looksLikeMarkup(base) && !looksLikeMarkup(mine) && !looksLikeMarkup(theirs);
-}
-
-/**
- * Whether a text is markup, cheaply and from the front.
- *
- * Deliberately crude, and erring towards "yes": the cost of a false yes is one
- * note merging as coarsely as it did before, and the cost of a false no is a
- * drawing a reader will not open.
- */
-function looksLikeMarkup(text: string): boolean {
-  return text.trimStart().startsWith("<");
+  return true;
 }
 
 /** diff-match-patch's operation codes, named so the intent is readable. */

@@ -251,4 +251,18 @@ if [ "$skipped" -gt 0 ]; then
   exit 2
 fi
 echo
-echo "Everything CI runs passed here."
+echo "Everything CI runs passed on this machine."
+# And what that does not establish, because it was believed to establish more.
+#
+# The drift guard above compares CI's step *names* against this script, so it
+# catches a step CI grows that this does not run. It cannot catch a step that
+# runs in both places and only fails in one, and four consecutive CI failures
+# were exactly that: a request timer that only fires on a runner slow enough to
+# still be running a second later, a default device name too long because the
+# runner's hostname is, and a systemd version that words an error differently.
+# All three passed here, every time, while main was red.
+echo
+echo "That is this machine: its speed, its hostname, its filesystem, its"
+echo "systemd. A check that passes here and fails on a runner is a real"
+echo "failure and this cannot see it. Push and read CI before believing a"
+echo "release is green."

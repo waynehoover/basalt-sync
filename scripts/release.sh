@@ -69,7 +69,16 @@ PY
   exit 0
 fi
 
-version=${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
+# What the *server* is being released as, when that is being said at all.
+#
+# Empty means it was not given, and the runbook below then declines to print
+# server commands rather than building them out of the fallback. It used to
+# build them out of `$version`, which without an argument is a `git describe`
+# string, so it printed `git tag -a server/vcli/v0.5.0-2-g0def89f` and a
+# `verify-release.sh --server cli/v0.5.0`. Both are nonsense and both look
+# exactly like something to paste.
+serverversion=${1:-}
+version=${serverversion:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 # A release is built from a committed state or it is not built.
@@ -235,6 +244,39 @@ for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
 done
 echo '  ```'
 
+# The client's version is its own, from the file npm publishes it from.
+cliversion=$(python3 -c 'import json;print(json.load(open("client/package.json"))["version"])')
+
+# The server block, and the verify flag, only where a version was given.
+if [ -n "$serverversion" ]; then
+  serverblock="  git tag -a server/v$serverversion -m \"basaltd $serverversion\" && git push origin server/v$serverversion
+  gh release create server/v$serverversion --draft --title \"basaltd $serverversion\" \\
+    release/server/*
+
+A draft here too, and finished the same way:
+
+  gh workflow run attest.yml -f tag=server/v$serverversion
+
+which rebuilds, signs and checksums the binaries and then publishes it.
+
+Pushing that tag is also what builds and pushes the container image, and it is
+what makes pin-check fail on main until the digest exists:
+
+  # after the image is published
+  scripts/pin-compose.sh && git add -A && git commit -m 'compose: pin the $serverversion server image' && git push
+
+Do that before tagging the plugin or the client. The publish gate refuses a tag
+whose commit CI has not passed on, and main is red in between, so a plugin tag
+pushed inside that window cannot be released."
+  verifyserver=" --server $serverversion"
+else
+  serverblock="  Re-run with the version to print these:  scripts/release.sh 0.5.0
+
+  Without it there is nothing to build a tag name out of but \`git describe\`,
+  and a tag called server/v$version is not what anybody meant."
+  verifyserver=""
+fi
+
 # ---- what to do with them ------------------------------------------------
 # Printed rather than done. The tag is the decision and this is only what
 # follows from it.
@@ -264,17 +306,7 @@ that anything was wrong.
 
 To publish the server, on its own tag because it moves on its own clock:
 
-  git tag -a server/v$version -m "basaltd $version" && git push origin server/v$version
-  gh release create server/v$version --draft --title "basaltd $version" \\
-    release/server/*
-
-A draft here too, and finished the same way:
-
-  gh workflow run attest.yml -f tag=server/v$version
-
-which rebuilds, signs and checksums the binaries and then publishes it.
-
-Pushing that tag is also what builds and pushes the container image.
+$serverblock
 
 The headless client builds nothing here, because npm is where it goes. Bump
 client/package.json on its own clock, then:
@@ -288,7 +320,9 @@ these can be wrong: the attestations are rebuilt and re-uploaded after the
 release is created, \`latest\` moves during it, and an npm version cannot be
 replaced once it is there.
 
-  scripts/verify-release.sh --plugin $pluginversion --server $version --cli $version
+  scripts/verify-release.sh --plugin $pluginversion --cli $cliversion$verifyserver
+
+Bare versions, not tag names: `--server 0.5.0`, not `--server server/v0.5.0`.
 
 It fetches the assets, checks the sums under the names somebody downloads them
 as, verifies the attestations on the bytes that are there now, runs the image on

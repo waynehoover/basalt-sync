@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I31 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review. I25 to I31 were added later, from measurements rather than from the review. **Everything here is now closed**: done, or evaluated and declined with the evidence kept. I25 (a WebAssembly codec) and I26 (a maintained diff-match-patch fork) are the two declined, and both are worth reading before anybody proposes them again. Add to this document rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -201,7 +201,7 @@ of the shapes that produced those fuzz cases, all of which were found coarse.
 
 ### I31 — Give markup the validity gate that JSON has
 
-- [ ] **Small; the checker already exists.** Then markup can merge as finely as prose does.
+- [x] **Done.** `core/markup.ts`, and markup merges as finely as prose.
 
 `stillValid` is asked of `.canvas` and `.json` because a line-wise merge can
 apply cleanly and leave a file Obsidian refuses to open, and only the caller
@@ -220,10 +220,28 @@ into core, asking it of the markup extensions the way `parsesAsJson` is asked
 of JSON, and then letting `fitsExactDiff` stop caring what the text looks like
 would give those files both properties at once.
 
-What to be careful of: the gate has to be exactly as strict as the corpus
-believes it is, or the measurement moves under it. Move the checker, keep
-`markup.test.ts` pointing at the moved copy so the corpus is still judging the
-same thing, and only then relax the exclusion.
+**Done.** `wellFormedMarkup` is in `core/markup.ts`, `markup.test.ts` imports
+it from there so the corpus judges with the instrument the engine gates with,
+and `fitsExactDiff` no longer cares what the text looks like.
+
+Two things came out of doing it.
+
+The corpus was measuring the wrong thing once the gate existed. Its runner
+called `mergeText` with no `stillValid` on purpose -- its comment said "the
+question is what the merge produces with nothing checking it, which is exactly
+the situation `.svg` is in" -- and that premise stopped being true. It now runs
+both arms: ungated is the evidence the gate is needed, gated is whether it
+works. It deliberately does not assert that the gate refused something, because
+only one of the three SVG writings reaches the failure and it reaches it once
+in twenty thousand; a floor on that is a test a harmless change to the
+generator breaks. The gate rejecting a malformed merge is asserted from one
+hand-built case instead.
+
+And the wiring was untested. Unwiring the gate from the engine passed the whole
+suite, because every test that could see it went through `mergeText` directly.
+The selection is now `validityGateFor`, out where a test can reach it, and that
+test fails when markup is dropped from it. That is the third time this session
+a guard has existed, read correctly, and been asked of nothing.
 
 ### I09 — Reduce duplicate chunk I/O without weakening verification
 
@@ -247,7 +265,7 @@ Measure startup latency, deletion-page queries, backup/verify duration, and sync
 
 ### I25 — A codec that is one implementation everywhere and faster than fflate
 
-- [ ] **Large; only with a format migration.** Investigate a WebAssembly deflate or zstd, and keep byte-for-byte agreement across platforms as the requirement rather than throughput.
+- [x] **Declined.** Not a WebAssembly blob inside an Obsidian plugin.
 
 Compression is the slowest step in sealing, by some way. Measured on 1 KiB text
 chunks: `compress (fflate) 31 MiB/s`, `encrypt (WebCrypto) 85 MiB/s`,
@@ -269,6 +287,25 @@ because a `.wasm` is not a native addon and loads on Obsidian mobile, unlike
 [simdutf](https://simdutf.github.io/simdutf/). Note that simdutf itself would
 not help whatever it were compiled to: UTF-8 validation and transcoding appear
 nowhere in the profile above.
+
+**Declined, on the plugin.** The whole value of the WASM route is that it is
+one implementation everywhere, which means shipping the blob inside the
+Obsidian plugin as well as the CLI. That is a binary artifact in a community
+plugin: larger downloads on a phone, something a directory reviewer has to take
+on trust, and a supply-chain surface with no good story for how a reader of the
+repository checks that the `.wasm` is the source next to it. None of that is
+worth a compression speedup on a step that is already fast enough for the
+vaults this syncs.
+
+The measurement stands and is worth keeping: compression is about sixty per
+cent of the cost of sealing a chunk, and `node:zlib` is 2.3x faster than fflate
+and produces different bytes. If sealing throughput ever becomes somebody's
+actual problem, the thing to revisit first is whether the plugin and the CLI
+have to use the same codec at all -- which they do today only because chunk
+names are derived from the sealed bytes.
+
+The rest of this item is kept because it is the reasoning, not because it is a
+plan:
 
 Treat this as a protocol change, not a dependency swap. It needs a format
 marker, both codecs readable during a migration, `compression-golden` extended

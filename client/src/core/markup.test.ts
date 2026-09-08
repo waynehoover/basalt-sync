@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { mergeText, mergeTextCharacters } from "./merge.ts";
+// From core, not defined here (I31). The corpus has to judge with the same
+// instrument the engine gates with, or it proves a property about code that
+// nothing runs.
+import { wellFormedMarkup } from "./markup.ts";
+import { validityGateFor } from "./engine.ts";
 
 /**
  * Whether `.svg`, `.xml` and `.csv` want the validity gate `.canvas` and
@@ -72,103 +77,6 @@ import { mergeText, mergeTextCharacters } from "./merge.ts";
  * where it will show up first, because the property fails rather than the
  * count drifting.
  */
-
-/**
- * The measuring instrument: is this text well-formed markup.
- *
- * Deliberately *not* production code. Declining the gate is the finding, so
- * this exists to make the finding checkable and lives with the test that uses
- * it. It is a scanner rather than a parser: tags balanced, one root, comments
- * and CDATA and processing instructions and DOCTYPE skipped, attribute values
- * quote-aware. It does not check entities, namespaces or the DTD, and it does
- * not need to: what is being measured is whether a merge unbalances the tags.
- *
- * Its own cases are asserted below before anything is measured with it, since
- * a corpus is worth nothing if the instrument is wrong.
- */
-export function wellFormedMarkup(text: string): boolean {
-  const NAME = /[A-Za-z_:][-A-Za-z0-9_:.]*/y;
-  const stack: string[] = [];
-  let roots = 0;
-  let i = 0;
-  while (i < text.length) {
-    const lt = text.indexOf("<", i);
-    if (lt < 0) break;
-    i = lt + 1;
-    if (text.startsWith("!--", i)) {
-      const end = text.indexOf("-->", i + 3);
-      if (end < 0) return false;
-      i = end + 3;
-      continue;
-    }
-    if (text.startsWith("![CDATA[", i)) {
-      const end = text.indexOf("]]>", i + 8);
-      if (end < 0) return false;
-      i = end + 3;
-      continue;
-    }
-    if (text.startsWith("?", i)) {
-      const end = text.indexOf("?>", i + 1);
-      if (end < 0) return false;
-      i = end + 2;
-      continue;
-    }
-    if (text.startsWith("!", i)) {
-      // DOCTYPE, whose internal subset is bracketed and may hold a `>`.
-      let depth = 0;
-      let j = i + 1;
-      for (; j < text.length; j++) {
-        const c = text[j];
-        if (c === "[") depth++;
-        else if (c === "]") depth--;
-        else if (c === ">" && depth <= 0) break;
-      }
-      if (j >= text.length) return false;
-      i = j + 1;
-      continue;
-    }
-    const closing = text[i] === "/";
-    if (closing) i++;
-    NAME.lastIndex = i;
-    const named = NAME.exec(text);
-    if (named === null) return false;
-    const name = named[0];
-    i = NAME.lastIndex;
-    let selfClosing = false;
-    let closed = false;
-    while (i < text.length) {
-      const c = text[i];
-      if (c === '"' || c === "'") {
-        const end = text.indexOf(c, i + 1);
-        if (end < 0) return false;
-        i = end + 1;
-        continue;
-      }
-      if (c === "<") return false; // a `<` inside a tag is never well formed
-      if (c === "/") {
-        selfClosing = true;
-        i++;
-        continue;
-      }
-      if (c === ">") {
-        i++;
-        closed = true;
-        break;
-      }
-      if (selfClosing) return false; // a `/` anywhere but before the `>`
-      i++;
-    }
-    if (!closed) return false;
-    if (closing) {
-      if (selfClosing) return false;
-      if (stack.pop() !== name) return false;
-      if (stack.length === 0) roots++;
-    } else if (!selfClosing) {
-      stack.push(name);
-    } else if (stack.length === 0) roots++;
-  }
-  return stack.length === 0 && roots === 1;
-}
 
 /** Whether text is still JSON. The predicate `engine.ts` supplies for `.canvas` and `.json`. */
 function parsesAsJson(text: string): boolean {
@@ -746,46 +654,69 @@ describe("no merge of two drawings is markup a reader will refuse", () => {
 
     let checked = 0;
     let merged = 0;
+    let gatedMerged = 0;
     const broken: string[] = [];
+    const gatedBroken: string[] = [];
     for (let i = 0; i < cases; i++) {
       const from = start();
       const base = write(from);
       const mine = write(mutate(from, "MINE"));
       const theirs = write(mutate(from, "THEM"));
       if (base === mine || base === theirs || mine === theirs) continue;
+      const judge = (text: string): boolean =>
+        write === jsonText ? parsesAsJson(text) : wellFormedMarkup(text);
       for (const [which, merge] of Object.entries({
         regions: mergeText,
         characters: mergeTextCharacters,
       })) {
         checked++;
-        // Unguarded on purpose: the question is what the merge produces with
-        // nothing checking it, which is exactly the situation `.svg` is in.
+        // Twice: once with nothing checking the result, and once with the gate
+        // the engine actually applies (I31).
+        //
+        // Ungated used to be the only run, because `.svg` was ungated and the
+        // question was what it produced unaided. The answer was zero malformed
+        // in 20,923 -- with the coarse diff. Making the diff exact for ordinary
+        // notes broke that, which is what put a gate on markup, and the two
+        // arms are now the evidence for it: ungated is why the gate is needed
+        // and gated is whether it works.
         const out = merge(base, mine, theirs, () => true);
-        if (out.kind === "conflict") continue;
-        merged++;
-        const good = write === jsonText ? parsesAsJson(out.text) : wellFormedMarkup(out.text);
-        if (!good) {
-          broken.push(
-            `case ${i} (${which})\nbase:\n${base}mine:\n${mine}theirs:\n${theirs}got:\n${out.text}`,
-          );
+        if (out.kind !== "conflict") {
+          merged++;
+          if (!judge(out.text)) {
+            broken.push(
+              `case ${i} (${which})\nbase:\n${base}mine:\n${mine}theirs:\n${theirs}got:\n${out.text}`,
+            );
+          }
+        }
+
+        const guarded = merge(base, mine, theirs, judge);
+        if (guarded.kind !== "conflict") {
+          gatedMerged++;
+          if (!judge(guarded.text)) {
+            gatedBroken.push(`case ${i} (${which}) passed the gate and is still malformed`);
+          }
         }
       }
     }
-    return { checked, merged, broken };
+    return { checked, merged, broken, gatedMerged, gatedBroken };
   }
 
   /** Eight seeds, because one generator run is one sample and this is a claim about none. */
   const over = (write: (roots: Node[]) => string) => {
     let checked = 0;
     let merged = 0;
+    let gatedMerged = 0;
     const broken: string[] = [];
+    const gatedBroken: string[] = [];
     for (const seed of [7, 11, 13, 17, 19, 23, 29, 31]) {
       const r = generated(4000, write, seed);
       checked += r.checked;
       merged += r.merged;
+      gatedMerged += r.gatedMerged;
       broken.push(...r.broken);
+      gatedBroken.push(...r.gatedBroken);
     }
-    return { checked, merged, broken };
+    return { checked, merged, broken, gatedMerged, gatedBroken };
   };
 
   /**
@@ -797,6 +728,55 @@ describe("no merge of two drawings is markup a reader will refuse", () => {
    * is asking whether the corpus still reaches the failure, not pinning a
    * count that a harmless change to the generator would break.
    */
+  it("is the gate the engine actually asks for, on a markup path", () => {
+    // The wiring, which is the part that goes untested. Every gate in this
+    // project can exist, read correctly, and be asked of nothing: unwiring
+    // this one passed the entire suite until the selection was pulled out of
+    // the engine into a function a test could reach.
+    const svg = validityGateFor("drawing.svg", "<svg/>", "<svg/>", "<svg/>");
+    expect(svg, "no gate for a .svg, so a merge can unbalance its tags").toBeDefined();
+    expect(svg!("<svg><g></g></svg>")).toBe(true);
+    expect(svg!("<svg><g></svg>")).toBe(false);
+
+    // Case-insensitively, and for the other markup extensions.
+    for (const path of ["A.SVG", "page.xhtml", "notes.xml", "index.html"]) {
+      expect(validityGateFor(path, "", "", ""), path).toBeDefined();
+    }
+    // And prose has nothing to ask, which is why it is not gated.
+    for (const path of ["note.md", "list.txt", "table.csv"]) {
+      expect(validityGateFor(path, "", "", ""), path).toBeUndefined();
+    }
+    // JSON keeps the gate it already had.
+    const canvas = validityGateFor("board.canvas", "{}", "{}", "{}");
+    expect(canvas).toBeDefined();
+    expect(canvas!('{"a":1}')).toBe(true);
+    expect(canvas!('{"a":1')).toBe(false);
+  });
+
+  it("rejects a merge that unbalances the tags, rather than returning it", () => {
+    // The gate, from one case rather than from a corpus. `mergeText` with
+    // `wellFormedMarkup` must refuse a result that is not well formed, which
+    // is what makes the zeroes above mean the gate works rather than meaning
+    // the corpus stopped looking.
+    //
+    // Built by hand: a merged result that is clean text and unbalanced markup.
+    const broken = "<svg><g></svg>";
+    expect(wellFormedMarkup(broken)).toBe(false);
+    expect(wellFormedMarkup("<svg><g></g></svg>")).toBe(true);
+
+    // And through the merge: the gate is the caller's predicate, so a merge
+    // whose result fails it comes back as a conflict.
+    const out = mergeText(
+      "<svg><g></g></svg>\n",
+      "<svg><g></g></svg>\nx\n",
+      "<svg></svg>\n",
+      () => false,
+    );
+    expect(out.kind, "a merge whose result the caller refused was returned anyway").toBe(
+      "conflict",
+    );
+  });
+
   it("breaks, when the same tree is written as a canvas", () => {
     const r = over(jsonText);
     expect(r.merged, "the control merged nothing").toBeGreaterThan(r.checked / 10);
@@ -813,10 +793,19 @@ describe("no merge of two drawings is markup a reader will refuse", () => {
   ])("holds for SVG written %s", (_name, write) => {
     const r = over(write);
     expect(r.merged, "the corpus merged nothing").toBeGreaterThan(r.checked / 10);
+    // Gated, which is what the engine does for `.svg` now: nothing malformed
+    // reaches a note. This is the property that has to hold.
     expect(
-      r.broken.slice(0, 1).join("\n"),
-      `${r.broken.length} of ${r.merged} merges produced markup that is not well formed`,
+      r.gatedBroken.slice(0, 1).join("\n"),
+      `${r.gatedBroken.length} merges passed the gate and were still malformed`,
     ).toBe("");
+    expect(r.gatedMerged, "the gate refused everything").toBeGreaterThan(r.checked / 10);
+    // Deliberately no assertion that the gate refused something here. Only one
+    // of the three writings reaches the failure at all, and it reaches it once
+    // in twenty thousand, so a floor on that count would be a test that a
+    // harmless change to the generator breaks. That the gate is wired and does
+    // reject a malformed merge is asserted directly below instead, where it
+    // can be done from one case rather than from a rare one.
   });
 });
 
