@@ -151,8 +151,24 @@ async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promis
   if (first === pending) throw new Error(what);
 }
 
-const synced = (p: Testable) =>
-  until("a sync", () => p.currentState.kind === "synced").catch((err: Error) => {
+/**
+ * `ms` because `until`'s default is fifteen seconds, and fifteen seconds is a
+ * fact about the machine that wrote it.
+ *
+ * The test below does about seven seconds of work here, which leaves rather
+ * little room, and it has timed out three times on CI's mounted-filesystem job
+ * while passing everywhere else. That job is not slower on average -- 146s
+ * against 141s for the ordinary client job on a run where both passed -- so
+ * this is an occasional stall on a shared runner eating a margin that was only
+ * ever about twofold, rather than a filesystem that is reliably slow. Which is
+ * the more annoying kind: it passes here every time.
+ *
+ * So pass a budget wherever the work is big. The surrounding `it` has its own
+ * much larger timeout, so waiting longer costs nothing when things are working
+ * and the only thing a short deadline buys is this.
+ */
+const synced = (p: Testable, ms?: number) =>
+  until("a sync", () => p.currentState.kind === "synced", ms).catch((err: Error) => {
     throw new Error(`${err.message}; the state is ${JSON.stringify(p.currentState)}`);
   });
 /**
@@ -597,11 +613,18 @@ describe("when things go wrong", () => {
     app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "this one is not");
 
     await startVault(plugin, "laptop");
-    await synced(plugin);
+    // A minute, not the default fifteen seconds. Sealing a 4800-character path
+    // and having the server refuse it is the most work any test in this file
+    // asks for in one pass: about seven seconds here, and past fifteen on the
+    // mounted-filesystem job, which failed on exactly this line three times in
+    // twelve runs while every other job passed it.
+    await synced(plugin, 120_000);
     // Said once, when the refusal first appears (P5), so it is looked for
     // rather than provoked again.
-    await until("the refusal to be announced", () =>
-      notices.some((n) => /cannot sync/.test(n.message)),
+    await until(
+      "the refusal to be announced",
+      () => notices.some((n) => /cannot sync/.test(n.message)),
+      120_000,
     );
     await plugin.syncNow();
     // And the refusal did not stop the file that was fine, and the status
