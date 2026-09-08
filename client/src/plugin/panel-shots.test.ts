@@ -146,15 +146,24 @@ describe("the panel walk", () => {
     }
   });
 
-  it("shows the pairing form to a device with nothing, and not to one with a broken config", () => {
-    // Two ways in, and only the first offers to overwrite anything.
-    expect(of("unpaired")).toContain("Start a new vault");
-    expect(of("unpaired")).toContain("Setup string");
+  it("asks a device with nothing which it is, and asks a broken one nothing", () => {
+    // The question, not a form. Both paths are named and neither field is
+    // drawn until one of them is chosen, because a screen holding both said
+    // nothing about which half was yours.
+    expect(of("unpaired")).toContain("It is joining a vault I already have");
+    expect(of("unpaired")).toContain("It is the first device on a new vault");
+    expect(of("unpaired")).toContain("Paste an invite");
+    expect(of("unpaired")).toContain("Use a setup line");
+    // And no fields yet: a field belongs to one of the two answers.
+    expect(of("unpaired")).not.toContain("Setup string");
+    expect(of("unpaired")).not.toContain("Invite or recovery key");
 
     // Rule 2: unreadable is not absent. A pairing form here would offer to
-    // write over a credential that may be the only copy, so there is none.
+    // write over a credential that may be the only copy, so there is none, and
+    // the question is not asked either.
     expect(of("config-unreadable")).toMatch(/stopped/);
-    expect(of("config-unreadable")).not.toContain("Start a new vault");
+    expect(of("config-unreadable")).not.toContain("Use a setup line");
+    expect(of("config-unreadable")).not.toContain("Which is this device?");
   });
 
   it("draws the paired panel's rows, in the order somebody reads them", () => {
@@ -221,18 +230,29 @@ describe("the panel walk", () => {
    * because the shape was still label-prose-label-prose all the way down. A
    * row is a label, a `?` and a control now, and no description at all.
    *
-   * The exception, and the only one: a description that *is* the row's
-   * content rather than an explanation of it. A device row is `id · added X ·
-   * last seen Y` and a deleted note is `Deleted X, last written on Y`; strip
-   * those and the list says nothing. They are recognised by shape rather than
-   * by an allowlist of rows, so a new list row is covered and a new sentence
-   * is not.
+   * The first exception: a description that *is* the row's content rather than
+   * an explanation of it. A device row is `id · added X · last seen Y` and a
+   * deleted note is `Deleted X, last written on Y`; strip those and the list
+   * says nothing. They are recognised by shape rather than by an allowlist of
+   * rows, so a new list row is covered and a new sentence is not.
+   *
+   * The second is a screen rather than a row: the question an unpaired device
+   * is asked. What made sixteen descriptions unreadable was
+   * label-prose-label-prose down a panel of rows that each do something; the
+   * unpaired panel has two rows and its whole job is to be chosen between, so
+   * the line under each is what somebody reads to choose rather than an
+   * explanation of a control. It cannot be behind a `?` for the same reason
+   * the `?` had to stop being a hover: on a phone a person choosing has no way
+   * to reveal it. Excepted by screen, not by row, so a third row on that
+   * screen is covered and a new sentence anywhere else is not.
    */
   it("gives rows a label and a control, and prose only where it is the content", () => {
     const isContent = (d: string): boolean =>
       d.includes(" · ") || /^Deleted .*(last written on|nothing to restore)/.test(d);
+    const chooses = (shotName: string): boolean => shotName === "unpaired";
     const prosey: string[] = [];
     for (const shot of shots) {
+      if (chooses(shot.name)) continue;
       for (const desc of descriptions(shot.body)) {
         if (!isContent(desc)) prosey.push(`${shot.name}: ${desc}`);
       }

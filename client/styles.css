@@ -134,10 +134,15 @@
   color: var(--text-muted);
 }
 
-/* The detail a one-line description cannot carry. Obsidian renders aria-label
- * as its own tooltip, so the marker is the whole of the affordance. */
+/* The detail a one-line description cannot carry.
+ *
+ * `cursor: pointer` and not `help`, because it is a button now: aria-label
+ * alone made it a hover tooltip, and a phone does not hover, so every one of
+ * these was dead on the platform this plugin is most used on. The tooltip
+ * stays for the desktop and pressing it reveals the same text in the row. */
 .basalt-help {
-  cursor: help;
+  cursor: pointer;
+  user-select: none;
   margin-left: 6px;
   padding: 0 5px;
   border-radius: 50%;
@@ -180,55 +185,33 @@
   font-size: var(--font-ui-smaller);
 }
 
-/* And the `?` itself is now something to press, so it needs a target a thumb
- * can hit. It was a 12px glyph. */
-.basalt-help {
-  cursor: pointer;
-  user-select: none;
-}
-
-/* The panel, wherever it is drawn.
+/* The panel is not styled row by row, and that is deliberate.
  *
- * It appears in a modal (ribbon, status bar, command palette) and in the
- * Settings tab, and Obsidian styles those two containers differently: the
- * modal gets separators between rows and the tab does not, so the same three
- * rows read as a list in one place and as three things adrift in whitespace in
- * the other. These rules make the two agree, so one screenshot describes both. */
-.basalt-panel .setting-item {
-    padding: 12px 0;
-    border-top: 1px solid var(--background-modifier-border);
-}
-
-/* The first row sits under a paragraph, not under another row. */
-.basalt-panel .setting-item:first-of-type,
-.basalt-panel h2 + .setting-item,
-.basalt-panel h3 + .setting-item,
-.basalt-panel p + .setting-item {
-    border-top: none;
-}
-
-/* A row that is only a button (Pair, Start a new vault, I have written it
- * down) is an action belonging to the fields above it rather than a row of its
- * own, so it gets no line above and sits closer to them.
+ * It appears in a modal and in the Settings tab, and Obsidian styles those two
+ * containers differently: since 1.13 a settings-tab row is a rounded card with
+ * its own background and padding, where a modal's rows are flat with
+ * separators. This file briefly tried to make the two agree, with a border-top
+ * and a padding on every `.setting-item` inside the panel. In the tab that drew
+ * a line across the inside of each card and made every row taller than the app
+ * makes its own, which is what "the padding looks off" meant.
  *
- * Matched on an *empty* name rather than a missing one. Obsidian's `Setting`
- * declares `nameEl` as a property and always creates the div, so the first
- * version of this rule said `:not(:has(.setting-item-name))` and could never
- * match anything: dead CSS that looked like it worked because the thing it was
- * meant to change is cosmetic. A Setting that never had `setName` called leaves
- * that div with no children and no text, which is what `:empty` is. */
-.basalt-panel .setting-item:has(.setting-item-name:empty) {
-    border-top: none;
-    padding-top: 4px;
-    justify-content: flex-end;
+ * So the rows are Obsidian's. The screenshot in docs/ is of the modal and the
+ * tab legitimately does not match it; that is a thing for the docs to say
+ * rather than for this file to override. What is left below is only what the
+ * app has no opinion about: a key that has to be selectable, and the detail a
+ * `?` reveals.
+ */
+
+/* A key or an invite inside a row's description column: block, so it wraps
+ * across the full width instead of being clipped to one line. */
+.basalt-panel .setting-item-description .basalt-pairing {
+    display: block;
+    margin: 0;
 }
 
-.basalt-panel h2 {
-    margin: 0 0 12px;
-    font-size: var(--font-ui-large);
-}
-
-.basalt-panel h3 {
-    margin: 20px 0 4px;
-    font-size: var(--font-ui-medium);
+/* The two rows an unpaired device chooses between. Their control is centred
+ * rather than top-aligned, because each carries two lines of the sentence
+ * somebody reads to choose and Obsidian pins a control to the top. */
+.basalt-choice {
+    align-items: center;
 }

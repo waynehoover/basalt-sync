@@ -2175,6 +2175,10 @@ function row(host: HTMLElement, name: string, detail: string): Setting {
   help(setting.nameEl, detail, setting.descEl);
   return setting;
 }
+// Do not call `setDesc` on what this returns. The `?` detail is a child of
+// `descEl` and `setDesc` writes that element's text, so the two silently
+// overwrite each other. Every current `setDesc` caller builds its Setting
+// directly, which is why nothing is broken today and why this is written down.
 
 /**
  * A paragraph that is filled later, and takes no room until it is.
@@ -2308,8 +2312,29 @@ class BasaltPanel {
       // and moving that definition to the truthful one took the key off the
       // screen and let the pairing sail past the wait it is supposed to hold
       // at. It belongs here, which is the state it describes.
-      const unfinished = this.freshRecoveryKey ?? this.plugin.pendingFirstPairing();
-      if (unfinished !== undefined) this.renderRecoveryKey(contentEl, unfinished);
+      // Two states, and they are not the same screen.
+      //
+      // A *fresh* key is a pairing in flight: it is waiting for somebody to say
+      // they have it (R02) and the claim is held open until they do. Nothing
+      // else is drawn, because a live "Start a new vault" under it is a second
+      // way forward that abandons the key the first one is asking to be written
+      // down. A screenshot showed both on one screen and every markup test was
+      // happy with it.
+      //
+      // A *pending* key is an abandoned pairing from some earlier session:
+      // nothing is in flight, the config holds the only copy of the key, and
+      // the form goes underneath because otherwise there is no way to try
+      // again. Drawing only the key here loops: acknowledging clears the fresh
+      // one and `pendingFirstPairing` still answers from the config, so the
+      // same screen comes back for ever. That is what this used to do for both
+      // states, and a test that says "there is no way to try again" is the one
+      // that caught it.
+      if (this.freshRecoveryKey !== undefined) {
+        this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
+        return;
+      }
+      const pending = this.plugin.pendingFirstPairing();
+      if (pending !== undefined) this.renderRecoveryKey(contentEl, pending);
       this.renderPairing(contentEl);
       return;
     }
@@ -2334,12 +2359,29 @@ class BasaltPanel {
     // is text a listener can update; a row is not, and a panel that was open
     // when the server was restored would otherwise say "stopped" beside no way
     // out until it was closed and opened again.
-    const drewRejoin = offersRejoin(this.plugin.currentState);
-    this.unwatch = this.plugin.watchState((state) => {
-      if (offersRejoin(state) !== drewRejoin) {
+    // What shape this pass drew, so a panel left open when the vault changes
+    // under it is redrawn rather than patched.
+    //
+    // This used to watch one thing, whether a rejoin row was needed. Unlinking
+    // from another surface therefore left every paired row on screen with "Not
+    // paired." above them: Sync, Add another device, Manage this vault and a
+    // Browse deleted that opened a recovery modal against a vault with no
+    // credential. Reported from the settings tab, which is the surface most
+    // likely to be sitting open while something else does the unlinking.
+    const shapeOf = () =>
+      JSON.stringify([
+        this.plugin.configProblem !== undefined,
+        this.plugin.paired,
+        (this.freshRecoveryKey ?? this.plugin.pendingFirstPairing()) !== undefined,
+        offersRejoin(this.plugin.currentState),
+      ]);
+    const drewShape = shapeOf();
+    this.unwatch = this.plugin.watchState(() => {
+      if (shapeOf() !== drewShape) {
         this.render();
         return;
       }
+      const state = this.plugin.currentState;
       status.setText(longStatus(state));
       // Both cursors, so "behind and nothing arriving" is something a person
       // can see (I11).
@@ -2367,7 +2409,7 @@ class BasaltPanel {
     // Only while it is the answer to something, and never inside the
     // disclosure below: a device the server has refused has to say so, and
     // offer the way out, without anybody opening anything first.
-    if (drewRejoin) this.renderRejoin(contentEl);
+    if (offersRejoin(this.plugin.currentState)) this.renderRejoin(contentEl);
 
     // A key this panel has just produced, still on screen until somebody says
     // they have it (R02). The unfinished-pairing case is drawn in the unpaired
@@ -2386,6 +2428,16 @@ class BasaltPanel {
       "The server keeps every version, including of notes you have deleted, until a purge.",
     ).addButton((b) =>
       b.setButtonText("Browse deleted").onClick(() => {
+        // Checked at the press as well as by the shape watcher above, because
+        // a panel can be looked at for a while: a click that arrives after the
+        // vault was unlinked elsewhere used to open a recovery modal with no
+        // credential behind it, which then failed inside the modal. A sentence
+        // where the modal would have been, which is what `syncNow` and
+        // `createInvite` already do.
+        if (!this.plugin.paired) {
+          new Notice("Basalt: this vault is not paired yet. There is nothing to recover.");
+          return;
+        }
         this.dismiss();
         new RecoverModal(this.plugin).open();
       }),
@@ -2790,8 +2842,8 @@ class BasaltPanel {
       contentEl,
       "This device's name",
       "What the device list, a note's history and conflict copies call this device. Changing it " +
-        "renames nothing already written: copies made before now keep the old name, because they " +
-        "are notes rather than labels.",
+        "renames nothing already written: copies made before now keep the old name, and older " +
+        "versions in a note's history keep the name that wrote them.",
     );
     setting.addText((t) => {
       t.setPlaceholder("laptop");
@@ -2891,26 +2943,83 @@ class BasaltPanel {
     });
   }
 
+  /**
+   * Which device this is, and then the one form that answers it.
+   *
+   * This used to be both forms at once: a device name, an invite field and
+   * *Pair*, then "Or start a new vault", a setup string and *Start a new
+   * vault*. Everything needed was on the screen and the screen did not say
+   * which half was yours. Reported from a phone as not knowing which path to
+   * take, and it was worse there than on a desktop for two reasons: the lines
+   * that disambiguated the two were on the `?` marks, which did nothing
+   * without a hover, and "Only for the first device" was one small line doing
+   * all the work.
+   *
+   * So the choice comes first and is a question about the device rather than
+   * about the protocol: has this vault got Basalt on it somewhere else, or is
+   * this the first one. Then only that path's fields are drawn. The guidance
+   * that decides the choice is visible text and not a `?`, because a line
+   * somebody needs in order to choose is content rather than detail.
+   *
+   * `joining` is panel state and not plugin state: closing the panel and
+   * opening it again starts at the question, which is right, because somebody
+   * who left is somebody who was not sure.
+   */
   private renderPairing(contentEl: HTMLElement): void {
-    // Short enough that the `?` stays on the line with it. At the width the
-    // panel actually renders, "from another device" pushed the badge onto a
-    // line of its own, where it read as a stray glyph belonging to nothing:
-    // the same fault twice fixed elsewhere in this file, found the same way,
-    // by looking at a screenshot. Where an invite comes from is on the badge.
-    const intro = contentEl.createEl("p", {
-      text: "Not paired. Paste an invite, or the vault's recovery key. ",
-    });
-    help(
-      intro,
-      "An invite is made on a device that already has the vault, under Add another device, and " +
-        "works once. The recovery key is for the day no device is left to make one.",
-    );
+    if (this.joining === undefined) {
+      contentEl.createEl("p", { text: "Not paired yet. Which is this device?" });
+
+      // `new Setting` and `setDesc` rather than `row`, deliberately: this text
+      // is what somebody reads to choose, so it cannot be behind a `?`. See the
+      // note under `row`, which is the other half of the same rule.
+      const joinRow = new Setting(contentEl)
+        .setName("It is joining a vault I already have")
+        .setDesc(
+          "Make an invite on a device that already has it, under Add another device, and paste " +
+            "it here. The vault's recovery key works too.",
+        )
+        .addButton((b) =>
+          b
+            .setButtonText("Paste an invite")
+            .setCta()
+            .onClick(() => {
+              this.joining = "invite";
+              this.render();
+            }),
+        );
+
+      const firstRow = new Setting(contentEl)
+        .setName("It is the first device on a new vault")
+        .setDesc(
+          "You will need the setup line the server printed on its first run, like " +
+            "host:3003#TOKEN. Do this once; every device after it joins with an invite.",
+        )
+        .addButton((b) =>
+          // Not "Start a new vault", which is what the button at the end of
+          // that path says. Two buttons with one label is a screen where the
+          // second press is a guess, and it made the tests ambiguous too.
+          b.setButtonText("Use a setup line").onClick(() => {
+            this.joining = "first";
+            this.render();
+          }),
+        );
+
+      // Obsidian top-aligns a row's control, which is right when the row is one
+      // line. These two carry the sentence somebody chooses by, so the button
+      // ends up pinned to the top of a card with two lines of text beside it
+      // and dead space underneath. Measured before changing: the row is 85px of
+      // 16px padding plus 52px of content, so the padding was never the
+      // problem and centring the control is the whole fix.
+      for (const r of [joinRow, firstRow]) r.settingEl.addClass("basalt-choice");
+
+      docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How pairing works");
+      return;
+    }
 
     // The fields are read when a button is pressed rather than tracked
     // through input events. One less thing between what was typed and what
     // is used, and it is what makes this reachable from a test.
     let deviceField: TextComponent | undefined;
-    let pairingField: TextComponent | undefined;
     const device = () => deviceField?.getValue() ?? "";
 
     // A suggestion in the field, not a placeholder behind it. A placeholder is
@@ -2920,85 +3029,111 @@ class BasaltPanel {
     row(
       contentEl,
       "Device name",
-      "Shown in the device list, in history and on conflict copies. Type over it.",
+      "Shown in the device list, in history and on conflict copies. Type over it. It can be " +
+        "changed later, under Manage this vault.",
     ).addText((t) => {
       t.setPlaceholder("laptop");
       t.setValue(suggestedDeviceName());
       deviceField = t;
     });
 
-    row(
-      contentEl,
-      "Invite or recovery key",
-      "An invite is made on a device that already has the vault, under Add another device, and " +
-        "works once. The recovery key is for the day no device is left to make one. Either way " +
-        "this device keeps a credential of its own.",
-    ).addText((t) => {
-      t.setPlaceholder("basalt3i_...");
-      pairingField = t;
-    });
+    if (this.joining === "invite") {
+      let pairingField: TextComponent | undefined;
+      row(
+        contentEl,
+        "Invite or recovery key",
+        "An invite is made on a device that already has the vault, under Add another device, and " +
+          "works once. The recovery key is for the day no device is left to make one. Either way " +
+          "this device keeps a credential of its own.",
+      ).addText((t) => {
+        t.setPlaceholder("basalt3i_...");
+        pairingField = t;
+      });
 
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText("Pair")
-        .setCta()
-        .onClick(async () => {
-          try {
-            await this.plugin.pair(pairingField?.getValue() ?? "", device());
-            // Reached the server, so this is true. It is syncing only
-            // once the loop says so, and the panel follows the loop.
-            new Notice("Paired. Basalt is connecting.");
-            this.render();
-          } catch (err) {
-            new Notice(`Basalt: ${(err as Error).message}`, 10_000);
-          }
-        }),
-    );
-
-    contentEl.createEl("h3", { text: "Or start a new vault" });
-    contentEl.createEl("p", { text: "Only for the first device." });
-
-    let setupField: TextComponent | undefined;
-    row(
-      contentEl,
-      "Setup string",
-      "The line the server printed on first run, like host:3003#TOKEN. Behind TLS, use that " +
-        "hostname instead.",
-    ).addText((t) => {
-      t.setPlaceholder("homelab:3003#K7M2PQR4-...");
-      setupField = t;
-    });
-    new Setting(contentEl).addButton((b) =>
-      b.setButtonText("Start a new vault").onClick(async () => {
-        try {
-          // Rendered the moment the key exists, which is before the vault is
-          // claimed and long before the registration replaces the root on
-          // disk (F02), and the pairing *waits here* until somebody says they
-          // have it (R02).
-          //
-          // Showing it and carrying on was not a handoff. Registration
-          // replaces the root with this device's own credential, so a reload
-          // or a closed panel in between took the only copy of a key nothing
-          // can reissue, and returning from a callback is not evidence that
-          // anybody read the screen. Nothing has been claimed while this
-          // waits, so abandoning it costs nothing: the config still holds the
-          // root, and the panel offers the key again on the next load.
-          await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), async (key) => {
-            this.freshRecoveryKey = key;
-            this.render();
-            await this.writtenDown;
-          });
-          new Notice(
-            "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
-          );
-          this.render();
-        } catch (err) {
-          new Notice(`Basalt: ${(err as Error).message}`, 10_000);
-        }
-      }),
-    );
+      new Setting(contentEl)
+        .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
+        .addButton((b) =>
+          b
+            .setButtonText("Pair")
+            .setCta()
+            .onClick(async () => {
+              try {
+                await this.plugin.pair(pairingField?.getValue() ?? "", device());
+                // Reached the server, so this is true. It is syncing only
+                // once the loop says so, and the panel follows the loop.
+                new Notice("Paired. Basalt is connecting.");
+                this.joining = undefined;
+                this.render();
+              } catch (err) {
+                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+              }
+            }),
+        );
+    } else {
+      let setupField: TextComponent | undefined;
+      row(
+        contentEl,
+        "Setup string",
+        "The line the server printed on first run, like host:3003#TOKEN. Behind TLS, use that " +
+          "hostname instead.",
+      ).addText((t) => {
+        t.setPlaceholder("homelab:3003#K7M2PQR4-...");
+        setupField = t;
+      });
+      new Setting(contentEl)
+        .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
+        .addButton((b) =>
+          b
+            .setButtonText("Start a new vault")
+            .setCta()
+            .onClick(async () => {
+              try {
+                // Rendered the moment the key exists, which is before the vault is
+                // claimed and long before the registration replaces the root on
+                // disk (F02), and the pairing *waits here* until somebody says they
+                // have it (R02).
+                //
+                // Showing it and carrying on was not a handoff. Registration
+                // replaces the root with this device's own credential, so a reload
+                // or a closed panel in between took the only copy of a key nothing
+                // can reissue, and returning from a callback is not evidence that
+                // anybody read the screen. Nothing has been claimed while this
+                // waits, so abandoning it costs nothing: the config still holds the
+                // root, and the panel offers the key again on the next load.
+                await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), async (key) => {
+                  this.freshRecoveryKey = key;
+                  this.render();
+                  await this.writtenDown;
+                });
+                new Notice(
+                  "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
+                );
+                this.joining = undefined;
+                this.render();
+              } catch (err) {
+                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+              }
+            }),
+        );
+    }
 
     docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How pairing works");
+  }
+
+  /** Which pairing path the panel is showing, or the question if neither. */
+  private joining: "invite" | "first" | undefined;
+
+  /**
+   * Back to the question, because a choice that cannot be unmade is one
+   * somebody has to be sure about before they know anything.
+   *
+   * On the same row as the action rather than a row of its own: two lone
+   * right-aligned buttons on two lines is what that looked like, which a
+   * screenshot said and no test could.
+   */
+  private chooseAgain(): void {
+    this.joining = undefined;
+    this.render();
   }
 
   /** The recovery key of a vault this panel just started, shown once. */
@@ -3053,42 +3188,50 @@ class BasaltPanel {
       "An invite adds a device, not this. The recovery key replaces the vault's secret and is " +
         "the only way back if every device is lost.",
     );
-    contentEl.createEl("p", { cls: "basalt-pairing", text: key });
-    new Setting(contentEl)
-      // Copy first, and before the acknowledgement, because the
-      // acknowledgement is what takes the key off the screen.
-      //
-      // "Write it down" is the advice and a phone is where it is hardest to
-      // follow: there is no second screen to read from and no keyboard worth
-      // transcribing sixty characters on. Without this the only ways off the
-      // device were a photograph of a secret or retyping it, and the clipboard
-      // is the least bad of the three for getting it into a password manager.
-      // The paragraph above is selectable for the same reason, which it was
-      // not: Obsidian's own UI turns selection off broadly, so a long press on
-      // a phone did nothing at all, and `copyToClipboard`'s fallback advice
-      // ("shown in the panel, to copy by hand") described something that could
-      // not be done. styles.css turns it back on for this one class.
-      .addButton((b) =>
-        b.setButtonText("Copy").onClick(async () => {
-          await copyToClipboard(
-            key,
-            "Recovery key copied. Put it somewhere offline, then clear the clipboard.",
-          );
-        }),
-      )
-      .addButton((b) =>
-        b.setButtonText("I have written it down").onClick(() => {
-          this.freshRecoveryKey = undefined;
-          // Releases the pairing, which has been holding the vault's claim
-          // until now. Cleared so a later key gets a wait of its own.
-          const go = this.confirmWrittenDown;
-          this.confirmWrittenDown = undefined;
-          this.giveUpWrittenDown = undefined;
-          this.writtenDown = Promise.resolve();
-          go?.();
-          this.render();
-        }),
-      );
+    // The key and its Copy on one row, so the button is beside the thing it
+    // copies rather than under the next paragraph.
+    //
+    // "Write it down" is the advice and a phone is where it is hardest to
+    // follow: there is no second screen to read from and no keyboard worth
+    // transcribing sixty characters on. Without a button the only ways off the
+    // device were a photograph of a secret or retyping it, and the clipboard is
+    // the least bad of the three for getting it into a password manager. The
+    // key is selectable for the same reason, which it was not: Obsidian's own
+    // UI turns selection off broadly, so a long press on a phone did nothing at
+    // all, and `copyToClipboard`'s fallback advice ("shown in the panel, to
+    // copy by hand") described something that could not be done. styles.css
+    // turns it back on for this one class.
+    const keyRow = new Setting(contentEl);
+    // `descEl`, not `nameEl`. A name is laid out as one short line, so a
+    // sixty-character key in it was clipped through the middle: the box showed
+    // half of the first line and overflowed the second. The description column
+    // is the full width of the row and wraps, and the control column keeps Copy
+    // beside it. Seen in a screenshot; the markup tests could not have said it.
+    keyRow.descEl.createEl("code", { cls: "basalt-pairing", text: key });
+    keyRow.addButton((b) =>
+      b.setButtonText("Copy").onClick(async () => {
+        await copyToClipboard(
+          key,
+          "Recovery key copied. Put it somewhere offline, then clear the clipboard.",
+        );
+      }),
+    );
+
+    // The acknowledgement is its own row, because it is what takes the key off
+    // the screen and it should not sit a thumb's width from Copy.
+    new Setting(contentEl).addButton((b) =>
+      b.setButtonText("I have written it down").onClick(() => {
+        this.freshRecoveryKey = undefined;
+        // Releases the pairing, which has been holding the vault's claim
+        // until now. Cleared so a later key gets a wait of its own.
+        const go = this.confirmWrittenDown;
+        this.confirmWrittenDown = undefined;
+        this.giveUpWrittenDown = undefined;
+        this.writtenDown = Promise.resolve();
+        go?.();
+        this.render();
+      }),
+    );
   }
 }
 

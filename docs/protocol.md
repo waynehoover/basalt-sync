@@ -434,9 +434,21 @@ would not notice a server that stored something else.
 
 Nothing about the vault's content moves. No uid is spent and no entry is
 written, so a rename is not part of the sync stream and nothing replays it;
-another device sees the new label the next time it lists. What a rename does
-not do is rename anything already written: conflict copies carry the device
-name in their filenames, and those are notes rather than labels.
+another device sees the new label the next time it lists.
+
+What a rename does not do is rename anything already written. Conflict copies
+carry the device name in their filenames, and those are notes rather than
+labels. Every entry carries the name of the device that wrote it, so a note's
+history goes on attributing older versions to the old name, which is what was
+true when they were written.
+
+That field is not covered by the entry authenticator, which is why a rename
+needs no migration and cannot invalidate anything: `macEntry` covers the path,
+the sizes and times, the flags, the chunk list and the parent, and never the
+device. It also means history says a *key holder* wrote a version rather than
+proving which device did, which is the same boundary `docs/design.md` draws in
+refusing per-device signatures. Read the name in a history row as a label, not
+as evidence.
 
 **A device may not `register`.** It holds no vault credential, so a stolen
 laptop cannot mint a row directly, cannot `rotate`, and cannot produce the

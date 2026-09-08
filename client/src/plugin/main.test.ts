@@ -168,6 +168,30 @@ async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promis
  * much larger timeout, so waiting longer costs nothing when things are working
  * and the only thing a short deadline buys is this.
  */
+/**
+ * Opens the panel and takes one of the two pairing paths.
+ *
+ * The unpaired panel asks which device this is before it draws a form, so a
+ * test that reaches straight for "Setup string" finds nothing. This is the
+ * click a person makes, in one place, because twenty tests should not each
+ * spell out the same two lines.
+ */
+function choosePairing(plugin: Testable, path: "invite" | "first"): void {
+  built.length = 0;
+  plugin.ribbonIcons[0]!.callback();
+  const label = path === "invite" ? "Paste an invite" : "Use a setup line";
+  const choice = built.find((s) => s.buttons.some((b) => b.label === label));
+  if (!choice) throw new Error(`the panel offers no ${label}: ${built.map((s) => s.name)}`);
+  const button = choice.buttons.find((b) => b.label === label)!;
+  // Cleared before the press, not after: the press re-renders the same panel,
+  // so what lands in `built` is the form. Opening the panel again would not
+  // do, because `joining` belongs to the panel and a second modal is a second
+  // panel, which starts at the question again. That is right for a person and
+  // it silently undid the choice here.
+  built.length = 0;
+  void button.click();
+}
+
 const synced = (p: Testable, ms?: number) =>
   until("a sync", () => p.currentState.kind === "synced", ms).catch((err: Error) => {
     throw new Error(`${err.message}; the state is ${JSON.stringify(p.currentState)}`);
@@ -595,8 +619,7 @@ describe("the `?` beside a label", () => {
   it("is a button that shows its detail, not a hover tooltip", async () => {
     await fresh();
     const { plugin } = await load();
-    built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "invite");
 
     const key = built.find((s) => s.name === "Invite or recovery key")!;
     const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
@@ -619,8 +642,7 @@ describe("the `?` beside a label", () => {
   it("keeps the hover tooltip for the desktop, where it worked", async () => {
     await fresh();
     const { plugin } = await load();
-    built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "invite");
     const key = built.find((s) => s.name === "Invite or recovery key")!;
     const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
     expect(mark.attributes.get("aria-label")).toMatch(/An invite is made on a device/);
@@ -1012,21 +1034,64 @@ describe("the panel, which is a modal and a settings tab", () => {
     expect(tab.containerEl.children).toEqual([]);
   }, 300_000);
 
-  it("asks to be paired when it is not", async () => {
+  it("asks which device this is before it asks for anything else", async () => {
+    // It used to draw both forms at once: a name, an invite and Pair, then "Or
+    // start a new vault", a setup string and Start a new vault. Everything
+    // needed was there and nothing said which half was yours, which is what
+    // was reported from a phone. So the question comes first, and it is a
+    // question about the device rather than about the protocol.
     const { plugin } = await load();
     plugin.ribbonIcons[0]!.callback();
 
-    const names = built.map((s) => s.name);
-    expect(names).toContain("Invite or recovery key");
-    expect(names).toContain("Device name");
-    // One field for the first device, holding the line the server printed,
-    // rather than a Server and a Token to split it into by hand.
-    expect(names).toContain("Setup string");
-    expect(names).not.toContain("Server");
-    expect(names).not.toContain("Token");
+    const asked = built.map((s) => s.name);
+    expect(asked).toContain("It is joining a vault I already have");
+    expect(asked).toContain("It is the first device on a new vault");
+    // And no fields yet, because a field belongs to one of the two answers.
+    expect(asked).not.toContain("Invite or recovery key");
+    expect(asked).not.toContain("Setup string");
+
+    // The line that decides the choice is a description and not a `?`. That was
+    // the whole defect: on a phone there is no hover, so the guidance was not
+    // reachable at all and the labels were on their own. Read off the rows
+    // rather than out of `allText`, because the fake keeps a description as a
+    // property where Obsidian renders it into the row.
+    const desc = (name: string) => built.find((s) => s.name === name)?.desc ?? "";
+    expect(desc("It is joining a vault I already have")).toMatch(
+      /Make an invite on a device that already has it/,
+    );
+    expect(desc("It is the first device on a new vault")).toMatch(/setup line the server printed/);
+    // And nothing that decides the choice is hidden behind a mark.
+    for (const name of [
+      "It is joining a vault I already have",
+      "It is the first device on a new vault",
+    ]) {
+      const mark = built.find((s) => s.name === name)!.nameEl.children;
+      expect(
+        mark.filter((c) => c.cls === "basalt-help"),
+        `${name} hides its reason`,
+      ).toEqual([]);
+    }
+
+    // Then one path, and only that path's fields.
+    choosePairing(plugin, "invite");
+    const joining = built.map((s) => s.name);
+    expect(joining).toContain("Invite or recovery key");
+    expect(joining).toContain("Device name");
+    expect(joining).not.toContain("Setup string");
+
+    choosePairing(plugin, "first");
+    const starting = built.map((s) => s.name);
+    expect(starting).toContain("Setup string");
+    expect(starting).toContain("Device name");
+    expect(starting).not.toContain("Invite or recovery key");
+    // One field holding the line the server printed, rather than a Server and
+    // a Token to split it into by hand.
+    expect(starting).not.toContain("Server");
+    expect(starting).not.toContain("Token");
+
     // No options anywhere in it. docs/design.md refuses a settings
     // screen, and this is the thing that would quietly become one.
-    expect(names.filter((n) => n.toLowerCase().includes("enable"))).toEqual([]);
+    expect(starting.filter((n) => n.toLowerCase().includes("enable"))).toEqual([]);
   });
 
   it("pairs from what was typed into it", async () => {
@@ -1036,11 +1101,14 @@ describe("the panel, which is a modal and a settings tab", () => {
     await synced(first.plugin);
 
     const second = await load();
-    second.plugin.ribbonIcons[0]!.callback();
+    choosePairing(second.plugin, "invite");
 
     built.find((s) => s.name === "Device name")!.texts[0]!.type("desktop");
     built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(pairing);
-    await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+      .buttons.find((b) => b.label === "Pair")!
+      .click();
 
     expect(second.plugin.paired).toBe(true);
     expect(second.plugin.deviceName).toBe("desktop");
@@ -1149,12 +1217,15 @@ describe("the panel, which is a modal and a settings tab", () => {
 
   it("says what went wrong rather than failing quietly", async () => {
     const { plugin } = await load();
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "invite");
     built
       .find((s) => s.name === "Invite or recovery key")!
       .texts[0]!.type("this is not a pairing string");
     notices.length = 0;
-    await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+      .buttons.find((b) => b.label === "Pair")!
+      .click();
 
     expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt3_/);
     expect(plugin.paired).toBe(false);
@@ -2875,11 +2946,13 @@ describe("adding a device from the panel", () => {
     expect(invite).toMatch(/^basalt3i_/);
 
     const second = await load();
-    built.length = 0;
-    second.plugin.ribbonIcons[0]!.callback();
+    choosePairing(second.plugin, "invite");
     built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
     built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(invite);
-    await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+      .buttons.find((b) => b.label === "Pair")!
+      .click();
     expect(second.plugin.paired).toBe(true);
     await synced(second.plugin);
     await until("the note to arrive", () => second.app.vault.adapter.text("note.md") !== undefined);
@@ -2960,11 +3033,13 @@ describe("adding a device from the panel", () => {
     await synced(first.plugin);
 
     const second = await load();
-    built.length = 0;
-    second.plugin.ribbonIcons[0]!.callback();
+    choosePairing(second.plugin, "invite");
     built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
     built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(key);
-    await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+      .buttons.find((b) => b.label === "Pair")!
+      .click();
     expect(second.plugin.paired).toBe(true);
     await synced(second.plugin);
     await until("the note to arrive", () => second.app.vault.adapter.text("note.md") !== undefined);
@@ -3015,7 +3090,7 @@ describe("adding a device from the panel", () => {
   it("shows the recovery key once when a vault is started, and says to write it down", async () => {
     await fresh();
     const { plugin } = await load();
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "first");
     built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
     built.find((s) => s.name === "Device name")!.texts[0]!.type("laptop");
     // Not awaited yet. The pairing now holds the vault's claim until somebody
@@ -3023,7 +3098,8 @@ describe("adding a device from the panel", () => {
     // the acknowledgement clicked further down.
     const starting = built
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "Start a new vault")!
+      .click();
     await until("the recovery key to be shown", () =>
       modals.at(-1)!.contentEl.allText().includes("Write this down"),
     );
@@ -3054,10 +3130,10 @@ describe("adding a device from the panel", () => {
       },
     });
     try {
-      const keyScreen = built.find((s) =>
-        s.buttons.some((b) => b.label === "I have written it down"),
-      )!;
-      const copy = keyScreen.buttons.find((b) => b.label === "Copy");
+      // Copy is on the key's own row now, beside the key, and the
+      // acknowledgement is a row of its own: a button that dismisses the only
+      // copy of a secret should not sit a thumb's width from one that does not.
+      const copy = built.flatMap((s) => s.buttons).find((b) => b.label === "Copy");
       expect(copy, "the recovery key was shown with no way to copy it").toBeDefined();
       await copy!.click();
       expect(copied, "Copy did not put the recovery key on the clipboard").toEqual([key]);
@@ -3099,11 +3175,12 @@ describe("adding a device from the panel", () => {
     await fresh();
     const { plugin } = await load();
 
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "first");
     built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
     const starting = built
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "Start a new vault")!
+      .click();
     await until("the recovery key to be shown", () =>
       built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
     );
@@ -3132,8 +3209,7 @@ describe("adding a device from the panel", () => {
     expect(plugin.paired, "an abandoned first pairing reads as a paired vault").toBe(false);
     expect(plugin.currentState.kind).toBe("unpaired");
 
-    built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "first");
     // The key is offered again, from the config, next to the form that lets
     // somebody start over.
     await until("the key to be offered again", () =>
@@ -3149,11 +3225,11 @@ describe("adding a device from the panel", () => {
       .click();
 
     // And starting over actually works, rather than being refused.
-    built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    choosePairing(plugin, "first");
     built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
-    const start = built.find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
-      .buttons[0]!;
+    const start = built
+      .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
+      .buttons.find((b) => b.label === "Start a new vault")!;
     // Cleared here, so what appears below is the render this click causes and
     // not the one that drew the key from the abandoned attempt. Waiting on the
     // stale one acknowledges a promise nothing is holding, and the pairing
@@ -3233,7 +3309,9 @@ describe("what the panel knows and used to keep to itself", () => {
     const { plugin } = await load();
     Platform.isMacOS = true;
     try {
-      plugin.ribbonIcons[0]!.callback();
+      // Either path draws the name field, since it is shared; this one is the
+      // one the rest of the test uses.
+      choosePairing(plugin, "first");
       // In the field, not behind it as a placeholder. A placeholder is not a
       // value: the field was empty and so was what got used.
       const suggested = nameField().getValue();
@@ -3244,7 +3322,8 @@ describe("what the panel knows and used to keep to itself", () => {
       // acknowledgement comes before the await.
       const starting = built
         .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
-        .buttons[0]!.click();
+        .buttons.find((b) => b.label === "Start a new vault")!
+        .click();
       await until("the recovery key to be shown", () =>
         built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
       );
@@ -3275,7 +3354,7 @@ describe("what the panel knows and used to keep to itself", () => {
     Platform.isTablet = true;
     Platform.isMacOS = true;
     try {
-      plugin.ribbonIcons[0]!.callback();
+      choosePairing(plugin, "first");
       expect(nameField().getValue()).toMatch(/^ipad-[0-9a-f]{4}$/);
     } finally {
       Platform.isIosApp = false;
