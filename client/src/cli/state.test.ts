@@ -9,7 +9,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -586,6 +587,128 @@ describe("the two ways of asking how a vault is", () => {
     // And it says which of the two unhappy things it is, rather than looking
     // like a transfer that failed.
     expect(syncJson.outcome.kind).toBe("recoveryUnknown");
+  }, 120_000);
+});
+
+/**
+ * A device that holds a copy and originates nothing (I29).
+ *
+ * The case this exists for is not a bug in the sync engine. A scan of a mount
+ * that came up empty, a path typo, a half-restored disk: each is an *ordinary
+ * local change*, and ordinary local changes propagate, so a mirror can delete
+ * notes on every device by being wrong about what is on its own disk. A device
+ * without the capability cannot make that mistake.
+ */
+describe("a read-only device", () => {
+  it("applies what the server has and sends nothing back", async () => {
+    const a = await paired("ro-writer");
+    await writeFile(join(a, "from-the-server.md"), "written elsewhere\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    // A second device on the same vault, read-only from the start.
+    const b = await vaultDir("ro-mirror");
+    const invite = JSON.parse((await cli("invite", "--dir", a, "--json")).out.at(-1)!) as {
+      invite: string;
+    };
+    expect((await cli("pair", invite.invite, "--dir", b, "--read-only")).code).toBe(0);
+    expect((await cli("sync", "--dir", b, "--json")).code).toBe(0);
+    // It received the note, because a mirror is still a copy.
+    expect(await readFile(join(b, "from-the-server.md"), "utf8")).toBe("written elsewhere\n");
+
+    // Now it changes locally, the way a broken mount or a stray editor would.
+    await writeFile(join(b, "invented-here.md"), "this must not travel\n");
+    await rm(join(b, "from-the-server.md"));
+
+    const mirrored = await cli("sync", "--dir", b, "--json");
+    expect(mirrored.code, mirrored.all).toBe(0);
+    const report = JSON.parse(mirrored.out.at(-1)!) as { heldBack: number; uploaded: number };
+    expect(report.uploaded).toBe(0);
+    expect(report.heldBack, "the local changes were not counted as held back").toBeGreaterThan(0);
+
+    // And the writer still has everything, which is the whole point: the
+    // mirror's deletion did not become everybody's deletion.
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect(await readFile(join(a, "from-the-server.md"), "utf8")).toBe("written elsewhere\n");
+    expect(existsSync(join(a, "invented-here.md"))).toBe(false);
+  }, 120_000);
+
+  it("stays read-only without the flag, because it is in the config", async () => {
+    // The reason it is not a flag alone. A cron line that loses an argument
+    // would otherwise turn a mirror into a writer, and nobody would find out
+    // until it had deleted something everywhere.
+    const a = await paired("ro-sticky-writer");
+    const b = await vaultDir("ro-sticky");
+    const invite = JSON.parse((await cli("invite", "--dir", a, "--json")).out.at(-1)!) as {
+      invite: string;
+    };
+    expect((await cli("pair", invite.invite, "--dir", b, "--read-only")).code).toBe(0);
+
+    await writeFile(join(b, "still-must-not-travel.md"), "x\n");
+    // No --read-only this time.
+    const out = await cli("sync", "--dir", b, "--json");
+    expect(out.code, out.all).toBe(0);
+    const report = JSON.parse(out.out.at(-1)!) as { heldBack: number; uploaded: number };
+    expect(report.uploaded, "the flag was forgotten and the mirror uploaded").toBe(0);
+    expect(report.heldBack).toBeGreaterThan(0);
+  }, 120_000);
+});
+
+/**
+ * Turning merging off (I30).
+ *
+ * Obsidian's own headless client has `--conflict-strategy merge|conflict` and
+ * this had no equivalent: it always merged when it safely could, and somebody
+ * who would rather look at two files had no way to say so. Merging is the only
+ * thing this client does that produces content neither device wrote, and while
+ * it refuses everything it cannot do safely, "refuses to guess" and "does not
+ * guess" are different promises to be able to make.
+ *
+ * Nothing is lost either way. Off means every case that would have merged
+ * keeps both versions, which is what merging already falls back to.
+ */
+describe("a device with merging turned off", () => {
+  /** Two devices on one vault, both able to write. */
+  async function pair2(name: string): Promise<{ a: string; b: string }> {
+    const a = await paired(name);
+    const b = await vaultDir(`${name}-b`);
+    const invite = JSON.parse((await cli("invite", "--dir", a, "--json")).out.at(-1)!) as {
+      invite: string;
+    };
+    expect((await cli("pair", invite.invite, "--dir", b)).code).toBe(0);
+    return { a, b };
+  }
+
+  /** Both devices edit one note in different places, then both sync. */
+  async function bothEdit(a: string, b: string, extra: string[]): Promise<string[]> {
+    const base = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n") + "\n";
+    await writeFile(join(a, "note.md"), base);
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+
+    await writeFile(join(a, "note.md"), base.replace("line 0", "line 0, changed by A"));
+    await writeFile(join(b, "note.md"), base.replace("line 11", "line 11, changed by B"));
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    await cli("sync", "--dir", b, ...extra);
+    return (await readdir(b)).filter((n) => n.endsWith(".md")).sort();
+  }
+
+  it("merges by default, which is what the client is for", async () => {
+    const { a, b } = await pair2("merge-on");
+    const files = await bothEdit(a, b, []);
+    expect(files, `expected one merged note, got ${files.join(", ")}`).toEqual(["note.md"]);
+    const merged = await readFile(join(b, "note.md"), "utf8");
+    expect(merged).toContain("changed by A");
+    expect(merged).toContain("changed by B");
+  }, 120_000);
+
+  it("keeps both versions instead, when told to", async () => {
+    const { a, b } = await pair2("merge-off");
+    const files = await bothEdit(a, b, ["--no-merge"]);
+    expect(files.length, `expected two files, got ${files.join(", ")}`).toBe(2);
+    // Both edits survive, in two files rather than one.
+    const all = (await Promise.all(files.map((f) => readFile(join(b, f), "utf8")))).join("\n");
+    expect(all).toContain("changed by A");
+    expect(all).toContain("changed by B");
   }, 120_000);
 });
 

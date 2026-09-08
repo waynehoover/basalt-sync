@@ -403,6 +403,19 @@ export interface DeviceConfig {
   readonly deviceId?: string;
   readonly deviceSecret?: Uint8Array;
   /**
+   * Whether this device may send anything to the server (I29).
+   *
+   * In the config rather than only in a flag, because the point of it is that
+   * the capability is absent: a mirror that becomes writable the moment a cron
+   * line loses an argument has not been made safe, it has been made
+   * conditional. Written by `init --read-only` and `pair --read-only`, and
+   * there is no flag that turns it off again.
+   *
+   * Absent means writable, so every config written before this existed reads
+   * exactly as it did.
+   */
+  readonly readOnly?: boolean;
+  /**
    * The vault's data key, unwrapped.
    *
    * Held directly rather than as the wrapping the server returns, because the
@@ -495,6 +508,10 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
     ...(config.deviceSecret ? { deviceSecret: base64urlEncode(config.deviceSecret) } : {}),
     ...(config.dataKey ? { dataKey: base64urlEncode(config.dataKey) } : {}),
     ...(config.secret ? { secret: base64urlEncode(config.secret) } : {}),
+    // Written only when true, so a writable config is byte-for-byte what it
+    // was before this existed, and an older build reading it sees a field it
+    // does not know and ignores rather than a value it misreads.
+    ...(config.readOnly === true ? { readOnly: "true" } : {}),
   };
 }
 
@@ -530,6 +547,11 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     ...key(record, "deviceSecret", DEVICE_SECRET_LENGTH, "a device secret", where),
     ...key(record, "dataKey", DATA_KEY_LENGTH, "a data key", where),
     ...key(record, "secret", SECRET_LENGTH, "a root secret", where),
+    // Only the exact string this writes turns it on. Anything else, including
+    // a missing field and including some other truthy word, means writable,
+    // because a device silently refusing to send would look exactly like a
+    // device with nothing to send (I29).
+    ...(record["readOnly"] === "true" ? { readOnly: true } : {}),
   };
   if (config.secret === undefined && config.deviceId === undefined) {
     // Neither credential, which is not a state anything here writes: a config

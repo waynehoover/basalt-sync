@@ -3602,6 +3602,8 @@ describe("what a restore is allowed to claim", () => {
       needsAttention: [],
       chunksSent: 0,
       bytesSent: 0,
+      heldBack: 0,
+      heldBackPaths: [],
     };
     const client = held.client as unknown as { settle: () => Promise<SyncReport> };
     client.settle = async () => report;

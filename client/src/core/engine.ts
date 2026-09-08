@@ -421,6 +421,18 @@ export interface EngineOptions {
    * mean exiting successfully having skipped the file the user just saved.
    */
   readonly coalesceWrites?: boolean;
+  /**
+   * Whether two edits to one note may be merged. Default true (I30).
+   *
+   * False keeps both versions in every case that would have merged, which is
+   * what merging already does when it cannot proceed safely.
+   */
+  readonly merge?: boolean;
+  /**
+   * Whether this device may send anything to the server. Default false, which
+   * is to say it may (I29).
+   */
+  readonly readOnly?: boolean;
 }
 
 /** Overrides for a single pass. */
@@ -433,6 +445,18 @@ export interface SyncOptions {
    * the line they just typed sits unsent is the exact status rule 7 forbids.
    */
   readonly coalesceWrites?: boolean;
+  /**
+   * Whether two edits to one note may be merged. Default true (I30).
+   *
+   * False keeps both versions in every case that would have merged, which is
+   * what merging already does when it cannot proceed safely.
+   */
+  readonly merge?: boolean;
+  /**
+   * Whether this device may send anything to the server. Default false, which
+   * is to say it may (I29).
+   */
+  readonly readOnly?: boolean;
 }
 
 /**
@@ -537,6 +561,18 @@ export interface SyncReport {
    * stopped syncing years ago.
    */
   ignored: number;
+  /**
+   * Local changes this device will never send, because it is read-only (I29).
+   *
+   * Its own count rather than folded into `ignored`, and out of the exit code
+   * for the same reason: it is the configuration doing what it was told. An
+   * `--ignore` is a path this device does not sync at all; this is one it
+   * syncs in a single direction, and somebody looking at a mirror quietly
+   * accumulating local edits should be told which of the two they have.
+   */
+  heldBack: number;
+  /** Which ones, so the line names them rather than counting them. */
+  heldBackPaths: string[];
   /**
    * Paths a file is standing in the way of.
    *
@@ -684,6 +720,8 @@ function emptyReport(): SyncReport {
     skipped: 0,
     skippedPaths: [],
     retryingPaths: [],
+    heldBack: 0,
+    heldBackPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],
@@ -873,6 +911,57 @@ export class Engine {
 
   private get coalesce(): boolean {
     return this.opts.coalesceWrites ?? true;
+  }
+
+  /**
+   * Whether this device may merge two edits into one note (I30).
+   *
+   * On by default, because it is the thing this client is for. Off is for
+   * somebody who would rather look at two files than trust anything to
+   * combine them: merging is the only operation here that produces content
+   * neither device wrote, and while it refuses everything it cannot do safely,
+   * "refuses to guess" and "does not guess" are different promises.
+   *
+   * Off does not mean anything is lost. It means every case that would have
+   * merged keeps both versions instead, which is what merging already falls
+   * back to.
+   */
+  private get merging(): boolean {
+    return this.opts.merge ?? true;
+  }
+
+  /**
+   * Whether this device may send anything to the server (I29).
+   *
+   * A mirror holds a copy and originates nothing. What this stops is not a
+   * mistake in the sync engine: a scan of a mount that came up empty, a path
+   * typo, a half-restored disk are all *ordinary local changes*, and ordinary
+   * local changes propagate. A device that cannot push cannot delete somebody's
+   * notes on every other device by being wrong about what is on its own disk.
+   *
+   * It does not make the client simpler, and it was proposed on the mistaken
+   * belief that it would. Downloads still land through `writePreserving`,
+   * because the bytes still arrive on a disk a person may have edited.
+   */
+  private get sending(): boolean {
+    return this.opts.readOnly !== true;
+  }
+
+  /**
+   * Records a local change this device is not going to send.
+   *
+   * Counted and named, never silent. A mirror with local edits is a thing
+   * somebody should find out about from `status` rather than by noticing years
+   * later that a machine has been quietly diverging, which is the reasoning
+   * that put `ignored` in the report (R2).
+   *
+   * Deliberately not a failure. Nothing is wrong and nothing needs fixing: the
+   * device was told not to send, and did not.
+   */
+  private heldBack(path: string, report: SyncReport, why: string): void {
+    report.heldBack++;
+    if (report.heldBackPaths.length < 20) report.heldBackPaths.push(path);
+    this.log("held back", path, why);
   }
 
   /** What this device knows, for a status line that describes the vault. */
@@ -1715,6 +1804,12 @@ export class Engine {
         return;
 
       case "deleteRemote": {
+        if (!this.sending) {
+          // The one this feature exists for. A mirror that decides a note is
+          // gone because its disk was not mounted must not be able to say so.
+          this.heldBack(path, report, "this device is read-only, so it was not deleted anywhere");
+          return;
+        }
         // Fixed once, because it is signed and then sent: calling now()
         // twice would sign one timestamp and send another.
         const deletedAt = this.now();
@@ -1791,6 +1886,17 @@ export class Engine {
      */
     sealed?: Scanned,
   ): Promise<void> {
+    // Here rather than at the decision, because this is the choke point (I29).
+    //
+    // The first version guarded the `upload` action in the switch above and a
+    // conflict copy went up anyway: this has four callers, and the other three
+    // are a merge result, a conflict copy and the note beside it. Guarding the
+    // one place that sends is the difference between a device that mostly does
+    // not send and one that cannot.
+    if (!this.sending) {
+      this.heldBack(path, report, "this device is read-only, so it was not sent");
+      return;
+    }
     if (entry.folder) {
       const facts: PutFacts = {
         path: await this.sealedPath(path),
@@ -3046,6 +3152,17 @@ export class Engine {
   ): Promise<void> {
     if (!remote) return;
 
+    // Turned off, so this is a conflict without looking at the bytes (I30).
+    //
+    // Before the decode and before the ancestor is fetched, because neither is
+    // worth doing to reach a decision already made, and because the reason a
+    // person reads should be the one they chose rather than whatever the text
+    // would have produced.
+    if (!this.merging) {
+      await this.conflict(path, entry, remote, report, "merging is off on this device");
+      return;
+    }
+
     // Refusing to decode is the point. A file is classified as text by its
     // extension, and an extension is a claim rather than a fact: a `.md`
     // holding bytes that are not UTF-8 decodes with replacement characters,
@@ -3503,6 +3620,13 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     skipped: b.skipped,
     skippedPaths: b.skippedPaths,
     retryingPaths: b.retryingPaths,
+    // The newest pass has the last word, like `ignored` and for the same
+    // reason this function's own comment gives: these are what the vault
+    // looks like at the end of a pass, not things that happened during one.
+    // Every pass re-decides the same local changes, so adding them would
+    // report one held-back note in two passes as two.
+    heldBack: b.heldBack,
+    heldBackPaths: b.heldBackPaths,
     ignored: b.ignored,
     blocked: b.blocked,
     inTheWay: b.inTheWay,

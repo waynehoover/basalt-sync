@@ -27,6 +27,8 @@ function report(over: Partial<SyncReport>): SyncReport {
     skipped: 0,
     skippedPaths: [],
     retryingPaths: [],
+    heldBack: 0,
+    heldBackPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],

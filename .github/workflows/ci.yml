@@ -213,6 +213,20 @@ jobs:
           sudo mkdir -p /etc/systemd/system
           sudo cp /tmp/basalt.service /etc/systemd/system/basalt.service
 
+          # And put the binary where the unit says it is.
+          #
+          # Newer systemd checks that ExecStart names something executable and
+          # says "Command /usr/local/bin/basaltd is not executable: No such
+          # file or directory". The filter below was written against an older
+          # version's wording and did not match it, so this job started failing
+          # on a runner image bump with nothing wrong in the unit.
+          #
+          # Installing it rather than widening the filter, because the filter
+          # would then be hiding the one thing this check should catch: a
+          # `-binary` path that is wrong. With the file really there, systemd
+          # resolving ExecStart is part of what passes.
+          sudo install -m 0755 /tmp/basaltd /usr/local/bin/basaltd
+
           # Warnings about a user or a binary that does not exist on a runner
           # are expected and are not what this is looking for. Everything else
           # is: a directive systemd does not know, a value it cannot parse, a

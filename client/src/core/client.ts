@@ -84,6 +84,10 @@ export interface ClientOptions {
   readonly timeoutMs?: number;
   /** Whether to hold back a file written moments ago. See EngineOptions. */
   readonly coalesceWrites?: boolean;
+  /** Whether two edits to one note may be merged. Default true (I30). */
+  readonly merge?: boolean;
+  /** Whether this device may send anything to the server. Default false (I29). */
+  readonly readOnly?: boolean;
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
@@ -208,6 +212,8 @@ export class Client {
       deviceId: opts.deviceId,
       token: opts.token,
       ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
+      ...(opts.merge !== undefined ? { merge: opts.merge } : {}),
+      ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
     });
@@ -1431,6 +1437,16 @@ export interface JoiningVault {
    */
   readonly secret: Uint8Array;
   /**
+   * Whether the device being registered may send anything to the server (I29).
+   *
+   * Carried through registration rather than written afterwards, because the
+   * config this produces *replaces* whatever was on disk: setting it at `init`
+   * and letting registration rebuild the file dropped it silently, and the
+   * spread that set it bypassed the excess-property check that would have
+   * said so.
+   */
+  readonly readOnly?: boolean;
+  /**
    * The server's first-run token, present only while this device is claiming
    * an unclaimed vault. The claim rides on the registrar hello below, so it is
    * spent by the same exchange that registers this device's row.
@@ -1531,6 +1547,7 @@ export async function registerAsDevice(
     deviceId,
     deviceSecret,
     dataKey,
+    ...(joining.readOnly === true ? { readOnly: true } : {}),
   };
   await save(device);
 

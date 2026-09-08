@@ -1298,11 +1298,22 @@ describe("recovery answers from a server that answers badly", () => {
     // thing, but sending a limit of zero would ask for the default and look
     // deliberate. Absent is the honest way to say nothing was specified.
     const { t, socket } = await helloed();
-    void t.history("SEALED");
+    // Caught and closed, because this reply never comes.
+    //
+    // `void` on its own leaves a request armed with a one-second clock and a
+    // promise nobody is holding. A second later the timer closes the transport
+    // and rejects it, and by then this test is over, so the rejection is
+    // unhandled and belongs to whatever is running instead. It never fired
+    // here -- the suite finishes first -- and it failed CI three runs in a row
+    // as `ConnectionError: no history within 1000ms`, blamed on an unrelated
+    // test in another file. Only the loaded runner was slow enough to see it.
+    const never = t.history("SEALED");
+    never.catch(() => {});
     await settle();
     const sent = socket.sentText.at(-1)!;
     expect("before" in sent).toBe(false);
     expect("limit" in sent).toBe(false);
+    t.close();
   });
 
   /**

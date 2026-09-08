@@ -86,6 +86,8 @@ basalt --version                          which release this is
 | `--vault-id ID` | which vault on the server, for `init` only (default `default`) |
 | `--json` | machine-readable output, on every command |
 | `--force` | for `unlock`: clear a lock held on another machine, which this one cannot check. It does not break a lock held by a process running here |
+| `--no-merge` | never combine two edits to one note; keep both versions instead |
+| `--read-only` | apply what the server has and send nothing. Recorded in the config by `init` and `pair`, and there is no flag that turns it off |
 | `--timeout MS` | how long to wait on the server (default 30000) |
 | `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |
 | `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable; local to this device |
@@ -256,6 +258,35 @@ Two things are still a person's job:
 If something writes the index anyway, the next save says so on stderr and
 replaces both files with a fresh snapshot rather than appending this device's
 changes onto somebody else's.
+
+### A mirror, and turning merging off
+
+Two settings for a device that should do less than the default.
+
+`--read-only` makes a device apply everything the server has and send nothing:
+no uploads, no deletions, no conflict copies going out. It is for a machine
+that holds a copy, a NAS or a backup box, and the reason is blast radius rather
+than tidiness. A bad scan on such a machine, a mount that came up empty, a path
+typo, a half-restored disk, is an *ordinary local change* as far as sync is
+concerned, and ordinary local changes propagate: the mirror can delete notes on
+every device. A device without the capability cannot make that mistake.
+
+    basalt pair INVITE --read-only
+
+`init` and `pair` write it into `.basalt/config.json`, so a cron line that
+loses the flag does not turn the mirror into a writer. There is no flag that
+turns it off; edit the config if you mean to. Local changes are still applied
+and are counted by `sync` and `status` as changed here and not sent, which is
+out of the exit code: the device was told not to send and did not.
+
+`--no-merge` keeps both versions wherever a merge would have happened. Merging
+is the only thing this client does that makes content neither device wrote, and
+although it refuses anything it cannot do safely, this is how to say you would
+rather look at two files. Nothing is lost either way.
+
+Two devices set differently converge on content but not on shape: one uploads a
+merged note and the other uploads a conflict copy, so the vault ends up with
+both. Untidy, not lossy.
 
 ### Filenames
 

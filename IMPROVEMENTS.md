@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25, I28, I29 and I30 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I28 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -14,7 +14,6 @@ The current foundation is useful: one shared client engine, a small Go deploymen
 | POC stabilization            | Bound work, exercise actual supported devices/filesystems, and make release/backup workflows dependable. | I05–I09, I12–I18, I20–I23 |
 | When a measured need appears | Optimize serialization/storage, add deeper repair, or change cryptographic epochs.                       | I01, I07, I10, I14, I24   |
 | Open, unscheduled            | Investigate when there is a reason to. None is work anybody is waiting on.                               | I25, I28                  |
-| Open, from Obsidian's client | Scope questions their headless client answers differently. I29 is the one with a safety argument.        | I29, I30                  |
 
 
 “Small,” “medium,” and “large” below describe relative scope, not delivery estimates. Items are proposals, not claims of additional proven defects.
@@ -381,7 +380,7 @@ about.
 
 ### I29 — A read-only headless client
 
-- [ ] **Small, and worth it for safety rather than for simplicity.** A mirror that cannot write to the server, so a misconfigured backup box cannot delete notes on every device.
+- [x] **Done.** `--read-only`, recorded in the config so a cron line cannot lose it.
 
 `basalt sync --read-only`: apply everything the server has, send nothing. The
 vault is still written, because that is what a mirror is; what stops is this
@@ -408,15 +407,26 @@ writes this vault, so an incoming version can be written without moving
 anything aside first. That is a promise a person cannot reliably make, and
 being wrong about it loses a note, so it is not on the table.
 
-Worth doing, then, as a safety property rather than a refactor. Points to
-settle: whether it refuses to start when the vault has local changes or just
-ignores them and says so on every pass; whether it belongs in the config rather
-than a flag, so a cron job cannot forget it; and what `status` reports, since
-"unsent" is not a problem on a device that never sends.
+Done, and the points it listed were settled this way. Local changes are
+applied and reported rather than refused, as `heldBack`, which is out of the
+exit code for the same reason `ignored` is: the device was told not to send and
+did not. It is in the config as well as being a flag, written by `init`,
+`pair` and pairing with an invite, and there is no flag that turns it off; a
+mirror that becomes writable when a cron line loses an argument has been made
+conditional rather than safe.
+
+Two things worth recording from building it. The guard belongs at `upload()`
+rather than at the `upload` action in the decision switch: that method has four
+callers and the first attempt guarded one of them, so a conflict copy went up
+anyway. And the config is written in *three* places -- `init`, pairing with a
+recovery key, and pairing with an invite -- and the first two patches missed
+the third, which is the one a mirror actually uses. The test for stickiness is
+what caught it; the spread that set the field bypasses TypeScript's
+excess-property check, so nothing else would have.
 
 ### I30 — Let a person turn merging off
 
-- [ ] **Small.** Obsidian's own client has `--conflict-strategy merge|conflict`. This one always merges when it can, and there is no way to say don't.
+- [x] **Done.** `--no-merge`.
 
 Merging is the only thing this client does that produces content neither device
 wrote. It is careful -- it refuses anything it cannot do safely and keeps both
@@ -437,10 +447,11 @@ disagree; a person who has turned merging off is not exposed to that at all.
 Two devices set differently converge on content but not on shape: one merges
 and uploads the merged note, the other keeps both and uploads a conflict copy.
 Nothing is lost, and the vault ends up with both outcomes, which is untidy and
-worth saying out loud in whatever documents the switch. Local to the device,
-like `--ignore`, and reported by `status` for the same reason `--ignore` is: a
-setting that changes what a device does with your notes and is invisible is how
-somebody spends an afternoon confused.
+is said out loud in `client/README.md`. Local to the device, like `--ignore`.
+
+Done as one flag rather than Obsidian's `--conflict-strategy merge|conflict`,
+because a two-valued enum is a boolean spelled at greater length, and this
+project's flags are plain words.
 
 ### I12 — Support secret input without shell history or process arguments
 

@@ -18,10 +18,12 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
+import { MAX_NAME_BYTES, checkName } from "../core/transport.ts";
 import { PAIRING_PREFIX, parseInvite } from "../core/pairing.ts";
 import { redeemInvite } from "../core/client.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
+  deviceNameFor,
   run,
   exitCodeFor,
   normaliseUrl,
@@ -1744,6 +1746,8 @@ describe("what the CLI says about itself and the vault", () => {
       skipped: 0,
       skippedPaths: [],
       retryingPaths: [],
+      heldBack: 0,
+      heldBackPaths: [],
       ignored: 0,
       blocked: 0,
       inTheWay: [],
@@ -1969,6 +1973,8 @@ describe("what needs attention looks like on the way out", () => {
     skipped: 0,
     skippedPaths: [],
     retryingPaths: [],
+    heldBack: 0,
+    heldBackPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],
@@ -2144,5 +2150,63 @@ describe("the commands", () => {
     expect([...documented].sort()).toEqual([...dispatched].sort());
     // And there really are some, so an empty pair of sets cannot pass.
     expect(dispatched.size).toBeGreaterThan(10);
+  });
+});
+
+/**
+ * The default device name, on a machine with a long hostname.
+ *
+ * Found by CI rather than here: a runner whose hostname is sixty-one
+ * characters produced a sixty-six byte default, the server refuses anything
+ * over sixty-four, and every pairing test on that runner failed with
+ * "the device name is 66 bytes". Nobody had chosen that name -- it is the
+ * hostname plus a random tail -- so `basalt init` failed on a machine whose
+ * only unusual property was what it is called.
+ *
+ * The split is between a name somebody typed and one this program derived. A
+ * typed name is theirs and a long one is refused, because it goes beside their
+ * notes in a conflict copy and handing back a different one is worse than
+ * saying no. A derived one is nobody's, so it is cut to fit.
+ */
+describe("the device name it makes up", () => {
+  const bytes = (s: string) => new TextEncoder().encode(s).length;
+
+  it("fits the server's limit however long the hostname is", () => {
+    for (const hostname of ["a".repeat(200), "a".repeat(64), "a".repeat(59), "short"]) {
+      const args = parseArgs(["init", "--dir", "/tmp/x"]);
+      const made = deviceNameFor({ ...args, device: hostname, deviceGiven: false });
+      expect(
+        bytes(made),
+        `a ${hostname.length}-character hostname made a ${bytes(made)}-byte name`,
+      ).toBeLessThanOrEqual(MAX_NAME_BYTES);
+      // And it is still a name, with the tail that tells two identical
+      // laptops apart.
+      expect(made).toMatch(/-[0-9a-f]{4}$/);
+    }
+  });
+
+  it("never cuts a character in half", () => {
+    // Bytes rather than characters is what the server counts, and a name cut
+    // at a byte offset can end in half a codepoint, which is a name no two
+    // devices would spell the same way.
+    const made = deviceNameFor({
+      ...parseArgs(["init", "--dir", "/tmp/x"]),
+      device: "é".repeat(100),
+      deviceGiven: false,
+    });
+    expect(bytes(made)).toBeLessThanOrEqual(MAX_NAME_BYTES);
+    expect(made).not.toContain("\uFFFD");
+    expect([...made].every((c) => c === "é" || /[-0-9a-f]/.test(c))).toBe(true);
+  });
+
+  it("still refuses a long name somebody typed, rather than shortening it", () => {
+    const typed = "a".repeat(200);
+    const made = deviceNameFor({
+      ...parseArgs(["init", "--dir", "/tmp/x"]),
+      device: typed,
+      deviceGiven: true,
+    });
+    expect(made, "a name the person chose was quietly changed").toBe(typed);
+    expect(() => checkName("device", made)).toThrow(/at most 64/);
   });
 });

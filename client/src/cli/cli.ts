@@ -78,7 +78,7 @@ import {
 } from "./config.ts";
 import type { Displaced, Inventory } from "../core/displaced.ts";
 import { lockVault, unlockVault } from "./lock.ts";
-import { ConnectionError, ProtocolError } from "../core/transport.ts";
+import { ConnectionError, MAX_NAME_BYTES, ProtocolError } from "../core/transport.ts";
 import { describeOutcome, exitCodeOf, outcomeOf } from "../core/outcome.ts";
 import { rotateVault } from "../core/rotation.ts";
 import { validateStoredState } from "../core/stored-state.ts";
@@ -132,6 +132,12 @@ Options
   --timeout MS     how long to wait on the server (default: 30000)
   --allow-last     revoke the last device, leaving the vault reachable only by its recovery key.
                    Needs --recovery-key: it is the one revocation a device cannot undo
+  --no-merge       never combine two edits to one note; keep both versions instead. Merging is the
+                   only thing that makes content neither device wrote, and this is how to say no
+  --read-only      apply what the server has and send nothing: no uploads, no deletions, no
+                   conflict copies going out. For a mirror that must not be able to change the
+                   vault everyone else sees. Recorded in the config by init and pair, so a cron
+                   job cannot lose it by forgetting the flag
   --force          for unlock: clear a lock held on another machine. This one cannot tell whether
                    that process is still running, so saying it is not is your assertion. It will
                    not break a lock held by a process on this machine that is still running
@@ -371,7 +377,16 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // derives, for good, so a secret that claimed a server without reaching the
   // disk first is a vault nobody can ever open. Read back rather than trusted:
   // not written, not renamed, but readable and decoding to itself.
-  const starting: Config = { url, vaultId: args.vaultId, device, secret };
+  const starting: Config = {
+    url,
+    vaultId: args.vaultId,
+    device,
+    secret,
+    // Recorded here rather than left to the flag (I29). A mirror that becomes
+    // writable when a cron line loses an argument has been made conditional
+    // rather than safe, and there is no flag that turns this back off.
+    ...(args.readOnly ? { readOnly: true } : {}),
+  };
   await saveConfig(args.dir, starting);
   await mustReadBack(args.dir, starting);
 
@@ -427,7 +442,14 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   let registered = false;
   try {
     await joinVault(
-      { url, vaultId: args.vaultId, device, secret, bootstrap: token },
+      {
+        url,
+        vaultId: args.vaultId,
+        device,
+        secret,
+        bootstrap: token,
+        ...(args.readOnly ? { readOnly: true } : {}),
+      },
       args,
       io,
       () => {
@@ -490,10 +512,41 @@ async function joinVault(
  * the point of having one in the filename. The tail is chosen at pairing and
  * kept in the config, so it never changes under a running vault.
  */
-function deviceNameFor(args: Args): string {
+export function deviceNameFor(args: Args): string {
+  // A name somebody typed is theirs, and one that is too long is refused
+  // rather than shortened: it goes beside their notes in a conflict copy and
+  // in `basalt devices`, so quietly handing back a different one is worse
+  // than saying no. `checkName` does the refusing.
   if (args.deviceGiven) return args.device;
+
+  // A derived one is not theirs, and refusing it means `basalt init` fails on
+  // a machine whose only crime is a long hostname. That is what happened: a
+  // runner with a 61-character hostname produced a 66-byte default and every
+  // pairing test failed with "the device name is 66 bytes". Nobody chose that
+  // name, so shortening it costs nothing anybody asked for.
   const tail = [...randomBytes(2)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `${args.device}-${tail}`;
+  return `${clipToBytes(args.device, MAX_NAME_BYTES - tail.length - 1)}-${tail}`;
+}
+
+/**
+ * The longest prefix of `name` that fits in `limit` UTF-8 bytes.
+ *
+ * Bytes rather than characters, because that is how the server counts, and
+ * never half a character: cutting a string at a byte offset can leave a lead
+ * surrogate with nothing after it, which is a name no two devices would agree
+ * on the spelling of.
+ */
+function clipToBytes(name: string, limit: number): string {
+  const enc = new TextEncoder();
+  if (enc.encode(name).length <= limit) return name;
+  let out = "";
+  for (const ch of name) {
+    if (enc.encode(out + ch).length > limit) break;
+    out += ch;
+  }
+  // A limit smaller than one character leaves nothing, and an empty device
+  // name is legal but useless for telling two laptops apart.
+  return out === "" ? "device" : out;
 }
 
 /**
@@ -561,6 +614,10 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
     vaultId: pairing.vaultId,
     device: deviceNameFor(args),
     secret: pairing.secret,
+    // The mirror case (I29). `init --read-only` and `pair --read-only` both
+    // have to record it, and only `init` did: this is the path a second
+    // device takes, which is the one a mirror actually uses.
+    ...(args.readOnly ? { readOnly: true } : {}),
   };
   let paired: Config;
   let registered = false;
@@ -629,6 +686,10 @@ async function pairWithInvite(invite: Invite, args: Args, io: Console): Promise<
     deviceId: redeemed.deviceId,
     deviceSecret: redeemed.deviceSecret,
     dataKey: redeemed.dataKey,
+    // The third of three places that write this config, and the one a mirror
+    // actually goes through: a second device is added with an invite (I29).
+    // The other two are `init` and pairing with a recovery key.
+    ...(args.readOnly ? { readOnly: true } : {}),
   };
   await saveConfig(args.dir, config);
   await mustReadBack(args.dir, config);
@@ -2122,6 +2183,14 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
     // A one-shot sync does not defer a file to a next pass it will never
     // run. A watching one does, because there is one.
     coalesceWrites: args.watch,
+    // Both of these are off by their absence rather than by a default, so a
+    // config that predates them behaves exactly as it did (I29, I30).
+    ...(args.merge ? {} : { merge: false }),
+    // The config wins over the flag, and there is no flag that turns it back
+    // on. A mirror that becomes writable when a cron line loses an argument is
+    // not a mirror, and the whole value of this is that the capability is
+    // absent rather than merely unused.
+    ...(args.readOnly || config.readOnly === true ? { readOnly: true } : {}),
     // Only while watching. A one-shot sync prints its report at the end and
     // a line per path on the way would bury it; a client that stays running
     // has nothing else to say between passes.
@@ -2208,6 +2277,11 @@ export function renderReport(
   // somebody can act on, so the reasons are what is printed. The counters and
   // the four maps behind them are untouched, and so is the exit code.
   say(needsAttention(r), "need attention");
+  // Apart from the counted lines and out of the exit code, like `ignored`: a
+  // read-only device not sending is the configuration doing what it was told
+  // (I29). Named all the same, because a mirror quietly accumulating local
+  // edits is something to find out about here rather than in a year.
+  say(r.heldBack, "changed here and not sent, because this device is read-only");
   // Apart, and still printed, because this one is not a problem: it is the
   // configuration doing what it was told, it is deliberately not in the exit
   // code (R2), and a number that quietly disappears is how somebody loses
@@ -2317,6 +2391,20 @@ interface Args {
   /** Whether rebase may remove the index, which the person confirms by typing it. */
   backupTaken: boolean;
   /**
+   * Whether two edits to one note may be merged on this device (I30).
+   *
+   * On unless `--no-merge` was typed. Off keeps both versions in every case
+   * that would have merged, which is what merging already falls back to.
+   */
+  merge: boolean;
+  /**
+   * Whether this device may send anything to the server (I29).
+   *
+   * Off with `--read-only`, and off for good once it is in the config: a
+   * mirror that can be made writable by forgetting a flag is not a mirror.
+   */
+  readOnly: boolean;
+  /**
    * Whether `unlock` may break a lock it *cannot check*.
    *
    * Which is a lock held on another machine: nothing here can ask that machine
@@ -2350,6 +2438,8 @@ export function parseArgs(argv: readonly string[]): Args {
     backupTaken: false,
     allowLast: false,
     force: false,
+    merge: true,
+    readOnly: false,
     timeout: 30_000,
     configDir: DEFAULT_CONFIG_DIR,
     ignore: [],
@@ -2486,6 +2576,12 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--force":
         args.force = true;
+        break;
+      case "--no-merge":
+        args.merge = false;
+        break;
+      case "--read-only":
+        args.readOnly = true;
         break;
       case "--recovery-key":
         args.recoveryKey = value!;
