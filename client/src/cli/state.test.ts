@@ -686,6 +686,110 @@ describe("a read-only device", () => {
     expect((await readdir(a)).filter((n) => n.endsWith(".md"))).toEqual(["note.md"]);
   }, 120_000);
 
+  it("does not merge the same remote version again on every pass", async () => {
+    // RR9, and the reason RR7's test did not catch it: every sync in it passes
+    // `--no-merge`, so the branch this is about was never entered. The fix went
+    // into `conflict` and the successful-merge path was left relying on the
+    // upload to move the ancestor, which on a mirror does not happen. Nine
+    // merges reported on the first pass and nine on the next, with nothing
+    // changed in between.
+    //
+    // Three paragraphs, because a merge has to succeed here rather than turn
+    // into a conflict copy: the two sides edit different ones.
+    const a = await paired("rr9-writer");
+    const original = "first paragraph\n\nsecond paragraph\n\nthird paragraph\n";
+    await writeFile(join(a, "note.md"), original);
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    const b = await vaultDir("rr9-mirror");
+    const invite = JSON.parse((await cli("invite", "--dir", a, "--json")).out.at(-1)!) as {
+      invite: string;
+    };
+    expect((await cli("pair", invite.invite, "--dir", b, "--read-only")).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+    expect(await readFile(join(b, "note.md"), "utf8")).toBe(original);
+
+    // The mirror edits the first paragraph, the writer the third, and only the
+    // writer's edit reaches the server.
+    await writeFile(
+      join(b, "note.md"),
+      original.replace("first paragraph", "first paragraph, from the mirror"),
+    );
+    await writeFile(
+      join(a, "note.md"),
+      original.replace("third paragraph", "third paragraph, from the writer"),
+    );
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    // Merging on, which is the default and the whole point of this case.
+    const pass = async (): Promise<{
+      merged: number;
+      uploaded: number;
+      conflicted: number;
+      heldBack: number;
+    }> => {
+      const r = await cli("sync", "--dir", b, "--json");
+      expect(r.code, r.all).toBe(0);
+      return JSON.parse(r.out.at(-1)!) as {
+        merged: number;
+        uploaded: number;
+        conflicted: number;
+        heldBack: number;
+      };
+    };
+
+    const first = await pass();
+    expect(first.merged, "the merge did not happen at all").toBeGreaterThan(0);
+    expect(first.uploaded, "a read-only device sent something").toBe(0);
+
+    // Both edits are in the one file, which is what a successful merge means.
+    const merged = await readFile(join(b, "note.md"), "utf8");
+    expect(merged).toContain("from the mirror");
+    expect(merged).toContain("from the writer");
+    expect((await readdir(b)).filter((n) => n.endsWith(".md"))).toEqual(["note.md"]);
+
+    // And now nothing has changed on either side, so there is nothing to merge.
+    for (let i = 0; i < 3; i++) {
+      const again = await pass();
+      expect(again.uploaded, "a read-only device sent something").toBe(0);
+      expect(again.merged, `pass ${i + 2} merged the same version again`).toBe(0);
+      expect(again.conflicted, `pass ${i + 2} wrote a conflict copy`).toBe(0);
+      // The local edit is still this device's and still cannot be sent, so it
+      // is held back, which is a state and not an event.
+      expect(again.heldBack, `pass ${i + 2} forgot the local edit is unsent`).toBeGreaterThan(0);
+      expect(await readFile(join(b, "note.md"), "utf8"), `pass ${i + 2} rewrote the note`).toBe(
+        merged,
+      );
+    }
+    expect((await readdir(b)).filter((n) => n.endsWith(".md"))).toEqual(["note.md"]);
+
+    // A later server version is still processed, and the merge still keeps
+    // both sides: settling the ancestor must not mean going deaf.
+    await writeFile(
+      join(a, "note.md"),
+      original
+        .replace("third paragraph", "third paragraph, from the writer")
+        .replace("second paragraph", "second paragraph, later"),
+    );
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    const later = await pass();
+    expect(later.merged, "a later server version was ignored").toBeGreaterThan(0);
+    expect(later.uploaded).toBe(0);
+    const after = await readFile(join(b, "note.md"), "utf8");
+    expect(after).toContain("from the mirror");
+    expect(after).toContain("second paragraph, later");
+    expect((await readdir(b)).filter((n) => n.endsWith(".md"))).toEqual(["note.md"]);
+
+    // Which settles too.
+    const settled = await pass();
+    expect(settled.merged, "the later version merged again on the next pass").toBe(0);
+
+    // The writer never received any of it.
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect(await readFile(join(a, "note.md"), "utf8")).not.toContain("from the mirror");
+  }, 120_000);
+
   it("stays read-only without the flag, because it is in the config", async () => {
     // The reason it is not a flag alone. A cron line that loses an argument
     // would otherwise turn a mirror into a writer, and nobody would find out

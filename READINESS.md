@@ -460,14 +460,33 @@ reproductions.** The full gate passed 28/28 checks, with 1,473 client tests and
 under stock Node on macOS and in a Linux container, including GC and vault-path
 alias checks.
 
-**Two new P2 defects remain:**
+**Two P2 defects were found at this snapshot; both now pass re-verification below:**
 
-- [ ] **RR7:** a read-only mirror with merging disabled creates the same
+- [x] **RR7:** a read-only mirror with merging disabled creates the same
   conflict copies on every sync, even with no new local or remote edits.
-- [ ] **RR8:** restore returns exit 1 for incomplete recovery while its JSON
+- [x] **RR8:** restore returns exit 1 for incomplete recovery while its JSON
   says `ok: true` and omits the recovery reason.
 
 Reproductions, acceptance criteria, evidence, verification limits, and suggested
 beta priorities are in
 [FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#product-improvements-verification--2026-09-07).
 Concurrent uncommitted merge-algorithm changes were outside this tested snapshot.
+
+## RR7/RR8 independently rechecked — 2026-09-07
+
+Verified `378b101f864e103f566ba5ffb4ddc0c3b27b2ac2`. **RR7 and RR8 now pass**, as
+do the seven earlier lock/recovery probes. A no-merge mirror also handles a
+subsequent server version once, retaining both incoming versions and its own
+unsent edit. Restore now explains incomplete recovery and distinguishes it from
+successful local restoration. The full gate passed **30/30 checks**, including
+**1,482 client tests and 24 stress tests**.
+
+- [x] **RR9:** fixed in 0.5.2. With automatic merging enabled, a read-only
+  mirror reported nine merges on every sync of the same unchanged state. The
+  successful-merge path lacked the local reconciliation transition added to the
+  conflict path; the transition now lives in `upload`, at the one place that
+  decides not to send, so all four of its callers reach it. Reproduced first at
+  the reviewer's number.
+
+Evidence, reproduction, acceptance criteria, and verification limits are in
+[FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#rr7rr8-re-verification--2026-09-07).

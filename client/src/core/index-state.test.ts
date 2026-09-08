@@ -5,6 +5,7 @@ import {
   newEntry,
   observe,
   readyToSyncAgain,
+  reconciled,
   renamed,
   synced,
   type Action,
@@ -368,6 +369,54 @@ describe("recording a completed sync", () => {
     const e = entry();
     synced(e, "h", [], 99, 0);
     expect(e.syncuid).toBe(99);
+  });
+});
+
+describe("recording a remote version as dealt with", () => {
+  // RR7 and RR9. A device that cannot send never uploads, and the upload is
+  // what normally records that a remote version has been handled, so without
+  // this the same conflict copy or the same merge is decided on every pass.
+  //
+  // The distinction this makes is unobservable through the CLI: the merged file
+  // gets a fresh mtime, so the next scan rehashes it and would put a wrong
+  // `hash` back regardless. Removing the distinction passed every read-only
+  // test. It is asserted here, where it is the whole content of the function.
+
+  it("moves the ancestor to the version that was dealt with", () => {
+    const e = entry({ synchash: BASE, syncuid: 7, synctime: 1 });
+    reconciled(e, "theirs", 8, 1_700_000);
+    expect(e.synchash).toBe("theirs");
+    expect(e.syncuid).toBe(8);
+    expect(e.synctime).toBe(1_700_000);
+  });
+
+  it("leaves the local bytes described as they are", () => {
+    // `hash` and `chunks` say what is on this disk. Moving them to the agreed
+    // version is the "a failed push looks like an agreed state" mistake that
+    // `synced` exists to avoid, arrived at from the other direction: the local
+    // edit would stop looking like an edit, stop being held back, and stop
+    // being sent if the device ever became writable.
+    const e = entry({ hash: "the bytes here", chunks: ["local1", "local2"] });
+    reconciled(e, "theirs", 8, 1_700_000);
+    expect(e.hash).toBe("the bytes here");
+    expect(e.chunks).toEqual(["local1", "local2"]);
+  });
+
+  it("does nothing at all when it is already that version", () => {
+    // Not merely idempotent in its result: `synctime` feeds the debounce, and
+    // a pass that decided nothing new must not push the next sync away.
+    const e = entry({ synchash: "theirs", syncuid: 8, synctime: 500 });
+    reconciled(e, "theirs", 8, 1_700_000);
+    expect(e.synctime).toBe(500);
+  });
+
+  it("still moves when the uid matches but the hash does not", () => {
+    // One version's bytes replaced under the same uid should not be mistaken
+    // for the version already recorded.
+    const e = entry({ synchash: "old", syncuid: 8, synctime: 500 });
+    reconciled(e, "new", 8, 1_700_000);
+    expect(e.synchash).toBe("new");
+    expect(e.synctime).toBe(1_700_000);
   });
 });
 

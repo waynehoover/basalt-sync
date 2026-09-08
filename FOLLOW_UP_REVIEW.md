@@ -1197,3 +1197,109 @@ Obsidian desktop/mobile acceptance, physical power cuts, CI-only systemd and
 mounted-filesystem acceptance, and published release artifacts were not
 independently verified here. Linux kernel tests used a local container
 filesystem, not a network filesystem.
+
+## RR7/RR8 re-verification — 2026-09-07
+
+Verified **`378b101f864e103f566ba5ffb4ddc0c3b27b2ac2`**. The working tree was
+clean when the isolated test snapshots were captured. **The original RR7 and
+RR8 failures are fixed. A related read-only merge defect remains, RR9 below.**
+
+### What now passes
+
+- **RR7:** the read-only/no-merge reproduction keeps exactly two files after
+  the first conflict and creates no more on subsequent commands. A further
+  server edit creates exactly one additional copy; the next command creates
+  none. The mirror retains its unsent original and both distinct incoming
+  versions, with zero uploads.
+- **RR8:** restore with an incomplete recovery inventory returns exit 1 and
+  `ok: false`, reports `restored: true`, includes a `recoveryUnknown` outcome
+  and explanation, and writes the expected restored bytes.
+- The seven earlier lock/recovery probes still pass. The original nine-probe
+  suite is green; extending it to cover automatic merging gives **9 passing
+  probes and 1 failure**, RR9.
+- `bash scripts/check.sh` passed **30 checks, 0 failed, 0 skipped**, including
+  **1,482 client tests in 77 files**, **16 panel tests**, **24 stress tests**,
+  Go race/vet checks, formatting/type/build checks, release-shell tests,
+  packaged CLI checks, the kernel-lock check, and local Docker checks.
+
+### RR9 — A read-only mirror never settles a successful automatic merge
+
+- [x] **P2 · Follow-up to RR7 · Fixed. Reproduced first, at the reviewer's
+      number: `expected 9 to be +0` on the second pass.**
+
+      The reconcile went to the choke point rather than to the branch. RR7 put
+      it in `conflict`, and `upload` already carried the comment explaining why
+      that is the wrong place: it has four callers, the first read-only guard
+      was written at one of them, and a conflict copy went up anyway. It is now
+      in `upload`'s not-sending branch, where every caller reaches it, and the
+      copy in `conflict` is gone.
+
+      The reason RR7's test did not catch this is that every `sync` in it
+      passes `--no-merge`, so the branch was never entered. The new test runs
+      with merging on: one file, both edits present, then three further passes
+      reporting zero merges, zero conflicts and the local edit still held back,
+      then a later server version that must still merge and settle.
+
+      Two things the fix needed that the reproduction could not show. Claiming
+      the local bytes were the agreed version passed every read-only test,
+      because the merged file gets a fresh mtime and the next scan rehashes it
+      anyway; `reconciled` had no unit test at all, and now has four. And the
+      stale-version check can never fire on a device that cannot send, since
+      nothing commits to its `remote` map, so it is `answeredVersion` now,
+      exported and tested on its own. Both were guards asked of nothing.
+
+      Gate 30/30, 1491 client tests. Six mutations: no reconcile (fails RR9 and
+      RR7), the stale-version check dropped, `reconciled` moving `hash`, its
+      early return removed, and `entry.hash` claimed as agreed. The last of
+      those was the one the CLI tests could not see, which is why the unit
+      tests exist.
+
+RR7 added `reconciled()` to the conflict-copy path. The
+[successful merge path](client/src/core/engine.ts#L3282) still calls `upload()`
+and relies on that upload to advance the ancestor. On a read-only mirror,
+`upload()` returns without sending or advancing it, and `report.merged` is
+incremented anyway. The next pass selects the same merge again.
+[`settle()`](client/src/core/client.ts#L331) treats that counter as work and
+continues until its pass limit, rather than reaching a settled state.
+
+**Reproduction:** sync a note with three paragraphs from writable A to B, paired
+with persistent `--read-only`. Edit the first paragraph on B and the third on
+A. Sync A, then run B's ordinary `sync --json` twice with merging enabled and
+no further edits. The merged note correctly contains both edits, and only one
+note file exists. Nevertheless, **both commands report `merged: 9`**, alongside
+`uploaded: 0`, `heldBack: 1`, and an unchanged server cursor of 2. The second
+command should have no merge to perform.
+
+This reproduction does not lose bytes, create duplicate files, or send anything
+to the server. It does show repeated merge work and misleading activity on
+every invocation. It is the same missing local reconciliation transition as
+RR7, in the successful-merge branch rather than the conflict branch.
+
+**Fix and acceptance:** record the remote version as reconciled after a
+successful local merge on a read-only device, independently of an upload.
+Preserve the distinction between the merged local bytes and the server's
+version, and keep local edits held back. Repeated passes and commands after
+restart must report zero new merges and leave the note unchanged. A later
+server version must still be processed, with both edits preserved. Keep the
+existing no-merge regression test as well.
+
+**Cause check:** applying the existing `reconciled()` transition after the
+successful merge in the disposable snapshot makes all three product probes
+pass. That experimental change was removed and the source was compared with
+the reviewed commit. It was not applied to the working repository and is not
+a substitute for the implementer's complete regression coverage.
+
+### Evidence and limits
+
+The full gate log is `/tmp/basalt-rr78-review.mX6TpD/check.log`. Independent
+probes are in `/tmp/basalt-rr78-probes.U3zWuG`: `probes.log` records the original
+nine tests passing, `final-probes.log` records the extended suite's nine passes
+and one failure, and `merge-cause-probe.log` records the temporary cause check.
+The probe source is `client/src/product-review-probes.test.ts` in that
+disposable snapshot.
+
+This verifies source and locally exercised behavior. It does not establish
+actual Obsidian desktop/Android acceptance or the contents and CI status of
+published 0.5.1 artifacts. Systemd acceptance and the Linux mounted-filesystem
+suite remain CI-only on this macOS host. Only review documentation was changed
+in the working repository.

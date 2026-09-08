@@ -1897,6 +1897,31 @@ export class Engine {
     // not send and one that cannot.
     if (!this.sending) {
       this.heldBack(path, report, "this device is read-only, so it was not sent");
+
+      // And the ancestor moves here too, for the same reason the guard is here
+      // (RR7, RR9).
+      //
+      // Sending the local version against `basedOn` is what normally records
+      // that this remote version has been dealt with. A device that never sends
+      // never records it, so the next pass sees both sides moved since the
+      // ancestor, decides the same thing again, and does it again: another
+      // conflict copy every pass, or the same merge reported every pass. The
+      // first fix put this in `conflict` alone and the successful-merge branch
+      // kept the defect, which is exactly the mistake the guard above is here
+      // to stop being made once per caller.
+      //
+      // Only `synchash` and `syncuid` move. `hash` and `chunks` describe the
+      // bytes on this disk and saying they were the agreed version would be the
+      // "a failed push looks like an agreed state" mistake `synced` warns
+      // about, reached from the other side. The local edit therefore stays
+      // described as it is, the next pass sees an upload, holds it back and
+      // says so, which is true and is a fixed point rather than a loop.
+      //
+      // Nothing is claimed when the answer is not to a version, or when the
+      // server has moved on since the decision was taken: a later version has
+      // not been dealt with and must not be recorded as though it had.
+      const answered = answeredVersion(basedOn, this.remote.get(path));
+      if (answered) reconciled(entry, answered.hash, answered.uid, this.now());
       return;
     }
     if (entry.folder) {
@@ -3357,25 +3382,11 @@ export class Engine {
       size: incoming.length,
     });
     await this.upload(copyPath, copyEntry, report, this.remote.get(copyPath)?.uid);
+    // Which is also what records that this remote version has been dealt with
+    // on a device that cannot send it (RR7). That lives in `upload`, at the one
+    // place that decides not to send, because it was here first and the
+    // successful-merge branch went on repeating itself (RR9).
     await this.upload(path, entry, report, remote.uid);
-
-    // On a device that will never upload, the two calls above did nothing, and
-    // nothing else moves this path's ancestor (RR7).
-    //
-    // Sending the local version against `remote.uid` is what normally records
-    // that this remote version has been dealt with. A read-only mirror does not
-    // send, so without this the entry still shows both sides moved since the
-    // ancestor, the next pass decides "conflict" again, and it writes another
-    // copy of the same incoming body. Every pass. Eleven files became twenty on
-    // the second command.
-    //
-    // The ancestor moves to the version that was just written beside the note.
-    // The local edit stays unsent and stays described as it is, so the next
-    // pass sees an upload and holds it back, which is both true and a fixed
-    // point.
-    if (!this.sending) {
-      reconciled(entry, remote.hash, remote.uid, this.now());
-    }
 
     // On the queue, not on the commit, for the reason `merged` gives above:
     // both copies are on this disk whatever the flush then does.
@@ -3671,6 +3682,32 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
  * diff exact for ordinary notes took the corpus in `markup.test.ts` from zero
  * malformed merges in 20,923 to one (I28, I31).
  */
+/**
+ * The server version a held-back write was answering, when it is still that
+ * version.
+ *
+ * Out here and exported because the alternative was a condition inside
+ * `upload` that nothing could ask about. It only ever declines on a device
+ * that cannot send, which is a device whose `remote` map nothing commits to,
+ * so the deciding case is one the read-only tests structurally cannot reach:
+ * exactly the guard-that-is-asked-of-nothing this codebase keeps producing.
+ *
+ * Declining matters anyway. `reconciled` writes a hash and a uid together as
+ * the ancestor, and a hash belonging to one version recorded against another
+ * uid is a lie about what has been dealt with, which is how a later version
+ * gets skipped rather than merged. So: nothing is claimed for a write that
+ * answered no version, and nothing is claimed when the version it answered is
+ * no longer the one the server has.
+ */
+export function answeredVersion(
+  basedOn: number | undefined,
+  remote: { uid: number; hash: string } | undefined,
+): { uid: number; hash: string } | undefined {
+  if (basedOn === undefined) return undefined;
+  if (!remote || remote.uid !== basedOn) return undefined;
+  return { uid: basedOn, hash: remote.hash };
+}
+
 export function validityGateFor(
   path: string,
   base: string,

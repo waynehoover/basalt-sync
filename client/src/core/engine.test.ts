@@ -17,6 +17,7 @@ import {
   Engine,
   OWN_LIMITS,
   SEAL_WINDOW,
+  answeredVersion,
   boundedBy,
   contentId,
   refuseIfBehind,
@@ -3192,4 +3193,38 @@ describe("an Excalidraw drawing two devices both drew on", () => {
       expect(opens(text), `${name} will not open:\n${text}`).toBe(true);
     }
   }, 240_000);
+});
+
+/**
+ * The one condition in the read-only reconcile that its own tests cannot reach.
+ *
+ * A device that cannot send is a device whose `remote` map nothing commits to,
+ * so the version it answered is always still the version the server has, and
+ * every read-only test takes the same branch. Recording a hash from one version
+ * against another version's uid would be a lie about what has been dealt with,
+ * and the branch that refuses to is only asked about here.
+ */
+describe("the version a held-back write answered", () => {
+  const remote = { uid: 7, hash: "sha-of-seven" };
+
+  it("is the version, when that is still the version", () => {
+    expect(answeredVersion(7, remote)).toEqual({ uid: 7, hash: "sha-of-seven" });
+  });
+
+  it("is nothing when the write answered no version", () => {
+    // A conflict copy is a new path, so there is no server version it replies
+    // to, and there is nothing to record as dealt with.
+    expect(answeredVersion(undefined, remote)).toBeUndefined();
+    expect(answeredVersion(undefined, undefined)).toBeUndefined();
+  });
+
+  it("is nothing when the server has moved on since the decision", () => {
+    // uid 8 has not been dealt with. Recording 7 as the ancestor with 8's hash
+    // would say it had, and the next pass would not merge it.
+    expect(answeredVersion(7, { uid: 8, hash: "sha-of-eight" })).toBeUndefined();
+  });
+
+  it("is nothing when the path has no server version at all", () => {
+    expect(answeredVersion(7, undefined)).toBeUndefined();
+  });
 });
