@@ -1702,10 +1702,18 @@ describe("what the CLI says about itself and the vault", () => {
     const nameB = paired.json()["device"] as string;
     const { hostname } = await import("node:os");
     const host = hostname().split(".")[0] || "device";
-    expect(nameA).toMatch(
-      new RegExp(`^${host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-[0-9a-f]{4}$`),
-    );
+    // A *prefix* of the hostname, not the whole of it. This asserted the whole
+    // of it, and on a runner whose hostname is sixty-one characters the name
+    // that produced was sixty-six bytes and the server refused it, which is
+    // what the clipping fixed and what this then contradicted. The point of
+    // the name is that it says which machine and that two machines with one
+    // hostname differ, and a prefix does both.
+    expect(host.startsWith(nameA.slice(0, nameA.length - 5))).toBe(true);
+    expect(nameA).toMatch(/-[0-9a-f]{4}$/);
     expect(nameB).toMatch(/-[0-9a-f]{4}$/);
+    for (const name of [nameA, nameB]) {
+      expect(new TextEncoder().encode(name).length).toBeLessThanOrEqual(MAX_NAME_BYTES);
+    }
     expect(nameA).not.toBe(nameB);
     // A name that was typed is used as typed.
     const c = await vaultDir("c");
