@@ -79,6 +79,20 @@ else
   fail "nothing checks the draft state, so a rerun replaces a public release's files"
 fi
 
+# And that job can actually see a draft.
+#
+# The check above asks whether the step is there, which it was while the job
+# could not read the thing it checks: GitHub shows a draft release only to a
+# token with push access, so `contents: read` makes `gh release view` answer
+# "release not found" and the whole gate fails closed on every release. That
+# is a safe failure and a broken one, and it survived a review because the
+# step existed and read correctly.
+if printf '%s\n' "$checked" | grep -qE "^      contents: write"; then
+  ok "and can read one, which needs write: a draft is hidden from a read-only token"
+else
+  fail "the checked job cannot see a draft release, so every release fails at the gate"
+fi
+
 # And two runs against one release do not interleave: one replacing assets
 # while the other publishes is the same exposure by another route.
 if settings "$workflow" | grep -q "group: attest-"; then

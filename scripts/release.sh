@@ -258,7 +258,7 @@ and publishes the release as its last step. Nothing is downloadable until all
 of that has passed, and a run that fails leaves a draft you can delete.
 
 The dispatch is a second command because GitHub does not fire a release event
-for a draft: `created` is documented as excluding them, so a workflow listening
+for a draft: \`created\` is documented as excluding them, so a workflow listening
 for it would leave the draft sitting there with nothing running and no sign
 that anything was wrong.
 

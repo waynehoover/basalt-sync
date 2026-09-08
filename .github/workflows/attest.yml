@@ -65,7 +65,14 @@ jobs:
     # workflow's runs is not in the default set.
     permissions:
       actions: read
-      contents: read
+      # `write`, for a job that only reads, and the reason is GitHub's: a draft
+      # release is visible only to a token with push access, so `contents: read`
+      # makes `gh release view` answer "release not found" for the very thing
+      # this job exists to check. Narrowing this to `read` was part of adding
+      # the publish gate, and no release happened between then and now, so the
+      # tightening that was supposed to make publishing safer had quietly
+      # broken the check that makes it safe.
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
