@@ -114,6 +114,14 @@ if [ -n "$server" ]; then
       done < <("$here/scripts/release-tags.sh" "server/v$server" 2>/dev/null || true)
 
       for arch in amd64 arm64; do
+        # The local copy goes first, every time. One digest can be stored
+        # locally only once, so running amd64 caches that digest as the amd64
+        # image and arm64 then cannot be stored under the same name: Docker
+        # says "cannot overwrite digest" and the second architecture reads as
+        # broken when nothing is. The same bug was in the release workflow,
+        # and fixing it there and not here is how one of two call sites keeps
+        # the defect.
+        docker image rm -f "$image@$digest" >/dev/null 2>&1 || true
         if got=$(docker run --rm --platform "linux/$arch" "$image@$digest" version 2>&1); then
           case "$got" in
             *"$server"*) note "linux/$arch: $got" ;;
@@ -137,14 +145,20 @@ if [ -n "$cli" ]; then
     # anything published after a date" into "the version is not on npm", which
     # is a different and much more alarming sentence. What npm said is what
     # gets printed.
-    if ! tgz=$(cd "$dir" && npm pack "basalt-sync@$cli" 2>"$dir/err" | tail -1); then
+    # `--prefer-online`, because the point of this script is to check what is
+    # published and npm will answer from a cached packument instead. It did:
+    # minutes after 0.5.0 went up this said "No matching version found ... with
+    # a date before" and named a time before the publish. A verifier that
+    # reports a good release as broken is worse than no verifier, because the
+    # next person to see it assumes the same.
+    if ! tgz=$(cd "$dir" && npm pack --prefer-online "basalt-sync@$cli" 2>"$dir/err" | tail -1); then
       wrong "cannot fetch basalt-sync@$cli from npm. npm says:"
       sed 's/^/    /' "$dir/err" >&2
     else
       note "$tgz, $(wc -c < "$dir/$tgz" | tr -d ' ') bytes"
       # npm's own record of what it served, which is the closest thing the
       # registry has to a checksum somebody else can quote.
-      note "registry integrity: $(npm view "basalt-sync@$cli" dist.integrity 2>/dev/null || echo unknown)"
+      note "registry integrity: $(npm view --prefer-online "basalt-sync@$cli" dist.integrity 2>/dev/null || echo unknown)"
       if ( cd "$dir/elsewhere" && npm install --silent --no-audit --no-fund \
              --prefix "$dir/elsewhere" "$dir/$tgz" >/dev/null 2>&1 ); then
         bin=$dir/elsewhere/node_modules/.bin/basalt
