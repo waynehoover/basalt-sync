@@ -3,7 +3,7 @@
  *
  * This file is the codec and the replay, and nothing else: no files, no
  * adapters, no clock. The crash semantics are the whole point of the design
- * (see index-journal-spec.md), and they are cheapest to pin where there is no
+ * (see docs/index-journal.md), and they are cheapest to pin where there is no
  * I/O to arrange, so they are pinned here.
  *
  * ## The invariant this rests on

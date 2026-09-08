@@ -1,7 +1,7 @@
 /**
  * What the index journal costs, and what the snapshot policy should be.
  *
- * `index-journal-spec.md` proposed a quarter of the snapshot, 1000 records and
+ * `docs/index-journal.md` proposed a quarter of the snapshot, 1000 records and
  * a 64 KiB floor and said all three were guesses. A guess in a constant is a
  * decision nobody made, so this measures the four things the policy is a
  * trade between:

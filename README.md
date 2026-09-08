@@ -114,6 +114,7 @@ A server can still go quiet, and it can hand back an old version of a note under
 | [How it compares](docs/compared.md) | Against the alternatives, with measurements |
 | [Design](docs/design.md) | Durability rules, threat model, what is refused |
 | [Protocol](docs/protocol.md) | The wire protocol |
+| [Index journal](docs/index-journal.md) | How the client stores its index, and what a crash does to it |
 | [Findings](docs/findings.md) | Every numbered review finding a code comment cites |
 
 ## License

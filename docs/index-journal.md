@@ -1,9 +1,14 @@
 # The index as a journal and a snapshot
 
-This was a spec. It is now what both shells run, and the parts below that the
-implementation contradicts are marked where they sit; the code is the authority
-and `core/index-journal-store.ts` carries the reasoning. Four things changed on
-the way in, all of them found by building it:
+[Back to the README](../README.md)
+
+How the client stores its index: a snapshot plus an append-only log, one
+implementation for both shells. `core/index-journal-store.ts` is the authority
+and this is the reference beside it.
+
+This began as a spec, and where the implementation contradicts it that is marked
+where it sits. Four things changed on the way in, all of them found by building
+it:
 
 - **Six primitives, not five.** `logBytes` became `stamps`, which answers for
   the size and modification time of both files. The extra one is what lets a
@@ -30,8 +35,8 @@ docs/compared.md with which of the three governs at which vault size.
 
 ## Why, and why not a database
 
-`improvements.md` section 4 asks for a database, and the honest reasons against
-it are not about speed. A full rewrite costs 4 ms at ten thousand notes
+A database was asked for, and the honest reasons against it are not about
+speed. A full rewrite costs 4 ms at ten thousand notes
 (`docs/compared.md`), so the cliff it worried about is not there. The reasons
 are:
 
@@ -178,8 +183,8 @@ truncating at the first bad record yields an older index either way.
 
 - **fsync on phones.** The plugin's adapter offers no way to force one, so a
   journal there is as best-effort as today's write. This is not a regression,
-  and it is not an improvement either. `improvements.md` section 6 already
-  tracks it.
+  and it is not an improvement either. Nothing tracks it, because there is
+  nothing to do about it from inside a plugin.
 - **Two writers.** A journal has the same single-writer requirement the current
   file has, and one failure the current file does not: two writers number their
   records independently, so their appends interleave into a log whose sequences
@@ -196,9 +201,13 @@ truncating at the first bad record yields an older index either way.
   invariant, bounded by the snapshot policy, but it should be stated in the
   release notes rather than discovered.
 
-## Tests that must exist before this is finished
+## The ten properties the tests pin
 
-Rule 9 applies to each: write it, watch it fail, then make it pass.
+Rule 9 applied to each: written, watched failing, then made to pass. They live
+in `core/index-journal.test.ts` (the codec), `core/index-journal-store.test.ts`
+(the policy, against a fake filesystem), `index-journal-shells.test.ts` (every
+crash point, through the two stores the shells actually construct) and
+`stress/journal.stress.ts` (what it costs at a size where the cost shows).
 
 1. A record torn mid-line is discarded and everything before it survives.
 2. A record with a good line and a bad CRC is discarded (a torn write that
@@ -217,16 +226,3 @@ Rule 9 applies to each: write it, watch it fail, then make it pass.
    changes, which is the property that keeps one implementation honest.
 10. A vault holding today's `index.json` and no log loads unchanged.
 
-## Order of work
-
-All four are done. The tests above live in `core/index-journal.test.ts` (the
-codec), `core/index-journal-store.test.ts` (the policy, against a fake
-filesystem), `index-journal-shells.test.ts` (every crash point, through the two
-stores the shells actually construct) and `stress/journal.stress.ts` (what it
-costs at a size where the cost shows).
-
-1. The record codec and replay, pure and in `core`, with tests 1 to 5 and 10.
-   No I/O, so this is where the crash semantics get pinned cheaply.
-2. The two adapter methods, `append` and a size stat, one per shell.
-3. Wire `IndexStore`, keeping `load` and `save` exactly as they are to callers.
-4. Snapshot policy, then measure it and replace the guesses.

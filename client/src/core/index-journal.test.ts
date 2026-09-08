@@ -1,12 +1,12 @@
 /**
  * The journal's crash semantics.
  *
- * These are the tests index-journal-spec.md says must exist before the journal
- * is finished, and they live at the codec because that is where a crash can be
- * arranged exactly rather than provoked. Every one of them describes something
- * a real filesystem does to a file that was being appended to when the power
- * went: a cut line, a line whose bytes changed under a good newline, NUL
- * padding where the file grew but the write never landed.
+ * These are the ten properties docs/index-journal.md pins, and they live at the
+ * codec because that is where a crash can be arranged exactly rather than
+ * provoked. Every one of them describes something a real filesystem does to a
+ * file that was being appended to when the power went: a cut line, a line whose
+ * bytes changed under a good newline, NUL padding where the file grew but the
+ * write never landed.
  *
  * The property they all serve: an older index is safe, an empty one is not,
  * and an invented one is worst of all.
