@@ -176,6 +176,72 @@ import { diff_match_patch, type Diff } from "diff-match-patch";
 import { regions } from "./merge-regions.ts";
 import { splitName } from "./paths.ts";
 
+/**
+ * The largest text a merge will diff exactly, in UTF-16 code units.
+ *
+ * Measured rather than chosen. On a note with two fifths of its lines
+ * rewritten, which is the shape that makes a bisect work hardest, an exact
+ * diff costs 6.6 ms at 2 KiB, 28 ms at 10 KiB, 82 ms at 20 KiB and 248 ms at
+ * 50 KiB; a merge runs two of them. Eight KiB keeps the worst case near I08's
+ * 38 ms budget and covers an ordinary note comfortably -- it is around 1,300
+ * words -- while a note past it takes the coarse path and stays a fifth of a
+ * second instead of twenty-two seconds.
+ *
+ * Compared against `.length` rather than encoded bytes on purpose: this has to
+ * be the same number on both devices for them to make the same choice, and
+ * `.length` is the one measure that needs no encoder and no agreement about
+ * one.
+ */
+export const EXACT_DIFF_CEILING = 8 * 1024;
+
+/**
+ * Whether all three texts are small enough to diff exactly.
+ *
+ * All three, because the merge diffs `base` against each of the other two and
+ * the expensive one decides the cost. Deterministic by construction: the same
+ * three texts give the same answer on any device, which is the property that
+ * lets two of them merge alike.
+ */
+export function fitsExactDiff(base: string, mine: string, theirs: string): boolean {
+  if (
+    base.length > EXACT_DIFF_CEILING ||
+    mine.length > EXACT_DIFF_CEILING ||
+    theirs.length > EXACT_DIFF_CEILING
+  ) {
+    return false;
+  }
+  // And not markup, which is the part that had to be found rather than
+  // reasoned out.
+  //
+  // A finer diff merges more, and merging more is only safe where a broken
+  // result would be noticed. `stillValid` is asked of `.canvas` and `.json`
+  // and of nothing else, because `.svg`, `.xml` and `.csv` were *measured* not
+  // to have that failure -- and measured with the coarse diff. Making the diff
+  // exact invalidated the measurement: markup.test.ts went from zero malformed
+  // merges in 20,923 to one, which is the corpus doing exactly the job it was
+  // built for.
+  //
+  // So the finer diff is withheld from the one kind of file where this cannot
+  // check its own work. That is the same instinct as `stillValid` itself: be
+  // less willing to merge where a bad merge cannot be seen, not more.
+  //
+  // The better answer is to give markup a validity gate like the one JSON has
+  // -- `wellFormedMarkup` already exists in markup.test.ts and would only have
+  // to move into core -- and then let it merge finely under that gate.
+  return !looksLikeMarkup(base) && !looksLikeMarkup(mine) && !looksLikeMarkup(theirs);
+}
+
+/**
+ * Whether a text is markup, cheaply and from the front.
+ *
+ * Deliberately crude, and erring towards "yes": the cost of a false yes is one
+ * note merging as coarsely as it did before, and the cost of a false no is a
+ * drawing a reader will not open.
+ */
+function looksLikeMarkup(text: string): boolean {
+  return text.trimStart().startsWith("<");
+}
+
 /** diff-match-patch's operation codes, named so the intent is readable. */
 const DELETE = -1;
 const EQUAL = 0;
@@ -551,20 +617,34 @@ function mergeCore(
   }
 
   const dmp = new diff_match_patch();
-  // That `0` is an absolute deadline, not a timeout, and it is therefore
-  // already expired: any region needing a bisect comes back as a whole-block
-  // delete and insert rather than a fine-grained diff. Deterministic, which is
-  // what matters most here -- no clock is consulted, so two devices merge the
-  // same three texts the same way -- and coarser than it needs to be.
+  // Small enough to diff exactly, or big enough that it has to be coarse.
   //
-  // Every other `diff_main` in this client spells "no limit" the other way,
-  // as `Diff_Timeout = 0`, and the same number means the opposite in the two
-  // places. Whether this one was meant is not recorded anywhere, and measuring
-  // it says it costs about a third more conflict copies for 20 ms across 300
-  // merges. It is left alone because changing it changes what merges cleanly,
-  // and two devices on different releases would then disagree. IMPROVEMENTS.md
-  // I28 has the measurement and what the decision would involve.
-  const diff = dmp.diff_main(base, mine, true, 0);
+  // `diff_main`'s fourth argument is an absolute deadline, not a timeout, so
+  // passing `0` means "already expired": the bisect never runs and a tangled
+  // region comes back as one whole-block delete and insert. That is what makes
+  // a merge of a large note affordable, and it is I08's fix rather than an
+  // accident -- measured on a note with two fifths of its lines rewritten,
+  // exact against expired is 291 ms against 1 ms at 500 lines and 22.4 s
+  // against 21 ms at twenty thousand, on Obsidian's UI thread. Every other
+  // `diff_main` here spells "no limit" the other way, as `Diff_Timeout = 0`,
+  // and the same number means the opposite in the two places, which is why
+  // this needed measuring rather than reading.
+  //
+  // It is also coarser than it needs to be for an ordinary note, and coarse
+  // diffs make two edits look like they overlap when they do not: over 300
+  // two-sided edits on 20 to 70 line notes, exact merges 196 of them cleanly
+  // where expired merges 145. A third of those conflict copies did not have to
+  // exist.
+  //
+  // So the choice is made by size rather than taken once. Under the ceiling
+  // the diff is exact, which at 8 KiB is about 25 ms in the worst case
+  // measured and two diffs per merge; over it the deadline is expired and the
+  // 22 second case stays a fifth of a second. Decided from the input's length,
+  // never from a clock, so two devices given the same three texts make the
+  // same choice and compute the same merge (I28).
+  const exact = fitsExactDiff(base, mine, theirs);
+  if (exact) dmp.Diff_Timeout = 0;
+  const diff = exact ? dmp.diff_main(base, mine, true) : dmp.diff_main(base, mine, true, 0);
   if (diff.length > 2) {
     // Both passes, as Obsidian does. They do not change what the patch
     // means, they change how the result reads.
@@ -574,7 +654,9 @@ function mergeCore(
 
   // Refuse before attempting anything, when both sides changed the same text.
   // patch_apply would succeed and splice them together; see conflictingSpans.
-  const theirDiff = dmp.diff_main(base, theirs, true, 0);
+  const theirDiff = exact
+    ? dmp.diff_main(base, theirs, true)
+    : dmp.diff_main(base, theirs, true, 0);
   if (theirDiff.length > 2) {
     dmp.diff_cleanupSemantic(theirDiff);
     dmp.diff_cleanupEfficiency(theirDiff);

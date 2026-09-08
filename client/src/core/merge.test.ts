@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { diff_match_patch } from "diff-match-patch";
-import { conflictCopyPath, mergeText, mergeTextCharacters, sanitiseDevice } from "./merge.ts";
+import {
+  EXACT_DIFF_CEILING,
+  conflictCopyPath,
+  fitsExactDiff,
+  mergeText,
+  mergeTextCharacters,
+  sanitiseDevice,
+} from "./merge.ts";
 
 /**
  * diff-match-patch used the way its own documentation shows, with none of the
@@ -18,6 +25,17 @@ import { conflictCopyPath, mergeText, mergeTextCharacters, sanitiseDevice } from
  */
 function unguardedMerge(base: string, mine: string, theirs: string): string {
   const dmp = new diff_match_patch();
+  // The expired deadline, which is the coarse mode, and deliberately not what
+  // `mergeText` now uses for a fixture this small (I28). This function is here
+  // to show what the library does unaided in the shape that produced these
+  // cases, and every one of them was found with a coarse diff; running it
+  // exactly would demonstrate a different situation and prove nothing about
+  // the guard. What matters is the `mergeText` assertion beside each call,
+  // which still refuses all three.
+  //
+  // Not `diff_main(base, mine, true)` on a default instance either: that is a
+  // one-second wall-clock timeout, so the answer would depend on how loaded
+  // the machine is and the test would be flaky by construction.
   const diff = dmp.diff_main(base, mine, true, 0);
   if (diff.length > 2) {
     dmp.diff_cleanupSemantic(diff);
@@ -153,6 +171,13 @@ describe("refusing to merge rather than losing an edit", () => {
    */
   it("never returns a character merge that has lost a local insertion", () => {
     const dmp = new diff_match_patch();
+    // The same way the merge asks, which for a fixture this small is exact
+    // (I28). Asking coarsely here while the merge asks exactly compares one
+    // decomposition against another and fails on the difference rather than
+    // on anything lost: the coarse diff calls a whole block one insertion, and
+    // that block is not contiguous in a text the merge assembled from finer
+    // pieces.
+    dmp.Diff_Timeout = 0;
     const bases = [
       "one\ntwo\nthree\nfour\nfive\n",
       "# Heading\n\nSome prose here.\n\n- a list item\n- another\n",
@@ -177,7 +202,7 @@ describe("refusing to merge rather than losing an edit", () => {
           if (r.kind !== "merged") continue;
           mergedCount++;
 
-          const diff = dmp.diff_main(base, mine, true, 0);
+          const diff = dmp.diff_main(base, mine, true);
           if (diff.length > 2) {
             dmp.diff_cleanupSemantic(diff);
             dmp.diff_cleanupEfficiency(diff);
@@ -203,6 +228,13 @@ describe("refusing to merge rather than losing an edit", () => {
     // Rule 8, and the reason the count is asserted rather than mentioned: a
     // merge that grew more cautious would still pass the word property.
     const dmp = new diff_match_patch();
+    // The same way the merge asks, which for a fixture this small is exact
+    // (I28). Asking coarsely here while the merge asks exactly compares one
+    // decomposition against another and fails on the difference rather than
+    // on anything lost: the coarse diff calls a whole block one insertion, and
+    // that block is not contiguous in a text the merge assembled from finer
+    // pieces.
+    dmp.Diff_Timeout = 0;
     const bases = [
       "one\ntwo\nthree\nfour\nfive\n",
       "# Heading\n\nSome prose here.\n\n- a list item\n- another\n",
@@ -227,7 +259,7 @@ describe("refusing to merge rather than losing an edit", () => {
           if (r.kind !== "merged") continue;
           mergedCount++;
 
-          const diff = dmp.diff_main(base, mine, true, 0);
+          const diff = dmp.diff_main(base, mine, true);
           if (diff.length > 2) {
             dmp.diff_cleanupSemantic(diff);
             dmp.diff_cleanupEfficiency(diff);
@@ -545,7 +577,14 @@ describe("a hunk that did not apply", () => {
 
     // What the library reports, which is the fact the merge has to act on.
     const dmp = new diff_match_patch();
-    const diff = dmp.diff_main(base, mine, true, 0);
+    // The same way the merge asks, which for a fixture this small is exact
+    // (I28). Asking coarsely here while the merge asks exactly compares one
+    // decomposition against another and fails on the difference rather than
+    // on anything lost: the coarse diff calls a whole block one insertion, and
+    // that block is not contiguous in a text the merge assembled from finer
+    // pieces.
+    dmp.Diff_Timeout = 0;
+    const diff = dmp.diff_main(base, mine, true);
     if (diff.length > 2) {
       dmp.diff_cleanupSemantic(diff);
       dmp.diff_cleanupEfficiency(diff);
@@ -1227,4 +1266,124 @@ describe("a word neither device wrote", () => {
     expect(r.kind).toBe("merged");
     expect(r.kind === "merged" && r.text).toBe("a B C\n");
   });
+});
+
+/**
+ * Which diffs are exact, and what the ceiling is protecting (I28).
+ *
+ * `diff_main`'s fourth argument is an absolute deadline, so `0` means the
+ * bisect never runs and a tangled region collapses to one delete and one
+ * insert. That is coarse, and coarse diffs make two edits look like they
+ * overlap when they do not: 145 of 300 two-sided edits merged cleanly where an
+ * exact diff merges 196. It is also what makes a large merge affordable at
+ * all -- 22.4 seconds against 21 milliseconds on a twenty-thousand-line note
+ * with two fifths of its lines rewritten, on Obsidian's UI thread, which is
+ * I08's whole subject.
+ *
+ * So the choice is made from the input's size. These pin that it is made from
+ * the size and from nothing else, and that the expensive case is still cheap.
+ */
+describe("choosing an exact diff or a coarse one", () => {
+  const under = "a".repeat(EXACT_DIFF_CEILING);
+  const over = "a".repeat(EXACT_DIFF_CEILING + 1);
+
+  it("is decided by length, and by the longest of the three", () => {
+    expect(fitsExactDiff(under, under, under)).toBe(true);
+    // Any one of them over the ceiling is enough, because the merge diffs the
+    // ancestor against each of the other two and the dear one sets the cost.
+    expect(fitsExactDiff(over, under, under)).toBe(false);
+    expect(fitsExactDiff(under, over, under)).toBe(false);
+    expect(fitsExactDiff(under, under, over)).toBe(false);
+  });
+
+  it("withholds the exact diff from markup, which cannot check its own merge", () => {
+    // Found by markup.test.ts rather than reasoned out. `.svg` is not on the
+    // `stillValid` list because it was *measured* not to produce markup a
+    // reader refuses -- measured with the coarse diff. Making the diff exact
+    // took that corpus from zero malformed merges in 20,923 to one.
+    //
+    // A finer diff merges more, and merging more is only safe where a broken
+    // result would be noticed. So markup keeps the coarse path until it has a
+    // validity gate of its own.
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><g id="a"/></svg>\n';
+    expect(svg.length).toBeLessThanOrEqual(EXACT_DIFF_CEILING);
+    expect(fitsExactDiff(svg, svg, svg)).toBe(false);
+    // Any one of the three is enough, the same as the ceiling.
+    const prose = "- a note about the plumber\n";
+    expect(fitsExactDiff(prose, prose, prose)).toBe(true);
+    expect(fitsExactDiff(svg, prose, prose)).toBe(false);
+    expect(fitsExactDiff(prose, svg, prose)).toBe(false);
+    expect(fitsExactDiff(prose, prose, svg)).toBe(false);
+    // Leading whitespace does not smuggle it past.
+    expect(fitsExactDiff(`\n  ${svg}`, prose, prose)).toBe(false);
+  });
+
+  it("gives the same answer every time it is asked", () => {
+    // The property the whole design rests on: two devices handed the same
+    // three texts make the same choice, so they compute the same merge. A
+    // clock here, or a budget that counted work already done, would not.
+    for (let i = 0; i < 50; i++) expect(fitsExactDiff(under, over, under)).toBe(false);
+  });
+
+  it("merges a note the coarse diff would have kept both copies of", () => {
+    // The benefit, pinned. Each device makes several small edits spread
+    // through one short list and each removes a different line, which is the
+    // shape that needs a bisect: no single edit overlaps the other, and there
+    // is not enough common prefix or suffix to separate them cheaply.
+    //
+    // Coarse, this is one whole-block delete and insert on each side, they
+    // look like they overlap, and both versions are kept. Exact, they are
+    // several small changes that miss each other and it merges. That is the
+    // third of conflict copies the ceiling is worth, in one case somebody can
+    // read; without it, going back to a coarse diff everywhere would pass
+    // every other test in this file.
+    const lines = [
+      "- ring the plumber about the leak in the upstairs bathroom",
+      "- order more coffee before the weekend arrives",
+      "- book the car in for its service sometime in March",
+      "- reply to the letter from the council about the bins",
+      "- find the receipt for the printer and file it away",
+      "- ask the neighbours whether they want the old shelves",
+    ];
+    const base = lines.join("\n") + "\n";
+    const mine =
+      [lines[0], lines[2], `${lines[3]} today`, lines[4], `${lines[5]} or the desk`].join("\n") +
+      "\n";
+    const theirs =
+      [`${lines[0]} on Tuesday`, lines[1], `${lines[2]} or April`, lines[3], lines[5]].join("\n") +
+      "\n";
+
+    expect(base.length).toBeLessThanOrEqual(EXACT_DIFF_CEILING);
+    const r = mergeTextCharacters(base, mine, theirs);
+    expect(r.kind, "a note this size should merge, not keep both").toBe("merged");
+    if (r.kind === "merged") {
+      // And both devices' edits are in the one file.
+      expect(r.text).toContain("on Tuesday");
+      expect(r.text).toContain("or the desk");
+      expect(r.text).toContain("bins today");
+      expect(r.text).toContain("March or April");
+    }
+  });
+
+  it("keeps a large tangled note affordable", () => {
+    // Twenty thousand lines with two fifths of them rewritten on each side,
+    // which is the shape that took 23 s before I08. If this ever goes back to
+    // an exact diff it will not return inside the test's timeout, which is the
+    // point of asserting it here rather than asserting a duration.
+    let seed = 5;
+    const rnd = (): number => (seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff);
+    const lines: string[] = [];
+    for (let i = 0; i < 20_000; i++) lines.push(`line ${i} the quick brown fox jumps over it`);
+    const base = lines.join("\n") + "\n";
+    const churn = (t: string): string =>
+      t
+        .split("\n")
+        .map((l) => (rnd() % 100 < 40 ? l.split(" ").reverse().join(" ") : l))
+        .join("\n");
+
+    const r = mergeTextCharacters(base, churn(base), churn(base));
+    // Both versions kept, which is the safe answer for a note too tangled to
+    // merge and is what the coarse diff produces.
+    expect(r.kind).toBe("conflict");
+  }, 5_000);
 });

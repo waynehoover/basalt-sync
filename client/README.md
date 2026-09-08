@@ -266,7 +266,14 @@ Two settings for a device that should do less than the default.
 `--read-only` makes a device apply everything the server has and send nothing:
 no uploads, no deletions, no conflict copies going out. It is for a machine
 that holds a copy, a NAS or a backup box, and the reason is blast radius rather
-than tidiness. A bad scan on such a machine, a mount that came up empty, a path
+than tidiness.
+
+It is this client declining to write, not the server refusing it. The
+credential a read-only device holds is an ordinary one and the server would
+accept anything it sent; what stops it is the code above. That is the right
+shape for a machine you own and the wrong shape for one you do not trust, and
+a server-enforced read-only credential is a different feature that does not
+exist here. A bad scan on such a machine, a mount that came up empty, a path
 typo, a half-restored disk, is an *ordinary local change* as far as sync is
 concerned, and ordinary local changes propagate: the mirror can delete notes on
 every device. A device without the capability cannot make that mistake.

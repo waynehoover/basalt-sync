@@ -1067,3 +1067,133 @@ than killing a real Obsidian process. Real desktop/mobile acceptance, physical
 power cuts, and CI-only filesystem checks were not independently exercised.
 I25/I26 are explicitly deferred improvements, not newly discovered blockers in
 this verification.
+
+## Product improvements verification — 2026-09-07
+
+Reviewed **`0def89f1ac3fbd09d45a9650ec19525d6d1210aa`**, including the RR5/RR6
+repairs, kernel-managed CLI exclusion (I27), persistent read-only mirrors (I29),
+and the no-merge option (I30). **RR5 and RR6 now pass their reproductions. Two
+new P2 defects remain: RR7 and RR8 below.**
+
+The direction is sound: automatic recovery now uses exclusion released by the
+kernel, and the CLI can keep local edits from being sent. These findings call
+for focused fixes to feature interactions and command outcomes, not a rewrite
+or another custom lock protocol.
+
+### Validation
+
+- `bash scripts/check.sh` passed **28 checks, 0 failed, 0 skipped** in an isolated
+  detached worktree: **1,473 client tests in 77 files**, **16 panel tests**, and
+  **24 stress tests**, plus the Go, formatting, type, build, release-shell,
+  packaged-CLI, kernel-lock, and local Docker checks.
+- The kernel-lock script also passed independently under **stock Node on macOS
+  and Node 22 in a Linux container**, with eight assertions on each platform.
+  These cover exclusion, holder identity, SIGKILL recovery without manual
+  unlock, an abandoned record, forced garbage collection, and symlink/trailing
+  slash spellings of the same vault.
+- Seven prior safety probes pass, including overlapping unlocks, plugin recovery
+  failures/restart, disabled destructive compaction, the torn-tail retry, and
+  sync/status agreement about incomplete recovery.
+- Two additional tests using the real CLI, filesystem, and a local Go test
+  server fail as described below. The existing green gate does not cover these
+  combinations.
+
+Evidence: `/tmp/basalt-product-review.VQ32Ez/check.log`, `kernel-macos.log`, and
+`kernel-linux.log`; `/tmp/basalt-product-probes.mFioB6/probes.log` and
+`client/src/product-review-probes.test.ts`. Reproduction code and test data are
+in disposable snapshots. Only review documentation was changed in this review.
+
+### RR7 — A read-only mirror repeatedly creates the same conflict copy
+
+- [x] **P2 · Read-only/no-merge interaction · Reproduced against a real local server.**
+
+[`conflict()`](client/src/core/engine.ts#L3330) preserves the incoming version
+beside the local note, then relies on uploading both files to advance their
+state. The new [read-only guard](client/src/core/engine.ts#L1896) correctly
+prevents those uploads, but leaves the original conflict eligible for processing
+again. Each pass counts another conflict as work, so
+[`settle()`](client/src/core/client.ts#L331) repeats it through its pass limit.
+
+**Reproduction:** sync a base note from writable device A to device B, paired
+with persistent `--read-only`. Edit the note differently on A and B, sync A,
+then run B's `sync --json --no-merge` twice without further edits on either
+device. Both commands return exit 0, report nine conflicts and zero uploads,
+and leave the server cursor at 2. The local file count rises from **11 after the
+first command to 20 after the second**. Nineteen files contain the identical
+incoming remote body; the original still contains B's unsent edit.
+
+Preservation and prevention of uploads work, but the mirror never settles this
+remote version locally. Repeated invocations keep adding duplicate files and
+disk usage with no new server data. The reproduction exercises repeated CLI
+commands; ongoing growth under a scheduled/watch invocation follows from the
+same repeated processing but was not separately measured here.
+
+**Fix and acceptance:** persist that this remote version has been handled
+locally independently of whether this device may upload. Preserve the unsent
+local edit and one incoming copy without declaring the local edit synced.
+Repeated passes, commands, restart, and watch ticks must not create additional
+copies for that same version. A genuinely new remote version must still be
+handled once; local changes remain held back and no server writes occur.
+
+### RR8 — Restore JSON reports success while its exit status reports incomplete recovery
+
+- [x] **P2 · CLI outcome consistency · Reproduced against a real local server.**
+
+[`cmdRestore`](client/src/cli/cli.ts#L1994) emits unconditional `ok: true`, then
+returns the newly recovery-aware `exitCodeFor(report, client.vault)`. The JSON
+does not include the recovery reason, so the RR5 correction is incomplete
+across command renderers.
+
+**Reproduction:** initialize a vault, sync a note, write a torn JSON record to
+`.basalt/displaced.log`, and run `restore note.md --json`. The command restores
+and uploads `note (restored 1).md`, then returns **exit 1 with `ok: true`**. Its
+JSON fields are only `ok`, `path`, `uid`, `bytes`, and `sync`; none explains the
+incomplete recovery that caused the failure exit.
+
+The restore itself succeeded. The defect is an inconsistent overall result
+which makes automation's interpretation depend on whether it reads the JSON
+or the exit status.
+
+**Fix and acceptance:** derive overall success, exit status, and recovery
+explanation from the same outcome used by sync/rebase. Report successful local
+restoration separately so an unresolved recovery inventory does not obscure
+the fact that a new file was written. An actual restore against a reachable
+server with incomplete recovery must preserve the restored bytes, explain that
+condition, and give consistent overall success signals.
+
+### What to improve next
+
+Fix RR7/RR8, then keep the feature scope steady for a beta. The next work with
+the strongest product value is:
+
+1. **Usable local recovery in the plugin.** Build on the existing history and
+   deleted-note flows with an understandable inventory of locally displaced
+   versions: original name, reason, retained location, and an action to open or
+   restore a copy. A preserved version should not require interpreting a hidden
+   path or a log record.
+2. **Acceptance on actual supported devices.** Exercise desktop and Android
+   with offline edits on both devices, suspension/kill/resume, upgrades of an
+   existing vault, and pairing/restoration after reinstall. Include a sustained
+   run of the read-only mirror. These are release evidence, not more unit tests
+   reproducing the same implementation assumptions.
+3. **A redacted support bundle.** Export app/server versions, platform, sync and
+   recovery state, and relevant errors without note contents or keys. This
+   makes failures on another person's device diagnosable.
+
+The read-only setting is a client behavior for trusted devices, not a
+server-enforced read-only credential. That distinction should remain clear in
+product wording; adding server permissions is a separate requirement if the
+threat model later changes. I25/I26 need not be revived to ship this beta.
+
+### Verification limits
+
+The gate ran against the commit identified above. Another agent's uncommitted
+changes to `client/src/core/merge.ts` and `merge.test.ts` appeared during this
+review and were not included in it. RR7 explicitly disables merging, so merge
+algorithm changes do not address that reproduction.
+
+Plugin fault probes use `FakeAdapter` with the real `ObsidianVault`. Actual
+Obsidian desktop/mobile acceptance, physical power cuts, CI-only systemd and
+mounted-filesystem acceptance, and published release artifacts were not
+independently verified here. Linux kernel tests used a local container
+filesystem, not a network filesystem.

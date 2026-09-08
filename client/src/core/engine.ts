@@ -69,6 +69,7 @@ import {
   type IndexEntry,
   type LocalState,
   type RemoteState,
+  reconciled,
 } from "./index-state.ts";
 import {
   MAX_BATCH_ENTRIES,
@@ -3361,6 +3362,24 @@ export class Engine {
     });
     await this.upload(copyPath, copyEntry, report, this.remote.get(copyPath)?.uid);
     await this.upload(path, entry, report, remote.uid);
+
+    // On a device that will never upload, the two calls above did nothing, and
+    // nothing else moves this path's ancestor (RR7).
+    //
+    // Sending the local version against `remote.uid` is what normally records
+    // that this remote version has been dealt with. A read-only mirror does not
+    // send, so without this the entry still shows both sides moved since the
+    // ancestor, the next pass decides "conflict" again, and it writes another
+    // copy of the same incoming body. Every pass. Eleven files became twenty on
+    // the second command.
+    //
+    // The ancestor moves to the version that was just written beside the note.
+    // The local edit stays unsent and stays described as it is, so the next
+    // pass sees an upload and holds it back, which is both true and a fixed
+    // point.
+    if (!this.sending) {
+      reconciled(entry, remote.hash, remote.uid, this.now());
+    }
 
     // On the queue, not on the commit, for the reason `merged` gives above:
     // both copies are on this disk whatever the flush then does.

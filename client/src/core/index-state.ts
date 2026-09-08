@@ -450,6 +450,40 @@ export function synced(
 }
 
 /**
+ * Records that a path has been reconciled against a remote version this device
+ * will never answer (RR7).
+ *
+ * `synced` is for a version this device *sent*, and it writes `hash` and
+ * `chunks` as well, because the local file and the agreed version are then the
+ * same thing. On a read-only mirror they are not: the incoming version has been
+ * dealt with -- kept beside the local note as a conflict copy -- and the local
+ * edit is still unsent and always will be.
+ *
+ * Without this the mirror never settles. `conflict` advanced the state by
+ * uploading the local version against the remote uid, the read-only guard
+ * correctly stops that upload, and the entry then still shows both sides moved
+ * since the ancestor. Every pass reached the same conclusion and wrote another
+ * copy: eleven files after one command and twenty after the next, nineteen of
+ * them the same incoming body.
+ *
+ * So the ancestor moves and the local content does not. The next pass sees a
+ * path whose remote half matches the ancestor and whose local half does not,
+ * which is an upload, which is held back and reported. That is the truth about
+ * a mirror with a local edit, and it is a fixed point rather than a loop.
+ *
+ * `hash` and `chunks` are deliberately untouched: they describe the bytes on
+ * this disk, and saying they are the agreed version would be the "failed push
+ * looks like an agreed state" mistake `synced` warns about, arrived at from
+ * the other direction.
+ */
+export function reconciled(entry: IndexEntry, synchash: string, uid: number, now: number): void {
+  if (entry.synchash === synchash && entry.syncuid === uid) return;
+  entry.synchash = synchash;
+  entry.syncuid = uid;
+  entry.synctime = now;
+}
+
+/**
  * Whether enough time has passed since this file last synced to sync it again.
  *
  * Obsidian's, at `obsidian-sync-engine.js:930`: ten seconds for a small file,

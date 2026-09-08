@@ -964,8 +964,17 @@ describe("what counts as a successful run", () => {
     await chmod(join(dir, "locked.md"), 0o000);
     try {
       const r = await cli("restore", "note.md", "--dir", dir, "--json");
-      // The restore itself worked, and says so.
-      expect(r.json()["ok"], r.all).toBe(true);
+      // The restore itself worked, and says so -- in `restored`, which is its
+      // own field now (RR8).
+      //
+      // `ok` used to carry that meaning and sat beside an exit code answering
+      // a different question, so this command returned `ok: true` and exit 1
+      // and automation's answer depended on which it read. `ok` is the run,
+      // `restored` is the file, and both are here rather than one standing in
+      // for the other.
+      expect(r.json()["restored"], r.all).toBe(true);
+      expect(r.json()["ok"], "ok disagrees with the exit code").toBe(false);
+      expect((r.json()["outcome"] as Record<string, unknown>)["kind"]).toBe("retrying");
       expect((r.json()["sync"] as Record<string, number>)["retrying"]).toBe(1);
       expect(r.code, "a restore over a vault that cannot sync reported success").toBe(1);
     } finally {

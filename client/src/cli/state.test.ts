@@ -632,6 +632,60 @@ describe("a read-only device", () => {
     expect(existsSync(join(a, "invented-here.md"))).toBe(false);
   }, 120_000);
 
+  it("does not keep making the same conflict copy, pass after pass", async () => {
+    // RR7, the reviewer's reproduction. `conflict` normally records that a
+    // remote version has been dealt with by uploading the local one against
+    // its uid; a mirror does not upload, so nothing recorded it and every pass
+    // decided the same conflict again and wrote another copy. Eleven files
+    // after one command, twenty after the next, nineteen of them holding the
+    // same incoming body.
+    const a = await paired("rr7-writer");
+    await writeFile(join(a, "note.md"), "the original\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    const b = await vaultDir("rr7-mirror");
+    const invite = JSON.parse((await cli("invite", "--dir", a, "--json")).out.at(-1)!) as {
+      invite: string;
+    };
+    expect((await cli("pair", invite.invite, "--dir", b, "--read-only")).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+
+    // Both sides edit it, and only the writer's edit reaches the server.
+    await writeFile(join(a, "note.md"), "the original, changed by the writer\n");
+    await writeFile(join(b, "note.md"), "the original, changed on the mirror\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    const count = async (): Promise<number> =>
+      (await readdir(b)).filter((n) => n.endsWith(".md")).length;
+
+    const first = await cli("sync", "--dir", b, "--json", "--no-merge");
+    expect(first.code, first.all).toBe(0);
+    const afterFirst = await count();
+    expect(afterFirst, "the incoming version was not kept beside the local edit").toBe(2);
+
+    // And again, and again. Nothing has changed on either side, so nothing
+    // more should appear.
+    for (let i = 0; i < 3; i++) {
+      const again = await cli("sync", "--dir", b, "--json", "--no-merge");
+      expect(again.code, again.all).toBe(0);
+      const r = JSON.parse(again.out.at(-1)!) as { conflicted: number; uploaded: number };
+      expect(r.uploaded, "a read-only device sent something").toBe(0);
+      expect(r.conflicted, `pass ${i + 2} conflicted again`).toBe(0);
+    }
+    expect(await count(), "repeated passes kept adding copies").toBe(afterFirst);
+
+    // The mirror's own edit is still there, unsent, and the writer's version
+    // is beside it.
+    const bodies = await Promise.all(
+      (await readdir(b)).filter((n) => n.endsWith(".md")).map((n) => readFile(join(b, n), "utf8")),
+    );
+    expect(bodies.join("\n")).toContain("changed on the mirror");
+    expect(bodies.join("\n")).toContain("changed by the writer");
+    // And the writer never saw any of it.
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await readdir(a)).filter((n) => n.endsWith(".md"))).toEqual(["note.md"]);
+  }, 120_000);
+
   it("stays read-only without the flag, because it is in the config", async () => {
     // The reason it is not a flag alone. A cron line that loses an argument
     // would otherwise turn a mirror into a writer, and nobody would find out
@@ -709,6 +763,49 @@ describe("a device with merging turned off", () => {
     const all = (await Promise.all(files.map((f) => readFile(join(b, f), "utf8")))).join("\n");
     expect(all).toContain("changed by A");
     expect(all).toContain("changed by B");
+  }, 120_000);
+});
+
+/**
+ * Restore's two answers, which have to be the one answer (RR8).
+ *
+ * The exit code learned about unresolved recovery and the JSON's `ok` did not,
+ * so a restore on a vault whose displaced-version log cannot be read returned
+ * exit 1 beside `ok: true`. Automation's reading of that depended on which of
+ * the two fields it happened to look at, which is the shape rule 7 is about.
+ */
+describe("restore, on a vault that cannot say what is waiting", () => {
+  it("agrees with its own exit code, and still says the note came back", async () => {
+    const dir = await paired("rr8");
+    await writeFile(join(dir, "note.md"), "the original\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    await rm(join(dir, "note.md"));
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+
+    // A record cut short by a crash: the log names something and cannot say
+    // what, so this device cannot establish what is waiting.
+    await writeFile(join(dir, STATE_DIR, "displaced.log"), '{"at":"note.md..basalt-tmp-keep0a1');
+
+    const out = await cli("restore", "note.md", "--dir", dir, "--json");
+    const json = JSON.parse(out.out.at(-1)!) as {
+      ok: boolean;
+      restored: boolean;
+      outcome: { kind: string };
+      path: string;
+      recoveryUnknown: string | null;
+    };
+
+    expect({ ok: json.ok, code: out.code }, "the JSON and the exit code disagree").toEqual({
+      ok: false,
+      code: 1,
+    });
+    // And it still says the restore itself worked, which is the part somebody
+    // is actually asking about.
+    expect(json.restored).toBe(true);
+    expect(json.outcome.kind).toBe("recoveryUnknown");
+    expect(json.recoveryUnknown).toContain("cannot be read");
+    // The bytes are really there.
+    expect(await readFile(join(dir, json.path), "utf8")).toBe("the original\n");
   }, 120_000);
 });
 

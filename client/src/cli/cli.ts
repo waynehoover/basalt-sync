@@ -135,9 +135,10 @@ Options
   --no-merge       never combine two edits to one note; keep both versions instead. Merging is the
                    only thing that makes content neither device wrote, and this is how to say no
   --read-only      apply what the server has and send nothing: no uploads, no deletions, no
-                   conflict copies going out. For a mirror that must not be able to change the
-                   vault everyone else sees. Recorded in the config by init and pair, so a cron
-                   job cannot lose it by forgetting the flag
+                   conflict copies going out. For a mirror that should not change the vault
+                   everyone else sees. This client declining to write, not the server refusing
+                   it. Recorded in the config by init and pair, so a cron job cannot lose it by
+                   forgetting the flag
   --force          for unlock: clear a lock held on another machine. This one cannot tell whether
                    that process is still running, so saying it is not is your assertion. It will
                    not break a lock held by a process on this machine that is still running
@@ -1992,17 +1993,32 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
     const report = await client.settle({ coalesceWrites: false });
 
     if (args.json) {
-      // `restored` is already a counter on the report, so the path is `path`.
+      // `ok` from the same place the exit code comes from (RR8).
+      //
+      // It was `true` unconditionally beside an exit code that had learned
+      // about unresolved recovery, so a restore on a vault whose displaced-
+      // version log cannot be read returned exit 1 and `ok: true`, and
+      // automation's answer depended on which of the two it read.
+      //
+      // `restored` is separate on purpose. The bytes really are on this disk
+      // and saying so is not the same as saying the run had nothing else
+      // wrong with it; folding the two together is what made the old `true`
+      // look reasonable.
+      const outcome = outcomeOf(report, undefined, client.vault.recovery);
+      const code = exitCodeOf(outcome);
       io.out(
         JSON.stringify({
-          ok: true,
+          ok: code === 0,
+          restored: true,
+          outcome,
           path: done.path,
           uid: version.uid,
           bytes: done.bytes,
           sync: report,
+          recoveryUnknown: unknownRecovery(client.vault) ?? null,
         }),
       );
-      return exitCodeFor(report, client.vault);
+      return code;
     }
     io.out(
       `Restored version ${version.uid} of ${path} (${bytes(done.bytes)}, from ${when(version.mtime)}).`,

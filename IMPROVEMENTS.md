@@ -2,7 +2,7 @@
 
 Reviewed **2026-09-05**, commit **8f95bfe56e11c8d458ecad5c6b26e599e9031f47**. The concrete defects and their regression criteria are in [TODO.md](TODO.md). This document records improvements to pursue after or alongside those fixes, without treating every possible production feature as a POC requirement.
 
-I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I28 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
+I01 to I24 are from that review and are done, as are I26 (evaluated, declined) and I27. **I25 and I31 are open**, added later from measurements rather than from the review: they are things worth investigating when there is a reason to, not work anybody is waiting on. Add to them rather than starting another list.
 
 The current foundation is useful: one shared client engine, a small Go deployment, encrypted content-addressed chunks, metadata authentication, conservative conflict copies, explicit server limits, a journaled index, backup verification/rehearsal, and a substantial passing test suite. Preserve those properties while addressing the gaps.
 
@@ -128,7 +128,7 @@ Benchmark adversarial text shapes, not just random inputs. Where supported, move
 
 ### I28 — Decide whether the merge diff should be coarse on purpose
 
-- [ ] **Small change, large blast radius.** It costs a third more conflict copies than it needs to, and changing it changes what merges cleanly.
+- [x] **Done, and not as proposed.** The coarse diff turned out to be I08's fix rather than an oversight. The ceiling keeps both.
 
 `merge.ts` passes `0` as `diff_main`'s fourth argument, which is an absolute
 deadline and is therefore already expired: any region needing a bisect returns
@@ -153,16 +153,77 @@ across 300 merges. Nothing is lost either way -- keeping both versions is the
 safe direction and is what this project prefers when unsure -- but a person
 reading "Conflicted copy" on a note they could have had merged is paying for it.
 
-The reason this is a decision and not a fix: it changes merge output, so two
-devices on different releases would merge the same three texts differently.
-That is exactly the objection that closed I26, and it applies to this whether
-the change comes from a new library or from four characters. If it is done,
-it wants the same care: a version gate, or acceptance that a mixed-version pair
-produces a conflict copy where a matched pair would not.
+**What measuring it changed.** The proposal was to make the diff exact, and
+that would have reverted I08. On a note with two fifths of its lines rewritten,
+exact against expired is 291 ms against 1 ms at 500 lines, 6.7 s against 9 ms
+at eight thousand, and **22.4 s against 21 ms at twenty thousand**, on
+Obsidian's UI thread. Those are I08's own before-numbers, near enough to
+identify: 45 ms, 1.2 s and 23 s at one, five and twenty thousand lines. The
+`0` is that fix. Nothing said so, which is why it needed measuring rather than
+reading, but it was never an oversight.
+
+So neither answer was right and the choice is made by size. Under 8 KiB the
+diff is exact, over it the deadline stays expired. The ceiling was measured
+rather than picked: worst case 6.6 ms at 2 KiB, 28 ms at 10 KiB, 82 ms at
+20 KiB, 248 ms at 50 KiB, and a merge runs two diffs, so 8 KiB sits near I08's
+38 ms budget and covers an ordinary note of about 1,300 words.
+
+Decided from `.length` and never from a clock, so two devices handed the same
+three texts make the same choice and compute the same merge. That is what makes
+this safe to do at all, and it is the property `fitsExactDiff` exists to make
+testable.
+
+Measured after: 300 two-sided edits on ordinary notes merge 196 cleanly where
+they merged 145, and a twenty-thousand-line tangled note now conflicts in 42 ms
+rather than taking 22 seconds.
+
+**And markup does not get it**, which had to be found rather than reasoned out.
+`.svg` is not on the `stillValid` list because it was *measured* not to produce
+markup a reader refuses, and that was measured with the coarse diff. Making the
+diff exact took `markup.test.ts` from zero malformed merges in 20,923 to one:
+the corpus doing exactly the job it exists for, and a reminder that "measured
+safe" is only safe under the conditions it was measured in. A finer diff merges
+more, and merging more is only safe where a broken result would be noticed, so
+markup keeps the coarse path.
+
+Four mutations, all caught: always-coarse loses the finer merges, always-exact
+blows the large-note test's timeout, a ceiling that looks at only one of the
+three texts fails the decision test, and letting markup through fails both the
+decision test and the fuzz corpus. The last of those matters because the
+merge diffs the ancestor against each of the other two and the dear one sets
+the cost.
 
 The existing test `never returns a character merge that has lost a local
-insertion` mirrors the implementation's call rather than pinning it
-independently, so it is not evidence that coarse was intended.
+insertion` mirrored the implementation's call rather than pinning it, so it was
+not evidence either way, and it now asks the same way the merge does.
+`unguardedMerge` deliberately does not: it demonstrates what the library makes
+of the shapes that produced those fuzz cases, all of which were found coarse.
+
+### I31 — Give markup the validity gate that JSON has
+
+- [ ] **Small; the checker already exists.** Then markup can merge as finely as prose does.
+
+`stillValid` is asked of `.canvas` and `.json` because a line-wise merge can
+apply cleanly and leave a file Obsidian refuses to open, and only the caller
+knows how to judge that. `.svg`, `.xml` and `.csv` are not on the list because
+they were measured not to have that failure -- under the coarse diff, which
+I28 has now made conditional.
+
+Under an exact diff they do have it: one malformed merge in 20,923. I28's
+answer was to withhold the finer diff from markup, which keeps the measured
+zero and costs those files the third fewer conflict copies that prose gained.
+
+The better answer is a gate. `wellFormedMarkup` already exists, in
+`markup.test.ts`, and is the checker that corpus judges against: a hand-written
+scanner with no dependency and nothing platform-specific about it. Moving it
+into core, asking it of the markup extensions the way `parsesAsJson` is asked
+of JSON, and then letting `fitsExactDiff` stop caring what the text looks like
+would give those files both properties at once.
+
+What to be careful of: the gate has to be exactly as strict as the corpus
+believes it is, or the measurement moves under it. Move the checker, keep
+`markup.test.ts` pointing at the moved copy so the corpus is still judging the
+same thing, and only then relax the exclusion.
 
 ### I09 — Reduce duplicate chunk I/O without weakening verification
 
@@ -385,6 +446,12 @@ about.
 `basalt sync --read-only`: apply everything the server has, send nothing. The
 vault is still written, because that is what a mirror is; what stops is this
 device ever originating an upload, a deletion or a conflict copy.
+
+It is this client declining to write rather than the server refusing it. A
+read-only device holds an ordinary credential and the server would accept
+anything it sent. That is the right shape for a machine you own and the wrong
+shape for one you do not trust; a server-enforced read-only credential is a
+separate feature and a separate threat model.
 
 The case for it is blast radius, and it is a real one. A headless client on a
 NAS exists to hold a copy. Today a bad scan on that machine -- a mount that came
@@ -712,6 +779,16 @@ differing everywhere and the second reported it as identical everywhere. Both
 were wrong: the first had mismatched settings, the second had quietly dropped
 deletions from its corpus. The number that stands is from a corpus fixed once
 and shared by every arm.
+
+**And I28 closed the door rather than opening it.** The thought was that once
+nobody is relying on merge output staying still, the compatibility objection
+disappears and the fork becomes possible. Measuring I28 showed the expired
+deadline is load-bearing for performance, not just for history: without it a
+twenty-thousand-line note takes 22 seconds on the UI thread. The fork has no
+deadline parameter at all and its `timeout: 0` means unlimited, so it cannot
+express the one thing that keeps a large merge affordable. That is a permanent
+technical blocker rather than a scheduling one, and it stands whoever is or is
+not using this.
 
 That leaves the unmaintained dependency where it was, which I22's scheduled
 advisory checks are the answer to rather than this.

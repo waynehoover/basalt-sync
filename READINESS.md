@@ -451,3 +451,23 @@ or not this device uploads.
 does not have. Filed as I30. It is the version of PRODUCT_READINESS's
 "defer automatic merging" suggestion that costs the product nothing, and it
 gives I28 a way out for anyone who wants one.
+
+## Product improvements independently checked — 2026-09-07
+
+Verified `0def89f1ac3fbd09d45a9650ec19525d6d1210aa`. **RR5 and RR6 now pass their
+reproductions.** The full gate passed 28/28 checks, with 1,473 client tests and
+24 stress tests. Kernel exclusion and automatic SIGKILL recovery also passed
+under stock Node on macOS and in a Linux container, including GC and vault-path
+alias checks.
+
+**Two new P2 defects remain:**
+
+- [ ] **RR7:** a read-only mirror with merging disabled creates the same
+  conflict copies on every sync, even with no new local or remote edits.
+- [ ] **RR8:** restore returns exit 1 for incomplete recovery while its JSON
+  says `ok: true` and omits the recovery reason.
+
+Reproductions, acceptance criteria, evidence, verification limits, and suggested
+beta priorities are in
+[FOLLOW_UP_REVIEW.md](FOLLOW_UP_REVIEW.md#product-improvements-verification--2026-09-07).
+Concurrent uncommitted merge-algorithm changes were outside this tested snapshot.
