@@ -1,544 +1,177 @@
-# Basalt client
+# Basalt command-line client
 
-> **Experimental.** This is a mirror for a machine with no Obsidian, not a
-> general-purpose writable client. One Basalt writer per vault, a local
-> filesystem, and no other sync tool over the same directory:
-> [docs/design.md](../docs/design.md#where-this-is-supported) has the whole
-> list and the reasons. The plugin is the supported client.
+**Fast, secure, self-hosted sync for Obsidian. Simple setup.**
 
+Keep a local copy of your Obsidian notes on a NAS or another machine without
+Obsidian. Basalt connects to your own server, encrypts content before upload,
+and provides note history and recovery from the terminal.
 
-The Obsidian plugin and the headless client are one sync engine with two
-adapters, Obsidian's Vault API or the filesystem. This directory holds both.
-The headless client is what npm installs.
+**Experimental.** Use macOS or Linux, Node **22 or newer**, and a local
+filesystem. Run one Basalt process that writes to each vault, and keep other
+sync tools and the Obsidian plugin off that same directory. For everyday
+editing, use the
+[Obsidian plugin](https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md).
 
-## The headless client
+## Set up a mirror
 
-For a NAS, a server, or any machine without Obsidian. One file, no
-dependencies, Node 22 or newer.
+Create an invite on an existing device, using **Add another device** in the
+plugin or `basalt invite`. Then, on the mirror machine:
 
 ```bash
 npm install -g basalt-sync
-cd ~/vault
-basalt pair basalt3i_...       # an invite, from basalt invite on a device that has the vault
+mkdir -p ~/basalt-mirror
+cd ~/basalt-mirror
+basalt pair 'INVITE' --read-only
 basalt sync --watch
 ```
 
-Or, for the first device on a new server, the line the server printed:
+Replace `INVITE` with the string you created. It works once and expires after
+ten minutes by default. `--read-only` is saved during pairing, so subsequent
+syncs keep local changes from being uploaded even without the flag.
+
+Keep the process running for continuous sync. For a scheduled job, use
+`basalt sync --dir /path/to/basalt-mirror` instead.
+
+## Start a new vault
+
+If no device has claimed the server yet, use its setup string:
 
 ```bash
-basalt init 'homelab:3003#K7M2PQR4-...'
-basalt sync
+basalt init 'wss://homelab.example.ts.net#TOKEN' --dir ~/vault
+basalt sync --dir ~/vault
 ```
 
-If TLS is in front, put that hostname before the `#`. `init` claims the vault
-with the server's one-time token, generates the root secret, and prints the
-recovery key once. Write it down and keep it offline: it is the only way back
-in if every device is lost, and anyone who has it has the vault.
-`--server URL --token TOKEN` also works.
+This creates a writable client. Save the recovery key printed during setup,
+separate from your devices. If every device is lost, the key lets you pair a
+replacement. Basalt cannot recover it for you.
 
-To add a device, run `basalt invite` on one that already has the vault and
-paste what it prints into `basalt pair` on the new one. An invite works once,
-lasts ten minutes, and carries no root secret: it hands over the vault's data
-key and registers the new device a credential of its own, which `basalt revoke`
-can cut off without touching any other device.
+See [server setup](https://github.com/waynehoover/basalt-sync/blob/main/docs/server.md)
+for TLS and obtaining the token. A named server vault also needs
+`--vault-id NAME` on `init`.
 
-The recovery key also works in `basalt pair`, for when no device is left to
-invite from. Deliberately not the ordinary way in: it is written down and
-offline, and adding a phone should not mean going to get it. Either way the new
-device keeps only a credential of its own, neither the invite nor the key.
+## Everyday commands
 
-A config holding the recovery key and no device credential is not a device this
-client can use, and every command refuses it rather than guessing. `basalt
-init` leaves one when the claim goes through and the registration after it does
-not. The refusal prints the recovery key out of the config, since that copy may
-be the only one, and names the way back: `basalt unlink`, then `basalt pair`
-with that key. `basalt status` calls such a vault neither reachable nor
-refused, since nothing was asked of the server.
+Commands use the current directory unless you pass `--dir DIR`.
 
-### Commands
-
-```
-basalt init HOST:PORT#TOKEN               start a new vault, with the line the server printed
-basalt invite [--ttl 10m]                 print a single-use invite for another device
-basalt uninvite ID                        cancel an outstanding invite, from basalt devices
-basalt pair INVITE                        add this device to a vault, with an invite or its
-                                          recovery key
-basalt devices                            every device that may reach this vault
-basalt rename NAME                        change this device's name in the device list
-basalt revoke ID                          stop one device connecting, from basalt devices
-basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
-basalt rebase --backup-taken              rejoin a server restored from an older backup
-basalt sync                               sync once and exit
-basalt sync --watch                       sync, then keep syncing
-basalt status                             what this device thinks the state is
-basalt deleted                            notes the server has and this vault does not
-basalt history PATH                       every version of one note, newest first
-basalt restore PATH                       put a note back
-basalt repair                             resend bodies the server has lost
-basalt unlink                             forget the pairing, keep the notes
-basalt unlock                             clear a lock a basalt on another machine left behind
-basalt --version                          which release this is
-```
-
-| Option | |
+| Command | Use it to… |
 |---|---|
-| `--dir DIR` | the vault (default: the current directory) |
-| `--device NAME` | this device's name (default: the hostname plus four random characters, chosen once at pairing) |
-| `--vault-id ID` | which vault on the server, for `init` only (default `default`) |
-| `--json` | machine-readable output, on every command |
-| `--force` | for `unlock`: clear a lock held on another machine, which this one cannot check. It does not break a lock held by a process running here |
-| `--no-merge` | never combine two edits to one note; keep both versions instead |
-| `--read-only` | apply what the server has and send nothing. Recorded in the config by `init` and `pair`, and there is no flag that turns it off |
-| `--timeout MS` | how long to wait on the server (default 30000) |
-| `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |
-| `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable; local to this device |
-| `--uid N` | restore one exact version, from `basalt history` |
-| `--to PATH` | restore somewhere other than where it came from |
-| `--limit N` | how many versions `history` shows (default 20), or how many deletions `deleted` lists (default: all) |
-| `--allow-last` | revoke the last device, leaving the vault reachable only by its recovery key. Needs `--recovery-key` |
-| `--recovery-key K` | run `devices`, `revoke` or `uninvite` with the vault's recovery key rather than this device's own credential; any other command refuses it |
-| `--` | everything after it is a word rather than an option, for a device id that begins with `-` |
-| `-v`, `--verbose` | engine logging |
+| `basalt sync` | Sync once and exit. |
+| `basalt sync --watch` | Keep syncing and reconnect after temporary outages. |
+| `basalt status` | Check connection, local changes, and recovery issues. |
+| `basalt invite` | Add another device with a single-use invite. |
+| `basalt devices` | List devices and outstanding invites. |
+| `basalt rename NAME` | Rename this device's label. |
+| `basalt history "Note.md"` | View a note's versions, newest first. |
+| `basalt deleted` | List deleted notes and whether they can be restored. |
+| `basalt restore "Note.md"` | Restore the newest version with content. |
+| `basalt unlink` | Remove local pairing and index while keeping notes. |
 
-**Exit codes.** 0 worked. 1 something did not. 2 the command line was wrong.
+The [command reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md)
+covers all flags, device revocation, rotation, repair, and server recovery.
 
-Two values and not one per outcome, because a script asks "did this finish"
-and a code per outcome would make every caller enumerate them to answer it.
-What happened is in `--json` under `outcome`, which is the same conclusion the
-exit code is derived from and the same one the plugin's panel shows:
+## A mirror, and turning merging off
 
-| `outcome.kind` | exit | what it means |
-|---|---|---|
-| `synced` | 0 | everything this device knows about is where it should be |
-| `conflicted` | 0 | both versions are on this disk, waiting to be looked at |
-| `retrying` | 1 | named paths this device will try again on its own |
-| `refused` | 1 | named paths that need a person: a name that is a file here and a folder elsewhere, a file the server refused |
-| `passFailed` | 1 | the pass itself did not finish, so nothing per-path is known |
-| `offline` | 1 | no connection, so nothing about the vault is known |
+`--read-only` stops ordinary sync from uploading local edits, deletions, and
+conflict copies. It still downloads and changes local files. Preserve local
+edits you care about separately; this mode does not make the local directory
+immutable.
 
-`retrying` and `refused` carry the paths, because a count is not something
-anybody can act on. A conflict exits 0 on purpose: keeping both versions is
-the engine working, and a cron job that treated it as a failure would alert on
-ordinary use of two devices. A sync that gave up on a file exits non-zero, also
-on purpose, so a broken vault in cron is heard about. Files this device ignores
-are reported as ignored and exit 0, because refusing them is the configuration
-doing what it was told.
+The setting is a client behavior, **not a server-enforced permission**. The
+client keeps an ordinary device credential, and explicit administrative
+commands still work. In particular, `basalt repair` can resend missing content.
+Use this mode on a machine you trust.
 
-`basalt devices` lists every device that may reach this vault: its id, its
-name, when it was added and when it was last seen. The name is not an identity
-and two laptops may both be called laptop; the id is, and it is what `basalt
-revoke` takes.
+`init` and `pair` persist `--read-only`; passing it to `sync` applies it to that
+invocation. There is no flag to turn a persisted setting off.
 
-**Watching.** `sync --watch` reconnects with backoff when the connection drops,
-and when the server says it is busy, at the device limit or shutting down, it
-waits the time the server suggested. It stops only on a refusal that would
-repeat word for word: a wrong key, a protocol mismatch, or a server that has
-lost history this device already has. It also stops after three identical
-failures applying the same batch, naming the cursor and the version, so a
-poisoned entry is heard about rather than replayed forever.
-
-A row whose last seen says **never connected** is one nothing has ever signed
-in under: the registration commits before the new device saves anything, so a
-pairing that crashed after reaching the server strands a row, and so does a
-`basalt init` whose claim went through. Those rows still hold one of the eight
-slots, so a failed pairing names the row to revoke rather than sending you back
-to pairing, which would register a second.
-
-`basalt rename NAME` changes what this device is called, and only this device:
-the name is a label a person reads and the id is the identity, so there is no
-argument naming a row. It reaches the server first and writes the config after,
-because the device list is what another person reads and what this device cannot
-repair while offline; if the local write then fails, both halves are said, since
-the visible consequence is conflict copies that still carry the old name.
-
-Copies made before a rename keep the old name. They are notes on disk, and
-nothing here rewrites a note to tidy a label.
-
-`basalt revoke ID` removes that device's row and closes any connection it has
-open, in that order, so it stops at once rather than at its next reconnect. Any
-device may revoke any other, or itself: cutting off a stolen laptop should not
-need the recovery key out of its drawer.
-
-Revoking the vault's **last** device does need it:
+To review conflicting edits yourself instead of merging them:
 
 ```bash
-basalt revoke ID --allow-last --recovery-key basalt3_...
+basalt sync --no-merge
+basalt sync --watch --no-merge
 ```
 
-That is the one revocation nothing on a device can undo, since what it leaves
-is a vault only the recovery key opens, and it costs nothing in the case it is
-for: a device stolen when it was the only one wants `basalt rotate` too, which
-needs the key anyway. `--recovery-key` also works in a directory that was never
-paired, which is the way back into a vault whose eight rows are all crashed
-pairings, since nothing can register while it is full.
+Pass `--no-merge` on each invocation that should use it. Basalt keeps both
+versions when a merge would otherwise be needed.
 
-**Revoking stops a device connecting. It does not unread what that device
-already read**: it still holds the vault's key for every note it had synced. A
-device stolen rather than merely lost wants `basalt rotate` as well.
-
-`basalt devices` also lists the invites nobody has redeemed yet, by identifier
-and expiry, and `basalt uninvite ID` cancels one. Until they were listed, an
-invite was the one authority on a vault nothing could see, and the only ways to
-retire one were to wait out its hour or to rotate, which retires the recovery
-key too. The identifier alone redeems nothing: that also takes the invite key,
-which never reaches the server and exists only in the string that was printed.
-
-`basalt rotate RECOVERY-KEY` gives the vault a new root secret and prints the
-new one. It takes the old key on the command line because no device holds one:
-a device that could rotate could also register itself again after being
-revoked. History survives, because the content is sealed under a data key the
-root only wraps, so a new root re-wraps the same key and nothing is
-re-encrypted. **No device row is touched and every device keeps syncing across
-it.**
-
-The new key is printed before the request goes out, because there is nowhere on
-a device to keep a root. If the reply is lost, `rotate` asks the server which
-secret it has and says which key to keep; if somebody rotated first, it says so
-by name and says to cross the printed key out.
-
-`basalt rebase` is for a server restored from an older backup, which refuses
-this device with `cursor`. It prints both cursors and refuses without
-`--backup-taken`; with it, it forgets the local index, rejoins from the
-server's cursor, uploads what only this device holds as new versions, keeps
-both where the two disagree, and deletes nothing.
-
-`basalt status` prints the local cursor and the server cursor on separate
-lines, and the ignore list. `--ignore` is local to this device, and the plugin
-ignores nothing beyond the dot rule and the config folder, so the list is there
-to make a divergence visible.
-
-It exits 1 when the server cannot be reached or refused this device, when the
-local scan could not run, and when the vault is holding a version this client
-took off a note and could not put back. That last one is the odd member of the
-list: everything else is a condition that may clear itself, and this one waits
-for a person. It is on the list because a stranded version is hidden from every
-listing on purpose, so the only way anybody learns of it is being told, and a
-green exit is how a timer never mentions it. `status` names the paths, and
-`sync` prints them too.
-
-That is a different case from a conflict, which exits 0: both versions of a
-conflict are on the disk under names a person can see and open.
-
-### State
-
-Everything lives in `.basalt/` inside the vault, which is never synced.
-`config.json`, mode 0600, holds this device's id, the secret it connects with
-and the vault's data key; `index.json` plus `index.log` are what this device
-knows about every path. Not the root secret, which no device holds: it goes
-there only while `basalt init` is starting a vault, since a secret that claimed
-a server without reaching the disk first is a vault nobody can open, and this
-device's own credential replaces it the moment there is one.
-
-The index is a snapshot plus a journal of what has changed since, so an
-ordinary pass appends a few hundred bytes rather than rewriting the whole file,
-and the log is folded back in once it has grown against the snapshot. Losing
-its tail loses no note, because notes are made durable before the index that
-names them and the engine redoes the pass. `unlink` removes all three files and
-touches no notes.
-
-One process at a time, enforced for every command that writes, and enforced by
-the operating system rather than by this program. On macOS that is a `flock`
-taken as part of opening `.basalt/lock.excl`; on Linux it is an abstract Unix
-socket named after the vault. Both refuse a second basalt, and both are
-released by the kernel when the holder exits, however it exits.
-
-So a `basalt` that crashes or is killed does not wedge the next one. It leaves
-a record in `.basalt/lock` naming itself, and the next command replaces it,
-because holding the kernel's exclusion is proof that no other basalt on this
-machine is inside the vault. There is no staleness to detect and nothing to
-decide, which matters because deciding it from a file was attempted five times
-and four of those handed one vault to two writers. `docs/compared.md` has all
-five and what replaced them.
-
-Two things are still a person's job:
-
-- **A holder on another machine.** A kernel answers for one machine, so a vault
-  on a disk two machines can reach is outside all of this. The lock file's host
-  is what refuses it, and `basalt unlock --force` is how you say you know that
-  machine is not running.
-- **A filesystem where the exclusion does not hold.** It is checked on every
-  run rather than assumed, against the vault's own state folder, because a
-  network mount may ignore `O_EXLOCK`. Where it does not hold, basalt says so
-  on stderr and falls back to the file, and then a crash does need:
-
-      basalt unlock
-
-  which names who held the vault before it clears anything, and refuses while
-  that process is still running.
-
-If something writes the index anyway, the next save says so on stderr and
-replaces both files with a fresh snapshot rather than appending this device's
-changes onto somebody else's.
-
-### A mirror, and turning merging off
-
-Two settings for a device that should do less than the default.
-
-`--read-only` makes a device apply everything the server has and send nothing:
-no uploads, no deletions, no conflict copies going out. It is for a machine
-that holds a copy, a NAS or a backup box, and the reason is blast radius rather
-than tidiness.
-
-It is this client declining to write, not the server refusing it. The
-credential a read-only device holds is an ordinary one and the server would
-accept anything it sent; what stops it is the code above. That is the right
-shape for a machine you own and the wrong shape for one you do not trust, and
-a server-enforced read-only credential is a different feature that does not
-exist here. A bad scan on such a machine, a mount that came up empty, a path
-typo, a half-restored disk, is an *ordinary local change* as far as sync is
-concerned, and ordinary local changes propagate: the mirror can delete notes on
-every device. A device without the capability cannot make that mistake.
-
-    basalt pair INVITE --read-only
-
-`init` and `pair` write it into `.basalt/config.json`, so a cron line that
-loses the flag does not turn the mirror into a writer. There is no flag that
-turns it off; edit the config if you mean to. Local changes are still applied
-and are counted by `sync` and `status` as changed here and not sent, which is
-out of the exit code: the device was told not to send and did not.
-
-`--no-merge` keeps both versions wherever a merge would have happened. Merging
-is the only thing this client does that makes content neither device wrote, and
-although it refuses anything it cannot do safely, this is how to say you would
-rather look at two files. Nothing is lost either way.
-
-Two devices set differently converge on content but not on shape: one uploads a
-merged note and the other uploads a conflict copy, so the vault ends up with
-both. Untidy, not lossy.
-
-### Filenames
-
-Paths travel in NFC, whatever the disk spells them in. A Mac stores `café.md`
-with a combining accent (NFD) and every other platform with a precomposed one
-(NFC); the two are one name, and the plugin has always normalised. The headless
-client used to hand out the disk's bytes, so two devices that each created that
-note reported one file `in the way` of the other on every pass for ever, naming
-two strings nobody can tell apart.
-
-NFC is the whole keyspace, in both directions: a path arriving in some other
-normal form is the same path, filed under its NFC name, not a second note.
-
-A vault synced by an older headless client on a Mac holds those paths under the
-NFD spelling on the server, and the first device to meet one sends a rename:
-content and history kept, the NFC name carrying the old one as the name it used
-to have, nothing already on the server re-sent. One entry per name, once;
-earlier versions stay under the old spelling in `basalt history`.
-
-The disk is owed the same rename, or a Mac stays the only device holding the
-spelling it invented. A name spelled on disk other than the way this client
-reports it is renamed the first time the vault is listed: one `rename`, no
-content copied, nothing to finish if interrupted. A read-only vault, or one
-whose filesystem imposes a normal form of its own, keeps its spelling and syncs
-as it always did.
-
-Upgrade every device. A client older than this rule goes on spelling its
-accented names in NFD, so it re-creates the old spelling after every rename and
-the two names keep arriving. Nothing is lost while that lasts, and nothing
-settles either.
-
-A disk that keeps the two spellings apart can hold both files, and only a
-person can say which was meant. That one name is blocked, both files are left
-as they are, the rest of the vault carries on, and `basalt sync` counts it and
-exits non-zero. Refusing the whole vault is what this used to do, over one pair
-nobody could name.
-
-A folder two names claim blocks everything under it, by the same count. Nothing
-under such a name is uploaded, downloaded or reported deleted: a listing that
-stopped naming a note must not become a deletion that travels to every device.
-
-The differing characters are spelled out, because the two names print
-identically:
-
-    "cafe\u{301}.md" and "caf\u{e9}.md" are one name here, and only one of them can sync.
-
-### What is not synced
-
-Any file or folder whose name starts with a dot, at any depth: `.basalt`,
-`.trash`, `.git`, `.DS_Store`, `.gitignore`, all of them. Also `node_modules`,
-and the config folder, `.obsidian` unless `--config-dir` says otherwise. The
-plugin asks Obsidian which folder that is; the headless client has to be told.
-The rule applies in both directions, so a name this client would never upload
-is one it will never write when a peer sends it.
-
-Pointing `--config-dir` at some other folder makes `.obsidian` ordinary
-content on this device, which is the one way to sync it. It also makes this
-device disagree with the plugin, which keeps refusing that folder, so the files
-travel to the server and no plugin device writes them. Left working on purpose,
-but a flag to type deliberately rather than a supported arrangement.
-
-`--ignore NAME` adds one more name, matched at any depth. One name per flag
-rather than a comma-separated list, because a filename can contain a comma. It
-is local to this device.
-
-A path another device syncs and this one ignores is counted and printed on its
-own line, and does not change the exit code: refusing it is the configuration
-doing what it was told, and counting it as a failure made every later sync of
-that vault exit 1 for ever. A path that cannot work here, a name that is a file
-on this device and a folder on another, still does.
-
-### Sync output
-
-```
-$ basalt sync
-    3  uploaded
-    1  downloaded
-    1  kept both versions
-    1  ignored here, and synced by another device
-    2  chunks sent, 1.4 KiB
-Look for files with "Conflicted copy" in the name. Both versions are kept.
-```
-
-Counts are separate and never totalled. If a path is a file here and a folder
-on another device, nothing can be written there and the output names it: that
-is the one refusal only a rename clears.
-
-### Recovery
+## Recovery
 
 ```bash
-basalt deleted                            what the server has and this vault does not
-basalt history "Quarterly plan.md"        every version, newest first
-basalt restore "Quarterly plan.md"        the newest version with content
-basalt restore "Q.md" --uid 42            one exact version
-basalt restore "Q.md" --to old/Q.md       somewhere else
+basalt history "Quarterly plan.md"
+basalt restore "Quarterly plan.md" --uid 42
+basalt restore "Quarterly plan.md" --uid 42 --to "Recovered plan.md"
 ```
 
-Restoring never overwrites. If the path is occupied the copy lands beside it as
-`Q (restored 42).md`. The restored note is sent to the server right away.
+Restore never overwrites an existing file. If the target is occupied, it writes
+a copy such as `Quarterly plan (restored 42).md`. On a writable client, it then
+attempts to send that copy. On a read-only mirror, the copy stays local.
 
-### When a note will not download
+When the server has been restored from an older backup, use `basalt rebase`
+to inspect the recovery situation, then `basalt rebase --backup-taken` after
+preserving local notes and backing up the server. This rejoins without deleting
+local files and sends local-only versions when the device is writable.
+
+If a command reports a version kept at a hidden path, preserve that file and
+`.basalt/`. Copy the retained version to a new visible filename and inspect it
+before removing recovery material. An unreadable recovery inventory needs
+attention even when other transfers succeed.
+
+## Automation and output
+
+Use `--json` for structured output. Exit **0** means the command succeeded,
+**1** means a failure or unresolved issue, and **2** means invalid arguments.
+For sync, `outcome` explains the result and the counters describe the work.
+
+A conflict exits 0 because both versions were preserved. Ignored files and
+changes held back by read-only mode also do not make a sync fail. Inspect those
+fields if your job needs a stricter condition. Incomplete recovery is a failure.
+
+Restore separates `restored` (the local file was written) from `ok` (the overall
+operation succeeded). Check both before retrying it.
+
+To keep setup strings, invites, and recovery keys out of command arguments, use
+an existing private file or standard input:
 
 ```bash
-basalt repair                             offer the server everything this device holds
+basalt pair --key-file /private/path/invite.txt --read-only
+basalt pair - --read-only < /private/path/invite.txt
+basalt rotate --key-file /private/path/recovery.txt --key-out /private/path/new-recovery.txt
 ```
 
-A note that never finishes downloading usually means the server has lost the
-file behind a version: a disk rotted it and the server set it aside, or a
-restore brought back a database and a chunk tree of slightly different ages.
-Every row is intact, so nothing reads as broken.
+`--key-out` creates a new private file and refuses to overwrite one. The key is
+also printed, so protect command output and logs.
 
-Ordinary syncing cannot fix that, and the reason is the interesting part. This
-device is *right* to consider the note synced: the version is committed and the
-hashes agree, so a pass has nothing to do. It is holding the missing bytes and
-has no reason to send them. The only way to make it send them used to be to edit
-the note, which writes a version nobody typed into a vault that is already
-damaged.
+## Files and local state
 
-`basalt repair` offers the chunk names of everything this device holds, the
-server asks for the ones it is actually missing, and those bytes go up. No
-version is written, no version number is allocated, nothing about any note
-changes.
+Basalt stores credentials and the sync index in `.basalt/`, which never syncs.
+Protect this directory: it contains the keys this device needs to read notes.
+Unlink through the command rather than deleting state files by hand.
 
-Run it on every device. Each one can only offer versions it holds, so history a
-device never had is invisible from it, and a clean run here is not a statement
-that the vault is whole. `basaltd verify` on the server is what knows. If no
-device can supply a body, that version cannot be restored; `basalt history` will
-still list it, and `basaltd purge` drops versions nothing can serve.
+The CLI excludes dot-prefixed files and folders, `node_modules`, and the
+Obsidian configuration folder. Use `--config-dir NAME` if yours differs from
+`.obsidian`. Add `--ignore NAME` for a file or folder name to exclude at every
+depth; repeat the flag for more names. These choices apply to this device only.
 
-**Renames become deletions here.** A filesystem scan cannot tell a rename from
-a delete plus a create, so the old path is recorded as deleted and appears in
-`basalt deleted`. The plugin gets Obsidian's rename event and sends a rename.
-Nothing is lost either way: the content is on the server under both names, and
-the second cost no upload.
+Equivalent Unicode filename spellings are normalized. If two distinct files
+would become the same name, Basalt blocks those paths and identifies them;
+rename one yourself. Keep clients updated together to avoid older clients
+reintroducing obsolete spellings. Filesystem renames can appear as a deletion
+of the old path and a creation of the new one; both names retain their history.
 
-## Layout
+## A command says the vault is locked
 
-```
-src/core/     platform-free: crypto, chunking, merging, the index, the transport, the engine
-src/plugin/   the Obsidian plugin and its Vault API adapter
-src/cli/      the headless client and its filesystem adapter
-src/stress/   the hostile suite: kills, collisions, awkward names, scale
-```
+Stop an existing watcher before starting another command that writes to the
+vault. On supported local macOS and Linux setups, process exit releases the
+lock automatically, including after a crash.
 
-`core` is the whole client except for where files live. Sealing uses WebCrypto,
-chunking and merging are arithmetic, and the transport uses the `WebSocket`
-Node 22 and every Obsidian target provide. A sync decision that appears in
-either shell is in the wrong file.
-
-## Working on it
-
-```bash
-bun install
-bun run test         # everything, including against a real Go server
-bun run typecheck
-bun run format       # prettier; CI fails on anything it would change
-bun run stress       # the hostile suite, its own CI job
-bun run scale        # what 10,000 notes cost
-bun run dedup        # what deduplication saves across versions
-bun run bench        # chunking, sealing, bytes on the wire
-bun run bench:sync   # a whole vault, timed and checked
-bun run build        # dist/basalt.mjs and dist/plugin/
-```
-
-The tests need a Go toolchain. `server-harness.test.ts` builds `basaltd`, runs
-it on a loopback port, talks to it with the real transport, then asks the
-server's own `verify -deep` whether what it stored can be served.
-`transport.test.ts` is the other half: a fake socket that says things a correct
-server never would.
-
-The benchmarks run under bun and the shipped CLI under node. Two of the largest
-performance fixes were each invisible under one of the two, so anything
-measuring the chunker should run under both.
-
-### Testing the plugin without Obsidian
-
-The `obsidian` package is type declarations with no runtime, so the plugin
-would otherwise compile and never run in a test.
-
-- `src/plugin/fake.ts` implements `DataAdapter` against the real declarations,
-  so the compiler catches drift. Its `normalizePath` matches the shipped app.
-- `src/plugin/stub.ts` is a runtime `obsidian` module. `vitest.config.ts`
-  aliases to it for tests only. `tsc` checks against the genuine declarations
-  and the build marks `obsidian` external.
-- `src/build.test.ts` loads the built `dist/plugin/main.js`, hands it the stub,
-  and pairs two of them against a real Go server. It also checks the bundle for
-  `node:` imports, the regression that passes every test and fails only on a
-  phone.
-
-What none of it can tell you is whether Obsidian calls these methods when the
-plugin expects, or draws what it builds. That is what the screenshots in
-`docs/assets/screenshots/` are for.
-
-### Building
-
-`bun run build` produces `dist/basalt.mjs`, the CLI with everything bundled and
-only `node:` builtins left as imports, and `dist/plugin/` with the three files
-Obsidian loads. Both are minified in a release build. The two packages inside
-them, `diff-match-patch` and `fflate`, are pinned to exact versions.
-
-The CLI is published to npm from CI on a `cli/vX.Y.Z` tag, over OIDC with no
-stored token. The plugin is released on a bare `X.Y.Z` tag, its assets rebuilt
-and attested by `.github/workflows/attest.yml`.
-
-### For plugin reviewers
-
-The community directory's scanner flags the same things each run. Two were real
-and are fixed: release assets are rebuilt and attested in CI, and unused code
-is caught by `noUnusedLocals`. The rest are correct readings of the repository
-that do not apply to the plugin:
-
-- **Node built-in imports** are all in `src/cli/` or `core/test-server.ts`. The
-  shipped `dist/plugin/main.js` contains no `node:` reference, and a test
-  checks that.
-- **`no-unsafe-*` warnings** come from linting without the `obsidian` types
-  resolved. With them installed, `tsc` under `strict` reports nothing.
-- **`setTimeout` rather than `window.setTimeout`** because the timers are in
-  `core/`, which the CLI also runs, and `window` does not exist in the test
-  environment.
-- **`globalThis`** for the same reason: `crypto.subtle` has to be found in both
-  a renderer and Node.
-- **`fetch` rather than `requestUrl`** is used only on `app://` resource URLs
-  for files already on the device, with a `Range` header, which is what lets a
-  large attachment stream instead of being read whole.
-- **`.obsidian` as a literal** appears only in the headless client, which has no
-  `Vault` to ask, and in test doubles.
-- **One `console` call**, in the engine's failure path. A note that fails to
-  send is exactly the silent failure this project exists to avoid.
-- **Vault enumeration.** It is a sync engine. It cannot sync a vault it is not
-  allowed to list.
+If Basalt reports that manual recovery is required, run `basalt unlock` after
+confirming the previous process has stopped. It refuses a live local holder.
+`--force` is only for a holder recorded on another machine and requires you to
+verify that it is stopped. Shared network vaults remain unsupported.
 
 ## More
 
-- [Server](https://github.com/waynehoover/basalt-sync/blob/main/docs/server.md)
-- [Plugin](https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md)
-- [Design](https://github.com/waynehoover/basalt-sync/blob/main/docs/design.md)
-- [Protocol](https://github.com/waynehoover/basalt-sync/blob/main/docs/protocol.md)
+- [All documentation](https://github.com/waynehoover/basalt-sync/blob/main/docs/index.md)
+- [Command reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md)
+- [Security and privacy](https://github.com/waynehoover/basalt-sync/blob/main/docs/security.md)
+- [Build and contribute](https://github.com/waynehoover/basalt-sync/blob/main/docs/development.md)

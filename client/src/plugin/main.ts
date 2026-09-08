@@ -2157,6 +2157,49 @@ function help(el: HTMLElement, detail: string, into?: HTMLElement): void {
 }
 
 /**
+ * A `?` for a line that is rewritten on every state change.
+ *
+ * `help` captures its detail once, which is right for a label. The connection
+ * line is not one: it says which server answered, under what scheme, at what
+ * protocol, and all of that changes. Its badge was therefore built by hand as a
+ * bare span with an `aria-label`, which meant it never got the click handler
+ * `help` grew and stayed a hover-only tooltip after every other one stopped
+ * being one. Reported as "the ? next to the connected to line doesn't work",
+ * which it did not.
+ */
+function liveHelp(
+  el: HTMLElement,
+  into: HTMLElement,
+): { detail: (text: string) => void; show: (on: boolean) => void } {
+  const mark = el.createSpan({ cls: "basalt-help", text: "?" });
+  mark.setAttribute("role", "button");
+  mark.setAttribute("tabindex", "0");
+  const shown = into.createEl("p", { cls: "basalt-detail" });
+  shown.hide();
+  let open = false;
+  let text = "";
+  mark.addEventListener("click", () => {
+    open = !open;
+    shown.setText(text);
+    shown.toggle(open);
+  });
+  return {
+    detail: (t: string) => {
+      text = t;
+      mark.setAttribute("aria-label", t);
+      if (open) shown.setText(t);
+    },
+    show: (on: boolean) => {
+      mark.toggle(on);
+      if (!on) {
+        open = false;
+        shown.hide();
+      }
+    },
+  };
+}
+
+/**
  * A row: its label, its `?`, and the detail that `?` reveals.
  *
  * `setDesc` is still not used for the explanation, because a description under
@@ -2340,7 +2383,20 @@ class BasaltPanel {
     }
 
     const status = contentEl.createEl("p");
-    const cursors = later(contentEl, "basalt-advice");
+
+    // The two cursors and what answered them, behind a disclosure.
+    //
+    // Three paragraphs of numbers at the top of the panel is what this was, and
+    // they are the answer to "why is it not working" rather than to "is it
+    // working": the status line above says the second. So they fold away.
+    //
+    // The summary keeps I11's point rather than burying it. That finding is why
+    // both cursors are shown at all, so being behind has to be visible without
+    // opening anything: the summary says how far behind, and the section starts
+    // open when it is.
+    const server = contentEl.createEl("details", { cls: "basalt-server" });
+    const serverSummary = server.createEl("summary");
+    const cursors = later(server, "basalt-advice");
     // What it is talking to, under what it is doing. The panel said "up to
     // date, cursor 66" and nothing at all about the other end, which is the
     // first thing wanted when it is not working: whether this device is
@@ -2350,9 +2406,9 @@ class BasaltPanel {
     // because the sentence is refreshed with `setText` on every state change
     // and that takes every child of the element with it: a badge appended to
     // the paragraph would survive exactly until the first update.
-    const connection = contentEl.createEl("p", { cls: "basalt-advice" });
+    const connection = server.createEl("p", { cls: "basalt-advice" });
     const connectionText = connection.createSpan();
-    const connectionHelp = connection.createSpan({ cls: "basalt-help", text: "?" });
+    const connectionHelp = liveHelp(connection, server);
     const advice = later(contentEl, "basalt-advice");
     // Which rows this pass drew, so that a panel left open when the state
     // changes under it grows the recovery it now needs. Everything else here
@@ -2387,12 +2443,17 @@ class BasaltPanel {
       // can see (I11).
       const at = this.plugin.cursors();
       say(cursors, at === undefined ? "" : `Local cursor ${at.local}, server cursor ${at.server}.`);
+      const behind = at === undefined ? 0 : Math.max(0, at.server - at.local);
+      serverSummary.setText(behind > 0 ? `Server · ${behind} behind` : "Server");
+      // Opened, not just labelled, the first time it matters: a section that
+      // says "42 behind" and stays shut is I11's defect wearing a summary.
+      if (behind > 0) server.setAttribute("open", "true");
       const to = this.plugin.connection();
       connectionText.setText(to === undefined ? "" : describeConnection(to));
       // Hidden rather than empty when there is nothing to explain, so the
       // badge is never a lone glyph beside a blank line.
-      connectionHelp.toggle(to !== undefined);
-      if (to !== undefined) connectionHelp.setAttribute("aria-label", connectionDetail(to));
+      connectionHelp.show(to !== undefined);
+      if (to !== undefined) connectionHelp.detail(connectionDetail(to));
       say(advice, originAdvice(state));
     });
 
@@ -3201,37 +3262,46 @@ class BasaltPanel {
     // all, and `copyToClipboard`'s fallback advice ("shown in the panel, to
     // copy by hand") described something that could not be done. styles.css
     // turns it back on for this one class.
-    const keyRow = new Setting(contentEl);
-    // `descEl`, not `nameEl`. A name is laid out as one short line, so a
-    // sixty-character key in it was clipped through the middle: the box showed
-    // half of the first line and overflowed the second. The description column
-    // is the full width of the row and wraps, and the control column keeps Copy
-    // beside it. Seen in a screenshot; the markup tests could not have said it.
-    keyRow.descEl.createEl("code", { cls: "basalt-pairing", text: key });
-    keyRow.addButton((b) =>
-      b.setButtonText("Copy").onClick(async () => {
-        await copyToClipboard(
-          key,
-          "Recovery key copied. Put it somewhere offline, then clear the clipboard.",
-        );
-      }),
-    );
+    // The key is a block in the panel, not a column in a row.
+    //
+    // Two wrong homes before this, both found by looking at it rather than by a
+    // test. In the row's `nameEl` it was clipped through the middle, because a
+    // name is laid out as one short line and this is sixty characters. In the
+    // row's description column it wrapped correctly and sat indented from the
+    // paragraph above, because a row's columns carry the row's padding: the one
+    // thing on screen that has to be read character by character was the one
+    // thing aligned with nothing.
+    contentEl.createEl("code", { cls: "basalt-pairing", text: key });
 
-    // The acknowledgement is its own row, because it is what takes the key off
-    // the screen and it should not sit a thumb's width from Copy.
-    new Setting(contentEl).addButton((b) =>
-      b.setButtonText("I have written it down").onClick(() => {
-        this.freshRecoveryKey = undefined;
-        // Releases the pairing, which has been holding the vault's claim
-        // until now. Cleared so a later key gets a wait of its own.
-        const go = this.confirmWrittenDown;
-        this.confirmWrittenDown = undefined;
-        this.giveUpWrittenDown = undefined;
-        this.writtenDown = Promise.resolve();
-        go?.();
-        this.render();
-      }),
-    );
+    // Copy and the acknowledgement on one row, in reading order.
+    //
+    // They were two rows, which put a mostly empty row and a lone
+    // right-aligned button between the key and the bottom of the panel. What
+    // makes them safe together is R02 itself: a pairing abandoned here leaves
+    // the root in the config and the panel offers the key again on the next
+    // load, so a mis-tap costs a reload rather than a vault.
+    new Setting(contentEl)
+      .addButton((b) =>
+        b.setButtonText("Copy").onClick(async () => {
+          await copyToClipboard(
+            key,
+            "Recovery key copied. Put it somewhere offline, then clear the clipboard.",
+          );
+        }),
+      )
+      .addButton((b) =>
+        b.setButtonText("I have written it down").onClick(() => {
+          this.freshRecoveryKey = undefined;
+          // Releases the pairing, which has been holding the vault's claim
+          // until now. Cleared so a later key gets a wait of its own.
+          const go = this.confirmWrittenDown;
+          this.confirmWrittenDown = undefined;
+          this.giveUpWrittenDown = undefined;
+          this.writtenDown = Promise.resolve();
+          go?.();
+          this.render();
+        }),
+      );
   }
 }
 

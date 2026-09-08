@@ -128,8 +128,23 @@ async function load(
   return { plugin, app };
 }
 
-/** Waits for something to become true, or explains what it was waiting for. */
-async function until(what: string, cond: () => boolean, ms = 20_000): Promise<void> {
+/**
+ * Waits for something to become true, or explains what it was waiting for.
+ *
+ * The default is generous on purpose. Twenty seconds is a fact about the
+ * machine that chose it, and this file starts real Go servers over real
+ * sockets: CI's case-folding runner timed out one of these at `connecting`
+ * while every laptop passed it, and the fix at the time was to pass a budget
+ * at that one call site. Its sibling, seeded with the same 4800-character
+ * path, was left on the default and flaked next. Two call sites, one of them
+ * fixed, which is a shape this project keeps finding.
+ *
+ * So the default is the budget, chosen for the slowest thing here rather than
+ * the fastest. Nothing waits on this to *expire* as an assertion, and the
+ * enclosing `it` allows five minutes, so the cost of being generous is how
+ * long a genuinely stuck test takes to say so.
+ */
+async function until(what: string, cond: () => boolean, ms = 90_000): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (cond()) return;
@@ -1170,14 +1185,22 @@ describe("the panel, which is a modal and a settings tab", () => {
   }, 300_000);
 
   /**
-   * The rare rows behind one press, and the everyday ones not.
+   * The rare rows behind a press, and the everyday ones not.
    *
    * design.md: a thing that matters only when something specific happens
    * appears in that moment. Devices, the recovery key, replacing the secret
    * and unlinking are rare and three of the four cannot be undone, so they are
-   * inside one `<details>`. A `<details>` and not a tab or a second modal
+   * inside a `<details>`. A `<details>` and not a tab or a second modal
    * because it needs no code and holds no state, which is the whole reason the
    * panel can be the whole interface.
+   *
+   * There are two of them now, and the second is a different kind of thing.
+   * *Manage this vault* holds actions that are rare or cannot be undone;
+   * *Server* holds the two cursors and what answered them, which are numbers
+   * nobody needs while it is working and the first thing wanted when it is not.
+   * This used to assert that the panel had exactly one disclosure, by taking
+   * the first `<details>` it found, and that is why it is spelled by name here:
+   * a test that means "the Manage one" should say so.
    */
   it("puts the rare rows behind one disclosure and leaves the everyday ones out", async () => {
     await fresh();
@@ -1187,10 +1210,13 @@ describe("the panel, which is a modal and a settings tab", () => {
 
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
-    const manage = modals.at(-1)!.contentEl.children.find((el) => el.tag === "details")!;
-    expect(manage, "the panel has no disclosure").toBeDefined();
+    const disclosures = modals.at(-1)!.contentEl.children.filter((el) => el.tag === "details");
+    const manage = disclosures.find((el) => el.children[0]?.text === "Manage this vault")!;
+    expect(manage, "the panel has no Manage disclosure").toBeDefined();
     expect(manage.children[0]!.tag).toBe("summary");
-    expect(manage.children[0]!.text).toBe("Manage this vault");
+    // And the numbers are behind the other one, not loose at the top.
+    const server = disclosures.find((el) => el.children[0]?.text?.startsWith("Server"));
+    expect(server, "the server numbers are not behind a disclosure").toBeDefined();
 
     const inside = (name: string): boolean =>
       manage.children.includes(built.find((s) => s.name === name)!.settingEl);
@@ -1963,9 +1989,17 @@ describe("what is announced, and how often", () => {
     app.vault.adapter.seed("fine.md", "ok");
     app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "nope");
     await startVault(plugin, "laptop");
-    await synced(plugin);
-    await until("the refusal to be announced", () =>
-      notices.some((n) => /cannot sync/.test(n.message)),
+    // A budget, for the same reason the sibling test above has one: sealing a
+    // 4800-character path is the most work any test in this file asks for in
+    // one pass, and `until`'s default fifteen seconds is a fact about the
+    // machine that wrote it. That sibling was given a minute and this one was
+    // left, which is the one-of-two-call-sites shape; CI found it on the
+    // case-folding runner, timed out at `connecting`.
+    await synced(plugin, 120_000);
+    await until(
+      "the refusal to be announced",
+      () => notices.some((n) => /cannot sync/.test(n.message)),
+      120_000,
     );
     notices.length = 0;
     for (let i = 0; i < 4; i++) await plugin.syncNow();
@@ -3487,9 +3521,13 @@ describe("the device list in the panel", () => {
 
     // The stub does not render a setting's name into the DOM, so position is
     // the thing to assert: the container the rows are built into must come
-    // after the row that offers them. Both are inside the one disclosure the
-    // panel has now, so the children to look at are its children.
-    const manage = modals.at(-1)!.contentEl.children.find((el) => el.tag === "details");
+    // after the row that offers them. Both are inside the Manage disclosure,
+    // named rather than taken as the first `<details>`, because the panel has
+    // a second one for the server's numbers now.
+    const manage = modals
+      .at(-1)!
+      .contentEl.children.filter((el) => el.tag === "details")
+      .find((el) => el.children[0]?.text === "Manage this vault");
     expect(manage, "the panel has no disclosure to manage the vault from").toBeDefined();
     const kids = manage!.children;
     const row = built.find((b) => b.name.includes("laptop"))!;

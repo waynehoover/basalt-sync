@@ -3,7 +3,7 @@
 	"name": "Basalt Sync",
 	"version": "0.6.0",
 	"minAppVersion": "1.7.2",
-	"description": "Self-hosted sync. End-to-end encrypted, fast, and nothing to configure.",
+	"description": "Fast, secure, self-hosted sync for Obsidian. Simple setup.",
 	"author": "Wayne Hoover",
 	"isDesktopOnly": false
 }

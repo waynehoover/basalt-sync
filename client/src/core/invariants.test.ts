@@ -24,7 +24,7 @@
 import { describe, expect, it } from "vitest";
 
 import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
-import { FakeSocket, engineOnFakeSocket, settle } from "./fake-socket.ts";
+import { FakeSocket, engineOnFakeSocket, settle, settleUntil } from "./fake-socket.ts";
 import type { WireEntry } from "./transport.ts";
 import { otherVaultKeys } from "./test-keys.ts";
 
@@ -83,8 +83,13 @@ describe("failed input does not advance a cursor", () => {
     // A well-formed batch in every respect except the key that signed it.
     const forged = await entryFor(theirs, 1, "theirs.md", "not from this vault", bodies);
     socket.raw({ op: "batch", from: 1, to: 1, entries: [forged] });
-    await settle();
-    await settle();
+    // Until it is refused, not for a fixed number of ticks: the refusal
+    // verifies a MAC, so how many macrotasks it takes is a fact about the
+    // machine. Two was enough here and not enough on CI.
+    await settleUntil(
+      "the forged batch to be refused",
+      () => t.isClosed || logs.some((l: string) => /forg|not this vault|vault's key/i.test(l)),
+    );
 
     // The batch was delivered and refused, rather than never arriving: without
     // this the assertions below would hold for a test that did nothing.
@@ -99,7 +104,7 @@ describe("failed input does not advance a cursor", () => {
   });
 
   it("keeps the cursor where the last applied entry left it, not where the batch claimed", async () => {
-    const { engine, socket, vault, keys } = await engineOnFakeSocket();
+    const { engine, socket, vault, keys, t, logs } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();
     serving(socket, bodies);
 
@@ -125,8 +130,12 @@ describe("failed input does not advance a cursor", () => {
       to: 9,
       entries: [await entryFor(theirs, 9, "theirs.md", "not from this vault", bodies)],
     });
-    await settle();
-    await settle();
+    // The same race as above: the cursor is only safe to read once the batch
+    // has been refused, and refusing it verifies a MAC.
+    await settleUntil(
+      "the forged batch to be refused",
+      () => t.isClosed || logs.some((l: string) => /forg|not this vault|vault's key/i.test(l)),
+    );
 
     expect(engine.status().cursor, "the cursor jumped to the end of a batch that was refused").toBe(
       applied,

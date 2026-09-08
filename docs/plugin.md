@@ -1,464 +1,232 @@
-# The plugin
+# Use Basalt in Obsidian
 
-[Back to the README](../README.md)
+[Documentation](index.md) · [Server setup](server.md) · [Security and privacy](security.md)
 
-Basalt Sync runs inside Obsidian on desktop and mobile. It needs Obsidian 1.7.2
-or newer. It has no settings tab: one panel, opened from the ribbon icon, that
-pairs a vault and says what is happening.
+Basalt syncs your notes and attachments, shows sync status, and lets you recover
+earlier versions from inside Obsidian. Start with a
+[configured server](server.md) and Obsidian **1.7.2 or newer**.
 
-Every row in that panel is a label and one line. Three of them are on screen
-when it opens, because they are what somebody opens it for: *Sync now*, *Add
-another device*, *Recover a deleted note*. The four that are rare and mostly
-irreversible are behind *Manage this vault*, one disclosure that starts closed:
-*Devices*, *Recovery key*, *Replace the vault's secret*, *Unlink this vault*.
-*Rejoin this server* appears on the panel itself, and only when a restored
-server has refused this device.
-
-Where a line cannot carry the whole answer there is a small **?** beside the
-section, which Obsidian shows on hover. The rest is this page, and the panel
-links to it.
+Use a local vault on macOS, Linux, or Android. iOS is untested; Windows is not
+supported. Back up an existing vault before pairing, and disable other sync
+services for that vault. Each device should have its own local copy.
 
 ## Install
 
-Not yet in the community directory. Put `main.js`, `manifest.json` and
-`styles.css` from the [latest release](https://github.com/waynehoover/basalt-sync/releases/latest)
-into `<vault>/.obsidian/plugins/basalt-sync/`, then enable Basalt Sync under
-Community plugins.
+1. Download `main.js`, `manifest.json`, and `styles.css` from the
+   [latest plugin release](https://github.com/waynehoover/basalt-sync/releases/latest).
+2. Create `<vault>/.obsidian/plugins/basalt-sync/` and put the three files there.
+   If you use a custom Obsidian configuration folder, use that folder instead
+   of `.obsidian`.
+3. Reload Obsidian and enable **Basalt Sync** under **Settings → Community plugins**.
+4. Open the Basalt ribbon icon or run **Basalt Sync: Show status** from the
+   command palette.
 
-Every release asset is rebuilt in CI and attested. To check one:
-
-```bash
-gh attestation verify main.js --repo waynehoover/basalt-sync
-```
+Manual installation is required while Basalt is outside the community directory.
+To upgrade, replace the same three files and reload Obsidian. When a release
+changes the protocol, upgrade the server before its clients.
 
 ## Pairing
 
-Click the Basalt icon in the ribbon, or run **Basalt Sync: Show status**.
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/pairing-dark.png">
-  <img src="assets/screenshots/pairing.png" alt="The pairing panel: device name and an invite or the vault's recovery key to join a vault, or the server's setup string to start a new one." width="720">
+  <img src="assets/screenshots/pairing.png" alt="The Basalt pairing panel, with fields to join an existing vault or start a new one." width="720">
 </picture>
 
-**The first device** pastes the line the server printed on its first run into
-*Setup string*, under *Start a new vault*. It looks like
-`192.168.1.20:3003#K7M2PQR4-...`. If TLS is in front, put that hostname before
-the `#` instead: `wss://homelab.tailnet.ts.net#K7M2PQR4-...`. The plugin
-generates the vault's root secret, claims the vault, and shows the recovery key
-once, under *Write this down*. Write it down and keep it offline: it is the
-whole vault, past and future, and the server has never seen it and cannot
-reissue it. Adding a device does not need it: an invite does that.
+### Start your first device
 
-**Every other device** is added with an invite. On a device that already has
-the vault, press *Create invite* under *Add another device*; the string is
-shown in the panel and copied to the clipboard where there is one. Paste it
-into *Invite or recovery key* on the new device and press *Pair*. An invite
-works once, lasts ten minutes, and carries no root secret: it hands the new
-device the vault's data key and registers a credential of its own for it, which
-the *Devices* row can cut off without touching any other device.
+1. Give the device a recognizable name, such as `laptop`.
+2. Under **Start a new vault**, paste the server's setup string into
+   **Setup string**. With TLS configured, it looks like
+   `wss://homelab.example.ts.net#TOKEN`.
+3. Start the vault and save the recovery key shown under **Write this down**.
+4. Wait for sync to finish before adding another device.
 
-The recovery key works in the same field, and is what to use when no device is
-left to make an invite from. It is not the ordinary way in on purpose: it is
-written down and offline, and adding a phone should not mean going to get it.
-That an invite carries the data key rather than the root is what makes revoking
-one device mean something; [design.md](design.md#a-lost-or-stolen-device) has
-the reasoning.
+Keep the recovery key somewhere safe and separate from your devices. It is how
+you regain access if every device is lost; Basalt cannot reissue it. Use an
+invite for routine pairing.
 
-*Recovery key* in a paired panel is a sentence rather than a button, under
-*Manage this vault*: "Written down, not kept here. An invite adds a device, not
-this." The key was shown once, this device does not have it, and a device that
-did could register itself again after being revoked, so revoking would stop
-nothing. That last part is on the **?** beside the disclosure.
+A server using a vault name other than `default` must be initialized once with
+[the CLI](server.md#a-vault-that-is-not-called-default). The plugin can then
+join it with an invite.
 
-*Pair* reaches the server before it says paired, so a mistyped string is
-refused on the spot and nothing is left behind. An invite is spent by the
-exchange that registers the device, so nothing is written here until the server
-has answered, and the recovery key path is the same: it registers first and
-saves what came back. *Start a new vault* is the one that saves first, because
-that handshake is what claims the vault and the secret has to be on disk before
-the server binds to it; if the server then refuses, the notice says so and
-offers unlink.
+### Add another device
 
-**A pairing that never registered a device** stops rather than retrying. That
-is what is left if a vault was claimed and the registration after it failed,
-and there is nothing the plugin can do about it that a person cannot see: the
-panel shows the vault's recovery key, which may be the only copy of it, and
-says to write it down, unlink and pair again with it.
+1. On a paired device, open **Add another device → Create invite**.
+2. On the new device, install Basalt and open its panel.
+3. Choose a device name, paste the invite into **Invite or recovery key**, and
+   press **Pair**.
+4. Keep Obsidian open while the first sync finishes.
 
-The device name comes filled in, with what kind of machine this is and four
-random characters: `mac-3f2a`, `android-91c7`, `ipad-0b55`. Type over it with
-whatever you call this device: that replaces the whole suggestion, tail and
-all, the way `--device` does on the command line. The tail is why two Macs left
-at the suggestion do not share a name, and a name is worth having because it is
-what a row in *Devices* says, what version history shows against a version, and
-what a conflict copy is named after. `basalt` does the same thing with the
-machine's hostname.
-
-The pairing is stored in the plugin's own `data.json`: this device's id, the
-secret it connects with, and the vault's data key, all in the clear. The root
-secret is not among them, which is what makes the *Devices* row below mean
-something. The data key being there is inherent: the device has to decrypt the
-vault without asking anyone. It is the same exposure as any password manager's
-local store, and it is why revoking a device does not unread what it already
-read.
+An invite works once and expires after ten minutes. If it expires, create a new
+one. If no paired device remains, paste the recovery key into the same field.
+You can have up to eight registered devices.
 
 ## What it does
 
-The plugin syncs when you change something, after a 400 ms pause, and does a
-full pass every 30 seconds. A quiet vault costs about a millisecond per pass
-because Obsidian already keeps the file list in memory. When the connection
-drops it reconnects with backoff and picks up where it left off. A server that
-says it is busy, because the vault has eight devices connected or because it is
-shutting down, is treated the same way: offline, then a retry after the wait
-the server suggested. Only a refusal that would repeat word for word stops it.
+Basalt syncs shortly after edits and checks periodically while Obsidian is open.
+It reconnects after a dropped connection. You can also press **Sync now**.
 
-The panel shows the local cursor and the server cursor. A device that is behind
-and stays behind while nothing arrives is the one thing the protocol cannot
-detect on its own, and these two numbers are how you see it.
+Open the panel for the result and any files needing attention. It includes the
+server address and version, useful when diagnosing a connection problem.
 
-Under them is what this device is talking to: the address it holds, whether
-something in front of the server terminated TLS, and the protocol and server
-build from `ready`. That is the first thing wanted when sync is not working,
-and none of it costs a request. A device that is not connected shows the
-address and says the protocol and the build are not known yet, because a build
-missing for want of a connection looks exactly like a server that did not say.
-
-A `wss://` address means something in front of the server terminated TLS. A
-`ws://` one means nothing did, and the panel says what that costs in a clause:
-"notes stay sealed, the credential and note sizes are not". In full: the
-notes themselves are encrypted on this device either way, so a network in
-between cannot read one, but it can see this device's credential go past and it
-can see the size and the timing of every note that moves. On a home LAN or a
-tailnet that is usually the trade somebody meant to make. Over anything else it
-is not, and [server.md](server.md) has the two ways to put TLS in front.
-
-The status bar icon shows the state. Obsidian mobile has no status bar, so the
-same sentence is the ribbon icon's tooltip.
-
-| | |
+| Status | What to do |
 |---|---|
-| unpaired | open the panel to pair |
-| connecting, syncing | working |
-| synced | up to date, with the time of the last pass |
-| synced, needs attention | up to date except for files that need a person: a name that is a file here and a folder elsewhere, or a file the server refused. The panel names them. |
-| failed | the last pass did not finish, with the reason; it will try again |
-| offline | cannot reach the server, retrying |
-| stopped | a refusal that retrying would not fix, see below |
+| Unpaired | Pair this vault. |
+| Connecting or syncing | Wait for the current sync. |
+| Synced | No outstanding work was reported. |
+| Needs attention | Open the panel and follow the reason shown for each file. |
+| Failed or offline | Check the connection and the reported error; Basalt retries temporary failures. |
+| Stopped | Follow the panel's instructions. Repeated attempts alone will not fix this condition. |
 
-**Stopped** means retrying will not help, and mostly that is the server
-refusing this device in a way that will repeat: the protocol version differs,
-the vault is not this device's, or the server has lost history this device
-already has. The notice says which, and it says what to do about it. Upgrade
-the server and plugin together for a protocol mismatch, and unlink and pair
-again for a vault that is not this device's. For a server that has lost
-history, see *Rejoin this server* below.
-
-Two other causes are not the server's doing at all, and both stop for the same
-reason. A pairing that never registered a device has nothing to connect with,
-so nothing is asked of anybody; the notice names what is missing and prints the
-recovery key if it is still there. And an unreadable `data.json` stops the
-plugin rather than starting over, because starting over would replace what is
-in it and this device would lose its row on the vault.
-
-## Rejoining a restored server
-
-Restoring the server from an older backup leaves every device holding versions
-the server no longer has, and the server refuses those devices rather than
-reissue their version numbers for other notes. That is deliberate; without it
-the two ends diverge silently.
-
-A device in that state shows **stopped** with the reason, and its panel grows a
-*Rejoin this server* row. The first press asks the server where it is and shows
-both versions; the second forgets what this device believed it had synced,
-starts again from the server's version, and sends what only this device holds as
-new versions. Nothing is deleted, here or on the server, and where the two sides
-disagree both copies are kept. Back the server up first.
-
-Unlinking and pairing again works too and is worse: it resets the merge base, so
-every note comes back as a version with no ancestor and the next edit made on
-two devices at once makes conflict copies instead of merging. Use Rejoin.
-
-## Sending back what the server has lost
-
-A note can stop downloading and never finish. That usually means the server no
-longer has the file behind a version: a disk rotted it and the server set it
-aside, or a restore brought back a database and a chunk tree of slightly
-different ages. Every row is intact, so nothing looks broken, and the download
-retries for ever.
-
-Nothing fixes that on its own, and the reason is worth knowing. A device whose
-copy of the note has not changed is *right* to consider it synced: the version
-is committed and the hashes agree. It is holding the missing bytes and has no
-reason to send them, and making it send them used to mean editing the note,
-which writes a version nobody typed into a vault that is already damaged.
-
-*Manage this vault* has a **Send back what the server has lost** row. It offers
-the server everything this device holds, the server takes only what it is
-actually missing, and no new version is written. Do it on every device: each one
-can only offer the versions it holds, and history a device never had is not
-visible from it. `basaltd verify` on the server is what knows whether anything
-is still missing.
-
-## Devices, and revoking one
-
-*This device's name*, under *Manage this vault*, is a field and a *Rename*
-button. The name is what the device list, a note's history and every conflict
-copy call this device, and before protocol 5 it was chosen once at pairing and
-fixed: a typo or a laptop that became something else meant unlinking and pairing
-again, which makes a new row.
-
-It renames this device and no other, reaches the server before writing anything
-down here, and then reconnects, because the sync loop is handed the name when it
-starts and reads it at every conflict copy. Copies made before the rename keep
-the old name; they are notes rather than labels.
-
-*Devices* is under *Manage this vault*. It asks the server who may reach this
-vault, on *Show devices*, and lists each one: its name, the id that identifies it, when it was added and when
-it was last seen. Nothing is fetched until you press it, because it is a
-request to the server rather than something this device already knows. The name
-is not an identity, and two laptops may both be called laptop; the id is.
-
-Each row has *Revoke*, behind a second press: the button becomes *Yes, revoke*
-and says what that row will lose. Revoking removes the device's row and closes
-any connection it has open, in that order, so it stops at once rather than the
-next time it happens to reconnect. This device's own row is there too, where
-the button reads *Unlink from the server*, which is what unlinking looks like
-from the server's side.
-
-The vault's **last** device has no button, and the panel says why where the
-button would have been. Taking the last row off the server leaves a vault only
-the recovery key opens, which is the one revocation no device can undo, so it
-takes the recovery key: `basalt revoke ID --allow-last --recovery-key` on a
-machine with the command line client. No device holds a recovery key, so a
-button here could only ever be refused. To stop syncing on this device and
-leave its row where it is, *Unlink this vault* is further down.
-
-A row that says *never connected* is one nothing has ever signed in under. That
-is what a pairing which reached the server and then crashed leaves behind, and
-it holds one of the eight slots until it is revoked.
-
-Under the rows are the invites nobody has redeemed yet, each with *Cancel*.
-They belong with the list because they are the same question: a row is a device
-that was added, an outstanding invite is one about to be. An invite issued on a
-device you have since lost is the one worth seeing, and cancelling it retires
-that string without waiting out its hour and without replacing the vault's
-secret, which would retire the recovery key with it. What is shown is the
-invite's identifier and when it expires, never the string itself: the server
-never had the part that opens it, so nothing on this screen can add a device.
-
-**Revoking stops a device connecting. It does not unread what that device
-already read.** The summary under the rows says exactly that, beside the
-buttons that do it, and it is the one sentence in the panel that was never a
-candidate for cutting: the revoked device still holds the vault's key for every
-note it had synced, and nothing can take that back. A device that was stolen
-rather than merely lost wants its secret replaced as well, below. A panel that
-let somebody read "revoked" as "the vault is safe again" would have them skip
-the one step that helps.
-
-Eight devices, and the ninth registration is refused rather than quietly
-allowed and then unable to connect.
-
-## Replacing the vault's secret
-
-For a recovery key that has been somewhere it should not have been, and for the
-second half of a stolen device: revoking it stops it connecting, and this stops
-the key it was holding opening the vault again.
-
-*Replace the vault's secret*, under *Manage this vault*, asks for the vault's
-current recovery key, because no device holds one. That is the point of the
-change: a device that could replace the secret could also register itself again
-after being revoked. So somebody without the key cannot do it from here, and
-the row says so ("Paste the vault's current recovery key") rather than letting
-them find out by pressing.
-
-The vault keeps all of its history: its content is sealed under a data key that
-the root only wraps, so the wrapping changes and nothing is re-encrypted. **No
-device row is touched and every device keeps syncing**, including this one.
-That is the expensive half of what per-device credentials removed: it used to
-disconnect every device and each one had to be added again, which for a laptop,
-a phone, a desktop and a NAS is a weekend, and is the reason a leaked string
-went unrotated. It cannot unread what was already read;
-[design.md](design.md#a-lost-or-stolen-device) says more.
-
-The new key is made before the request goes out and is on screen the moment the
-call returns, because there is nowhere on a device to keep a root: not holding
-one is the point, so the durable copy is the one you write down. If the reply
-is lost, the plugin asks the server which secret it has, by trying the new one,
-and says which key to keep. It never puts up a key it knows is not the vault's:
-a rotation somebody else won says so and shows nothing to write down.
-
-## Commands
-
-| Command | |
-|---|---|
-| Sync now | forces a pass and reports what it did |
-| Show status | opens the panel |
-| Show version history | for the open note |
-| Recover a deleted note | lists what the server has and this vault does not |
-
-The panel holds the rest, in two altitudes. On screen: *Sync now*, *Add
-another device*, *Recover a deleted note*, and *Rejoin this server* when a
-restored server has refused this device. Behind *Manage this vault*: *Devices*,
-*Recovery key*, *Replace the vault's secret*, *Unlink this vault*. *Recovery
-key* is the one with no control at all: it says the key was written down and is
-not kept here, and that an invite is what adds a device. Revoking, replacing
-the secret and unlinking are behind warnings and confirmations; nothing there
-is a setting.
-
-Version history is also on a note's right-click menu, where Obsidian Sync puts
-it. Both are registered on Obsidian's own command line as `basalt:history` and
-`basalt:restore`.
+For a protocol mismatch, update the server and plugin to compatible releases.
+For a restored server, use **Rejoin this server** below. If the panel reports
+unreadable local state, preserve that state and your notes before attempting
+recovery; deleting the plugin's files is not a general troubleshooting step.
 
 ## Version history
 
-The server keeps every version of everything since the first sync. The history
-view lists them newest first, shows the text of the one you pick or its
-changes against what is on disk, and pages further back twenty at a time.
+Run **Basalt Sync: Show version history** for the open note, or use the note's
+right-click menu. Choose a version to read it or compare it with the local copy.
+Use **Show older** to go further back.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/changes-dark.png">
-  <img src="assets/screenshots/changes.png" alt="Version history for a note: a sidebar of versions, and what changed between two of them." width="800">
+  <img src="assets/screenshots/changes.png" alt="Version history showing the changes between an earlier note and its local copy." width="800">
 </picture>
 
-**Restoring never overwrites.** If the path is occupied, the restored copy is
-written beside it as `Note (restored 42).md` and the notice says so. The
-restored note keeps its original timestamp and is uploaded like any other
-change. The notice separates the two outcomes: "Restored X. Sent to your other
-devices." when the upload went through, and otherwise that it is on this device
-and will be sent when the next sync succeeds, with the reason.
+**Restore does not overwrite an existing file.** If the original path is
+occupied, the copy appears beside it, for example `Note (restored 42).md`.
+Basalt reports whether it was also sent to your other devices or is waiting
+for a successful sync.
+
+History remains available until the server operator
+[purges it](server-operations.md#purge).
 
 ## Deleted notes
 
-*Recover a deleted note* lists paths whose newest version is a deletion, with
-when and on which device, newest first, with *Show older* for more. Restore puts
-one back and sends it on. The heading counts what can be restored and what was
-purged separately, and a note whose history was purged is listed without a
-button, because a list that quietly dropped it would tell you a note was gone
-when it was only purged.
+Open **Recover a deleted note**, select the note, and restore it. A note whose
+content has been purged is listed without a restore button.
 
-A deletion arriving from another device is moved to the system trash, or to
-the vault's `.trash` if that fails. Nothing is deleted outright.
+A deletion received from another device goes to the system trash, or the
+vault's `.trash` if necessary. If you edit a note while another device deletes
+it, Basalt keeps the edit and sends it back as a new version.
 
 ## Conflicts
 
-Two devices editing the same note while apart is normal. Basalt merges the two
-when the changed regions do not overlap, which covers two devices appending to
-one daily note. When they do overlap, or the merge cannot be verified, both
-versions are kept:
+Basalt tries to combine edits made on different devices. If its merge checks
+fail, it keeps both versions, for example:
 
-```
+```text
 Meeting notes.md
 Meeting notes (Conflicted copy laptop 202608311412).md
 ```
 
-The **incoming** version gets the conflict name. The file you have open is
-never rewritten by a sync you did not ask for. Obsidian Sync does it the other
-way round.
+Open both files, combine the parts you want, then delete the extra copy when
+you are satisfied. Usually the incoming version gets the conflict name. An edit
+that arrives during a file replacement can instead be preserved under a new
+name; the panel reports preserved versions that need attention.
 
-A note deleted on one device and edited on another is restored, not deleted.
+Successful merges and ordinary downloads can update the original note. Keeping
+both versions on a conflict is not a promise that sync never changes an open file.
 
 ## What is not synced
 
-- `.obsidian`, or whatever your config folder is named. Settings, themes,
-  snippets, plugins and workspace do not sync. Obsidian holds that folder in
-  memory and writes it back, so a change arriving from elsewhere would be
-  silently undone, and the pairing secret lives in there.
-  [design.md](design.md) has the full reasoning and what would reopen
-  it.
-- Any file or folder whose name starts with a dot, at any depth. That covers
-  `.basalt`, `.trash`, `.git` and `.DS_Store`, and also things like
-  `.gitignore` or `.smart-env/`. Obsidian does not index dot-prefixed paths,
-  so the plugin neither uploads them nor accepts them from another device.
-- Files larger than the server's limit, 64 MiB by default. The plugin refuses
-  them from their size before opening them. `basaltd serve -max-file` raises
-  it.
+- Obsidian's configuration folder: settings, plugins, themes, snippets, and
+  workspace layout.
+- Files or folders whose names start with a dot, at any depth, including
+  `.git`, `.trash`, and `.basalt`.
+- Files above the server's limit, **64 MiB by default**. The server operator
+  can [adjust the limit](server-reference.md#serve).
 
-Everything else in the vault syncs, attachments included. Attachments are
-supported rather than optimised for; a vault that is mostly video wants a file
-sync, not a note sync.
+Other notes and attachments are included. Large attachments need more memory,
+particularly on phones.
 
 ## Phones
 
-There is no background sync on a phone. Basalt runs inside Obsidian and syncs
-while Obsidian is open and in the foreground; nothing runs when the app is
-closed or the screen is off, and there is no push. Open Obsidian and the vault
-catches up.
+Android sync runs while Obsidian is **open in the foreground**. There is no
+background service or push notification to wake it. Keep the screen on for a
+large first sync, and let changes finish before closing the app.
 
-Android is in daily use. Sync stops when the screen is off because Android
-suspends the network, and resumes on its own. A first sync of a large vault
-needs the screen on until it finishes.
+iOS has not been tested. If a first connection is rejected because of its
+browser origin, the panel shows an origin hint for the server operator; see
+[server connection troubleshooting](server.md#connection-troubleshooting).
 
-iOS is untested. The plugin is not marked desktop-only and the bundle contains
-nothing Node-specific, so it should run. If a new pairing never manages to
-connect, the panel shows this device's origin and the `-allow-origin` flag that
-would admit it, and the server logs the same thing; a pairing that has worked
-before and is merely offline gets no such advice.
+## Devices, and revoking one
+
+Under **Manage this vault**:
+
+- **This device's name → Rename** changes the label used for future activity.
+  Existing history and conflict filenames retain their old labels.
+- **Devices → Show devices** lists registered devices and outstanding invites.
+- **Revoke** stops a device connecting; **Cancel** invalidates an unused invite.
+
+Review the device ID as well as its name, since names need not be unique.
+Rows marked **never connected** may be left by an interrupted pairing and still
+count toward the eight-device limit.
+
+Revocation cannot erase notes or decryption keys already on a device. See
+[what to do after losing a device](security.md#if-a-device-is-lost-or-stolen).
+Revoking the final device requires the recovery key and the
+[CLI](cli-reference.md#device-access).
+
+## Replacing the vault's secret
+
+If your recovery key was exposed, choose **Manage this vault → Replace the
+vault's secret**, provide the current recovery key, and follow the confirmation.
+Save the new key. If the result is uncertain, keep both keys and follow the
+message before discarding either.
+
+This replaces the recovery key and cancels outstanding invites. Existing
+devices keep syncing and history remains available. It does not revoke those
+devices or replace the data-encryption key. Review
+[the privacy limits](security.md#if-a-device-is-lost-or-stolen) before relying
+on it after a theft.
+
+## Rejoining a restored server
+
+After the server is restored from an older backup, the panel may show
+**Stopped** and offer **Rejoin this server**.
+
+First have the operator back up the restored server and preserve local notes.
+Press **Rejoin this server**, review the two positions shown, then confirm.
+Basalt rejoins and sends versions held only on this device, keeping both copies
+where they disagree. Prefer this action to unlinking and pairing again.
+
+## Sending back what the server has lost
+
+If the operator confirms that the server is missing stored content, choose
+**Manage this vault → Send back what the server has lost** on a device that
+still has the notes. Basalt resends missing content without creating new note
+versions.
+
+Repeat on other devices that may have additional copies. The operator should
+then run `basaltd verify`; a successful repair on one device cannot establish
+that all server history is recoverable.
 
 ## Durability
 
-Every download is written to a staging file beside the note, read back byte
-for byte, and only then put in place. Obsidian's file API offers no way to
-flush to disk, so on desktop the plugin uses Electron's own file system to make
-a note durable before the index that names it is saved. On a phone there is no
-such call, and the ordering is best effort: a power loss in the second between
-a note landing and the index being written can leave the two out of step, and
-the next pass repairs it from the server. A crash can leave a staging file
-named `.basalt-tmp-...` beside a note; it is safe to delete.
+Basalt stages incoming files and checks the written bytes before putting them
+in place. Desktop and mobile provide different guarantees during a power loss;
+keep independent backups of your notes.
 
-### Versions kept somewhere Obsidian does not show
-
-Preservation moves a note's bytes aside before writing over them, and
-occasionally there is nowhere to put them: the conflict name is taken, or the
-folder cannot be written. The bytes survive under a hidden name, which is safe
-and useless on its own, so the plugin writes down what happened and the panel
-says so. The record lives in the plugin's own folder and never syncs.
-
-The panel line reads *N versions were kept somewhere Obsidian does not show*,
-and the notice names the note and where it is. The headless client answers the
-same question, from a log of the same shape, so the two clients cannot describe
-one vault two ways.
-
-### Why this does not use `Vault.process()`
-
-Obsidian's API declares `Vault.process(file, fn, options)` as "atomically read,
-modify, and save the contents of a note", which is exactly the shape a
-preserving write wants. It is not used here, and the reason is what the shipped
-code does rather than what the declaration says.
-
-Read out of `obsidian-1.13.7.asar`, both adapters implement it the same way:
-read the file, call `fn`, and if the result differs, write it back **in place**
-with no temporary and no rename. The desktop adapter uses `fsPromises.readFile`
-and `fsPromises.writeFile`; the Capacitor adapter uses its own `fs.read` and
-`fs.write`. `Vault.process` is a thin wrapper that bumps the file's `saving`
-count and clears its cache.
-
-So:
-
-- **It is not atomic on the filesystem.** An in-place write can be interrupted
-  half done, and what is left is a truncated note. What the plugin does instead
-   -- stage beside the note, read it back, then rename -- survives that, and
-  swapping to `process` would be trading a crash-safe write for a shorter one.
-- **The atomicity it does have is Obsidian's operation queue**, a single
-  in-process promise chain shared by every adapter call. That is real and
-  useful, and it is also what the plugin already relies on for `rename`
-  refusing an occupied destination. It says nothing about a second editor, a
-  different sync tool, or the headless client on the same vault.
-- **The desktop queue can abandon an operation.** It races each one against a
-  timeout that rejects with "File system operation timed out", so a rejection
-  from `process` does not establish that the write did not land (rule 4).
-- **It is strings only**, so attachments are excluded, and an attachment is
-  where an interrupted in-place write costs most.
-- **It covers replacement only.** Deletion, the conflict copy and the restore
-  are the rest of the preservation contract and it does nothing for any of
-  them.
-
-If a future Obsidian makes `process` a staged write, this is worth revisiting.
-The facts above come from the artefact, not the documentation, and they were
-checked because the documentation's word for it is "atomically".
+If the panel says **versions were kept somewhere Obsidian does not show**, keep
+the named files and the plugin's state folder. The notice gives their retained
+locations. Copy a retained version to a new visible note and check it before
+removing any recovery material. Do not clear hidden files as a general cleanup.
+The [technical design](design.md#file-replacement) explains these paths.
 
 ## Unlink
 
-*Unlink this vault* waits for the running pass to finish, removes the plugin's
-index, then forgets the pairing. Every note stays where it is, here and on the
-server. If a step fails the plugin stays paired and says why, and Unlink can be
-tried again. Pair again to resume.
+**Manage this vault → Unlink this vault** stops syncing here and removes the
+local pairing and sync index. Your notes remain on this device and the server.
+Pair again to resume. Unlinking locally does not revoke the server's device
+record; use **Devices** when you want to remove access.
+
+## Commands
+
+| Command-palette action | Result |
+|---|---|
+| Basalt Sync: Sync now | Run a sync. |
+| Basalt Sync: Show status | Open the panel. |
+| Basalt Sync: Show version history | View history for the open note. |
+| Basalt Sync: Recover a deleted note | Browse deleted notes. |

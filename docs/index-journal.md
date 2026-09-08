@@ -1,228 +1,115 @@
-# The index as a journal and a snapshot
+# Client index journal
 
-[Back to the README](../README.md)
+[Developer documentation](development.md) · [Design](design.md)
 
-How the client stores its index: a snapshot plus an append-only log, one
-implementation for both shells. `core/index-journal-store.ts` is the authority
-and this is the reference beside it.
-
-This began as a spec, and where the implementation contradicts it that is marked
-where it sits. Four things changed on the way in, all of them found by building
-it:
-
-- **Six primitives, not five.** `logBytes` became `stamps`, which answers for
-  the size and modification time of both files. The extra one is what lets a
-  session tell that something else has written the index, which is R3's rule
-  for the whole-file store and matters more here: a record appended beside
-  somebody else's snapshot is this device's delta over their base.
-- **A log is never applied to a snapshot with no `seq`.** The claim below that
-  today's shape "needs no migration step" is right about loading and wrong
-  about what happens next: a snapshot with no sequence reads as sequence zero,
-  so a log starting at one lines up with it by coincidence rather than by
-  construction. A device carrying an old index takes one snapshot to establish
-  the sequence, and then journals.
-- **`load` hands back what it found**, rather than a validated copy of it. The
-  engine checks the index (`stored-state.ts`) and its refusal names the field;
-  a store that refused first would replace that with a message naming the file.
-  Validation is still used for the one decision it is needed for: choosing the
-  snapshot over a replayed state that does not hold together.
-- **Replay folds in place.** Copying the whole index per record measured 454 ms
-  to start a client at ten thousand notes. See docs/compared.md.
-
-The policy constants below said they were guesses and had to be measured before
-they were believed. They were, they all stayed, and the measurement is in
-docs/compared.md with which of the three governs at which vault size.
-
-## Why, and why not a database
-
-A database was asked for, and the honest reasons against it are not about
-speed. A full rewrite costs 4 ms at ten thousand notes
-(`docs/compared.md`), so the cliff it worried about is not there. The reasons
-are:
-
-- **SQLite cannot ship where the problem is.** The plugin has no Node on
-  mobile, so SQLite means WASM, which persists as one file blob written through
-  the same adapter: the identical whole-file write, plus a WASM dependency,
-  plus a second storage path through the file the first rule is about.
-- **IndexedDB cannot ship where the CLI is.** Node has no IndexedDB. It works
-  well in the plugin, and obsidian-livesync proves it at scale on both
-  platforms, but adopting it means SQLite or a shim on the CLI: two
-  implementations of one index, kept identical by hand forever.
-
-A journal is the only option that is **one implementation on both shells**,
-because both already have the primitive. Obsidian's `DataAdapter` has `append`
-and `appendBinary`; Node has `appendFile`. It also keeps the index inside the
-vault directory, where the rest of the device's state lives.
+The client stores a snapshot and an append-only journal through one shared
+implementation, [index-journal-store.ts](../client/src/core/index-journal-store.ts).
+The CLI and plugin provide the file operations. This page describes the current
+implementation rather than the proposal it replaced.
 
 ## The invariant everything rests on
 
-From `plugin/vault.ts`, on choosing the live index over a staged copy:
-
-> an older index is always safe, because notes are durable before the index
-> that names them.
-
-This is what makes a journal viable. Losing the tail of the index is not
-losing data, it is redoing work: the engine rescans, re-derives, and reapplies
-from an older cursor. So the recovery rule for every ambiguous case below is
-the same, **fall back to something older**, never to something empty (rule 2)
-and never to something guessed.
+Notes are made durable before the index recording their application is saved,
+to the extent each platform supports durability. Recovering an older index can
+repeat work; inventing a newer or empty state can make incorrect sync decisions.
+Unreadable state is therefore not treated as a fresh vault.
 
 ## Files
 
-Two, both beside today's index, in the plugin's data folder or the CLI's
-config dir.
-
-| file | what it is |
+| File | Contents |
 |---|---|
-| `index.json` | a snapshot: exactly today's `StoredState` JSON, plus a `seq` |
-| `index.log` | records appended since that snapshot |
+| `index.json` | `StoredState` snapshot plus its sequence number, `seq`. |
+| `index.log` | Changes after that snapshot. |
 
-`index.json` keeping today's shape is deliberate: a vault with a snapshot and
-no log loads exactly as it does now, so there is no migration step. What that
-does not buy, and the implementation adds: the first save after loading such a
-file writes a whole snapshot rather than a record, because a snapshot with no
-`seq` cannot say which records it already holds.
+These live in the CLI's `.basalt/` folder or the plugin's state folder. Older
+snapshots without `seq` can load, but no journal is applied to them. The first
+subsequent save writes a sequenced snapshot before journaling can begin.
+
+## File interface
+
+The shared store uses six operations: read/write snapshot, read/append/truncate
+log, and inspect stamps. Stamps include the size and modification time of both
+files and detect changes made outside this store instance.
+
+The adapters own staged snapshot publication and flushing where available.
+The store owns sequencing, replay, delta computation, and snapshot policy.
 
 ## Record format
 
-One record per line, newline terminated:
+Each newline-terminated record has this form:
 
-```
-<seq> <crc32> <json>\n
-```
-
-- `seq` is a decimal integer, strictly increasing, never reused.
-- `crc32` is a hex CRC-32 of the JSON text alone.
-- `json` is an object holding **absolute values, never increments**, so that
-  replaying a record twice is the same as replaying it once.
-
-```json
-{ "cursor": 51, "set": { "Note.md": { ... } }, "del": ["Old.md"],
-  "remote": { "Note.md": { ... } }, "unremote": [], "pending": ["A.md"] }
+```text
+<sequence> <crc32> <json>
 ```
 
-`pending` is written whole because it is small and order matters. `entries`
-and `remote` are written as `set` and `del` because they are the large ones and
-a pass touches few of them.
+The CRC covers the JSON text. Deltas contain absolute values, not increments:
+`cursor`, changed entries in `set`, removed names in `del`, changed remote state
+in `remote`, removed remote names in `unremote`, and a complete `pending` list
+when needed. Replaying the same assignment does not apply a change twice.
 
-A record is **valid** only if the line is newline terminated, the CRC matches,
-and the JSON parses. Anything else ends the journal at that point.
+The codec validates framing, checksum, JSON, and sequence continuity. A damaged
+record ends the usable prefix of the journal. The sequence ties records to the
+snapshot; it is not sufficient to apply an otherwise valid log to an unrelated
+base.
 
 ## Save
 
-1. Compute the delta against the last saved state held in memory.
-2. If the delta is empty, write nothing. (Today's `LastIndexWrite` exists for
-   exactly this; a settled vault must stay silent.)
-3. Append one record. Flush, and fsync where the shell can.
-4. Verify the outcome, not the call (rule 4): stat the log and confirm it grew
-   by the bytes written. A short append is a failure and must raise.
-5. If the log now exceeds the snapshot policy below, snapshot.
+1. Compare current state with the last saved state.
+2. If unchanged, write nothing unless a fresh snapshot is required.
+3. Append the delta and verify the resulting log size.
+4. Snapshot when the policy requires it.
+
+If either file's stamp changed unexpectedly, report it and write a complete
+snapshot rather than append a delta over an unknown base. This is detection and
+recovery, not a substitute for single-writer exclusion.
 
 ## Snapshot
 
-Written with the machinery that already exists, unchanged: the CLI stages to a
-temp and renames; the plugin stages a copy, writes in place, and reads it back
-to verify, because its adapter will not rename onto an occupied file.
+Publish and make the new snapshot durable **before** truncating the journal.
+A crash between those operations leaves redundant records, which replay skips
+using the snapshot's sequence number.
 
-Ordering, and it is the only ordering that is correct:
-
-1. Write the new `index.json` (containing `seq` = the last record folded in)
-   and make it durable.
-2. **Only then** truncate `index.log`.
-
-A crash between the two leaves a snapshot at seq N and a log containing records
-up to and including seq N. That is why records carry `seq`: on load, every
-record with `seq <= snapshot.seq` is skipped. The window is exact, not
-idempotent-by-luck.
-
-Truncating rather than deleting keeps the file present, so a missing log and an
-empty log stay distinguishable.
-
-**Policy:** snapshot when the log exceeds 25% of the snapshot's size, or 1000
-records, whichever comes first, and never below a 64 KiB floor. All three were
-guesses; all three were measured (`bun run src/stress/journal.ts`) and kept,
-and the useful result is that they bind at three different vault sizes: the
-floor at forty notes, the fraction at a thousand, the record count at ten
-thousand. The figures are in docs/compared.md.
+The default policy snapshots at **1,000 records**, or when the log is at least
+**64 KiB** and exceeds **25%** of snapshot size. The record-count limit is
+independent of the byte floor. The [source](../client/src/core/index-journal-store.ts)
+records the measurements behind these thresholds.
 
 ## Load
 
-1. Read `index.json`. If it is absent, treat the snapshot as empty at seq 0.
-   If it is present but unreadable or does not parse, **refuse** (rule 2, and
-   the incident behind it: falling back to empty and writing that back
-   disabled every plugin on a device).
-2. `validateStoredState` it, as today.
-3. Read `index.log` if present. Replay records in order:
-   - skip any with `seq <= snapshot.seq`;
-   - stop at the first invalid record, and discard it and everything after it;
-   - stop also at a `seq` that is not greater than the previous one applied.
-4. `validateStoredState` the result. If the replayed state fails validation but
-   the snapshot alone passes, **use the snapshot alone** and say so in the log.
-   An older index is safe; a self-inconsistent one is not.
-5. Record the recovered state as "what is on disk", so a first pass that
-   changes nothing writes nothing.
+Read the snapshot and journal, then reconstruct the last usable state. The
+engine validates the returned state and reports invalid fields. The store also
+validates when deciding whether replay must fall back to the snapshot.
 
-## What can go wrong, and what happens
-
-| situation | what load does |
+| Situation | Behavior |
 |---|---|
-| no snapshot, no log | fresh device, empty state |
-| snapshot only | loads as today |
-| torn last record | discard it, keep everything before it |
-| corruption mid-log | discard from there on, keep everything before it |
-| log entirely garbage | use the snapshot alone, log loudly |
-| log's first seq > snapshot.seq + 1 | records were lost; use the snapshot alone, log loudly |
-| log seq <= snapshot.seq | already folded in, skip |
-| snapshot unreadable, log intact | **refuse.** The log is a delta against a base that cannot be read, so applying it would invent a state that never existed |
-| snapshot corrupt, log absent | refuse, as today |
+| No snapshot and no nonempty log | Fresh state. |
+| Nonempty log without a snapshot | Refuse; the base is missing. |
+| Unreadable or invalid JSON snapshot | Refuse. |
+| Snapshot without `seq` | Ignore an unbound journal; require a snapshot on the next save. |
+| Records already included in the snapshot | Skip them. |
+| Torn record, bad CRC, invalid JSON, or sequence gap | Stop replay at the last usable state and report the problem. |
+| Replay produces invalid state but the snapshot is valid | Fall back to the snapshot. |
+| Invalid state after loading | Engine refuses it rather than overwriting it with defaults. |
 
-The mid-log and torn-tail cases cannot be told apart, and do not need to be:
-truncating at the first bad record yields an older index either way.
+## Limits
 
-## What this does not fix
+- Mobile adapters cannot offer the same flush guarantees as desktop.
+- One writer is required. Stamps can detect foreign writes but do not serialize
+  them.
+- Older clients that ignore the journal can redo work from an older snapshot;
+  do not downgrade casually.
+- The index cannot reconstruct note content whose only copy has been lost.
 
-- **fsync on phones.** The plugin's adapter offers no way to force one, so a
-  journal there is as best-effort as today's write. This is not a regression,
-  and it is not an improvement either. Nothing tracks it, because there is
-  nothing to do about it from inside a plugin.
-- **Two writers.** A journal has the same single-writer requirement the current
-  file has, and one failure the current file does not: two writers number their
-  records independently, so their appends interleave into a log whose sequences
-  collide and replay stops at the collision, silently discarding everything
-  after it. The CLI's lock still governs and the plugin is one instance, and
-  that is exactly the kind of "should not happen" a journal of state goes
-  missing behind. So the implementation stamps both files after every write and
-  checks them before the next one: a file that is not what this session left is
-  said out loud and answered with a whole snapshot, which is complete on its own
-  and cannot be a delta over the wrong base. That is last-writer-wins, which is
-  what the whole-file store already did, and now it is audible.
-- **A downgrade.** An older client reads `index.json` and ignores the log,
-  silently dropping up to one journal's worth of recent state. Safe by the
-  invariant, bounded by the snapshot policy, but it should be stated in the
-  release notes rather than discovered.
+A journal keeps one storage implementation across both clients. SQLite or
+IndexedDB would add platform-specific integration; the historical cost
+comparison is in [engineering notes](research.md#client-index).
 
-## The ten properties the tests pin
+## Verification
 
-Rule 9 applied to each: written, watched failing, then made to pass. They live
-in `core/index-journal.test.ts` (the codec), `core/index-journal-store.test.ts`
-(the policy, against a fake filesystem), `index-journal-shells.test.ts` (every
-crash point, through the two stores the shells actually construct) and
-`stress/journal.stress.ts` (what it costs at a size where the cost shows).
-
-1. A record torn mid-line is discarded and everything before it survives.
-2. A record with a good line and a bad CRC is discarded (a torn write that
-   happens to land on a newline).
-3. NUL padding after the last record, which some filesystems leave on a crash,
-   is discarded and does not parse as a record.
-4. A crash between snapshot and truncate: snapshot at seq N, log holding
-   1..N, loads to exactly the snapshot, and no record is applied twice.
-5. A log whose first seq skips ahead falls back to the snapshot alone.
-6. An unreadable snapshot with a healthy log refuses, and does not write
-   anything back.
-7. A settled vault appends nothing across many passes.
-8. The snapshot policy triggers, and the log is empty afterwards while the
-   state is unchanged across the boundary.
-9. Both shells produce byte-identical journals for the same sequence of
-   changes, which is the property that keeps one implementation honest.
-10. A vault holding today's `index.json` and no log loads unchanged.
-
+The codec, store, adapter, and stress tests cover torn records, CRC failures,
+padding, sequence gaps, snapshot/truncate interruption, unreadable snapshots,
+no-op saves, compaction, identical output from both adapters, and old snapshot
+compatibility. See
+[index-journal.test.ts](../client/src/core/index-journal.test.ts),
+[index-journal-store.test.ts](../client/src/core/index-journal-store.test.ts), and
+[index-journal-shells.test.ts](../client/src/index-journal-shells.test.ts).

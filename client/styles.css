@@ -165,6 +165,7 @@
  * character, and `overflow-wrap: anywhere` because a key is one long word that
  * would otherwise push the modal sideways on a narrow screen. */
 .basalt-pairing {
+  display: block;
   user-select: text;
   -webkit-user-select: text;
   font-family: var(--font-monospace);
@@ -204,14 +205,25 @@
 
 /* A key or an invite inside a row's description column: block, so it wraps
  * across the full width instead of being clipped to one line. */
-.basalt-panel .setting-item-description .basalt-pairing {
-    display: block;
-    margin: 0;
+/* The server numbers, folded away. The summary is a control, so it looks like
+ * one, and matches the disclosure the panel already has. */
+.basalt-server {
+  margin: 4px 0 12px;
+}
+
+.basalt-server > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.basalt-server > p {
+  margin: 6px 0 0;
 }
 
 /* The two rows an unpaired device chooses between. Their control is centred
  * rather than top-aligned, because each carries two lines of the sentence
  * somebody reads to choose and Obsidian pins a control to the top. */
 .basalt-choice {
-    align-items: center;
+  align-items: center;
 }

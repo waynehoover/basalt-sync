@@ -117,6 +117,31 @@ export function ready(over: Record<string, unknown> = {}): Record<string, unknow
 /** Lets queued notification work run before asserting on it. */
 export const settle = (): Promise<unknown> => new Promise((r) => setTimeout(r, 0));
 
+/**
+ * Settles until something is true, rather than a guessed number of times.
+ *
+ * `settle()` is one macrotask, so `await settle(); await settle();` is a guess
+ * about how many the work takes. It is right for notification work, which is
+ * queued and synchronous once it runs. It is wrong for anything that verifies:
+ * refusing a batch signed by another vault checks a MAC, which is async crypto,
+ * and two settles was enough on a laptop and not enough on a loaded CI runner.
+ * The test failed there saying "nothing refused the forged batch, so this
+ * proves nothing", which is the guard doing its job about a race in the test
+ * rather than a fault in the client.
+ *
+ * `invariants.test.ts` already had this shape written out inline in two places,
+ * as `for (let i = 0; i < 200 && ...; i++) await settle()`. This is the same
+ * thing with a name and a reason, so the next assertion about a refusal does
+ * not have to rediscover it.
+ */
+export async function settleUntil(what: string, cond: () => boolean, ticks = 400): Promise<void> {
+  for (let i = 0; i < ticks; i++) {
+    if (cond()) return;
+    await settle();
+  }
+  if (!cond()) throw new Error(`settled ${ticks} times and ${what} never happened`);
+}
+
 /** The fixed root every fake-socket rig derives its keys from. */
 export const RIG_SECRET = new Uint8Array(32).fill(1);
 

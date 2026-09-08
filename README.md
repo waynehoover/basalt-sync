@@ -1,122 +1,93 @@
 # <img src="docs/assets/logo.svg" width="40" alt=""> Basalt Sync
 
-**Fast, private, self-hosted sync for Obsidian.**
+**Fast, secure, self-hosted sync for Obsidian. Simple setup.**
 
-One binary and one pairing string. Only the part of a note that changed crosses the wire, and it is encrypted before it leaves your device.
+Basalt keeps your notes in sync through a server you control. Note contents and
+filenames are encrypted on your devices. Keep writing offline, catch up when
+you reconnect, and recover earlier versions from inside Obsidian.
 
 [![CI](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](server/go.mod)
 [![npm](https://img.shields.io/npm/v/basalt-sync?logo=npm&label=basalt-sync)](https://www.npmjs.com/package/basalt-sync)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<a href="#get-started">Get started</a> | <a href="docs/server.md">Server</a> | <a href="docs/plugin.md">Plugin</a> | <a href="docs/protocol.md">Protocol</a> | <a href="docs/compared.md">How it compares</a>
+**[Get started](docs/server.md)** · [How it compares](docs/compared.md) · [Documentation](docs/index.md)
 
 <table>
   <tr>
-    <th align="center">The panel, which is all of the interface</th>
-    <th align="center">Version history, with a diff against disk</th>
+    <th align="center">Sync status at a glance</th>
+    <th align="center">Find and restore an earlier version</th>
   </tr>
   <tr>
     <td align="center">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
-        <img src="docs/assets/screenshots/panel.png" alt="The Basalt panel: up to date, sync now, add another device, recover a deleted note, and everything rarer behind Manage this vault.">
+        <img src="docs/assets/screenshots/panel.png" alt="Basalt's panel with sync status, Sync now, Add another device, and Recover a deleted note.">
       </picture>
     </td>
     <td align="center">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/changes-dark.png">
-        <img src="docs/assets/screenshots/changes.png" alt="Version history for a note, showing what changed between two versions.">
+        <img src="docs/assets/screenshots/changes.png" alt="A note's version history, showing changes against the current copy.">
       </picture>
     </td>
   </tr>
 </table>
 
-## Why
+## Made for your personal vault
 
-I wanted self-hosted sync that is as easy as the official one, without the setup every other sync plugin asks for. So: one server, one panel, and no settings to get wrong.
+- **Host it where you want.** Run a Docker container or a standalone server
+  binary on your homelab. Basalt is free, open-source software; you provide the
+  hosting and backups.
+- **Keep your notes private.** Contents and filenames are encrypted before
+  upload. The server stores the encrypted copies.
+- **Send less when you edit.** Basalt uploads changed pieces of a file and
+  reuses the rest, reducing transfers and storage across versions.
+- **Recover your work.** Browse history, compare changes, and restore deleted
+  notes. Restoring creates a separate copy when a file already exists.
+- **Handle conflicting edits.** Basalt combines edits when its merge checks
+  pass and keeps both versions when they do not.
+- **Add devices with an invite.** Pair up to eight of your devices and revoke
+  a lost device from another one.
 
 ## Get started
 
-**1. Run the server.**
+1. **[Set up your server](docs/server.md).** Run Basalt, configure a secure
+   connection, and get the setup string for your first device.
+2. **[Install the Obsidian plugin](docs/plugin.md#install).** Start the vault
+   with that string and save the recovery key shown during setup.
+3. **[Add your other devices](docs/plugin.md#pairing).** Create an invite on a
+   paired device and paste it into Basalt on the next one.
 
-```bash
-docker run -d --name basalt -p 127.0.0.1:3003:3003 -v basalt-data:/data ghcr.io/waynehoover/basalt-sync
-docker logs basalt
-```
+For a NAS or a machine without Obsidian, the experimental
+**[command-line client](client/README.md)** can keep a local mirror.
 
-The log prints one line for your first device: `host:3003#TOKEN`. There is no TLS in the binary on purpose, so put something in front before anything else reaches it. `tailscale serve --bg 3003` does it; [docs/server.md](docs/server.md) has Compose, systemd and Caddy.
+## Before you choose Basalt
 
-**2. Install the plugin.** Not in the community directory yet, so drop `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/waynehoover/basalt-sync/releases/latest) into `<vault>/.obsidian/plugins/basalt-sync/`, then enable Basalt Sync under Community plugins.
+Basalt is an early project for one person's devices. The supported setup is
+Obsidian on **macOS, Linux, and Android**, with local storage. The plugin needs
+Obsidian **1.7.2 or newer** and is installed manually. iOS is untested; Windows
+is not supported.
 
-**3. Start the vault.** Open Basalt from the ribbon icon or Settings, paste that line under **Start a new vault**, and write down the recovery key it shows once. It is the only way back if every device is lost, and anyone holding it has the vault.
+On Android, sync runs while Obsidian is open in the foreground. Settings,
+themes, plugins, and hidden files do not sync. Attachments are included, with a
+default limit of **64 MiB per file**.
 
-**4. Add your other devices.** On a device that already has the vault, press **Add another device**, then **Create invite**, and paste what it shows into Basalt on the new one. An invite works once and expires in ten minutes.
+Use one sync service per local vault, and keep it off network filesystems.
+Basalt needs you to maintain the server and keep backups. See
+**[How it compares](docs/compared.md)** if you prefer a hosted service or need
+different storage options.
 
-### Without Obsidian
+## Find what you need
 
-The same engine with the filesystem in place of Obsidian's API, for a NAS or a server.
-
-```bash
-npm install -g basalt-sync
-basalt init 'homelab:3003#K7M2...'   # the first device, from the server log
-basalt invite                        # on a device that has the vault
-basalt pair basalt3i_...             # on the new device
-basalt sync --watch
-```
-
-## What you get
-
-- End-to-end encrypted note contents and file names
-- Only the chunk that changed crosses the wire
-- Conflicts keep both versions, and never rewrite the file you have open
-- Full version history and deleted-note recovery, inside Obsidian
-- A credential per device, so a lost one is revoked without touching the others
-- A headless client for a machine with no Obsidian (experimental)
-
-**Where it is supported.** Obsidian on macOS and Linux desktops and on Android, over a local filesystem, one Basalt writer per vault. Not iOS, which should work and has never been run. Not a vault another sync tool also has (Dropbox, iCloud Drive, Syncthing, LiveSync): keeping your edits works by moving bytes aside and identifying them afterwards, and a second engine moving the same bytes turns every step of that into a guess. Not a network filesystem. [docs/design.md](docs/design.md#where-this-is-supported) has the whole list and the reasons.
-
-The headless client is experimental. It is a mirror for a machine with no Obsidian, not a general-purpose writable client.
-
-Also not yet: a memory measurement on an older phone, the community directory, and syncing themes and snippets.
-
-## Security
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/security-dark.svg">
-  <img src="docs/assets/security.svg" alt="The recovery key stays offline and does two things: register a device and rewrap the data key. Each paired device holds a device secret of its own, whose auth key proves it may connect, and the vault's data key, which derives the keys for names, bodies, nonces and version signatures. Only ciphertext crosses to the server, which holds sealed bodies and names, one row per device with a hash of its key, and a wrapped data key it cannot open.">
-</picture>
-
-- **The server never holds a key.** It sees ciphertext, its length, and which chunks repeat, which is what deduplication is made of.
-- **It cannot write, either.** Every version is signed under a key the server has never seen, so it cannot forge one, alter one, or move a file's contents onto another.
-- **Lose a device, revoke a device.** Each holds a credential of its own, never the recovery key. Leak that and `basalt rotate` replaces it without losing history or disconnecting anything.
-
-A server can still go quiet, and it can hand back an old version of a note under a new number, which reverts it to something it really did say once. It cannot invent, alter or mix up a version. Two devices disagreeing is how you notice. Stated rather than solved: [the design doc](docs/design.md) has both, and what would close the second.
-
-## Speed
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/wire-dark.svg">
-  <img src="docs/assets/wire.svg" alt="Editing one line of a 2 MiB note: whole-file sync sends 2.0 MiB, Basalt sends 21.7 KiB, of which 12.7 KiB is the chunk that changed and 9.0 KiB is the entry naming every chunk of the new version.">
-</picture>
-
-- **Only the delta.** Notes are cut into content-defined chunks, so editing one line of a 2 MiB note sends 21.7 KiB.
-- **Tens of round trips, not thousands.** Two thousand files reach a second device in 18 up and 27 down.
-- **Measured, not claimed.** Including a run against a real 3,751-file vault: [docs/compared.md](docs/compared.md).
-
-## Docs
-
-| | |
+| I want to… | Guide |
 |---|---|
-| [Server](docs/server.md) | Install, TLS, backup, restore, every flag |
-| [Plugin](docs/plugin.md) | Pairing, history, conflicts, phones |
-| [Headless client](client/README.md) | The `basalt` command |
-| [How it compares](docs/compared.md) | Against the alternatives, with measurements |
-| [Design](docs/design.md) | Durability rules, threat model, what is refused |
-| [Protocol](docs/protocol.md) | The wire protocol |
-| [Index journal](docs/index-journal.md) | How the client stores its index, and what a crash does to it |
-| [Findings](docs/findings.md) | Every numbered review finding a code comment cites |
+| Run Basalt on my server | [Server setup](docs/server.md) |
+| Pair devices or recover a note | [Obsidian plugin](docs/plugin.md) |
+| Back up, restore, or free server space | [Server maintenance](docs/server-operations.md) |
+| Keep a copy without Obsidian | [Command-line client](client/README.md) |
+| Understand privacy and recovery keys | [Security and privacy](docs/security.md) |
+| Build or contribute | [Developer documentation](docs/development.md) |
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE).
