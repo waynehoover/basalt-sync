@@ -11,6 +11,14 @@
 #   `--server 0.5.0`, not `...`   -> "Bare versions, not tag names: , not ."
 #   server/v$version              -> `git tag -a server/vcli/v0.5.0-2-g0def89f`
 #
+# The first fix, ${var//@NAME@/value}, was a fourth: since bash 5.2 an
+# unescaped `&` in the replacement stands for the matched text, so on the runner
+# every `&&` in the pinning command came back as `@SERVERBLOCK@`. macOS ships
+# bash 3.2 and has never had the feature, so this file passed here and failed
+# there. It is python3 now, whose replace has no metacharacters, and the two
+# checks at the end are what hold it there: one on the `&&` surviving, and one
+# on the source, because no shell on a Mac can reproduce what the runner does.
+#
 # None of the three announced itself. Two of them printed a shorter sentence
 # that still read as English, and the third printed a tag name that is only
 # wrong if you know what the right one looks like. The runbook is quoted
@@ -103,6 +111,25 @@ case $verify in
   *'--server 0.5.1'*) ok "verify-release is given bare versions: $verify" ;;
   *) bad "no verify-release command in the runbook" ;;
 esac
+
+# ---- and the ampersands in it are ampersands ------------------------------
+case $with in
+  *"scripts/pin-compose.sh && git add -A && git commit -m 'compose: pin the 0.5.1 server image' && git push"*)
+    ok "a command joined by && survives substitution" ;;
+  *) bad "the pinning command came back without its &&" ;;
+esac
+
+# The same question asked of the source, because the behaviour above is only
+# wrong on bash 5.2 and this machine may not have one. A shell pattern
+# substitution building the runbook is the defect whatever it prints here.
+# Comments are allowed to name it, and the one above the substitution does.
+shellsub=$(grep -n '{[a-z]*//@' "$script" | grep -v '^[0-9]*:[[:space:]]*#' || true)
+if [ -n "$shellsub" ]; then
+  bad "the runbook is substituted with a shell pattern, which is not literal on bash 5.2:"
+  printf '%s\n' "$shellsub" | sed 's/^/       /'
+else
+  ok "the runbook is not substituted by shell pattern replacement"
+fi
 
 if [ $fails -eq 0 ]; then
   echo "the runbook prints what it was written to print"

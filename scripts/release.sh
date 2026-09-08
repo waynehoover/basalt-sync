@@ -266,16 +266,27 @@ fi  # ! $runbookonly
 # Printed rather than done. The tag is the decision and this is only what
 # follows from it.
 #
-# Every heredoc below is quoted, and the values are put in afterwards with
-# ${var//@NAME@/value}, which substitutes literally and expands nothing. An
-# unquoted heredoc hands the whole runbook to the shell first, and a runbook is
-# made of exactly what a shell eats: this one lost `created` to a subshell once
-# and then lost both halves of "Bare versions, not tag names: `--server 0.5.0`,
-# not `--server server/v0.5.0`" to another, printing "Bare versions, not tag
-# names: , not ." The failure is silent by construction, because the characters
-# that would show you something went wrong are the ones that got eaten. Escaping
-# them works and has to be done again by whoever writes the next sentence, which
-# is how it came back twice.
+# Every heredoc below is quoted, and the values are put in afterwards by
+# python3. An unquoted heredoc hands the whole runbook to the shell first, and a
+# runbook is made of exactly what a shell eats: this one lost `created` to a
+# subshell once and then lost both halves of "Bare versions, not tag names:
+# `--server 0.5.0`, not `--server server/v0.5.0`" to another, printing "Bare
+# versions, not tag names: , not ." The failure is silent by construction,
+# because the characters that would show you something went wrong are the ones
+# that got eaten. Escaping them works and has to be done again by whoever writes
+# the next sentence, which is how it came back twice.
+#
+# python3 rather than ${var//@NAME@/value}, which is what this was written with
+# first and which is not literal on every bash. Since 5.2 an unescaped `&` in
+# the replacement stands for the text that was matched, and one of the values
+# below is a command line joined by `&&`, so on the runner every `&&` in it came
+# back as `@SERVERBLOCK@` and the guard at the end refused to print any of it.
+# macOS ships bash 3.2, which has never had the feature, so it was right here
+# and wrong in CI: the fourth time that has happened and the reason check.sh no
+# longer claims a green run means a green build. Escaping the `&` would work and
+# would be one more thing to remember. python3's str.replace has no
+# metacharacters at all, and this script already needs python3 to read the
+# manifest.
 
 # The client's version is its own, from the file npm publishes it from.
 cliversion=$(python3 -c 'import json;print(json.load(open("client/package.json"))["version"])')
@@ -317,7 +328,8 @@ BLOCK
   verifyserver=""
 fi
 
-runbook=$(cat <<'RUNBOOK'
+template=$(mktemp); trap 'rm -f "$template"' EXIT
+cat > "$template" <<'RUNBOOK'
 
 To publish the plugin, tagged bare because the community directory requires the
 tag to be exactly the manifest version:
@@ -365,18 +377,22 @@ It fetches the assets, checks the sums under the names somebody downloads them
 as, verifies the attestations on the bytes that are there now, runs the image on
 both architectures, and installs the package from npm.
 RUNBOOK
-)
 
 # The ones carrying placeholders of their own go in first, or the pass that
 # would have resolved them has already gone by. @VERIFYSERVER@ was last here and
 # put an unresolved @SERVER@ into the verify command; the guard below is what
 # said so, on its first run.
-runbook=${runbook//@SERVERBLOCK@/$serverblock}
-runbook=${runbook//@VERIFYSERVER@/$verifyserver}
-runbook=${runbook//@SERVER@/$serverversion}
-runbook=${runbook//@DESCRIBE@/$version}
-runbook=${runbook//@PLUGIN@/$pluginversion}
-runbook=${runbook//@CLI@/$cliversion}
+runbook=$(python3 - "$template" \
+  "$serverblock" "$verifyserver" "$serverversion" "$version" "$pluginversion" "$cliversion" <<'PY'
+import sys
+
+names = ("@SERVERBLOCK@", "@VERIFYSERVER@", "@SERVER@", "@DESCRIBE@", "@PLUGIN@", "@CLI@")
+text = open(sys.argv[1]).read()
+for name, value in zip(names, sys.argv[2:]):
+    text = text.replace(name, value)
+sys.stdout.write(text)
+PY
+)
 
 # Nothing may reach the terminal with a placeholder still in it. A name added to
 # the prose and not to the list above would otherwise print @THING@ in the
