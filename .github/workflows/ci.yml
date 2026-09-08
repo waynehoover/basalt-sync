@@ -117,6 +117,12 @@ jobs:
       - name: the attestation can be started
         run: scripts/attest-trigger.test.sh
 
+      - name: the runbook prints what it means to
+        run: scripts/release-runbook.test.sh
+
+      - name: the pin check excuses one commit and no others
+        run: scripts/pin-check.test.sh
+
       # A declaration inserted between a doc comment and its function leaves
       # the paragraph documenting something else, and the compiler has nothing
       # to say about it. Eight had accumulated, one of them the durability

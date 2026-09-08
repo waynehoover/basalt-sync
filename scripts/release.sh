@@ -69,6 +69,17 @@ PY
   exit 0
 fi
 
+# --runbook prints only the commands, building nothing.
+#
+# The runbook is the part of this that has been wrong most often, and it was
+# also the part that could not be looked at without committing first: the
+# guard below refuses a dirty tree, correctly, because a release is built from
+# a commit. That made every fix to a sentence a commit to see the sentence, and
+# it is why a test could not run this at all. Printing is not building, so this
+# mode skips the guards and the build and goes straight to the end.
+runbookonly=false
+if [ "${1:-}" = --runbook ]; then runbookonly=true; shift; fi
+
 # What the *server* is being released as, when that is being said at all.
 #
 # Empty means it was not given, and the runbook below then declines to print
@@ -81,6 +92,11 @@ serverversion=${1:-}
 version=${serverversion:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+# Read here rather than in the plugin section below, because --runbook needs
+# them and does not run it.
+minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
+pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
+
 # A release is built from a committed state or it is not built.
 #
 # Passing a version explicitly, which is the normal way to call this, threw away
@@ -88,7 +104,7 @@ commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 # version string and only when $1 is absent. Go stamps the commit and a
 # "modified" flag into the binary itself, so a release built over an unfinished
 # edit is a different binary that nobody would think to look at.
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if ! $runbookonly && { ! git diff --quiet || ! git diff --cached --quiet; }; then
   echo "release: the tree has uncommitted changes, and a release is built from a commit" >&2
   git status --short >&2
   exit 1
@@ -103,12 +119,14 @@ fi
 # build picks up. Ignored files are excluded, which is what --exclude-standard
 # does, so release/ and dist/ do not count.
 untracked=$(git ls-files --others --exclude-standard -- server client manifest.json versions.json)
-if [ -n "$untracked" ]; then
+if ! $runbookonly && [ -n "$untracked" ]; then
   echo "release: these are not in git, and the build reads them anyway:" >&2
   echo "$untracked" | sed 's/^/  /' >&2
   echo "Commit them, delete them, or ignore them. A release is built from a commit." >&2
   exit 1
 fi
+
+if ! $runbookonly; then
 
 rm -rf "$out"
 mkdir -p "$out/plugin" "$out/server"
@@ -146,9 +164,6 @@ cp -R client/dist/plugin/. "$out/plugin/"
 for required in main.js manifest.json styles.css; do
   [ -f "$out/plugin/$required" ] || { echo "release: the plugin build produced no $required" >&2; exit 1; }
 done
-
-minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
-pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
 
 # versions.json maps a plugin version to the oldest Obsidian it runs on, and
 # it must already say so before this runs (I23).
@@ -244,55 +259,77 @@ for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
 done
 echo '  ```'
 
+fi  # ! $runbookonly
+
+# ---- what to do with them ------------------------------------------------
+#
+# Printed rather than done. The tag is the decision and this is only what
+# follows from it.
+#
+# Every heredoc below is quoted, and the values are put in afterwards with
+# ${var//@NAME@/value}, which substitutes literally and expands nothing. An
+# unquoted heredoc hands the whole runbook to the shell first, and a runbook is
+# made of exactly what a shell eats: this one lost `created` to a subshell once
+# and then lost both halves of "Bare versions, not tag names: `--server 0.5.0`,
+# not `--server server/v0.5.0`" to another, printing "Bare versions, not tag
+# names: , not ." The failure is silent by construction, because the characters
+# that would show you something went wrong are the ones that got eaten. Escaping
+# them works and has to be done again by whoever writes the next sentence, which
+# is how it came back twice.
+
 # The client's version is its own, from the file npm publishes it from.
 cliversion=$(python3 -c 'import json;print(json.load(open("client/package.json"))["version"])')
 
 # The server block, and the verify flag, only where a version was given.
 if [ -n "$serverversion" ]; then
-  serverblock="  git tag -a server/v$serverversion -m \"basaltd $serverversion\" && git push origin server/v$serverversion
-  gh release create server/v$serverversion --draft --title \"basaltd $serverversion\" \\
+  serverblock=$(cat <<'BLOCK'
+  git tag -a server/v@SERVER@ -m "basaltd @SERVER@" && git push origin server/v@SERVER@
+  gh release create server/v@SERVER@ --draft --title "basaltd @SERVER@" \
     release/server/*
 
 A draft here too, and finished the same way:
 
-  gh workflow run attest.yml -f tag=server/v$serverversion
+  gh workflow run attest.yml -f tag=server/v@SERVER@
 
 which rebuilds, signs and checksums the binaries and then publishes it.
 
-Pushing that tag is also what builds and pushes the container image, and it is
-what makes pin-check fail on main until the digest exists:
+Pushing that tag is also what builds and pushes the container image. Once it is
+published, pin it:
 
-  # after the image is published
-  scripts/pin-compose.sh && git add -A && git commit -m 'compose: pin the $serverversion server image' && git push
+  scripts/pin-compose.sh && git add -A && git commit -m 'compose: pin the @SERVER@ server image' && git push
 
-Do that before tagging the plugin or the client. The publish gate refuses a tag
-whose commit CI has not passed on, and main is red in between, so a plugin tag
-pushed inside that window cannot be released."
-  verifyserver=" --server $serverversion"
+Nothing is waiting on that. pin-check excuses the commit the server tag points
+at, because the image is built by the tag being pushed and the digest does not
+exist while that commit is being written, so main stays green and the plugin
+and client tags can go on the same commit without waiting for the image. It
+excuses that one commit only: the next thing to land has to carry the pin.
+BLOCK
+  )
+  verifyserver=" --server @SERVER@"
 else
-  serverblock="  Re-run with the version to print these:  scripts/release.sh 0.5.0
+  serverblock=$(cat <<'BLOCK'
+  Re-run with the version to print these:  scripts/release.sh 0.5.1
 
-  Without it there is nothing to build a tag name out of but \`git describe\`,
-  and a tag called server/v$version is not what anybody meant."
+  Without it there is nothing to build a tag name out of but `git describe`,
+  and a tag called server/v@DESCRIBE@ is not what anybody meant.
+BLOCK
+  )
   verifyserver=""
 fi
 
-# ---- what to do with them ------------------------------------------------
-# Printed rather than done. The tag is the decision and this is only what
-# follows from it.
-cat <<EOF
+runbook=$(cat <<'RUNBOOK'
 
 To publish the plugin, tagged bare because the community directory requires the
 tag to be exactly the manifest version:
 
-  git tag -a $pluginversion -m "Basalt Sync $pluginversion" && git push origin $pluginversion
-  gh release create $pluginversion --draft --title "Basalt Sync $pluginversion" \\
-    release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \\
+  git tag -a @PLUGIN@ -m "Basalt Sync @PLUGIN@" && git push origin @PLUGIN@
+  gh release create @PLUGIN@ --draft --title "Basalt Sync @PLUGIN@" \
+    release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \
     release/plugin/SHA256SUMS
 
 Then start the workflow that finishes it:
 
-  gh workflow run attest.yml -f tag=$pluginversion
+  gh workflow run attest.yml -f tag=@PLUGIN@
 
 A draft, and that is not a detail: it checks that CI passed on that commit,
 rebuilds these three files, signs them, writes the checksums for what it built,
@@ -300,13 +337,13 @@ and publishes the release as its last step. Nothing is downloadable until all
 of that has passed, and a run that fails leaves a draft you can delete.
 
 The dispatch is a second command because GitHub does not fire a release event
-for a draft: \`created\` is documented as excluding them, so a workflow listening
+for a draft: `created` is documented as excluding them, so a workflow listening
 for it would leave the draft sitting there with nothing running and no sign
 that anything was wrong.
 
 To publish the server, on its own tag because it moves on its own clock:
 
-$serverblock
+@SERVERBLOCK@
 
 The headless client builds nothing here, because npm is where it goes. Bump
 client/package.json on its own clock, then:
@@ -317,14 +354,37 @@ That tag publishes it over OIDC, with no token and no 2FA code.
 
 Then check the release from the outside, which is the only place several of
 these can be wrong: the attestations are rebuilt and re-uploaded after the
-release is created, \`latest\` moves during it, and an npm version cannot be
+release is created, `latest` moves during it, and an npm version cannot be
 replaced once it is there.
 
-  scripts/verify-release.sh --plugin $pluginversion --cli $cliversion$verifyserver
+  scripts/verify-release.sh --plugin @PLUGIN@ --cli @CLI@@VERIFYSERVER@
 
-Bare versions, not tag names: `--server 0.5.0`, not `--server server/v0.5.0`.
+Bare versions, not tag names: `--server 0.5.1`, not `--server server/v0.5.1`.
 
 It fetches the assets, checks the sums under the names somebody downloads them
 as, verifies the attestations on the bytes that are there now, runs the image on
 both architectures, and installs the package from npm.
-EOF
+RUNBOOK
+)
+
+# The ones carrying placeholders of their own go in first, or the pass that
+# would have resolved them has already gone by. @VERIFYSERVER@ was last here and
+# put an unresolved @SERVER@ into the verify command; the guard below is what
+# said so, on its first run.
+runbook=${runbook//@SERVERBLOCK@/$serverblock}
+runbook=${runbook//@VERIFYSERVER@/$verifyserver}
+runbook=${runbook//@SERVER@/$serverversion}
+runbook=${runbook//@DESCRIBE@/$version}
+runbook=${runbook//@PLUGIN@/$pluginversion}
+runbook=${runbook//@CLI@/$cliversion}
+
+# Nothing may reach the terminal with a placeholder still in it. A name added to
+# the prose and not to the list above would otherwise print @THING@ in the
+# middle of a command that somebody pastes.
+if printf '%s' "$runbook" | grep -q '@[A-Z][A-Z]*@'; then
+  echo "release: the runbook still has a placeholder in it:" >&2
+  printf '%s' "$runbook" | grep -o '@[A-Z][A-Z]*@' | sort -u | sed 's/^/  /' >&2
+  exit 1
+fi
+
+printf '%s\n' "$runbook"

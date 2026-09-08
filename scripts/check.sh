@@ -136,6 +136,10 @@ run "the image promotion picks published images" "" \
   bash "$root/scripts/release-promote.test.sh"
 run "the attestation can be started" "" \
   bash "$root/scripts/attest-trigger.test.sh"
+run "the runbook prints what it means to" "" \
+  bash "$root/scripts/release-runbook.test.sh"
+run "the pin check excuses one commit and no others" "" \
+  bash "$root/scripts/pin-check.test.sh"
 run "every doc comment names what it sits on" "" \
   bash "$root/scripts/godoc-attached.sh"
 run "every action is pinned to a commit" "" \

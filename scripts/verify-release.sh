@@ -92,6 +92,66 @@ check_release() { # check_release <tag> <what>
 [ -z "$plugin" ] || check_release "$plugin" plugin
 [ -z "$server" ] || check_release "server/v$server" server
 
+# ---- what the plugin release says about itself -----------------------------
+#
+# The two files that decide whether an install works, read from the release
+# rather than from here. Nothing else looks inside them: the sums say the bytes
+# are the bytes that were built, and the attestation says this repository built
+# them, and both are true of a manifest naming the wrong version.
+#
+# versions.json is the one with history. It maps a plugin version to the oldest
+# Obsidian that runs it, and Obsidian reads it from the repository *at the tag*,
+# not from the release assets, so a correct release with the entry in a
+# follow-up commit installs on current Obsidian and tells every older one that
+# nothing it can run exists. That is what release.sh --prepare and the check in
+# release.sh are for, and this is the same question asked of the published
+# thing, which is the only place the answer is not taken on trust.
+if [ -n "$plugin" ]; then
+  printf '\n== the plugin release describes itself\n'
+  manifest=$work/plugin/manifest.json
+  if [ ! -f "$manifest" ]; then
+    wrong "the $plugin release has no manifest.json, and Obsidian installs nothing without one"
+  else
+    read -r saidversion saidminapp <<EOF2
+$(python3 - "$manifest" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(m.get("version", "-"), m.get("minAppVersion", "-"))
+PY
+)
+EOF2
+    if [ "$saidversion" = "$plugin" ]; then
+      note "manifest.json says $saidversion, needs Obsidian $saidminapp"
+    else
+      wrong "the $plugin release ships a manifest.json that says $saidversion"
+    fi
+
+    if need gh; then
+      if ! raw=$(gh api "repos/$repo/contents/versions.json?ref=$plugin" \
+                   -H "Accept: application/vnd.github.raw" 2>"$work/vjson.err"); then
+        wrong "no versions.json at the $plugin tag: $(tr -d '\n' < "$work/vjson.err")"
+      else
+        printf '%s' "$raw" > "$work/versions.json"
+        entry=$(python3 - "$work/versions.json" "$plugin" <<'PY'
+import json, sys
+try:
+    known = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("unreadable:%s" % e); raise SystemExit
+print(known.get(sys.argv[2], ""))
+PY
+)
+        case $entry in
+          "")            wrong "versions.json at the tag has no entry for $plugin, so an older Obsidian is told nothing it can run exists" ;;
+          unreadable:*)  wrong "versions.json at the $plugin tag is not JSON: ${entry#unreadable:}" ;;
+          "$saidminapp") note "versions.json at the tag agrees: $plugin needs $saidminapp" ;;
+          *)             wrong "versions.json at the tag says $plugin needs $entry, the manifest says $saidminapp" ;;
+        esac
+      fi
+    fi
+  fi
+fi
+
 # ---- the image: it runs, on both architectures, and says what it is --------
 if [ -n "$server" ]; then
   printf '\n== the container image\n'

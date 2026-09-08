@@ -157,6 +157,39 @@ jobs:
             exit 1
           fi
 
+      # And that the repository at this tag says which Obsidian can run it.
+      #
+      # Obsidian reads versions.json from the repository at the tag, not from
+      # the release, and looks up the newest version an install is allowed. A
+      # missing entry is not an error anybody sees: current Obsidian installs
+      # the plugin from the manifest and every older one is told there is
+      # nothing it can run, which looks like the plugin not existing. The entry
+      # therefore has to be in the commit the tag points at, and a commit is not
+      # something a release can add afterwards.
+      #
+      # scripts/release.sh checks this too. That check only runs for somebody
+      # who used it; this one runs before the release is made downloadable,
+      # which is the last moment it can still be fixed by moving a tag.
+      - name: versions.json at this tag says what runs it
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          version=$(node -p "require('./attested/manifest.json').version")
+          minapp=$(node -p "require('./attested/manifest.json').minAppVersion")
+          entry=$(node -p "(require('./versions.json')['$version'] || '')")
+          if [ -z "$entry" ]; then
+            echo "versions.json at $TAG has no entry for $version." >&2
+            echo "Every Obsidian older than the current one will be told there is" >&2
+            echo "nothing it can run. scripts/release.sh --prepare writes it, and it" >&2
+            echo "has to be committed before the tag." >&2
+            exit 1
+          fi
+          if [ "$entry" != "$minapp" ]; then
+            echo "versions.json says $version needs Obsidian $entry, the manifest says $minapp" >&2
+            exit 1
+          fi
+          echo "$version needs Obsidian $minapp, and versions.json at $TAG agrees"
+
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |

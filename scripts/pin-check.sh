@@ -34,6 +34,27 @@ fi
 echo "compose pins $pinned, newest server release is $newest"
 older=$(printf '%s\n%s\n' "$pinned" "$newest" | sort -V | head -1)
 if [ "$pinned" != "$newest" ] && [ "$older" = "$pinned" ]; then
+  # Except on the commit the tag itself points at, which is the one commit that
+  # could not have pinned the new digest: the image is built *by* that tag being
+  # pushed, so the digest does not exist until after the commit is written. This
+  # used to fail there, which made main red from the server tag until the pin
+  # commit, and that was not only untidy. The publish gate refuses to release a
+  # tag whose commit CI has not passed on, so a plugin tag pushed in the window
+  # sat there unreleasable, and the way out was to wait, pin, and tag again.
+  #
+  # Only that commit is excused, and only until something lands on top of it.
+  # The pin commit is what should land on top, and if anything else does, this
+  # fails again and is right to: by then the digest exists and nothing pinned it.
+  tagged=$(git rev-list -n1 "server/v$newest" 2>/dev/null || echo none)
+  if [ "$tagged" = "$(git rev-parse HEAD)" ]; then
+    echo "this is the commit server/v$newest tags, so the image it builds does not"
+    echo "exist yet and cannot be pinned from here. Pin it once it is published:"
+    echo
+    echo "  scripts/pin-compose.sh && git add -A && git commit -m 'compose: pin the $newest server image' && git push"
+    echo
+    echo "Anything that lands on this commit without that pin fails here."
+    exit 0
+  fi
   echo "compose.yaml pins $pinned but the newest server release is $newest." >&2
   echo "Update the tag and its digest together:  scripts/pin-compose.sh" >&2
   exit 1
