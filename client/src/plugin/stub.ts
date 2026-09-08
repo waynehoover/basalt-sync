@@ -529,10 +529,21 @@ export class Setting {
    */
   readonly infoEl = new FakeEl("div", "setting-item-info");
   readonly nameEl = new FakeEl("div", "setting-item-name");
+  /**
+   * The block under the name, which is where a revealed `?` detail goes.
+   *
+   * Added for the same reason as the two above: `help` writes into it, and a
+   * fake without it would let that throw only in a real vault. This is the
+   * third time that comment has had to be extended, which is the argument for
+   * modelling the whole of what is reached for rather than what is reached for
+   * today.
+   */
+  readonly descEl = new FakeEl("div", "setting-item-description");
 
   constructor(containerEl: FakeEl) {
     this.settingEl.children.push(this.infoEl);
     this.infoEl.children.push(this.nameEl);
+    this.infoEl.children.push(this.descEl);
     containerEl.children.push(this.settingEl);
     built.push(this);
   }

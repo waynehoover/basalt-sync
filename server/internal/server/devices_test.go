@@ -756,3 +756,82 @@ func TestLastSeenMovesOnConnectAndNotOtherwise(t *testing.T) {
 		t.Fatalf("last_seen moved from %d to %d without a connect", seen, after.LastSeen)
 	}
 }
+
+// A device relabels itself, and only itself.
+//
+// The gap this closes: a device name was chosen once at pairing and there was
+// no way to change it afterwards short of unlinking and pairing again, which
+// makes a new row. The name is what the device list, history and conflict copy
+// filenames are read by, so a typo or a repurposed laptop was permanent.
+//
+// Protocol 5's whole content. The asymmetry worth pinning is that there is no
+// field naming the row: rename is always this device, which is why a registrar
+// cannot send it and why no authorisation rule was needed.
+func TestADeviceRenamesItself(t *testing.T) {
+	r := newRigDerived(t)
+	device := claimed(t, r, "a")
+
+	device.sendJSON(wire.In{Op: "rename", ID: 7, Name: "the-good-laptop"})
+	var done wire.Renamed
+	device.recvInto("renamed", &done)
+	if done.Name != "the-good-laptop" {
+		t.Fatalf("renamed echoed %q", done.Name)
+	}
+
+	// The list is the authority, so it is what is checked.
+	device.sendJSON(wire.In{Op: "devices", ID: 8})
+	var list wire.DeviceList
+	device.recvInto("devices", &list)
+	found := ""
+	for _, d := range list.Devices {
+		if d.ID == deviceID("a") {
+			found = d.Name
+		}
+	}
+	if found != "the-good-laptop" {
+		t.Fatalf("the device list says %q", found)
+	}
+
+	// Again, to a different name, because a rename that only works once is a
+	// rename somebody has to be careful with.
+	device.sendJSON(wire.In{Op: "rename", Name: "laptop"})
+	device.recvInto("renamed", &wire.Renamed{})
+
+	// A name that could not have been chosen at pairing cannot arrive here
+	// either: the same CheckName, and the same code every other name refusal
+	// uses.
+	for _, bad := range []string{"", strings.Repeat("x", store.MaxDeviceLen+1), "two\nlines"} {
+		device.sendJSON(wire.In{Op: "rename", Name: bad})
+		if msg := device.expectErr(wire.CodeBadName); msg == "" {
+			t.Fatalf("a device name of %q was accepted", bad)
+		}
+	}
+
+	// And the row is still the one it was: a refused rename changes nothing.
+	device.sendJSON(wire.In{Op: "devices"})
+	list = wire.DeviceList{}
+	device.recvInto("devices", &list)
+	for _, d := range list.Devices {
+		if d.ID == deviceID("a") && d.Name != "laptop" {
+			t.Fatalf("a refused rename left the name as %q", d.Name)
+		}
+	}
+}
+
+// The recovery key administers the device list and has no row of its own, so it
+// is told which credential a rename needs rather than "unknown op". The
+// distinction matters because a client waiting on a reply that never comes
+// looks the same either way and the two are fixed differently.
+func TestARegistrarHasNoNameToChange(t *testing.T) {
+	r := newRigDerived(t)
+	device := claimed(t, r, "a")
+	device.conn.CloseNow()
+	waitFor(t, "the device to leave", func() bool { return r.srv.Peers(testVault) == 0 })
+
+	reg := registrarWith(t, r, "recovery-key", longKey)
+	reg.sendJSON(wire.In{Op: "rename", Name: "the-server"})
+	msg := reg.expectErr(wire.CodeAuth)
+	if !strings.Contains(msg, "rename") {
+		t.Fatalf("the refusal does not name the op: %q", msg)
+	}
+}

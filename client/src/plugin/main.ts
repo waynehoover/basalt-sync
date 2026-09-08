@@ -689,6 +689,57 @@ export default class BasaltPlugin extends Plugin {
     return client.repair();
   }
 
+  /**
+   * Renames this device, on the server and then here, and restarts the loop.
+   *
+   * The order is `client.rename`'s: the server first, because the device list
+   * is what another person reads and what this device cannot repair while
+   * offline, and a local name that ran ahead would have this device writing
+   * conflict copies under a label the vault does not know.
+   *
+   * The restart is the part that is easy to leave out. The engine is handed
+   * `device` when it is built and reads it at every conflict copy, so a config
+   * saved under a running loop renames the device list and nothing else: the
+   * next conflict copy still carries the old name, and it does until Obsidian
+   * is restarted. That is a rename that half worked and said it worked.
+   *
+   * A reconnect costs a handshake, once, for something done rarely. The
+   * alternative is threading a mutable name through the engine so a pass in
+   * flight can change what it calls this device halfway, which is worse: two
+   * copies of one divergence would be named differently.
+   */
+  async renameDevice(name: string): Promise<string> {
+    const client = this.client;
+    if (!client) throw new Error(this.whyNoClient());
+    const config = this.config;
+    if (!config) throw new Error("this vault is not paired yet.");
+
+    const said = await client.rename(name);
+    try {
+      await this.saveVerified({ ...config, device: said });
+    } catch (err) {
+      // Both halves. "Renamed" and "written down here" are different facts and
+      // the visible consequence of the second failing is conflict copies that
+      // still say the old name, which is not something to discover from a
+      // filename later.
+      throw new Error(
+        `the device list now says ${said}, and this device could not write it down: ` +
+          `${(err as Error).message}. Conflict copies made here will still say ` +
+          `${config.device} until this is done again.`,
+      );
+    }
+    this.config = { ...config, device: said };
+
+    // `quiet` and then `start`, which is what rotate and rebase do and for a
+    // related reason: a run that is merely disconnected reconnects, and a pass
+    // in flight is still writing under the old name. `stop` is not the way to
+    // do this, because it puts "Basalt has stopped" and a cause on screen, and
+    // nothing here has gone wrong.
+    await this.quiet();
+    this.start();
+    return said;
+  }
+
   /** Syncs on demand, and says so, because a command with no feedback is a guess. */
   async syncNow(): Promise<void> {
     if (!this.config) {
@@ -2072,20 +2123,56 @@ const DOCS = "https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.m
  * is scannable, and the prose is one hover away for the row that needs it.
  * A sentence or two, and anything longer belongs in `DOCS`.
  */
-function help(el: HTMLElement, detail: string): void {
-  el.createSpan({ cls: "basalt-help", text: "?" }).setAttribute("aria-label", detail);
+/**
+ * The `?` beside a label, and the detail it reveals.
+ *
+ * `aria-label` alone used to be the whole of this, which Obsidian renders as a
+ * hover tooltip. A phone does not hover, so every `?` in the panel was dead on
+ * the platform this plugin is most used on, and because `row` deliberately
+ * keeps explanations out of the description slot the detail was not reachable
+ * there at all: the panel read as a column of terse labels each wearing a glyph
+ * that did nothing. Reported from a phone, and it explains most of what "the
+ * plugin screen is confusing" meant.
+ *
+ * So the mark is a button and the detail is a paragraph it shows and hides. The
+ * hover tooltip stays for the desktop, where it was the only thing that worked.
+ * Keyboard users get the tooltip rather than the toggle, because a span with
+ * `role="button"` does not receive a synthetic click from Enter and the panel
+ * has no keyboard story worth half-building here.
+ */
+function help(el: HTMLElement, detail: string, into?: HTMLElement): void {
+  const mark = el.createSpan({ cls: "basalt-help", text: "?" });
+  // Kept, because on a desktop it worked and costs nothing.
+  mark.setAttribute("aria-label", detail);
+  mark.setAttribute("role", "button");
+  mark.setAttribute("tabindex", "0");
+
+  const shown = (into ?? el).createEl("p", { cls: "basalt-detail", text: detail });
+  shown.hide();
+  let open = false;
+  mark.addEventListener("click", () => {
+    open = !open;
+    shown.toggle(open);
+  });
 }
 
 /**
- * A row: its label, its `?`, and no description.
+ * A row: its label, its `?`, and the detail that `?` reveals.
  *
- * `setDesc` survives only where the text is the row's *content* rather than an
- * explanation of it, which is every list: a device row without its id and last
- * seen, or a deleted note without when it went, is a row that says nothing.
+ * `setDesc` is still not used for the explanation, because a description under
+ * every row is what made this panel unreadable the first time; it survives only
+ * where the text is the row's *content* rather than an explanation of it, which
+ * is every list: a device row without its id and last seen, or a deleted note
+ * without when it went, is a row that says nothing.
+ *
+ * The detail goes in `descEl` all the same, hidden until the `?` is pressed. So
+ * the row is one line until somebody asks, and what they are told arrives in
+ * the slot Obsidian already lays out under the name rather than in a tooltip
+ * half the platforms cannot show.
  */
 function row(host: HTMLElement, name: string, detail: string): Setting {
   const setting = new Setting(host).setName(name);
-  help(setting.nameEl, detail);
+  help(setting.nameEl, detail, setting.descEl);
   return setting;
 }
 
@@ -2186,9 +2273,24 @@ class BasaltPanel {
   }
 
   render(): void {
-    const contentEl = this.host;
     this.unwatch?.();
-    contentEl.empty();
+    this.host.empty();
+
+    // A class on the host, because the same panel is drawn into two hosts that
+    // style it differently. Obsidian gives a modal's content separators between
+    // rows and a settings tab's content none, so the same three rows read as a
+    // list in one place and as three things adrift in whitespace in the other,
+    // and the screenshot in docs/ is of the modal. Reported as "the settings
+    // screen doesn't look like the screenshot", which it did not.
+    //
+    // The first version of this wrapped everything in a div of its own, on the
+    // grounds that the host belongs to Obsidian. It also put a level between
+    // the host and the panel, which three tests walk directly, and they said so
+    // immediately: `contentEl.children.find(el => el.tag === "details")` found
+    // a div. A class is the smaller liberty of the two, and this already calls
+    // `empty()` on the same element.
+    this.host.addClass("basalt-panel");
+    const contentEl = this.host;
     contentEl.createEl("h2", { text: "Basalt Sync" });
 
     const problem = this.plugin.configProblem;
@@ -2301,6 +2403,7 @@ class BasaltPanel {
         "already read.",
     );
 
+    this.renderThisDeviceName(manage);
     this.renderDevices(manage);
 
     // Said, not shown, because there is nothing to show: this device holds a
@@ -2665,6 +2768,60 @@ class BasaltPanel {
    * every other registrar and only then replies, so a reply lost in between
    * leaves a vault whose new root exists only on paper.
    */
+  /**
+   * This device's own name, changeable, which it was not until protocol 5.
+   *
+   * The name is what the device list, a note's history and every conflict copy
+   * are read by, and it was chosen once at pairing and then fixed: a typo or a
+   * laptop that became something else meant unlinking and pairing again, which
+   * makes a new row and detaches the old one's history of who wrote what.
+   *
+   * Under Manage rather than on the front of the panel, with the device list it
+   * changes, because it is a thing done once and not a thing done often.
+   *
+   * The server first and the config after, which is the order `client.rename`
+   * explains. If the save fails the sentence says both halves, because "renamed"
+   * and "written down here" are different facts and the visible consequence of
+   * the second failing is conflict copies that still carry the old name.
+   */
+  private renderThisDeviceName(contentEl: HTMLElement): void {
+    let field: TextComponent | undefined;
+    const setting = row(
+      contentEl,
+      "This device's name",
+      "What the device list, a note's history and conflict copies call this device. Changing it " +
+        "renames nothing already written: copies made before now keep the old name, because they " +
+        "are notes rather than labels.",
+    );
+    setting.addText((t) => {
+      t.setPlaceholder("laptop");
+      t.setValue(this.plugin.deviceName ?? "");
+      field = t;
+    });
+    setting.addButton((b) =>
+      b.setButtonText("Rename").onClick(async () => {
+        const wanted = (field?.getValue() ?? "").trim();
+        if (wanted === "") {
+          new Notice("A device name cannot be empty.");
+          return;
+        }
+        if (wanted === this.plugin.deviceName) {
+          new Notice("That is already this device's name.");
+          return;
+        }
+        b.setDisabled(true).setButtonText("Renaming");
+        try {
+          const said = await this.plugin.renameDevice(wanted);
+          new Notice(`This device is now ${said} in the device list.`);
+          this.render();
+        } catch (err) {
+          new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+          b.setDisabled(false).setButtonText("Rename");
+        }
+      }),
+    );
+  }
+
   private renderRotate(contentEl: HTMLElement): void {
     const said = later(contentEl, "basalt-advice");
     let keyField: TextComponent | undefined;
@@ -2897,19 +3054,41 @@ class BasaltPanel {
         "the only way back if every device is lost.",
     );
     contentEl.createEl("p", { cls: "basalt-pairing", text: key });
-    new Setting(contentEl).addButton((b) =>
-      b.setButtonText("I have written it down").onClick(() => {
-        this.freshRecoveryKey = undefined;
-        // Releases the pairing, which has been holding the vault's claim
-        // until now. Cleared so a later key gets a wait of its own.
-        const go = this.confirmWrittenDown;
-        this.confirmWrittenDown = undefined;
-        this.giveUpWrittenDown = undefined;
-        this.writtenDown = Promise.resolve();
-        go?.();
-        this.render();
-      }),
-    );
+    new Setting(contentEl)
+      // Copy first, and before the acknowledgement, because the
+      // acknowledgement is what takes the key off the screen.
+      //
+      // "Write it down" is the advice and a phone is where it is hardest to
+      // follow: there is no second screen to read from and no keyboard worth
+      // transcribing sixty characters on. Without this the only ways off the
+      // device were a photograph of a secret or retyping it, and the clipboard
+      // is the least bad of the three for getting it into a password manager.
+      // The paragraph above is selectable for the same reason, which it was
+      // not: Obsidian's own UI turns selection off broadly, so a long press on
+      // a phone did nothing at all, and `copyToClipboard`'s fallback advice
+      // ("shown in the panel, to copy by hand") described something that could
+      // not be done. styles.css turns it back on for this one class.
+      .addButton((b) =>
+        b.setButtonText("Copy").onClick(async () => {
+          await copyToClipboard(
+            key,
+            "Recovery key copied. Put it somewhere offline, then clear the clipboard.",
+          );
+        }),
+      )
+      .addButton((b) =>
+        b.setButtonText("I have written it down").onClick(() => {
+          this.freshRecoveryKey = undefined;
+          // Releases the pairing, which has been holding the vault's claim
+          // until now. Cleared so a later key gets a wait of its own.
+          const go = this.confirmWrittenDown;
+          this.confirmWrittenDown = undefined;
+          this.giveUpWrittenDown = undefined;
+          this.writtenDown = Promise.resolve();
+          go?.();
+          this.render();
+        }),
+      );
   }
 }
 

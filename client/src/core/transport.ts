@@ -41,17 +41,22 @@ import { CRYPTO_SUITE, chunkName, isChunkName } from "./crypto.ts";
 /**
  * The protocol version this client speaks. A mismatch is refused, not negotiated.
  *
- * Four, and nothing else. Four is not compatible with three and there is no
- * shim: a hello now carries a `deviceId` and the credential beside it is that
- * device's own, where in three it was the vault's, used by every device. A
- * client that guessed would be asking a protocol 4 server for exactly the sync
- * rights per-device credentials exist to make revocable. Three was in use by
- * one person for one day.
+ * Five, and nothing else. Five adds `rename`, so a device's label can change
+ * without unlinking and pairing again, and it is a clean break from four rather
+ * than a range because nothing was deployed on four outside this repository. A
+ * range would be the first dual-path code in the protocol, bought for
+ * compatibility nobody needs.
+ *
+ * Four was not compatible with three and there was no shim either: a hello
+ * carries a `deviceId` and the credential beside it is that device's own, where
+ * in three it was the vault's, used by every device. A client that guessed
+ * would be asking for exactly the sync rights per-device credentials exist to
+ * make revocable.
  *
  * The number still travels, and a mismatch still names both ends and the
  * server's version, because that is how the next upgrade gets diagnosed.
  */
-export const PROTO = 4;
+export const PROTO = 5;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
@@ -2142,6 +2147,37 @@ export class Transport {
       );
     }
     return { deviceId, self: reply["self"] === true };
+  }
+
+  /**
+   * Changes this device's own label in the vault's device list.
+   *
+   * Only its own: there is no field naming a row, because the row is the one
+   * this session authenticated as. A device relabelling another would need a
+   * rule for who may relabel whom, and the only thing that wants one is tidying
+   * somebody else's list.
+   *
+   * The name is echoed back and checked against what was sent, for the reason
+   * every other reply here is checked: the server is the authority on what the
+   * device list says, and a client that believed its own request would not
+   * notice a server that stored something else.
+   *
+   * Nothing about the vault's content moves. No uid is spent, no entry is
+   * written, and a pass running on another device is unaffected; that device
+   * sees the new label the next time it lists.
+   */
+  async rename(name: string): Promise<string> {
+    const reply = await this.request({ op: "rename", name }, "renamed");
+    if (reply["res"] !== "renamed") {
+      throw new ProtocolError("protostate", `expected renamed, got ${JSON.stringify(reply)}`);
+    }
+    const said = reply["name"];
+    if (said !== name) {
+      throw this.malformed(
+        `a renamed naming ${JSON.stringify(said)}, which is not the ${JSON.stringify(name)} that was sent`,
+      );
+    }
+    return name;
   }
 
   /**

@@ -246,7 +246,8 @@ describe("replacing the vault's secret from the panel", () => {
     ).toBe(false);
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "I have written it down")!
+      .click();
     await rotating;
 
     // This device's own credential is untouched, which is why it keeps

@@ -47,9 +47,9 @@ may do.
 and `token` is that device's own auth key.
 
 ```
--> {op:"hello", id, proto:4, vault, deviceId, token, device,
+-> {op:"hello", id, proto:5, vault, deviceId, token, device,
     crypto:"basalt/hkdf-aes-gcm/1", cursor}
-<- {res:"ready", id, proto:4, minProto:4, serverVersion, cursor,
+<- {res:"ready", id, proto:5, minProto:5, serverVersion, cursor,
     perFileMax, chunkMax, maxChunks, maxBatchBytes, maxFetchBytes, wrapped}
 ```
 
@@ -60,8 +60,8 @@ administer the device list with `devices`, `revoke` and `uninvite`. It may not
 read or write a note, and has nothing else to send.
 
 ```
--> {op:"hello", id, proto:4, vault, token, device, crypto, claim?, wrapped?}
-<- {res:"registrar", id, proto:4, minProto:4, serverVersion, maxDevices}
+-> {op:"hello", id, proto:5, vault, token, device, crypto, claim?, wrapped?}
+<- {res:"registrar", id, proto:5, minProto:5, serverVersion, maxDevices}
 ```
 
 A registrar gets no `ready`, no catch-up and no place in the fan-out, because
@@ -75,17 +75,23 @@ row the redemption is to register. It is answered `redeemed` and closed; see
 added and the reason the recovery key stays offline.
 
 ```
--> {op:"hello", id, proto:4, vault, device, crypto, invite, deviceId, auth, name?}
+-> {op:"hello", id, proto:5, vault, device, crypto, invite, deviceId, auth, name?}
 <- {res:"redeemed", id, sealed, deviceId}
 ```
 
 `cursor` is the last uid the client applied, or 0. The server speaks every
 version from `minProto` to `proto` and answers in the one the client asked for,
 so the upgrade order is the server first, then each client. That range is one
-version wide: 4 is the only protocol, and anything outside it, or a `crypto`
+version wide: 5 is the only protocol, and anything outside it, or a `crypto`
 the server does not implement, is refused with `{res:"err", code:"proto"}`
 naming both numbers rather than negotiated. Interoperating with a version we
-have not seen is how a silent incompatibility ships. That refusal does not name
+have not seen is how a silent incompatibility ships.
+
+5 added `rename` and nothing else. It could have been a 4..5 range, since a 4
+client asks for nothing 5 removed, and it is not one because nothing was
+deployed on 4 outside this repository: a range would be the first dual-path
+code in the protocol, bought for compatibility nobody needed. The range stays
+in the handshake for the version that does need it. That refusal does not name
 the server's version: nothing has authenticated when it is sent, and
 `serverVersion` travels in `ready` and `registrar`, after a hello has
 succeeded.
@@ -392,6 +398,9 @@ identity; the name never is, and two laptops may both be called laptop.
 
 -> {op:"revoke", id, deviceId, allowLast?}        either credential
 <- {res:"revoked", id, deviceId, self}            allowLast: registrar only
+
+-> {op:"rename", id, name}                        device sessions only
+<- {res:"renamed", id, name}
 ```
 
 `auth` is the new device's auth key, not its hash, for the same reason `claim`
@@ -407,6 +416,27 @@ registration having happened: the half-finished case where the row committed
 and the reply was lost. Answering `badentry` there would leave a device
 retrying for ever, the same defect a duplicate invite identifier had. A *different* key under an id the vault already holds is
 somebody else's device and is `badentry`, and nothing is overwritten.
+
+`rename` changes the label on the calling device's own row and takes no
+`deviceId`, which is the whole of its authorisation: the row is the one the
+session authenticated as. A device relabelling another would need a rule for
+who may relabel whom, and the only thing that wants one is tidying somebody
+else's list. A registrar has no row of its own, so it is refused with `auth`
+naming the credential a rename needs rather than with `protostate`, which is
+what an op nobody implements gets.
+
+The name is checked with the same rule `register` applies, so a name that could
+not have been chosen at pairing cannot arrive by renaming either, and an empty
+one is `badname`: a blank row says nothing, which is what the suggested name at
+pairing exists to avoid. The reply echoes the name because the server is the
+authority on what the list says, and a client that believed its own request
+would not notice a server that stored something else.
+
+Nothing about the vault's content moves. No uid is spent and no entry is
+written, so a rename is not part of the sync stream and nothing replays it;
+another device sees the new label the next time it lists. What a rename does
+not do is rename anything already written: conflict copies carry the device
+name in their filenames, and those are notes rather than labels.
 
 **A device may not `register`.** It holds no vault credential, so a stolen
 laptop cannot mint a row directly, cannot `rotate`, and cannot produce the
@@ -574,7 +604,7 @@ The new device redeems it at hello, in place of a token, and names the device
 row it is asking for:
 
 ```
--> {op:"hello", id, proto:4, vault, device, crypto, invite, deviceId, auth, name?}
+-> {op:"hello", id, proto:5, vault, device, crypto, invite, deviceId, auth, name?}
 <- {res:"redeemed", id, sealed, deviceId}
 ```
 

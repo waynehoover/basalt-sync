@@ -64,6 +64,7 @@ basalt uninvite ID                        cancel an outstanding invite, from bas
 basalt pair INVITE                        add this device to a vault, with an invite or its
                                           recovery key
 basalt devices                            every device that may reach this vault
+basalt rename NAME                        change this device's name in the device list
 basalt revoke ID                          stop one device connecting, from basalt devices
 basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
 basalt rebase --backup-taken              rejoin a server restored from an older backup
@@ -142,6 +143,16 @@ pairing that crashed after reaching the server strands a row, and so does a
 `basalt init` whose claim went through. Those rows still hold one of the eight
 slots, so a failed pairing names the row to revoke rather than sending you back
 to pairing, which would register a second.
+
+`basalt rename NAME` changes what this device is called, and only this device:
+the name is a label a person reads and the id is the identity, so there is no
+argument naming a row. It reaches the server first and writes the config after,
+because the device list is what another person reads and what this device cannot
+repair while offline; if the local write then fails, both halves are said, since
+the visible consequence is conflict copies that still carry the old name.
+
+Copies made before a rename keep the old name. They are notes on disk, and
+nothing here rewrites a note to tidy a label.
 
 `basalt revoke ID` removes that device's row and closes any connection it has
 open, in that order, so it stops at once rather than at its next reconnect. Any

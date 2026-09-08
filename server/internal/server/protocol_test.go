@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -840,7 +841,10 @@ func TestAHelloOutsideTheRangeIsRefusedNamingBothNumbers(t *testing.T) {
 	cl.sendRaw(wire.In{Op: "hello", ID: 1, Proto: 2, Crypto: wire.Crypto,
 		Vault: testVault, Token: testToken, Device: "old-phone"})
 	msg := cl.expectErr(wire.CodeProto)
-	for _, want := range []string{"protocol 2", "4 to 4"} {
+	for _, want := range []string{
+		"protocol 2",
+		fmt.Sprintf("%d to %d", wire.MinProto, wire.Proto),
+	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("the refusal does not name %q: %q", want, msg)
 		}

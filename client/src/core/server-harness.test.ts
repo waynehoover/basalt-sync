@@ -33,7 +33,7 @@ import {
 } from "./crypto.ts";
 import { testKeys, testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
-import { ProtocolError, Transport, type Batch, type BatchEntry } from "./transport.ts";
+import { ProtocolError, Transport, type Batch, type BatchEntry, PROTO } from "./transport.ts";
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -260,9 +260,9 @@ describe("the handshake, against the real server", () => {
     const c = new Client(await testKeys(SECRET), "a");
     clients.push(c);
     const ready = await c.connect(server);
-    expect(ready.proto).toBe(4);
+    expect(ready.proto).toBe(PROTO);
     // One protocol, so the range the server speaks is one number wide.
-    expect(ready.minProto).toBe(4);
+    expect(ready.minProto).toBe(PROTO);
     expect(ready.serverVersion).not.toBe("");
     // And a data key, which every vault has.
     expect(ready.wrapped).not.toBe("");
@@ -831,11 +831,11 @@ describe("refusals that the session survives", () => {
   });
 
   /**
-   * The other side of the version check: this client says `proto: 4`, and a
-   * hello in any other version is refused rather than answered. A server that
-   * answered an older one would hand a connection the vault's own credential
-   * as a sync credential, which is exactly what per-device credentials took
-   * away.
+   * The other side of the version check: this client says the one version it
+   * speaks, and a hello in any other is refused rather than answered. A server
+   * that answered an older one would hand a connection the vault's own
+   * credential as a sync credential, which is exactly what per-device
+   * credentials took away.
    */
   it("refuses a hello in any protocol but this one", async () => {
     const creds = server.credentials(
@@ -871,7 +871,7 @@ describe("refusals that the session survives", () => {
     // Both numbers named, because that is how somebody works out which end to
     // upgrade. 3 stands in for any version outside the range.
     expect(String(refusal["msg"])).toMatch(/protocol 3 not supported/);
-    expect(String(refusal["msg"])).toMatch(/4 to 4/);
+    expect(String(refusal["msg"])).toMatch(new RegExp(`${PROTO} to ${PROTO}`));
   });
 });
 

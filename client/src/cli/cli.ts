@@ -113,6 +113,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt sync --watch                       sync, then keep syncing
   basalt status                             what this device thinks the state is
   basalt devices                            every device that may reach this vault
+  basalt rename NAME                        change this device's name in the device list
   basalt revoke ID                          stop one device connecting, from basalt devices
   basalt deleted                            notes the server still has and you do not
   basalt history PATH                       every version the server holds of one note
@@ -191,6 +192,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await locked(args, () => cmdPair(args, io));
       case "devices":
         return await cmdDevices(args, io);
+      case "rename":
+        return await locked(args, () => cmdRename(args, io));
       case "revoke":
         return await cmdRevoke(args, io);
       case "rotate":
@@ -268,6 +271,7 @@ const POSITIONALS: Record<string, number> = {
   init: 1,
   pair: 1,
   history: 1,
+  rename: 1,
   restore: 1,
   revoke: 1,
   rotate: 1,
@@ -1032,6 +1036,65 @@ async function openDeviceList(
  * `--allow-last`, which needs the recovery key, because emptying the vault is
  * the one revocation nothing on a device can undo.
  */
+/**
+ * Changes this device's name, on the server and then here.
+ *
+ * Under the vault lock, because it writes the config, and that is the file the
+ * pairing lives in.
+ *
+ * The order is the server first. It cannot be atomic across a network and a
+ * disk, so which half goes first is a decision: the device list is what another
+ * person reads and what this device cannot repair while offline, whereas a
+ * local name that ran ahead would have this device writing conflict copies
+ * under a label the vault does not know. If the local save then fails, that is
+ * said in full rather than reported as a failure, because the rename did
+ * happen and running it again is what finishes it.
+ */
+async function cmdRename(args: Args, io: Console): Promise<number> {
+  const name = args.rest[0];
+  if (!name) throw new Error("rename needs a name: basalt rename laptop");
+  // `deviceGiven`, because this name was typed. Without it `deviceNameFor`
+  // takes the derived path and appends a random tail, so `basalt rename laptop`
+  // would have produced `laptop-3f9c`: a name nobody asked for, quietly. A
+  // typed name is refused rather than shortened, which is what `checkName`
+  // does below and what the server does again.
+  const wanted = deviceNameFor({ ...args, device: name, deviceGiven: true });
+
+  const config = await mustLoad(args.dir);
+  const client = await open(config, args, io);
+  let said: string;
+  try {
+    said = await client.rename(wanted);
+  } finally {
+    await client.close();
+  }
+
+  try {
+    await saveConfig(args.dir, { ...config, device: said });
+  } catch (err) {
+    // Both halves, because the useful sentence is what is true of each. The
+    // list has the new name and this device does not, which shows up as
+    // conflict copies still carrying the old one.
+    io.err(
+      `The device list now says ${said}, and this device could not write it down: ` +
+        `${(err as Error).message}. Conflict copies made here will still say ` +
+        `${JSON.stringify(config.device)} until this runs again.`,
+    );
+    if (args.json) io.out(JSON.stringify({ ok: false, renamed: true, name: said, saved: false }));
+    return 1;
+  }
+
+  if (args.json) {
+    io.out(JSON.stringify({ ok: true, renamed: true, name: said, saved: true }));
+    return 0;
+  }
+  io.out(`This device is now ${said} in the device list.`);
+  // Said because it is the half a person would otherwise discover from a
+  // filename months later, and because it is not a fault to be fixed.
+  io.out("Conflict copies made before now keep the old name; they are notes, not labels.");
+  return 0;
+}
+
 async function cmdRevoke(args: Args, io: Console): Promise<number> {
   const deviceId = args.rest[0];
   if (!deviceId) throw new Error("revoke needs a device id, from basalt devices");

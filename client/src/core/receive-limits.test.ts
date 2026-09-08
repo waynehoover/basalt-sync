@@ -20,6 +20,7 @@ import { describe, expect, it } from "vitest";
 
 import { MAX_CHUNK_PLAINTEXT, openChunk, seal } from "./crypto.ts";
 import { testKeys } from "./test-keys.ts";
+import { PROTO } from "./transport.ts";
 
 const CHUNK_RAW = 0;
 const CHUNK_DEFLATE = 1;
@@ -105,8 +106,8 @@ describe("what a server may talk this device into holding", () => {
     socket.raw({
       res: "ready",
       id: 1,
-      proto: 4,
-      minProto: 4,
+      proto: PROTO,
+      minProto: PROTO,
       cursor: 0,
       perFileMax: Number.MAX_SAFE_INTEGER,
       chunkMax: Number.MAX_SAFE_INTEGER,
@@ -148,8 +149,8 @@ describe("what a server may talk this device into holding", () => {
     socket.raw({
       res: "ready",
       id: 1,
-      proto: 4,
-      minProto: 4,
+      proto: PROTO,
+      minProto: PROTO,
       cursor: 0,
       perFileMax: 1024,
       chunkMax: 1024,

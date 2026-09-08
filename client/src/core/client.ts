@@ -910,6 +910,35 @@ export class Client {
     );
   }
 
+  /**
+   * Changes this device's own label, and only its own.
+   *
+   * The name is what the device list, a note's history and a conflict copy's
+   * filename are read by, and until protocol 5 it was chosen once at pairing
+   * and fixed: a typo or a repurposed laptop meant unlinking and pairing
+   * again, which makes a new row and loses the old one's history of who wrote
+   * what.
+   *
+   * **The server first, and the caller writes the local copy after.** The two
+   * cannot be made atomic across a network and a disk, so the order is chosen
+   * rather than accidental: the device list is what another person reads and
+   * what this device cannot fix while offline, and a local name that has moved
+   * ahead of the server's is a device writing conflict copies under a label
+   * the list does not know. The other way round leaves the server's list wrong
+   * with nothing prompting a retry.
+   *
+   * The engine's own `device` is not touched here. It is read at every conflict
+   * copy, so changing it under a pass in flight would name two copies of one
+   * divergence differently; the shells save the config and the next pass picks
+   * it up.
+   *
+   * Existing conflict copies keep the old name. They are notes on disk, and
+   * rule 1 does not rewrite notes to tidy a label.
+   */
+  async rename(name: string): Promise<string> {
+    return this.serial(() => this.transport.rename(name));
+  }
+
   /** This device's own row id, so a caller can tell itself out of the list. */
   get deviceId(): string {
     return this.opts.deviceId;

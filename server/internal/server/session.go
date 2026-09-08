@@ -653,6 +653,10 @@ func (s *Session) run() error {
 var deviceOps = map[string]bool{
 	"put": true, "putmany": true, "get": true, "fetch": true,
 	"history": true, "deleted": true, "invite": true,
+	// rename is a device relabelling itself, so it needs a device's own
+	// credential by construction: there is no field naming which row to
+	// change. A registrar has no row of its own and is told so here.
+	"rename": true,
 	// resend writes bodies the vault already refers to and nothing else: no
 	// entry, no uid, no authenticator. A device is the only thing that can
 	// have them, so it is the only thing that can repair them (I14).
@@ -743,6 +747,8 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handleDevices(m)
 	case "revoke":
 		return s.handleRevoke(m)
+	case "rename":
+		return s.handleRename(m)
 	case "register":
 		// A device may not mint a credential from the root, because it does
 		// not hold one. That is the boundary and it is narrower than an
@@ -2442,6 +2448,55 @@ func (s *Session) handleDevices(m wire.In) error {
 	return s.writeJSON(wire.DeviceList{
 		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: store.MaxDevices, Invites: invites,
 	})
+}
+
+// handleRename changes this device's own label, and only its own.
+//
+// There is no field naming the row: it is `s.deviceID`, the device this session
+// authenticated as. That is the whole authorisation story, and it is deliberate.
+// A device renaming another would need a rule for who may relabel whom, and the
+// only reason to want one is tidying somebody else's device list, which is not
+// worth an authorisation question. A registrar is refused by deviceOps for the
+// same reason: it has no row of its own to rename.
+//
+// The name is checked with the same CheckName that register and invite
+// redemption use, so a name that could not have been chosen at pairing cannot
+// arrive by renaming either. `badname` rather than `badentry`, matching every
+// other refusal about a name's shape.
+//
+// Nothing about the vault's content moves, no uid is spent and no entry is
+// written, so this is not part of the sync stream and nothing replays it. A
+// device that renames itself while another device is mid-pass affects that pass
+// not at all; the other device sees the new label the next time it lists.
+func (s *Session) handleRename(m wire.In) error {
+	if err := store.CheckName("device", m.Name, store.MaxDeviceLen); err != nil {
+		return s.reject(wire.CodeBadName, err)
+	}
+	// Empty is refused rather than accepted as "no name". A blank label in a
+	// device list is a row that says nothing, which is the state the suggested
+	// name at pairing exists to avoid, and a rename is not the place to reach
+	// it by another route.
+	if m.Name == "" {
+		return s.reject(wire.CodeBadName, errors.New(
+			"a device name cannot be empty: it is what the device list, history and conflict "+
+				"copies are read by"))
+	}
+	if err := s.srv.st.RenameDevice(s.vaultID, s.deviceID, m.Name); err != nil {
+		if errors.Is(err, store.ErrUnknownDevice) {
+			// This session authenticated against a row that has since gone,
+			// which is a revocation landing between the hello and this. Fatal
+			// for the same reason a revoked device's next op is: retrying
+			// cannot succeed, and the connection is no longer one the vault
+			// recognises.
+			return s.fatal(wire.CodeNoDevice, errors.New(
+				"this device is no longer on the vault, so it was not renamed; it was revoked "+
+					"while this connection was open"))
+		}
+		s.srv.log.Error("renaming a device failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the device could not be renamed: "+err.Error()))
+	}
+	s.srv.log.Info("device renamed", "vault", s.vaultID, "device", s.deviceID, "name", m.Name)
+	return s.writeJSON(wire.Renamed{Res: "renamed", ID: s.reqID, Name: m.Name})
 }
 
 // handleRevoke deletes a device's row and closes every session that device has

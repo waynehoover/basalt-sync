@@ -630,6 +630,81 @@ describe("status", () => {
   }, 300_000);
 });
 
+describe("renaming this device", () => {
+  /**
+   * Protocol 5. The name was chosen once at pairing and then fixed, so a typo
+   * or a laptop that became something else meant unlinking and pairing again,
+   * which makes a new row and detaches the old one's history of who wrote what.
+   */
+  it("changes the device list and this device's own record", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+    const before = await cli("devices", "--dir", a, "--json");
+    const mine = before.json()["thisDevice"] as string;
+
+    const done = await cli("rename", "the-good-laptop", "--dir", a, "--json");
+    expect(done.code, done.all).toBe(0);
+    expect(done.json()["name"], done.all).toBe("the-good-laptop");
+    expect(done.json()["saved"], done.all).toBe(true);
+
+    // The list is the authority, so it is what is checked, and the row is the
+    // same row: a rename is not a re-pairing.
+    const after = await cli("devices", "--dir", a, "--json");
+    const rows = after.json()["devices"] as Record<string, unknown>[];
+    const row = rows.find((d) => d["id"] === mine);
+    expect(row?.["name"], after.all).toBe("the-good-laptop");
+    expect(after.json()["thisDevice"], "the rename made a new row").toBe(mine);
+  }, 60_000);
+
+  it("is what conflict copies made afterwards are named by", async () => {
+    // The half a person would otherwise discover from a filename. The engine
+    // is handed the name when it is built, so a config saved under a running
+    // loop would rename the list and nothing else.
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "note.md", "the original\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+
+    expect((await cli("rename", "renamed-one", "--dir", b, "--json")).code).toBe(0);
+
+    // Both sides edit it, and only a's edit reaches the server, so b has to
+    // keep both.
+    await write(a, "note.md", "changed on a\n");
+    await write(b, "note.md", "changed on b\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b, "--no-merge")).code).toBe(0);
+
+    const copies = (await readdir(b)).filter((n) => n.includes("Conflicted copy"));
+    expect(copies.length, `copies: ${copies.join(", ")}`).toBeGreaterThan(0);
+    expect(copies.join(" "), "a conflict copy still carries the old name").toContain("renamed-one");
+  }, 120_000);
+
+  it("refuses a name the server would refuse, before asking it", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+    const long = await cli("rename", "x".repeat(200), "--dir", a);
+    expect(long.code, long.all).not.toBe(0);
+    expect(long.all).toMatch(/bytes|limit/i);
+
+    // And an empty one is not a way to clear the label.
+    const empty = await cli("rename", "", "--dir", a);
+    expect(empty.code, empty.all).not.toBe(0);
+    expect(empty.all).toMatch(/needs a name|cannot be empty/i);
+  }, 60_000);
+
+  it("uses the name as typed, without a random tail", async () => {
+    // `deviceNameFor` appends four hex characters to a *derived* name, so that
+    // two laptops with one hostname differ. A name somebody typed is theirs:
+    // without `deviceGiven` this command would have quietly produced
+    // `laptop-3f9c`.
+    await fresh();
+    const { a } = await twoDevices();
+    const done = await cli("rename", "laptop", "--dir", a, "--json");
+    expect(done.json()["name"], done.all).toBe("laptop");
+  }, 60_000);
+});
+
 describe("unlinking", () => {
   it("names the row it leaves behind, and what removes it", async () => {
     // Unlinking is local on purpose: it has to work when the server does not.

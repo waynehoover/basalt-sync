@@ -21,12 +21,20 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // ship here is a device that connects and syncs under a credential nobody can
 // revoke.
 //
-// Both are 4, so the range is one version wide and nothing older is carried.
+// Both are 5, so the range is one version wide and nothing older is carried.
 // The range stays in the handshake because the next version needs somewhere to
 // say so.
+//
+// 5 adds `rename`, so that a device's label can be changed without unlinking
+// and pairing again. It is a clean break rather than a 4..5 range because
+// nothing is deployed on 4 outside this repository: a two-version range would
+// be the first dual-path code in the protocol, bought for compatibility nobody
+// needs. The upgrade order is the one the range exists for and is unchanged,
+// server first and then each client, and a 4 client meeting a 5 server is
+// refused with `proto` naming both numbers rather than half-working.
 const (
-	Proto    = 4
-	MinProto = 4
+	Proto    = 5
+	MinProto = 5
 )
 
 // MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
@@ -656,6 +664,20 @@ type Deleted struct {
 	// would hand somebody a short list that looks complete, and the note they
 	// are looking for is exactly the one that might be missing from it.
 	More bool `json:"more"`
+}
+
+// Renamed answers a rename, and carries the name the row now holds.
+//
+// The name is echoed rather than assumed. A client that sent one and got a bare
+// acknowledgement would have to believe its own request, and the server is the
+// authority on what the device list says; anything that trimmed or refused part
+// of a name would then be invisible until somebody read the list. Nothing here
+// trims today, which is exactly why the field is cheap to add now and awkward
+// to add later.
+type Renamed struct {
+	Res  string `json:"res"` // "renamed"
+	ID   int64  `json:"id,omitempty"`
+	Name string `json:"name"`
 }
 
 // Pong answers a ping. A client behind NAT needs something to send.

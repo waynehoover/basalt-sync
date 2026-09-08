@@ -24,14 +24,15 @@ import {
   wrapDataKey,
 } from "./crypto.ts";
 import { FakeSocket, RIG_SECRET, settle } from "./fake-socket.ts";
+import { PROTO } from "./transport.ts";
 import { TEST_DATA_KEY } from "./test-keys.ts";
 
 /** A well-formed registrar reply, with whatever the case wants changed. */
 function registrar(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     res: "registrar",
-    proto: 4,
-    minProto: 4,
+    proto: PROTO,
+    minProto: PROTO,
     serverVersion: "test",
     maxDevices: 8,
     ...over,
@@ -72,7 +73,7 @@ describe("the session the recovery key opens", () => {
   it("offers the vault's credential and names no device", async () => {
     const { socket } = await openRegistrar();
     const hello = socket.sentText.find((m) => m["op"] === "hello")!;
-    expect(hello["proto"]).toBe(4);
+    expect(hello["proto"]).toBe(PROTO);
     expect("deviceId" in hello).toBe(false);
     expect(hello["token"]).toBe(
       (await import("./crypto.ts")).authToken(await deriveRootKeys(RIG_SECRET)),

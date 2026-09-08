@@ -14,7 +14,7 @@
 import { type Schedule } from "./crypto.ts";
 import { TEST_DATA_KEY, testKeys, testWrapped } from "./test-keys.ts";
 import { Engine } from "./engine.ts";
-import { Transport, type SocketLike } from "./transport.ts";
+import { PROTO, Transport, type SocketLike } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 export class FakeSocket implements SocketLike {
@@ -98,8 +98,8 @@ export class FakeSocket implements SocketLike {
 export function ready(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     res: "ready",
-    proto: 4,
-    minProto: 4,
+    proto: PROTO,
+    minProto: PROTO,
     serverVersion: "test",
     cursor: 10,
     perFileMax: 1,

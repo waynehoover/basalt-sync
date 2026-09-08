@@ -229,7 +229,14 @@ func TestTheProtoAndCryptoRefusalsStillNameWhatThisServerSpeaks(t *testing.T) {
 	cl.sendRaw(wire.In{Op: "hello", ID: 1, Proto: wire.MinProto - 1, Crypto: wire.Crypto,
 		Vault: testVault, Device: "prober"})
 	msg := cl.expectErr(wire.CodeProto)
-	for _, want := range []string{"protocol 3", "4 to 4"} {
+	// Derived, not written down: these assert that the refusal names the version
+	// that was asked for and the range this server speaks, which is a property
+	// of the machinery rather than of any particular number. Spelled out, they
+	// had to be edited for protocol 5 and would be again for 6.
+	for _, want := range []string{
+		fmt.Sprintf("protocol %d", wire.MinProto-1),
+		fmt.Sprintf("%d to %d", wire.MinProto, wire.Proto),
+	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("the proto refusal does not name %q: %q", want, msg)
 		}

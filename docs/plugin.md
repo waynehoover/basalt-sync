@@ -201,6 +201,17 @@ is still missing.
 
 ## Devices, and revoking one
 
+*This device's name*, under *Manage this vault*, is a field and a *Rename*
+button. The name is what the device list, a note's history and every conflict
+copy call this device, and before protocol 5 it was chosen once at pairing and
+fixed: a typo or a laptop that became something else meant unlinking and pairing
+again, which makes a new row.
+
+It renames this device and no other, reaches the server before writing anything
+down here, and then reconnects, because the sync loop is handed the name when it
+starts and reads it at every conflict copy. Copies made before the rename keep
+the old name; they are notes rather than labels.
+
 *Devices* is under *Manage this vault*. It asks the server who may reach this
 vault, on *Show devices*, and lists each one: its name, the id that identifies it, when it was added and when
 it was last seen. Nothing is fetched until you press it, because it is a

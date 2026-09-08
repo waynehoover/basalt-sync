@@ -18,7 +18,14 @@ import { describe, expect, it, vi } from "vitest";
 import { chunkName } from "./crypto.ts";
 import { FakeSocket, RIG_SECRET, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import { testKeys } from "./test-keys.ts";
-import { Backoff, ConnectionError, ProtocolError, Transport, type Batch } from "./transport.ts";
+import {
+  Backoff,
+  ConnectionError,
+  PROTO,
+  ProtocolError,
+  Transport,
+  type Batch,
+} from "./transport.ts";
 
 /** A connected transport and the socket behind it. */
 async function connected(
@@ -198,7 +205,7 @@ describe("the handshake", () => {
     socket.reply(ready({ proto: 2, serverVersion: "0.2.2" }));
     await expect(hello).rejects.toMatchObject({ code: "proto" });
     await expect(hello).rejects.toThrow(/protocol 2/);
-    await expect(hello).rejects.toThrow(/speaks 4/);
+    await expect(hello).rejects.toThrow(new RegExp(`speaks ${PROTO}`));
     await expect(hello).rejects.toThrow(/upgrade the server first/);
   });
 
@@ -221,12 +228,12 @@ describe("the handshake", () => {
     });
     await expect(hello).rejects.toMatchObject({ code: "proto", retryable: false });
     await expect(hello).rejects.toThrow(/speaks 2 to 2/);
-    await expect(hello).rejects.toThrow(/This client speaks protocol 4/);
+    await expect(hello).rejects.toThrow(new RegExp(`This client speaks protocol ${PROTO}`));
     await expect(hello).rejects.toThrow(/upgrade the server first/);
     expect(t.isClosed).toBe(true);
   });
 
-  it("sends protocol 4, a device id, an id, and the crypto suite this client implements", async () => {
+  it("sends its protocol version, a device id, an id, and the crypto suite it implements", async () => {
     // A client that names a scheme it does not implement gets a session it
     // cannot decrypt anything in.
     const { t, socket } = await connected();
@@ -236,7 +243,7 @@ describe("the handshake", () => {
     await settle();
     expect(socket.sentText[0]).toMatchObject({
       op: "hello",
-      proto: 4,
+      proto: PROTO,
       crypto: "basalt/hkdf-aes-gcm/1",
     });
     expect(socket.sentText[0]!["id"]).toBe(1);
@@ -255,7 +262,7 @@ describe("the handshake", () => {
       }),
     );
     expect(await hello).toMatchObject({
-      proto: 4,
+      proto: PROTO,
       minProto: 3,
       serverVersion: "1.2.3",
       maxBatchBytes: 1234,
@@ -339,7 +346,7 @@ describe("the handshake", () => {
       .hello({ vault: "v", deviceId: "dev-1", token: "t", device: "d", cursor: 0 })
       .catch(() => {});
     await settle();
-    expect(socket.sentText[0]).toMatchObject({ op: "hello", proto: 4, deviceId: "dev-1" });
+    expect(socket.sentText[0]).toMatchObject({ op: "hello", proto: PROTO, deviceId: "dev-1" });
 
     const reg = await connected();
     void reg.t.helloAsRegistrar({ vault: "v", token: "t", device: "d" }).catch(() => {});

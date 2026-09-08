@@ -3257,6 +3257,46 @@ func (s *Store) RevokeDevice(vaultID, deviceID, vaultHash string, allowLast bool
 	})
 }
 
+// RenameDevice changes the label on one device's row, and nothing else.
+//
+// A device renames itself: the caller is the authenticated device, so there is
+// no authorisation question to answer here beyond the row existing. `name` is a
+// label a person reads and `device_id` is the identity, which is what makes
+// this a one-column update rather than anything to migrate. Nothing
+// authenticates the label, so there is no MAC to maintain either; see the
+// devices table and verifyRegistry, which reads the name and checks the row
+// around it.
+//
+// Not conditional on the vault hash, unlike RevokeDevice. That guard is there
+// because revoking is destructive and a retired root must not reach it. A
+// device relabelling itself destroys nothing, cannot affect another device, and
+// is undone by doing it again.
+//
+// An unknown row is ErrUnknownDevice rather than a silent success, because the
+// case it covers is a device renaming itself after being revoked, and "renamed"
+// would be a lie told to a device that is no longer on the vault.
+func (s *Store) RenameDevice(vaultID, deviceID, name string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	return s.inTx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(
+			`UPDATE devices SET name = ? WHERE vault_id = ? AND device_id = ?`,
+			name, vaultID, deviceID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrUnknownDevice
+		}
+		return nil
+	})
+}
+
 // SawDevice moves a device's last_seen to at, in milliseconds, and touches
 // nothing else. It is what a connect calls; the name, the id and the auth hash
 // are not its business, and a device that is not registered is ErrUnknownDevice

@@ -17,9 +17,10 @@
  */
 
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { PROTO } from "../core/transport.ts";
 import {
   App,
   type FakeEl,
@@ -473,6 +474,156 @@ describe("pairing", () => {
     expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
     // And no button, because there is nothing for one to do.
     expect(row.buttons, "the panel offers to show a key it does not have").toEqual([]);
+  }, 300_000);
+});
+
+describe("renaming this device from the panel", () => {
+  /**
+   * Protocol 5. The name is what the device list, a note's history and every
+   * conflict copy are read by, and until now it was chosen once at pairing and
+   * fixed: a typo meant unlinking and pairing again, which makes a new row.
+   */
+  it("renames on the server and writes it down here", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    expect(plugin.deviceName).toBe("laptop");
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const setting = built.find((s) => s.name === "This device's name")!;
+    expect(setting, "the panel offers no way to rename this device").toBeDefined();
+    setting.texts[0]!.type("the-good-laptop");
+    await setting.buttons.find((b) => b.label === "Rename")!.click();
+
+    // Written down here, so a restart does not undo it.
+    await until("the name to change", () => plugin.deviceName === "the-good-laptop");
+    expect((plugin.savedData as Record<string, string>)["device"]).toBe("the-good-laptop");
+
+    // And on the server, which is the authority a second device reads.
+    await until("it to reconnect", () => plugin.currentState.kind === "synced");
+    const list = await plugin.devices();
+    const mine = list.devices.find((d) => d.id === plugin.deviceId);
+    expect(mine?.name, JSON.stringify(list.devices)).toBe("the-good-laptop");
+  }, 300_000);
+
+  it("is what a conflict copy made afterwards is named by", async () => {
+    // The half that has to be a test rather than a comment. The engine is
+    // handed `device` when it is built and reads it at every conflict copy, so
+    // saving the config under a running loop renames the device list and
+    // nothing else: the next copy still carries the old name, and does until
+    // Obsidian restarts. Removing the `quiet`/`start` in `renameDevice` passes
+    // every other test in this file, which is how this one came to exist.
+    await fresh();
+    const a = await load();
+    a.app.vault.adapter.seed("note.md", "# Note\n\nThe original.\n");
+    await startVault(a.plugin, "laptop");
+    await synced(a.plugin);
+
+    const b = await load();
+    await b.plugin.pair(keyOf(a.plugin), "desktop");
+    await synced(b.plugin);
+    await until("the note to arrive", () => b.app.vault.adapter.text("note.md") !== undefined);
+
+    // b takes a new name, with its loop running, which is the case that broke.
+    built.length = 0;
+    b.plugin.ribbonIcons[0]!.callback();
+    const setting = built.find((s) => s.name === "This device's name")!;
+    setting.texts[0]!.type("renamed-desktop");
+    await setting.buttons.find((btn) => btn.label === "Rename")!.click();
+    await until("the rename to land", () => b.plugin.deviceName === "renamed-desktop");
+    await until("it to reconnect", () => b.plugin.currentState.kind === "synced");
+
+    // Now diverge, so b has to keep both and name the copy after itself.
+    a.app.vault.adapter.seed("note.md", "# Note\n\nA's sentence.\n", 9_000_000_000_000);
+    b.app.vault.adapter.seed("note.md", "# Note\n\nB's other sentence.\n", 9_000_000_000_000);
+    for (let i = 0; i < 5; i++) {
+      await a.plugin.syncNow();
+      await b.plugin.syncNow();
+    }
+
+    const copies = b.app.vault.adapter
+      .filePaths()
+      .filter((path) => path.includes("Conflicted copy"));
+    expect(copies.length, `paths: ${b.app.vault.adapter.filePaths().join(", ")}`).toBeGreaterThan(
+      0,
+    );
+    // Named for the new name, and not for the old one. Spelled as the whole
+    // "Conflicted copy <name>" because `renamed-desktop` contains `desktop`:
+    // a bare `not.toContain("desktop")` fails on the right answer, which is
+    // how the first version of this assertion was wrong.
+    expect(copies.join(" "), "a conflict copy still carries the old name").toMatch(
+      /Conflicted copy renamed-desktop/,
+    );
+    expect(copies.join(" ")).not.toMatch(/Conflicted copy desktop\b/);
+  }, 300_000);
+
+  it("says no to an empty name and to the name it already has", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const setting = built.find((s) => s.name === "This device's name")!;
+
+    notices.length = 0;
+    setting.texts[0]!.type("   ");
+    await setting.buttons.find((b) => b.label === "Rename")!.click();
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/cannot be empty/i);
+    expect(plugin.deviceName, "an empty name was accepted").toBe("laptop");
+
+    notices.length = 0;
+    setting.texts[0]!.type("laptop");
+    await setting.buttons.find((b) => b.label === "Rename")!.click();
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/already this device's name/i);
+  }, 300_000);
+});
+
+describe("the `?` beside a label", () => {
+  /**
+   * Reported from a phone: "the ? tooltips don't work".
+   *
+   * They were an `aria-label`, which Obsidian shows on hover, and a phone does
+   * not hover. Every one of them was dead there, and since `row` keeps the
+   * explanation out of the description slot on purpose, the detail was not
+   * reachable at all: a column of terse labels each wearing a glyph that did
+   * nothing. This is the half of it a test can hold, which is that the detail
+   * is in the panel and revealed by pressing the mark rather than by hovering.
+   */
+  it("is a button that shows its detail, not a hover tooltip", async () => {
+    await fresh();
+    const { plugin } = await load();
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+
+    const key = built.find((s) => s.name === "Invite or recovery key")!;
+    const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
+    expect(mark, "no ? on the row").toBeDefined();
+    expect(mark.attributes.get("role"), "the ? is not pressable").toBe("button");
+
+    // Hidden to start with, or the panel is a wall of prose again.
+    expect(key.descEl.allText()).toBe("");
+
+    mark.fire("click");
+    expect(key.descEl.allText(), "pressing the ? said nothing").toMatch(
+      /An invite is made on a device that already has the vault/,
+    );
+
+    // And it closes again, so a row asked about does not stay expanded for ever.
+    mark.fire("click");
+    expect(key.descEl.allText()).toBe("");
+  }, 300_000);
+
+  it("keeps the hover tooltip for the desktop, where it worked", async () => {
+    await fresh();
+    const { plugin } = await load();
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const key = built.find((s) => s.name === "Invite or recovery key")!;
+    const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
+    expect(mark.attributes.get("aria-label")).toMatch(/An invite is made on a device/);
   }, 300_000);
 });
 
@@ -2889,11 +3040,37 @@ describe("adding a device from the panel", () => {
     const key = shown.split(/\s+/).find((w) => w.startsWith("basalt3_"))!;
     expect(key, "no recovery key was shown").toBeDefined();
 
+    // And a way to get it off the device, which is the whole point of showing
+    // it. "Write it down" is hardest to follow exactly where this plugin is
+    // most used: a phone has no second screen to read from, and the paragraph
+    // was not selectable because Obsidian turns selection off across its UI. So
+    // the button copies, and it copies the key rather than anything near it.
+    const copied: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: async (t: string) => {
+          copied.push(t);
+        },
+      },
+    });
+    try {
+      const keyScreen = built.find((s) =>
+        s.buttons.some((b) => b.label === "I have written it down"),
+      )!;
+      const copy = keyScreen.buttons.find((b) => b.label === "Copy");
+      expect(copy, "the recovery key was shown with no way to copy it").toBeDefined();
+      await copy!.click();
+      expect(copied, "Copy did not put the recovery key on the clipboard").toEqual([key]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
     // Acknowledged, it is gone from the panel, and reopening does not bring
     // it back on its own.
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "I have written it down")!
+      .click();
     // And now the pairing may finish.
     await starting;
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
@@ -2968,7 +3145,8 @@ describe("adding a device from the panel", () => {
     ).toBe(true);
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "I have written it down")!
+      .click();
 
     // And starting over actually works, rather than being refused.
     built.length = 0;
@@ -2987,7 +3165,8 @@ describe("adding a device from the panel", () => {
     );
     await built
       .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
-      .buttons[0]!.click();
+      .buttons.find((b) => b.label === "I have written it down")!
+      .click();
     await settles(again, "the second pairing never finished");
     expect(plugin.paired, "the vault could not be paired after an abandoned attempt").toBe(true);
     await synced(plugin);
@@ -3071,7 +3250,8 @@ describe("what the panel knows and used to keep to itself", () => {
       );
       await built
         .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
-        .buttons[0]!.click();
+        .buttons.find((b) => b.label === "I have written it down")!
+        .click();
       await starting;
       await synced(plugin);
 
@@ -3120,14 +3300,14 @@ describe("what the panel knows and used to keep to itself", () => {
     expect(shown).toContain(`Connected to ${server.wsUrl}`);
     // From `ready` and nowhere else, and both of them present: an absent
     // build is what a server that never answered looks like.
-    expect(to.server!.proto).toBe(4);
+    expect(to.server!.proto).toBe(PROTO);
     // Not "unknown", which is what `readReady` puts there when the server did
     // not say. A panel showing the fallback as a build is the failure this
     // line exists for, and it reads exactly like a build.
     expect(to.server!.version, "the build is the fallback, not what ready said").not.toBe(
       "unknown",
     );
-    expect(shown).toContain(`Protocol 4, basaltd ${to.server!.version}.`);
+    expect(shown).toContain(`Protocol ${PROTO}, basaltd ${to.server!.version}.`);
     expect(shown).not.toContain("Not connected");
     // A test server has nothing in front of it. What that costs is on the
     // line's `?` rather than in the line, because it is the same two clauses
