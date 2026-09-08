@@ -27,18 +27,15 @@ changes the protocol, upgrade the server before its clients.
 
 ## Pairing
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/pairing-dark.png">
-  <img src="assets/screenshots/pairing.png" alt="The Basalt pairing panel, with fields to join an existing vault or start a new one." width="720">
-</picture>
-
 ### Start your first device
 
-1. Give the device a recognizable name, such as `laptop`.
-2. Under **Start a new vault**, paste the server's setup string into
+1. Choose **Use a setup line** for the first device, then give it a recognizable
+   name, such as `laptop`.
+2. Paste the server's setup string into
    **Setup string**. With TLS configured, it looks like
    `wss://homelab.example.ts.net#TOKEN`.
-3. Start the vault and save the recovery key shown under **Write this down**.
+3. Press **Start a new vault**, save the recovery key under **Write this down**,
+   then press **I have written it down**.
 4. Wait for sync to finish before adding another device.
 
 Keep the recovery key somewhere safe and separate from your devices. It is how
@@ -52,7 +49,7 @@ join it with an invite.
 ### Add another device
 
 1. On a paired device, open **Add another device → Create invite**.
-2. On the new device, install Basalt and open its panel.
+2. On the new device, install Basalt, open its panel, and choose **Paste an invite**.
 3. Choose a device name, paste the invite into **Invite or recovery key**, and
    press **Pair**.
 4. Keep Obsidian open while the first sync finishes.

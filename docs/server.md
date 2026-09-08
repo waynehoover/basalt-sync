@@ -111,8 +111,10 @@ wss://homelab.example.ts.net#TOKEN
 ```
 
 1. [Install the plugin](plugin.md#install) on your first device.
-2. Open Basalt and paste the string under **Start a new vault**.
-3. Save the recovery key shown during setup, somewhere safe and separate.
+2. Open Basalt, choose **Use a setup line**, paste the setup string, and press
+   **Start a new vault**.
+3. Save the recovery key somewhere safe and separate, then press
+   **I have written it down**.
 4. Wait for sync to finish.
 5. Use **Add another device → Create invite** for each additional device.
 

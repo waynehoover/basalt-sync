@@ -171,6 +171,7 @@ verify that it is stopped. Shared network vaults remain unsupported.
 
 ## More
 
+- [Install with an agent](https://github.com/waynehoover/basalt-sync/blob/main/llm.md)
 - [All documentation](https://github.com/waynehoover/basalt-sync/blob/main/docs/index.md)
 - [Command reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md)
 - [Security and privacy](https://github.com/waynehoover/basalt-sync/blob/main/docs/security.md)

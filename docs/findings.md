@@ -1,22 +1,14 @@
-# Findings
+# Historical findings index
 
-[Back to the README](../README.md)
+[Developer documentation](development.md)
 
-Every numbered finding a code comment cites. Code says `(R40)` or `(I29)` where
-a decision came from a review rather than from the design, and this is where the
-number resolves to a sentence. Three schemes that resolved to nothing are gone
-from the code instead; the last section says which and why.
+Definitions of the review IDs cited in code, such as `(R40)` and `(I29)`.
+These titles preserve the original reviewers' wording. They describe historical
+work recorded as resolved or deliberately declined, not a fresh readiness audit.
 
-The reviews themselves are gone from the tree. They were eight files and 3,115
-lines of checklists with nothing open in any of them, which is a filing cabinet
-rather than a document. `git log -- FOLLOW_UP_REVIEW.md IMPROVEMENTS.md
-READINESS.md TODO.md PRODUCT_READINESS.md` has all of it: the reproductions, the
-acceptance criteria, the evidence and the arguments, at the commit each was
-written. What is kept here is the index, because a citation in a comment should
-resolve without a `git log`.
-
-Titles are the reviewers' own words, extracted rather than paraphrased. Every
-one of these is closed.
+Reproductions, acceptance criteria, and verification evidence remain in Git
+history: `git log -- FOLLOW_UP_REVIEW.md IMPROVEMENTS.md READINESS.md TODO.md
+PRODUCT_READINESS.md`.
 
 ## R: the review rounds
 
@@ -86,9 +78,8 @@ one of these is closed.
 
 ## I: improvements, done or evaluated and declined
 
-The declined ones are worth reading before anybody proposes them again:
-I25 (a WebAssembly codec) and I26 (a maintained diff-match-patch fork).
-`docs/compared.md` has the measurements under "Measured and refused".
+See [evaluated alternatives](research.md#evaluated-alternatives) before
+revisiting I25 (a codec replacement) or I26 (a diff-match-patch fork).
 
 - **I01** Split large modules along existing responsibilities
 - **I02** Share credential-operation state machines between CLI and plugin
@@ -123,28 +114,12 @@ I25 (a WebAssembly codec) and I26 (a maintained diff-match-patch fork).
 - **I31** Give markup the validity gate that JSON has
 
 
-## What cannot be resolved, and was not resolvable before either
+## Removed citation schemes
 
-The `C`, `P` and `T` schemes are not here, and no longer in the code either.
-Their definitions were never committed: they came from review rounds whose
-documents stayed on the reviewer's machine, so about two hundred comments cited
-a number that resolved to nothing and always had. Those citations have been
-removed rather than indexed, and the sentences they sat beside were already
-carrying the meaning.
+`C`, `P`, and `T` review IDs were removed from code because their definitions
+were never committed. Other documents reused those labels for unrelated
+checklists or priority tiers, so reconstructing an index would be ambiguous.
+The explanatory comments remain. This cleanup was recorded at `9f99b6a`.
 
-Two collisions found while trying to index them anyway, both of which would have
-made this file confidently wrong:
-
-- The deleted `READINESS.md` used `C1` to `C6` for a design checklist for the
-  displaced-version ledger, while code used `C1` to `C6` for review findings
-  about landing races, case-only renames and slow links. Same numbers, unrelated
-  subjects.
-- The deleted `TODO.md` had headings `## P1: data, recovery, and integrity` and
-  `## P2: stabilization and truthful behavior`. Those are priority tiers, and
-  they collide with the `P1` and `P2` that code cited as findings.
-
-`C0` and `C1` still appear once in `server/cmd/basaltd/service.go`, where they
-are the Unicode control-character classes and have never had anything to do with
-a review.
-
-Recorded at 9f99b6a.
+`C0` and `C1` in server name validation refer to Unicode control-character
+classes, not review findings.

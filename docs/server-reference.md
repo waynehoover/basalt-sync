@@ -2,9 +2,11 @@
 
 [Documentation](index.md) · [Setup](server.md) · [Maintenance](server-operations.md)
 
-`basaltd` runs the server and its maintenance commands. Each command accepts
-`-data DIR`; the default is `$BASALT_DATA`, then `~/.basalt`. Only `serve`
-creates a new data directory. Use each subcommand's `-h` for installed usage.
+`basaltd` runs the server and its maintenance commands. Commands that use a
+store, plus `service`, accept `-data DIR`; the default is `$BASALT_DATA`, then
+`~/.basalt`. `health` uses an address instead, and `version` needs neither.
+Only `serve` creates a new server data directory. Use each subcommand's `-h`
+for installed usage.
 
 ## Commands
 

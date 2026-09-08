@@ -58,6 +58,9 @@ you reconnect, and recover earlier versions from inside Obsidian.
 3. **[Add your other devices](docs/plugin.md#pairing).** Create an invite on a
    paired device and paste it into Basalt on the next one.
 
+**Prefer to have your agent handle setup?** Give it [llm.md](llm.md). The guide
+covers the server, plugin, pairing, and checks that sync works.
+
 For a NAS or a machine without Obsidian, the experimental
 **[command-line client](client/README.md)** can keep a local mirror.
 
@@ -81,6 +84,7 @@ different storage options.
 
 | I want to… | Guide |
 |---|---|
+| Set up Basalt with an agent | [Agent installation guide](llm.md) |
 | Run Basalt on my server | [Server setup](docs/server.md) |
 | Pair devices or recover a note | [Obsidian plugin](docs/plugin.md) |
 | Back up, restore, or free server space | [Server maintenance](docs/server-operations.md) |

@@ -1,86 +1,56 @@
 # Basalt Sync
 
-Self-hosted sync for Obsidian. One binary, one pairing string.
+Fast, secure, self-hosted sync for Obsidian. Simple setup.
 
-## Layout
+## Layout and scope
 
-- `server/` is the Go server. Its binary is `basaltd`, and every subcommand it
-  has is a server operation: serve, backup, verify, purge, stats, service,
-  health.
-- `client/src/core` is the sync engine, which knows nothing about where files
-  live. `client/src/cli` is the headless client, whose binary is `basalt`.
-  `client/src/plugin` is the Obsidian plugin.
-- Two binaries, two names, because a homelab runs both.
+- `server/`: Go server, `basaltd`.
+- `client/src/core/`: shared sync engine.
+- `client/src/cli/`: headless client, `basalt`.
+- `client/src/plugin/`: Obsidian plugin and adapter.
 
-Read `docs/design.md` before adding anything. It is short and it is the
-point of the project.
+Read [docs/design.md](docs/design.md) before adding features. The supported scope
+is one person's devices, one server per vault, local storage, and one sync
+service per local vault. Storage backends, teams, and web interfaces are outside
+that scope.
 
-## The first rule
+## Preserve notes
 
-**Do not lose a note.** When simplicity and correctness conflict, correctness
-wins and the feature gets cut instead. `docs/design.md` lists eleven durability
-rules, each with the incident that produced it; they are not aspirational.
+**Do not lose a note.** Correctness takes priority over simplicity; cut a feature
+if necessary. Preserve the eleven [durability rules](docs/design.md#the-durability-rules).
 
-## Scope, and what is refused
+Every write to a live Obsidian vault on a development machine must go through
+the `obsidian` CLI, never direct `mv`, `rm`, or `cp`. This preserves Obsidian's
+view of changes. Repository files are not live vault notes.
 
-One backend, one transport, one platform, one person's devices on a private
-network. No S3, no CouchDB, no peer-to-peer, no teams, no web UI, no settings
-screen. Refusals are in the philosophy doc and are decisions, not gaps.
+## Architecture
 
-## Protocol
+The server is a static Go binary with embedded SQLite, no cgo, and no external
+database. TLS terminates at a proxy such as Tailscale Serve or Caddy. The server
+must not receive plaintext notes or client decryption secrets.
 
-`docs/protocol.md`. Basalt does not speak Obsidian Sync's protocol; every rule
-in ours inverts a specific defect in theirs, six of which fail silently.
+Keep shared sync behavior in core and platform operations in adapters. Read
+[the protocol](docs/protocol.md) for wire contracts. Verify claims against the
+shipped artifact; state what could not be established.
 
-## Conventions
+## Verification
 
-- The server is a single static binary: pure-Go SQLite, no cgo, no external
-  database, no message broker. TLS is terminated in front of it by
-  `tailscale serve` or a tunnel, so no key material lives here.
-- The server never sees plaintext or the passphrase, and must never need to.
-- Every vault write on a dev machine goes through the `obsidian` CLI, never
-  `mv`/`rm`/`cp`. Obsidian's index and any sync engine learn about changes
-  through the file watcher; writes behind its back are invisible to sync and
-  not reliably repairable.
-- Verify against the shipped artifact, never infer. Where an artifact cannot
-  answer, say so rather than guess.
+**Run `scripts/check.sh` before pushing.** Exit 0 means the full local gate
+passed; exit 2 means checks could not run and is not a pass. Inspect CI for the
+exact commit too: local success does not establish CI success. The script's
+drift guard checks CI step coverage, not equivalence between environments.
 
-## Testing
+A unit-test pass alone does not cover stress or real-runtime behavior. For every
+bug fix, show that its regression test fails without the fix and passes with
+it. Check preservation of the edited content, not just agreement between clients.
 
-**Run `scripts/check.sh` before pushing.** It runs every check CI runs and
-nothing less. Exit 0 means all of them passed *here*; exit 2 means some could
-not run, which is not the same thing and is not green.
+## Documentation and prior art
 
-Exit 0 is not the same as CI being green, and it was once written here as
-though it were. The drift guard compares CI's step names against the script, so
-it catches a step CI grows that the script does not run; it cannot catch a step
-that runs in both places and fails in only one. Four consecutive CI failures
-were that: a request timer that fires only on a machine slow enough to still be
-running a second later, a default device name too long because the runner's
-hostname is, and a systemd version wording an error differently. All three
-passed locally every time. So: run the script before pushing, and read CI
-before believing a release is green.
+Write the README and user guides for people choosing, installing, and using
+Basalt. Put implementation details in the [developer documentation](docs/development.md).
+[llm.md](llm.md) is the installation runbook for agents helping users.
 
-This exists because of a shipped regression. `bun run test` is one of nine
-checks, and the stress suite is a separate command in a separate job. A release
-went out on a green `bun run test` while `bun run stress` had been failing the
-whole time, on the same machine, catching precisely the bug that shipped. "The
-tests pass" was true and meant much less than it sounded. A guard inside the
-script fails when CI grows a step the script does not run, so the two cannot
-drift apart again.
-
-Unit tests are necessary and never sufficient here. Every real bug this project
-has had was a *silent* failure that only appeared when the system ran. A fix
-without a test that failed before it is not finished: revert the fix, watch the
-test fail, restore it.
-
-## Prior art
-
-`docs/compared.md` credits every project this one learned from. Add to it when
-reading someone else's code changes something here. The one that comes up most
-is [obsidian-livesync](https://github.com/vrtmrz/obsidian-livesync), MIT: source
-of the content-defined chunking idea and the confirmation that text merging is
-solved. Considerably broader in scope; see the philosophy doc on why we are not.
-
-Facts about Obsidian Sync's own protocol come from reading the shipped app, and
-are recorded in `docs/protocol.md` rather than inferred again.
+Credit projects and record design evaluations in [docs/research.md](docs/research.md),
+including LiveSync's influence on content-defined chunking. Keep product
+comparison in [docs/compared.md](docs/compared.md) focused on user needs. Historical
+review IDs are defined in [docs/findings.md](docs/findings.md).

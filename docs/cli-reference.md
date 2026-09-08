@@ -66,8 +66,13 @@ Any paired device can revoke another or cancel an invite. To revoke the last
 device, provide the recovery key explicitly:
 
 ```bash
-basalt revoke DEVICE_ID --allow-last --recovery-key - < /private/path/recovery.txt
+basalt revoke DEVICE_ID --allow-last --recovery-key 'RECOVERY_KEY'
 ```
+
+Replace `RECOVERY_KEY` with the actual key. Unlike the positional secret inputs
+to `init`, `pair`, and `rotate`, `--recovery-key` accepts a literal value only;
+it does not support `-` or `--key-file`. Avoid recording this command in shell
+history, and be aware that the value is visible in process arguments.
 
 The recovery key can also list devices and cancel invites when no working
 paired device remains. It does not erase a device's local notes or data key.

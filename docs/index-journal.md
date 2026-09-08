@@ -55,9 +55,9 @@ base.
 ## Save
 
 1. Compare current state with the last saved state.
-2. If unchanged, write nothing unless a fresh snapshot is required.
-3. Append the delta and verify the resulting log size.
-4. Snapshot when the policy requires it.
+2. If there is no delta, normally write nothing.
+3. Choose a fresh snapshot when required by recovery or snapshot policy.
+4. Otherwise append the delta and verify the resulting log size.
 
 If either file's stamp changed unexpectedly, report it and write a complete
 snapshot rather than append a delta over an unknown base. This is detection and
