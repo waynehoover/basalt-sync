@@ -106,7 +106,7 @@ async function stateDir(): Promise<string[]> {
   return out.sort();
 }
 
-describe("listing while something else is deleting (C10)", () => {
+describe("listing while something else is deleting", () => {
   it("reports a file deleted between readdir and stat as absent, and the rest as present", async () => {
     await mkdir(join(root, "notes"));
     await writeFile(join(root, "notes", "keep.md"), "kept");
@@ -139,7 +139,7 @@ describe("listing while something else is deleting (C10)", () => {
 });
 
 /**
- * review finding C21. `FileHandle.write` says how much it wrote and may say less
+ * `FileHandle.write` says how much it wrote and may say less
  * than it was given; the count was ignored, so a short write was fsynced and
  * renamed into place as a complete note, or a complete index.
  */
@@ -171,7 +171,7 @@ describe("a write the filesystem cuts short", () => {
 });
 
 /**
- * review finding C14. The config is the only copy of the root secret, and the
+ * The config is the only copy of the root secret, and the
  * first device claims the server the moment after writing it. It goes through
  * the same durable path as a note, and a failure at any step leaves either the
  * previous config or none, never a temporary and never a partial file.
@@ -216,7 +216,7 @@ describe("the config on disk", () => {
 });
 
 /**
- * review finding C18. Several helpers turned every filesystem error into "absent"
+ * Several helpers turned every filesystem error into "absent"
  * or "not the same". A `remove` that could not look at the file reported it
  * gone, a trash name that could not be looked at was taken for free, and a
  * write whose spelling check failed went ahead under an unverified name.
@@ -267,7 +267,7 @@ describe("a filesystem that answers with an error rather than an answer", () => 
 });
 
 /**
- * review finding C19. The directory syncs that make the index safe to save were
+ * The directory syncs that make the index safe to save were
  * forgotten on failure, and only a plain write registered its directory.
  */
 describe("what a flush remembers", () => {
@@ -322,7 +322,7 @@ describe("what a flush remembers", () => {
 });
 
 /**
- * review finding C20. The move across filesystems copied and then removed, and
+ * The move across filesystems copied and then removed, and
  * trusted the copy. Rule 3 says copy, compare, then delete.
  */
 describe("moving a note across filesystems", () => {
@@ -431,7 +431,7 @@ describe("moving a note across filesystems", () => {
 });
 
 /**
- * review finding C22. Any name containing the temp marker vanished from the
+ * Any name containing the temp marker vanished from the
  * listing, while a crash's own temporaries stayed beside notes for ever.
  */
 describe("temporary files, ours and not", () => {

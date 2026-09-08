@@ -51,7 +51,7 @@ async function ready(): Promise<{ client: Client; vault: MemoryVault }> {
   return { client, vault };
 }
 
-describe("restoring onto an occupied path (C8)", () => {
+describe("restoring onto an occupied path", () => {
   it("numbers a second restored copy rather than writing over the first", async () => {
     const { client: c, vault } = await ready();
     await vault.edit("note.md", "the old text\n");
@@ -77,7 +77,7 @@ describe("restoring onto an occupied path (C8)", () => {
   }, 120_000);
 
   /**
-   * review finding C17. The name was checked free and then written to with a
+   * The name was checked free and then written to with a
    * replacing write, so a file appearing in between was replaced by the
    * restore.
    */

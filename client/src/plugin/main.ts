@@ -103,7 +103,7 @@ export type State =
        * Different from `refused` and reported apart from it: a refused file is
        * one that is not syncing and is still where its author left it, and one
        * of these is a note that exists only under a name Obsidian does not
-       * show. Nothing in this plugin used to say so at all (R46, C4).
+       * show. Nothing in this plugin used to say so at all (R46).
        */
       waiting: number;
       /**
@@ -910,7 +910,7 @@ export default class BasaltPlugin extends Plugin {
    * is *awaited*, so the server has answered before this reports a paired
    * vault: a wrong address or a wrong key used to be saved and announced as
    * paired, and the first sign of it was a status bar saying stopped, later
-   * (C39, I13). See `registerAsDevice`.
+   * (I13). See `registerAsDevice`.
    */
   async pair(pairingString: string, device: string): Promise<void> {
     await this.onePairing(async () => {

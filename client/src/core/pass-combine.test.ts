@@ -1,5 +1,5 @@
 /**
- * review finding C35. A sync asked for while a pass was running runs again when it
+ * A sync asked for while a pass was running runs again when it
  * finishes, and the two reports were added field by field. The work counters
  * add; the state counters do not: one file held back by the write debounce in
  * both passes was reported as two waiting, and a settled vault passed over
@@ -39,7 +39,7 @@ function report(over: Partial<SyncReport>): SyncReport {
   };
 }
 
-describe("two passes of one sync, combined (C35)", () => {
+describe("two passes of one sync, combined", () => {
   it("adds what happened and keeps the last word on how the vault looks", () => {
     const first = report({
       uploaded: 2,

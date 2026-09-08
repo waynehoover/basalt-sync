@@ -595,7 +595,7 @@ async function refuseIfPaired(dir: string): Promise<void> {
  * register-then-save, and nothing is written until the row exists: the key was
  * pasted in a moment ago, so there is nothing on this disk yet worth keeping
  * and a key that turns out to be wrong should leave the vault exactly as
- * unpaired as it found it (C39). A crash between the registration and the save
+ * unpaired as it found it. A crash between the registration and the save
  * leaves the same orphan row the invite path leaves, and the same way to see
  * and remove it. See `registerAsDevice`.
  *
@@ -672,7 +672,7 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
  * process, and the invite that carried it is already spent (rule 4). Then the
  * connection, because a pairing that says "paired" without having reached the
  * server is how a wrong address is found out later, from a sync that fails
- * (C39, I13).
+ * (I13).
  */
 async function pairWithInvite(invite: Invite, args: Args, io: Console): Promise<number> {
   const device = deviceNameFor(args);
@@ -1295,7 +1295,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
  *
  * A file that can never sync is not a successful run, whatever else worked,
  * and neither is one still failing when the pass gave up, nor one waiting on
- * a name that is a file here and a folder elsewhere (C33). Exiting zero over
+ * a name that is a file here and a folder elsewhere. Exiting zero over
  * any of those is how a broken vault stays broken quietly in somebody's cron,
  * and it is how a sync that lost its connection half way through once
  * reported that it had finished.
@@ -1723,7 +1723,7 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     io.out(`kept     ${local.stranded.length} version(s) this client could not put back:`);
     // With the reason where there is one. A path on its own says a file is
     // there and not which note it came off or why, which is a person opening
-    // `note.md..basalt-tmp-keep3f9c` to find out (C2).
+    // `note.md..basalt-tmp-keep3f9c` to find out.
     const known = new Map(local.displaced.map((d) => [d.at, d]));
     for (const at of local.stranded) {
       io.out(`  ${join(args.dir, at)}`);

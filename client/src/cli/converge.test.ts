@@ -408,7 +408,7 @@ describe("all four divergences at once, on two real directories", () => {
    * every path before it flushes, and the deletion, the move and the two
    * merges all land in the same pass here, which is where an inbox filled part
    * way through and a delete list built from a stale set of writes have both
-   * gone wrong before (C1, C2).
+   * gone wrong before.
    */
   it("converges, holds every conflict copy on both, and keeps history whole", async () => {
     const { a, b } = await twoDevices();

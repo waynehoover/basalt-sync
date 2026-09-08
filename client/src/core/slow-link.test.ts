@@ -104,7 +104,7 @@ const BIG_UP = 32 * 1024 * 1024;
 const RATE_UP = 4_000_000;
 const TIMEOUT_UP = 3_000;
 
-describe("a large file over a slow link (C4)", () => {
+describe("a large file over a slow link", () => {
   it("arrives, because bodies keep coming even though the whole takes longer than the timeout", async () => {
     server = new TestServer();
     await server.start();
@@ -144,7 +144,7 @@ describe("a large file over a slow link (C4)", () => {
   }, 120_000);
 });
 
-describe("a long backlog over a slow link (C4)", () => {
+describe("a long backlog over a slow link", () => {
   it("is caught up on, because the wait is measured from the last batch", async () => {
     server = new TestServer();
     await server.start();

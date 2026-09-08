@@ -338,12 +338,12 @@ class HidingIndex extends FakeVaultIndex {
 }
 
 /**
- * review finding P2. The plugin's listing comes from Obsidian's index, which
+ * The plugin's listing comes from Obsidian's index, which
  * omits every dot-prefixed path, and the filter on the way in refused only
  * five names. A peer's `.gitignore` was written here, never listed, reported
  * deleted on the next pass, and the peer trashed its only copy.
  */
-describe("a dotfile a headless peer holds (P2)", () => {
+describe("a dotfile a headless peer holds", () => {
   it("is neither written here nor deleted there", async () => {
     await fresh();
     // The headless client lists everything the way NodeVault does.
@@ -431,11 +431,11 @@ describe("two devices with the same name (device-name collision)", () => {
 });
 
 /**
- * review finding C17, through the plugin's adapter. A restore chose its name with
+ * through the plugin's adapter. A restore chose its name with
  * `exists` and then wrote with a replacing write, so a file appearing in the
  * gap was replaced by the restore.
  */
-describe("a restore whose name is taken in the gap (C17)", () => {
+describe("a restore whose name is taken in the gap", () => {
   it("goes under the next free name rather than over what appeared", async () => {
     await fresh();
     const a = await device("a");

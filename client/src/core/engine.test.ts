@@ -305,7 +305,7 @@ async function convergeBoth(a: Device, b: Device, rounds = 5): Promise<void> {
 }
 
 /**
- * C40. The vault's keys come from the data key `ready` carries, and every
+ * The vault's keys come from the data key `ready` carries, and every
  * vault has one. A `ready` without it used to mean "derive your content keys
  * from the root instead", which is a schedule no other device on the vault
  * uses: this device would seal every note under keys nothing else can open,
@@ -316,7 +316,7 @@ async function convergeBoth(a: Device, b: Device, rounds = 5): Promise<void> {
  * A fake socket rather than the real server, because the real server cannot
  * make this mistake and this is about what happens when something does.
  */
-describe("a server that answers ready with no data key (C40)", () => {
+describe("a server that answers ready with no data key", () => {
   it("ends the session and derives nothing", async () => {
     const socket = new FakeSocket();
     const transport = new Transport("ws://test", {
@@ -588,7 +588,7 @@ describe("concurrent edits, which is where notes get lost", () => {
    * B sees a clean download of a version built on its own and takes it over
    * its edit, and nothing anywhere says conflict.
    */
-  it("keeps the other device's edit when it landed mid-pass (C1)", async () => {
+  it("keeps the other device's edit when it landed mid-pass", async () => {
     await fresh();
     const av = new GatedVault();
     const a = await device("a", undefined, av);
@@ -645,7 +645,7 @@ describe("concurrent edits, which is where notes get lost", () => {
  * final fill, but a full inbox is filled part way through the loop, so the
  * writes from that earlier fill were forgotten by the time the deletes ran.
  */
-describe("a case-only rename on a receiving device (C2)", () => {
+describe("a case-only rename on a receiving device", () => {
   async function scenario(others: number): Promise<{ b: Device; report: SyncReport }> {
     await fresh();
     const a = await device("a", undefined, new FoldingVault());
@@ -914,7 +914,7 @@ describe("folders and renames", () => {
    * agree, so the folder never got a synctime and read as one this device had
    * never seen. Removing it then brought it back, every pass.
    */
-  it("does not put back a folder both devices already had (C5)", async () => {
+  it("does not put back a folder both devices already had", async () => {
     await fresh();
     const a = await device("a");
     await a.vault.edit("dir/a.md", "from a\n");
@@ -993,7 +993,7 @@ describe("folders and renames", () => {
    * only the entry it was told about, so each file went over as new at its
    * new path and deleted at its old one.
    */
-  it("carries a folder rename as a rename of everything inside it (P9)", async () => {
+  it("carries a folder rename as a rename of everything inside it", async () => {
     await fresh();
     const a = await device("a");
     const b = await device("b");
@@ -1036,7 +1036,7 @@ describe("folders and renames", () => {
 });
 
 /**
- * review finding C16. Two distinct paths on the server that one disk files as a
+ * Two distinct paths on the server that one disk files as a
  * single name. Writing the second replaced the first, both were recorded as
  * synced, and the next scan reported the first deleted to every device.
  */
@@ -1102,7 +1102,7 @@ describe("two notes the receiving disk cannot hold apart", () => {
 });
 
 /**
- * review finding C41. A path the server holds in a Unicode normal form no
+ * A path the server holds in a Unicode normal form no
  * current client produces, which is every accented name a Mac running a
  * client older than the NFC rule ever uploaded.
  *
@@ -1228,7 +1228,7 @@ describe("one name a peer spells in another normal form", () => {
 });
 
 /**
- * review finding C17. The conflict copy is the only surviving record of one side
+ * The conflict copy is the only surviving record of one side
  * of a divergence, and its name was chosen with `exists` and then written
  * with an ordinary replacing write. A file appearing in between was replaced.
  */
@@ -1313,7 +1313,7 @@ describe("a note edited while the other side of its merge is in flight (F01)", (
   }, 240_000);
 });
 
-describe("a merge against an ancestor that has been purged (C7)", () => {
+describe("a merge against an ancestor that has been purged", () => {
   it("keeps both and says why, rather than blaming the encoding", async () => {
     await fresh();
     const a = await device("a");

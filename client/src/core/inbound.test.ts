@@ -56,13 +56,13 @@ async function accepted(engine: { status(): { pending: number } }, n: number): P
 }
 
 /**
- * review finding C29. A peer wrote a path under a dot folder, which this device
+ * A peer wrote a path under a dot folder, which this device
  * will never list and so would report deleted the moment it wrote it. The
  * vault refused the write, the engine filed the refusal for retry, and the
  * one-shot sync exited 1 on every run for ever, saying the file would be
  * tried again.
  */
-describe("an inbound path that never syncs (C29)", () => {
+describe("an inbound path that never syncs", () => {
   it("is refused at accept as permanent, not retried, and never written", async () => {
     const { engine, socket, vault, keys } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();
@@ -119,13 +119,13 @@ describe("an inbound path that never syncs (C29)", () => {
 });
 
 /**
- * review finding C36. `a//b`, `a/./b` and `a/b/` are not the paths they look
+ * `a//b`, `a/./b` and `a/b/` are not the paths they look
  * like: a filesystem collapses them onto `a/b`, and the engine keyed its
  * whole idea of a file on the string as it arrived. Two spellings of one file
  * are two entries here and one file there, which is the alias problem with a
  * different cause, so a path that is not already canonical is refused.
  */
-describe("a wire path that is not canonical (C36)", () => {
+describe("a wire path that is not canonical", () => {
   it("is refused at accept, by name, and the canonical one beside it is taken", async () => {
     const { engine, socket, vault, keys, logs } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();
@@ -151,12 +151,12 @@ describe("a wire path that is not canonical (C36)", () => {
 });
 
 /**
- * review finding C30. The alias check ran per fill, against the listing taken at
+ * The alias check ran per fill, against the listing taken at
  * the start of the pass, so two paths one disk files as one that arrived in
  * different fills of one pass both landed: the second over the first, and
  * both recorded as synced.
  */
-describe("two aliases of one file arriving in different fills (C30)", () => {
+describe("two aliases of one file arriving in different fills", () => {
   it("refuses the second, because the first has already landed this pass", async () => {
     const { engine, socket, vault, keys } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();
@@ -183,11 +183,11 @@ describe("two aliases of one file arriving in different fills (C30)", () => {
 });
 
 /**
- * review finding C37. Every sealed path ever seen was kept in a map for the life
+ * Every sealed path ever seen was kept in a map for the life
  * of the session, so a device that stayed connected through months of
  * renames and deletions held every name it had ever been told, for nothing.
  */
-describe("the sealed-path cache (C37)", () => {
+describe("the sealed-path cache", () => {
   it("forgets paths that nothing refers to any more", async () => {
     const { engine, socket, vault, keys, logs } = await engineOnFakeSocket();
     const bodies = new Map<string, Uint8Array>();

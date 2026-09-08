@@ -223,7 +223,7 @@ describe("paths from elsewhere", () => {
    * was therefore written, never listed, and reported deleted on the next
    * pass; the peer then deleted its own copy on this device's word.
    */
-  it("refuses a never-synced name at any depth, exactly where list skips it (C3)", async () => {
+  it("refuses a never-synced name at any depth, exactly where list skips it", async () => {
     const v = new NodeVault(root);
     const nested = [
       "notes/.git/hooks/post-checkout",
@@ -265,7 +265,7 @@ describe("paths from elsewhere", () => {
 });
 
 /**
- * review finding C17: a create that is exclusive, so the gap between choosing a
+ * a create that is exclusive, so the gap between choosing a
  * free name and writing to it cannot swallow a file that appeared in it.
  */
 describe("creating a file only if nothing is there", () => {
@@ -299,7 +299,7 @@ describe("creating a file only if nothing is there", () => {
 });
 
 /**
- * review finding C16: the identity the disk gives a name, asked of the disk.
+ * the identity the disk gives a name, asked of the disk.
  */
 describe("what this disk files a name under", () => {
   it("folds Unicode normalisation always, and case as the disk does", async () => {
@@ -978,7 +978,7 @@ describe("a name the disk spells in NFD", () => {
     expect(listed.map((f) => f.path)).toEqual([nfc]);
   });
 
-  it("is renamed on disk to the spelling every other device uses (C44)", async () => {
+  it("is renamed on disk to the spelling every other device uses", async () => {
     // The listing said NFC and the disk went on holding NFD, so a Mac was
     // left as the only device with that spelling and every other device had
     // the other one. Invisible here, where the two reach one file, and two

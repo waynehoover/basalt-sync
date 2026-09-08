@@ -1,7 +1,7 @@
 /**
  * One name, two spellings, on a disk that keeps them apart.
  *
- * review finding C42. A Mac stores `café.md` with a combining accent and every
+ * A Mac stores `café.md` with a combining accent and every
  * other platform with a precomposed one: the two are one name, the vault
  * reports NFC, and reads, writes and the disk itself have to end up agreeing.
  * None of that can be exercised on the machine most of this is written on.
@@ -59,7 +59,7 @@ function vault(): NodeVault {
 }
 
 /**
- * review finding C44. Reporting one spelling while holding another is half a
+ * Reporting one spelling while holding another is half a
  * fix, and the half that is missing loses the vault's whole promise.
  *
  * Shipped in 0.3.3: a Mac created `écombining.md` with a combining acute, this
@@ -262,7 +262,7 @@ describe("a vault holding both spellings", () => {
 });
 
 /**
- * review finding C43. The spellings were learned only by `list`, and the
+ * The spellings were learned only by `list`, and the
  * commands that recover a note never call it: `basalt restore` is its own
  * process, and it went straight to `exists` and a write.
  *
@@ -357,7 +357,7 @@ async function second(name: string): Promise<{ c: Client; dir: string }> {
 }
 
 /**
- * The whole of failure C44, end to end, on the disk that cannot hide it.
+ * The whole of that failure, end to end, on the disk that cannot hide it.
  *
  * This is the shape of the stress suite's "round-trips every one to another
  * device", which is where it was found, run here against the injected normal
@@ -529,7 +529,7 @@ describe("naming two spellings a person cannot tell apart", () => {
 });
 
 /**
- * The same C43 finding, through the command that has it: a restore in its own
+ * The same finding, through the command that has it: a restore in its own
  * process, against a real server, over a disk that keeps the spellings apart.
  *
  * The vault is put back into the disk's own spelling by hand before the

@@ -619,7 +619,7 @@ describe("when things go wrong", () => {
     // mounted-filesystem job, which failed on exactly this line three times in
     // twelve runs while every other job passed it.
     await synced(plugin, 120_000);
-    // Said once, when the refusal first appears (P5), so it is looked for
+    // Said once, when the refusal first appears, so it is looked for
     // rather than provoked again.
     await until(
       "the refusal to be announced",
@@ -628,7 +628,7 @@ describe("when things go wrong", () => {
     );
     await plugin.syncNow();
     // And the refusal did not stop the file that was fine, and the status
-    // says the vault needs a person (P33). One phrase, not three: "stuck",
+    // says the vault needs a person. One phrase, not three: "stuck",
     // "ignored" and "in the way" were three words a person had to learn before
     // the status could be read, and what differs between them is the reason,
     // which the notice above carries.
@@ -1068,11 +1068,11 @@ describe("on a device with no status bar", () => {
   }, 300_000);
 
   /**
-   * review finding P13. A connection that was up and went is network loss, and
+   * A connection that was up and went is network loss, and
    * the origin was demonstrably fine. Advice about it on every offline state
    * sent people to restart a server that had nothing wrong with it.
    */
-  it("says nothing about origins when a working connection is lost (P13)", async () => {
+  it("says nothing about origins when a working connection is lost", async () => {
     await fresh();
     const { plugin } = await load();
     await startVault(plugin, "laptop");
@@ -1208,13 +1208,13 @@ function slowIndexLoad(app: App, ms: number): { began: Promise<void> } {
 }
 
 /**
- * P1 and review finding P12. A run inside `connect()` used to survive `unlink`:
+ *  A run inside `connect` used to survive `unlink`:
  * the shell was handed the client only once the handshake had succeeded, so
  * a vault unlinked during a slow handshake had nothing to close, and the
  * connection went on to complete with the old secret. The two tests this
  * replaces asserted that a counter had moved, which is not the property.
  */
-describe("unlinking during the handshake (P1)", () => {
+describe("unlinking during the handshake", () => {
   it("closes the connecting client, and nothing of the old pairing is written afterwards", async () => {
     await fresh();
     const { sockets, restore } = recordSockets();
@@ -1267,7 +1267,7 @@ describe("unlinking during the handshake (P1)", () => {
     }
   }, 300_000);
 
-  it("unloading during the handshake retires the run and closes it (P1)", async () => {
+  it("unloading during the handshake retires the run and closes it", async () => {
     await fresh();
     const { sockets, restore } = recordSockets();
     try {
@@ -1291,12 +1291,12 @@ describe("unlinking during the handshake (P1)", () => {
 });
 
 /**
- * P15 and review finding P23, the plugin half of C13. Unlink used to discard the
+ *  Unlink used to discard the
  * promise from `close()`, clear the saved config, and then remove the index,
  * so a pass in flight could recreate the index after its removal and an
  * adapter failure left the vault unpaired on disk and paired in memory.
  */
-describe("unlink, in order and all the way (P15)", () => {
+describe("unlink, in order and all the way", () => {
   const INDEX = ".obsidian/plugins/basalt/index.json";
   const STAGED = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
 
@@ -1375,7 +1375,7 @@ describe("unlink, in order and all the way (P15)", () => {
     expect(b.plugin.savedData).toBe(null);
   }, 300_000);
 
-  it("takes the staged index copy too (P23)", async () => {
+  it("takes the staged index copy too", async () => {
     await fresh();
     const { plugin, app } = await load();
     await startVault(plugin, "laptop");
@@ -1432,10 +1432,10 @@ describe("unlink, in order and all the way (P15)", () => {
   }, 300_000);
 
   /**
-   * P26 in TODO-NEW.md. A "working on" timer armed before unlink fired after
+   * A "working on" timer armed before unlink fired after
    * it and painted the bar back to syncing an unpaired vault.
    */
-  it("clears the timers, so nothing paints over unpaired (P26)", async () => {
+  it("clears the timers, so nothing paints over unpaired", async () => {
     await fresh();
     const { plugin } = await load();
     await startVault(plugin, "laptop");
@@ -1448,13 +1448,13 @@ describe("unlink, in order and all the way (P15)", () => {
 });
 
 /**
- * review finding P16, the plugin half of C15. The first device claims the vault
+ * The first device claims the vault
  * with the server's bootstrap token and then drops the token. If the drop
  * never saved, or the claim's reply was lost, the next start offered the
  * spent token first and was refused for ever.
  */
 /**
- * review finding P16, and what protocol 4 leaves of it.
+ * What protocol 4 leaves of it.
  *
  * Starting a vault writes the root to `data.json` and reads it back before the
  * claim goes out, because the claim binds the server to that secret for good
@@ -1464,7 +1464,7 @@ describe("unlink, in order and all the way (P15)", () => {
  * of the answer has to be in what the phone shows, and it is tested for the
  * key itself rather than for advice about it.
  */
-describe("a vault that was started and never joined (P16)", () => {
+describe("a vault that was started and never joined", () => {
   it("stops with the recovery key on screen rather than retrying for ever", async () => {
     await fresh();
     const first = await load();
@@ -1674,11 +1674,11 @@ describe("a vault that was started and never joined (P16)", () => {
 });
 
 /**
- * review finding P3. An unreadable data.json set the state to stopped, but the
+ * An unreadable data.json set the state to stopped, but the
  * panel branched on `paired` and offered the pairing form, and pairing
  * overwrote the file with a new secret.
  */
-describe("a config that cannot be read (P3)", () => {
+describe("a config that cannot be read", () => {
   it("refuses to pair over it, and the panel shows why and where instead of the form", async () => {
     await fresh();
     const unreadable = { url: "ws://x", vaultId: "default", device: "d", secret: "AAAA" };
@@ -1699,11 +1699,11 @@ describe("a config that cannot be read (P3)", () => {
 });
 
 /**
- * review finding P4. "Working on X" stuck after any pass the plugin did not
+ * "Working on X" stuck after any pass the plugin did not
  * start: the ticker and an arriving batch. Every pass now reports through one
  * hook, and the state follows it.
  */
-describe("passes the plugin did not start (P4)", () => {
+describe("passes the plugin did not start", () => {
   it("returns to synced after a slow download that a batch started", async () => {
     await fresh();
     const a = await load();
@@ -1731,10 +1731,10 @@ describe("passes the plugin did not start (P4)", () => {
 });
 
 /**
- * review finding P5. "Cannot sync N file(s)" fired on every pass for a file that
+ * "Cannot sync N file(s)" fired on every pass for a file that
  * would never sync, and a notice on every pass is a notice nobody reads.
  */
-describe("what is announced, and how often (P5)", () => {
+describe("what is announced, and how often", () => {
   it("says a file is stuck once, not on every pass", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1832,10 +1832,10 @@ describe("what is announced, and how often (P5)", () => {
 });
 
 /**
- * review finding P7. `syncNow` could reject with the promise discarded by both
+ * `syncNow` could reject with the promise discarded by both
  * callers, so a pass that threw was a button that did nothing.
  */
-describe("a sync that fails (P7)", () => {
+describe("a sync that fails", () => {
   it("says so, and the state is honest about it", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1863,10 +1863,10 @@ describe("a sync that fails (P7)", () => {
 });
 
 /**
- * review finding P8. "It will sync as soon as it reconnects" was shown while
+ * "It will sync as soon as it reconnects" was shown while
  * stopped, which is the one state in which it will not.
  */
-describe("what is said while stopped (P8)", () => {
+describe("what is said while stopped", () => {
   it("does not promise a reconnection that is not coming", async () => {
     await fresh();
     const first = await load();
@@ -1898,11 +1898,11 @@ describe("what is said while stopped (P8)", () => {
 });
 
 /**
- * review finding P9. A folder rename is one event, for the folder, and every
+ * A folder rename is one event, for the folder, and every
  * path under it moved without a word. Each file inside used to be reported
  * deleted at its old path and new at its new one.
  */
-describe("renaming a folder (P9)", () => {
+describe("renaming a folder", () => {
   it("produces no phantom deletions for the files inside it", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1925,11 +1925,11 @@ describe("renaming a folder (P9)", () => {
 });
 
 /**
- * review finding P10. `basalt:restore` looked at one page of two hundred
+ * `basalt:restore` looked at one page of two hundred
  * versions, so a version older than that was one `basalt:history` would list
  * and this would then say did not exist.
  */
-describe("restoring by uid from the command line (P10)", () => {
+describe("restoring by uid from the command line", () => {
   it("pages back as far as it has to", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1971,11 +1971,11 @@ describe("restoring by uid from the command line (P10)", () => {
 });
 
 /**
- * review finding P11 and P32 in TODO-NEW.md. A pairing string was saved and
+ * md. A pairing string was saved and
  * announced as paired before the server had been reached, and two presses of
  * Pair made two secrets.
  */
-describe("pairing honestly (P11, P32)", () => {
+describe("pairing honestly", () => {
   it("reaches the server before saving a pairing, and saves nothing it could not reach", async () => {
     await fresh();
     const first = await load();
@@ -2028,7 +2028,7 @@ describe("pairing honestly (P11, P32)", () => {
     expect(said).not.toMatch(/syncing/);
   }, 300_000);
 
-  it("runs one pairing at a time (P32)", async () => {
+  it("runs one pairing at a time", async () => {
     await fresh();
     const { plugin } = await load();
     const [a, b] = await Promise.allSettled([startVault(plugin, "one"), startVault(plugin, "two")]);
@@ -2057,10 +2057,10 @@ describe("pairing honestly (P11, P32)", () => {
 });
 
 /**
- * review finding P13. `addStatusBarItem` is declared "not available on mobile"
+ * `addStatusBarItem` is declared "not available on mobile"
  * and was called unguarded.
  */
-describe("on a phone (P13)", () => {
+describe("on a phone", () => {
   it("adds no status bar item and still says everything on the ribbon", async () => {
     await fresh();
     Platform.isMobileApp = true;
@@ -2077,10 +2077,10 @@ describe("on a phone (P13)", () => {
 });
 
 /**
- * review finding P22. Every row was called recoverable, including the ones drawn
+ * Every row was called recoverable, including the ones drawn
  * a few lines down as purged.
  */
-describe("the recovery header (P22)", () => {
+describe("the recovery header", () => {
   const note = (path: string, restorable: number) => ({
     uid: 1,
     path,
@@ -2113,10 +2113,10 @@ describe("the recovery header (P22)", () => {
 });
 
 /**
- * P31 in TODO-NEW.md. A restore that landed on disk and then could not be
+ * A restore that landed on disk and then could not be
  * uploaded was reported as a failure, and a retry made a second copy.
  */
-describe("a restore whose upload fails (P31)", () => {
+describe("a restore whose upload fails", () => {
   it("is reported as restored here and not yet sent", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -2504,10 +2504,10 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
 });
 
 /**
- * P33 in TODO-NEW.md. One permanently refused file showed the same green
+ * One permanently refused file showed the same green
  * check as a clean vault.
  */
-describe("synced, with files that need a person (P33)", () => {
+describe("synced, with files that need a person", () => {
   it("is not the plain check", async () => {
     const { plugin } = await load();
     const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
@@ -2522,11 +2522,11 @@ describe("synced, with files that need a person (P33)", () => {
 });
 
 /**
- * P34 and P35 in TODO-NEW.md. The gap between `exists` and `read`, and the
+ * The gap between `exists` and `read`, and the
  * command-line handlers throwing out of their channel.
  */
-describe("small honesties (P34, P35)", () => {
-  it("reads a note that is gone as nothing, not as a failure (P34)", async () => {
+describe("small honesties", () => {
+  it("reads a note that is gone as nothing, not as a failure", async () => {
     const { plugin, app } = await load();
     const source = plugin.historySource();
     expect(await source.currentText("never.md")).toBeUndefined();
@@ -2546,7 +2546,7 @@ describe("small honesties (P34, P35)", () => {
     await expect(source.currentText("gone.md")).resolves.not.toThrow();
   });
 
-  it("answers the command line in words, whatever happens (P35)", async () => {
+  it("answers the command line in words, whatever happens", async () => {
     await fresh();
     const { plugin } = await load();
     const history = plugin.cliHandlers.get("basalt:history")!.handler;
@@ -2846,7 +2846,7 @@ describe("adding a device from the panel", () => {
   }, 300_000);
 
   it("leaves nothing behind when the recovery key is not the vault's", async () => {
-    // C39, I13. A key the server does not know used to be saved and announced
+    // I13. A key the server does not know used to be saved and announced
     // as paired, and the first sign of it was a status bar saying stopped.
     await fresh();
     const first = await load();

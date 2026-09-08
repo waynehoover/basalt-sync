@@ -266,7 +266,7 @@ describe("the handshake", () => {
   });
 
   /**
-   * C40. Every vault has a data key, so a `ready` without one is not a second
+   * Every vault has a data key, so a `ready` without one is not a second
    * kind of vault: it is a server telling this device to derive its content
    * keys some other way, and the only other way was from the root. A device
    * that accepted it would seal its notes under keys no other device on the
@@ -500,7 +500,7 @@ describe("put, against a server that answers oddly", () => {
 });
 
 /**
- * review finding C11. The ack follows the last body, and a loopback server answers
+ * The ack follows the last body, and a loopback server answers
  * inside the same tick as the send. A waiter installed after the bodies went
  * out found the answer already there, and with no waiter in place a valid
  * acknowledgement read as a reply nobody asked for and closed the connection.
@@ -624,7 +624,7 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
 
   it("does not time out an upload that drains slowly but steadily", async () => {
     // The drain takes several timeouts; every step is progress, and the ack
-    // clock starts only once the last byte has left. C4 and C11 together.
+    // clock starts only once the last byte has left.
     const socket = new DrainingSocket();
     socket.answer = { res: "ack", uid: 9 };
     socket.after = 1;
@@ -755,12 +755,12 @@ describe("errors", () => {
   });
 
   /**
-   * review finding C26. On shutdown the server sends every idle session
+   * On shutdown the server sends every idle session
    * `{res:"err", code:"busy"}` and then closes it. Read as a stray reply this
    * was a protocol violation, so every plugin attached to a restarting server
    * went to "stopped" instead of waiting for it to come back.
    */
-  describe("an error frame nobody asked for (C26)", () => {
+  describe("an error frame nobody asked for", () => {
     async function idle() {
       const socket = new FakeSocket();
       let cause: Error | undefined;
@@ -927,12 +927,12 @@ describe("errors", () => {
 });
 
 /**
- * review finding C31. `connect` waited for the socket to open with no deadline, so
+ * `connect` waited for the socket to open with no deadline, so
  * a server that accepted the TCP connection and never completed the handshake,
  * or a firewall that swallowed it, left the client hanging for as long as the
  * platform cared to wait, and the CLI held the vault's lock for the whole of it.
  */
-describe("a connection that never opens (C31)", () => {
+describe("a connection that never opens", () => {
   it("gives up within the timeout and closes the socket", async () => {
     vi.useFakeTimers();
     try {
@@ -1029,7 +1029,7 @@ describe("bodies", () => {
   });
 
   /**
-   * review finding C34. A fetch was once answered in bare bodies, so
+   * A fetch was once answered in bare bodies, so
    * a body left over from a refused one was consumed as the answer to the
    * next. The `bodies` header removes the class: a fetch is answered by the
    * header and exactly that many frames, or by an error and none, so there
@@ -1077,7 +1077,7 @@ describe("bodies", () => {
 });
 
 /**
- * review finding C24. Success replies were read leniently: a missing or non-numeric
+ * Success replies were read leniently: a missing or non-numeric
  * uid became zero and was committed to the index as a version, and a `want`
  * with a malformed member dropped it and carried on. Every field a reply is
  * acted on has one shape, and anything else ends the session.

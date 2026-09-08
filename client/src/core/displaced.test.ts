@@ -4,7 +4,7 @@
  * The bytes always survived. What did not was the knowledge: a scan could see
  * a parked file and had no way to say which note it came off or why, and the
  * plugin could not see it at all because its displaced versions go into a
- * hidden folder Obsidian does not list (R46, C4).
+ * hidden folder Obsidian does not list (R46).
  *
  * So the properties here are about the record surviving what the note survived:
  * a restart, a torn write, an unreadable log, and a person putting the version

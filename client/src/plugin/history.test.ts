@@ -282,12 +282,12 @@ it("names the note whose history it is showing", async () => {
 });
 
 /**
- * review finding P6. `diffLines` was a set difference of the two line lists, so
+ * `diffLines` was a set difference of the two line lists, so
  * anything a set cannot see, a duplicate removed or two paragraphs swapped,
  * came out as "No difference", and somebody deciding whether to restore was
  * told two versions were the same when they were not.
  */
-describe("the line diff (P6)", () => {
+describe("the line diff", () => {
   it("shows a removed duplicate paragraph", () => {
     const diff = diffLines("a\nb\na\n", "a\nb\n");
     expect(diff).not.toMatch(/No difference/);
@@ -314,11 +314,11 @@ describe("the line diff (P6)", () => {
 });
 
 /**
- * review finding P19. Reading a version is a round trip and two clicks start two.
+ * Reading a version is a round trip and two clicks start two.
  * The one that finished last used to win the pane, so the list said B, Restore
  * restored B, and the text on screen was A.
  */
-describe("selections that finish out of order (P19)", () => {
+describe("selections that finish out of order", () => {
   const version = (uid: number): Version => ({
     uid,
     path: "note.md",

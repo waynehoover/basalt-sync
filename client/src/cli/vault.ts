@@ -1130,7 +1130,7 @@ export class NodeVault implements Vault {
       //
       // And the disk is put into that spelling as well, because reporting one
       // name while holding another leaves this device the only one with the
-      // spelling it invented (C44, `normalizeName`). Where the rename cannot
+      // spelling it invented (`normalizeName`). Where the rename cannot
       // happen the disk's spelling is remembered instead, so reads and writes
       // still land on the file (cli/vault.test.ts, "a name the disk spells in
       // NFD"; cli/vault-spelling.test.ts; cli/normalization.test.ts).

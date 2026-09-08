@@ -350,7 +350,7 @@ export class ObsidianVault implements Vault {
    * `stranded` was never implemented here at all. The headless client answered
    * the question by walking the vault for parked names, which the hidden
    * folder is not, so the Obsidian client -- which is the product -- had no
-   * answer (C4).
+   * answer.
    */
   private readonly ledger: DisplacedLedger;
   /** Refreshed by every scan, for anything that reports. */
@@ -526,7 +526,7 @@ export class ObsidianVault implements Vault {
    * two adapters to one engine cannot disagree about what a vault contains.
    * The divergence was unreachable, because Obsidian normalizes as it indexes,
    * and it was still two shells answering one question two ways
-   * (plugin/vault.test.ts, "two names the plugin cannot hold apart (P20)").
+   * (plugin/vault.test.ts, "two names the plugin cannot hold apart ").
    *
    * Grouped before anything is decided, because a clash cannot be seen one
    * entry at a time and what is done about it applies to the whole group. The
@@ -1044,7 +1044,7 @@ export class ObsidianVault implements Vault {
    * durable ahead of the notes it names (rule 3, in the form the header of
    * core/vault.ts gives it). `DataAdapter` has no way to ask for this, so
    * for a long time the plugin's answer was nothing at all and the ordering
-   * the engine relies on held only by luck (P25).
+   * the engine relies on held only by luck.
    *
    * On desktop the adapter is Electron's `FileSystemAdapter`, the vault is
    * a real directory, and Node's fs is a `require` away: every file written

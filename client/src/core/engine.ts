@@ -246,7 +246,7 @@ export function boundedBy(fromServer: number, own: number): number {
  *
  * Every path that acts on an entry comes through here, and the reason it is
  * one function is that for a while it was two and only one of them existed.
- * The sync path checked every batch entry; recovery did not (C32), so a
+ * The sync path checked every batch entry; recovery did not, so a
  * `history` was shown, a `deleted` list was offered for restore, and the
  * version chosen was fetched and written, all on the server's word. The
  * server holds every sealed path and could name any file; an entry it
@@ -748,7 +748,7 @@ interface Retry {
  * `café.md` under a spelling no other device produces. This device files that
  * note under its NFC name, and remembers the other one so the next upload can
  * say which name it used to have. Without that the upload is a second note
- * with a name nobody can tell from the first (C41).
+ * with a name nobody can tell from the first.
  */
 type Remote = RemoteState & { readonly wire?: string };
 
@@ -1164,9 +1164,9 @@ export class Engine {
       const path = paths[at]!;
       const wire = wires[at]!;
       // A path this device would never list is refused here, once, as a
-      // fact about the path rather than filed for retry (C29): written, it
+      // fact about the path rather than filed for retry: written, it
       // would be invisible to the next scan and reported deleted. A path
-      // that is not in canonical form is refused the same way (C36): a
+      // that is not in canonical form is refused the same way: a
       // filesystem collapses `a//b` onto `a/b`, and the engine keys its
       // whole idea of a file on the string, so two spellings of one file
       // would be two entries here and one file there. Neither ends the
@@ -1558,7 +1558,7 @@ export class Engine {
 
     let action = decide({ local, remote, index: entry, mergeable: this.mergeable(path) });
 
-    // The server still spells this name a way this device does not (C41).
+    // The server still spells this name a way this device does not.
     //
     // Only a vault an older Mac client wrote is in this state: it uploaded
     // `café.md` in NFD, which is the same name as `café.md` and not the same
@@ -1817,7 +1817,7 @@ export class Engine {
         const deletedAt = this.now();
         const facts: PutFacts = {
           // Under the name the server has, where that is not the name this
-          // device uses (C41). A note downloaded from a vault an older Mac
+          // device uses. A note downloaded from a vault an older Mac
           // client wrote is here under its NFC name and there under an NFD
           // one, and until the rename has gone up those are different files
           // to the server: a deletion sent under the NFC name deletes
@@ -2659,7 +2659,7 @@ export class Engine {
    * `localByIdentity` is for the alias check in every later fill of this
    * pass: it was built from the listing at the start and never updated, so a
    * second spelling of a file the first fill had just landed was not "in the
-   * way" of anything and landed over it (C30).
+   * way" of anything and landed over it.
    */
   private landed(path: string): void {
     this.wroteThisPass.push(path);
@@ -3426,7 +3426,7 @@ export class Engine {
       return;
     }
     // `neversync` is a vault refusing to write under a name its shell never
-    // syncs, which no retry changes (C29); the other three are the server's.
+    // syncs, which no retry changes; the other three are the server's.
     const permanent =
       code !== undefined && ["badentry", "badname", "toolarge", "neversync"].includes(code);
 
@@ -3497,7 +3497,7 @@ export class Engine {
       this.remote.delete(path);
     }
 
-    // The sealed-path cache, kept to what the two indexes still name (C37).
+    // The sealed-path cache, kept to what the two indexes still name.
     // It was never pruned, so a device connected through months of renames
     // held every name it had ever been told. Unsealing a path it meets again
     // costs one cipher call, and forgetting one it will not is free.
@@ -3622,7 +3622,7 @@ export class Engine {
  * counters do not: `unchanged`, `waiting`, `retrying`, `skipped`, `ignored`,
  * `blocked` and `inTheWay` describe how the vault looks at the end of a pass,
  * and adding them reported one file held back in two passes as two waiting
- * (C35), and one unchanged file looked at four times as four unchanged. The
+ * , and one unchanged file looked at four times as four unchanged. The
  * newest pass has the last word on those.
  *
  * This is also how a settle adds its passes up, which for a while it did

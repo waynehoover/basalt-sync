@@ -4,7 +4,7 @@ import { configFolderName, foldsTogether, isNeverSynced, spellOut, splitName } f
 
 const none: ReadonlySet<string> = new Set();
 
-describe("what never syncs (P2, C3, T4)", () => {
+describe("what never syncs", () => {
   it("refuses a dot-prefixed segment wherever it sits", () => {
     for (const path of [
       ".obsidian",

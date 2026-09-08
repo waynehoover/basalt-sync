@@ -1129,7 +1129,7 @@ describe("adding a device", () => {
     expect(again.code).toBe(1);
     expect(again.all).toMatch(/not authorised/);
     // Nothing kept, so the next attempt with a fresh invite is the ordinary
-    // path rather than an unlink first (C39).
+    // path rather than an unlink first.
     await expect(stat(join(c, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
     // And the vault gained one device, not two.
     const devices = (await cli("devices", "--dir", a, "--json")).json()["devices"] as unknown[];
@@ -1183,7 +1183,7 @@ describe("adding a device", () => {
     expect(await read(b, "note.md")).toBe("from a\n");
   }, 60_000);
 
-  it("reaches the server before it says paired (C39)", async () => {
+  it("reaches the server before it says paired", async () => {
     await fresh();
     const { recoveryKey } = await startedWithKey();
     const b = await vaultDir("b");
@@ -1208,7 +1208,7 @@ describe("adding a device", () => {
     expect(paired.code).toBe(1);
     expect(paired.all).toMatch(/not authorised/);
     // And nothing is left behind. A key the server does not know has to leave
-    // the vault exactly as unpaired as it found it (C39), or the next attempt
+    // the vault exactly as unpaired as it found it, or the next attempt
     // is refused for being already paired and the person has to unlink first.
     await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({
       code: "ENOENT",
@@ -1585,7 +1585,7 @@ describe("rotating the secret (I5)", () => {
    * token: the first device offered a data key and every device after it
    * offered a claim with none. That left a vault that could be bound without
    * one, whose content was then sealed under the root itself: unrotatable,
-   * and readable only by a device that guessed the same schedule (C40).
+   * and readable only by a device that guessed the same schedule.
    */
   it("offers a data key with every claim, from the first device and the second", async () => {
     await fresh();
@@ -1678,7 +1678,7 @@ describe("a folder this device ignores and another device syncs (R2)", () => {
 });
 
 /**
- * I11, I14, I15, I24 and review finding C33: the smaller CLI contracts.
+ * I11, I14, I15, I24: the smaller CLI contracts.
  */
 describe("what the CLI says about itself and the vault", () => {
   it("prints both cursors on their own lines, and the ignore list (I11, I14)", async () => {
@@ -1746,7 +1746,7 @@ describe("what the CLI says about itself and the vault", () => {
     expect(j.json()["version"]).toBe("development");
   });
 
-  it("exits non-zero for a report with only blocked paths (C33)", async () => {
+  it("exits non-zero for a report with only blocked paths", async () => {
     const { exitCodeFor } = await import("./cli.ts");
     const clean = {
       uploaded: 0,
@@ -1784,7 +1784,7 @@ describe("what the CLI says about itself and the vault", () => {
     expect(exitCodeFor({ ...clean, ignored: 4 })).toBe(0);
   });
 
-  it("exits non-zero when a path is blocked by a name that is a file here and a folder elsewhere (C33)", async () => {
+  it("exits non-zero when a path is blocked by a name that is a file here and a folder elsewhere", async () => {
     await fresh();
     const { a, b } = await twoDevices();
     // A folder called `notes` on a, a file called `notes` on b.

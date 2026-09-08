@@ -4,7 +4,8 @@
 
 Every numbered finding a code comment cites. Code says `(R40)` or `(I29)` where
 a decision came from a review rather than from the design, and this is where the
-number resolves to a sentence.
+number resolves to a sentence. Three schemes that resolved to nothing are gone
+from the code instead; the last section says which and why.
 
 The reviews themselves are gone from the tree. They were eight files and 3,115
 lines of checklists with nothing open in any of them, which is a filing cabinet
@@ -121,29 +122,29 @@ I25 (a WebAssembly codec) and I26 (a maintained diff-match-patch fork).
 - **I30** Let a person turn merging off
 - **I31** Give markup the validity gate that JSON has
 
-## C: the displaced-version ledger
-
-- **C1** A displaced-version ledger in core over a small shell-supplied file interface, in the shape of `JournalFiles`: everything hard above it, one implementation for both shells
-- **C2** Records written when a version is displaced and cleared when it is resolved, carrying the note it came from and the reason
-- **C3** The CLI adapter writes and reads it; the scan reconciles the ledger against the disk rather than replacing it
-- **C4** The plugin adapter implements `stranded` from the same records
-- **C5** `status`, the sync report and the plugin panel all read the ledger, so there is one answer to "what is waiting"
-- **C6** Tests, including across a restart
 
 ## What cannot be resolved, and was not resolvable before either
 
-Code cites 165 distinct finding numbers. 96 of them are above. The other 69 are
-`C0`, `C7`, `C8`, `C10` to `C44`, and `P1` to `P35`, and **those definitions were
-never committed**: they came from review rounds whose documents stayed on the
-reviewer's machine. Deleting the trackers did not orphan them, and searching the
-history will not find them either. The comments carrying those numbers have to
-stand on their own text, which they have done since they were written.
+The `C`, `P` and `T` schemes are not here, and no longer in the code either.
+Their definitions were never committed: they came from review rounds whose
+documents stayed on the reviewer's machine, so about two hundred comments cited
+a number that resolved to nothing and always had. Those citations have been
+removed rather than indexed, and the sentences they sat beside were already
+carrying the meaning.
 
-One trap worth naming, because it nearly went into this index. The deleted
-`TODO.md` had headings reading `## P1: data, recovery, and integrity` and
-`## P2: stabilization and truthful behavior`. Those are priority tiers, not
-findings, and they collide with the `P1` and `P2` that code cites as review
-findings. Resolving a `(P1)` in a comment against that heading would give a
-confident wrong answer, which is worse than the honest one above.
+Two collisions found while trying to index them anyway, both of which would have
+made this file confidently wrong:
+
+- The deleted `READINESS.md` used `C1` to `C6` for a design checklist for the
+  displaced-version ledger, while code used `C1` to `C6` for review findings
+  about landing races, case-only renames and slow links. Same numbers, unrelated
+  subjects.
+- The deleted `TODO.md` had headings `## P1: data, recovery, and integrity` and
+  `## P2: stabilization and truthful behavior`. Those are priority tiers, and
+  they collide with the `P1` and `P2` that code cited as findings.
+
+`C0` and `C1` still appear once in `server/cmd/basaltd/service.go`, where they
+are the Unicode control-character classes and have never had anything to do with
+a review.
 
 Recorded at 9f99b6a.

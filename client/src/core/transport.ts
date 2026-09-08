@@ -22,9 +22,9 @@
  * notification, is what this transport used to do and what request ids
  * removed. Matching a reply to a request by position produced three separate
  * defects here: an acknowledgement arriving from inside the last `send`,
- * before its waiter was armed, read as a reply nobody asked for (C11); a
- * shutdown notice read as a bad reply (C26); and the bodies of a refused fetch
- * consumed as the answer to the next one (C34). Every request now carries an
+ * before its waiter was armed, read as a reply nobody asked for; a
+ * shutdown notice read as a bad reply; and the bodies of a refused fetch
+ * consumed as the answer to the next one. Every request now carries an
  * `id` and every reply echoes it, so a reply is matched to its request by name
  * and a reply with no name is a notification or the reason the connection is
  * closing. docs/protocol.md, "Request ids".
@@ -621,7 +621,7 @@ export class Transport {
   /**
    * Opens the socket, within the timeout.
    *
-   * The open used to have no deadline at all (C31). A server that accepts the
+   * The open used to have no deadline at all. A server that accepts the
    * TCP connection and never completes the handshake, or a firewall that
    * swallows the SYN, left `connect` hanging for as long as the platform
    * cared to wait, and the CLI held the vault's lock for the whole of it.
@@ -918,7 +918,7 @@ export class Transport {
       // sent `busy` and then closed, and a rotation sends every other
       // device `auth`. Read as a stray reply this was a protocol violation,
       // so a server restarting put every plugin into "stopped" when what it
-      // meant was "not now" (C26). Whether a loop retries is the error's
+      // meant was "not now". Whether a loop retries is the error's
       // own `retryable`, which the server set.
       this.die(errorFrom(frame));
       return;
@@ -1353,7 +1353,7 @@ export class Transport {
     const version = reply["serverVersion"];
     const wrapped = reply["wrapped"];
     if (typeof wrapped !== "string" || wrapped === "") {
-      // C40. Every vault has a data key, so an absent one is not a second
+      // Every vault has a data key, so an absent one is not a second
       // kind of vault to accommodate: it is a server saying "derive your
       // content keys some other way", and the only other way was the
       // root-derived schedule. A device that took the hint would seal its
@@ -1463,7 +1463,7 @@ export class Transport {
 
     // The ack answers the same id as the put, so the waiter for it is the
     // one taken out again here, before any body goes out: a loopback server
-    // acks from inside the last send (C11), and a waiter installed after
+    // acks from inside the last send, and a waiter installed after
     // the bodies found the answer already there.
     const id = idOf(reply);
     const ack = this.expectMore(id, "acknowledgement");
@@ -1650,7 +1650,7 @@ export class Transport {
    *
    * A put is answered twice under one id: `want`, then `ack` after the bodies.
    * The slot is taken again *before* the bodies go out, because a loopback
-   * server acks inside the same tick as the last send (C11), and a waiter
+   * server acks inside the same tick as the last send, and a waiter
    * installed afterwards found the answer already there. No timer, because
    * the sending phase has its own: `drained` watches the socket for progress,
    * which is the honest measure of an upload. The clock on the reply itself
@@ -1803,7 +1803,7 @@ export class Transport {
    * frames, or an `err` and no frames; the server refuses the whole fetch if
    * it lacks any of them, so a partial answer is not a case to handle and
    * bodies from a refused fetch can no longer be taken as the answer to the
-   * next one (C34).
+   * next one.
    *
    * Every body is checked against the name it was asked for, here rather than
    * in the caller. Bodies arrive as bare binary frames with nothing but their
@@ -2458,7 +2458,7 @@ function entriesOf(value: unknown, what: string): WireEntry[] {
       throw new ProtocolError("protostate", `${what}[${i}] has no chunks list`);
     }
     // Every name the shape a chunk name has, before anything is fetched by
-    // it (C32). A `get` is held to this already; a recovery list was not.
+    // it. A `get` is held to this already; a recovery list was not.
     for (const name of row.chunks) {
       if (!isChunkName(name)) {
         throw new ProtocolError(

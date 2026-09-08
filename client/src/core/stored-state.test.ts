@@ -1,5 +1,5 @@
 /**
- * review finding C23. Both index stores handed back any valid JSON, and the engine
+ * Both index stores handed back any valid JSON, and the engine
  * spread it into state through casts. What follows is the corpus of shapes
  * that used to be accepted and are now refused, each with the field named.
  */
@@ -120,7 +120,7 @@ export const corpus: [string, (s: Record<string, unknown>) => unknown, RegExp][]
   ],
 ];
 
-describe("what a saved index must look like (C23)", () => {
+describe("what a saved index must look like", () => {
   it("accepts a complete, correct index, and nothing at all", () => {
     expect(validateStoredState(good())).toEqual(good());
     expect(validateStoredState(undefined)).toBeUndefined();

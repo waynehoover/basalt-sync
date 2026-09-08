@@ -73,7 +73,7 @@ class SlowWriteVault extends MemoryVault {
   }
 }
 
-describe("a connection that ends while a pass is running (C6)", () => {
+describe("a connection that ends while a pass is running", () => {
   /**
    * `runUntilClosed` resolved the moment the transport closed, while a pass
    * started by a batch arriving could still be writing the vault and the
@@ -124,7 +124,7 @@ describe("a connection that ends while a pass is running (C6)", () => {
   }, 120_000);
 });
 
-describe("a settle that is between passes when the client closes (C6)", () => {
+describe("a settle that is between passes when the client closes", () => {
   /**
    * `settle` sleeps between passes, outside the serial queue. `close` drained
    * an idle queue and resolved, and the next pass then ran against the closed
@@ -240,13 +240,13 @@ describe("what a shell is handed and when", () => {
 });
 
 /**
- * I2 and review finding C27. `busy` used to be in the loop's fatal list, so a
+ * I2 and `busy` used to be in the loop's fatal list, so a
  * device refused for the device limit, or told the server was shutting down,
  * stopped for good. The server now says on every error whether reconnecting
  * can help, and the loop has nothing to interpret: retryable goes to backoff,
  * anything else stops it. The hint that travels with busy lengthens the wait.
  */
-describe("what the loop does with a refusal (I2, C27)", () => {
+describe("what the loop does with a refusal (I2)", () => {
   it("retries a busy and stops on an auth, by the server's word rather than a list", async () => {
     const { isFatal, retryWait } = await import("./client.ts");
     const { ProtocolError } = await import("./transport.ts");

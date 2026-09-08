@@ -1,7 +1,7 @@
 /**
  * The vault's state directory under contention and under failure.
  *
- * C12 and review finding C13. Two processes on one vault each loaded the index,
+ *  Two processes on one vault each loaded the index,
  * decided from it, and wrote notes, config and index over each other from
  * state the other never saw; and an unlink removed the config before the
  * index, so a failure in between left a vault that read as unpaired while an
@@ -398,7 +398,7 @@ describe("a version the client could not put back", () => {
   }, 120_000);
 });
 
-describe("the vault lock (C12)", () => {
+describe("the vault lock", () => {
   it("refuses a second holder and names the first", async () => {
     const dir = await vaultDir("lock");
     const release = await lockVault(dir, "basalt sync");
@@ -913,7 +913,7 @@ describe("restore, on a vault that cannot say what is waiting", () => {
   }, 120_000);
 });
 
-describe("unlinking as one transition (C13)", () => {
+describe("unlinking as one transition", () => {
   it("removes the index before the config, and leaves the vault paired if it cannot", async () => {
     const dir = await paired("unlink");
     await writeFile(join(dir, "note.md"), "a note\n");
@@ -970,10 +970,10 @@ describe("unlinking as one transition (C13)", () => {
 });
 
 /**
- * review finding C23, at the CLI. The index on disk is valid JSON and nothing
+ * at the CLI. The index on disk is valid JSON and nothing
  * else, and both `sync` and `status` used to read numbers out of it.
  */
-describe("an index that is valid JSON and wrong (C23)", () => {
+describe("an index that is valid JSON and wrong", () => {
   it("is refused by sync and status alike, with the field named", async () => {
     const dir = await paired("badindex");
     expect((await cli("sync", "--dir", dir)).code).toBe(0);
@@ -991,7 +991,7 @@ describe("an index that is valid JSON and wrong (C23)", () => {
 });
 
 /**
- * review finding C15, at the place protocol 4 leaves it.
+ * at the place protocol 4 leaves it.
  *
  * A vault is claimed by the hello that starts it, and the config holding the
  * root is written and read back before that hello goes out for exactly this
@@ -1007,7 +1007,7 @@ describe("an index that is valid JSON and wrong (C23)", () => {
  * failure this project has, so it is tested end to end rather than by the
  * words of the refusal alone.
  */
-describe("a vault that was started and never joined (C15)", () => {
+describe("a vault that was started and never joined", () => {
   /**
    * Puts a vault back into the state a lost reply leaves: claimed on the
    * server, and a config on disk that still holds the root and has no device

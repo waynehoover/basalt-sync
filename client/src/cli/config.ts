@@ -118,7 +118,7 @@ export async function removeState(vault: string): Promise<string | undefined> {
   const first = await removeIndex(vault);
   await rm(configPath(vault), { force: true });
   await mustBeGone(configPath(vault), "the config");
-  // Synced, so the removal is as durable as the writes were (C38). Without
+  // Synced, so the removal is as durable as the writes were. Without
   // this a power cut after unlink could bring the config back, and with it
   // a vault that reads as paired to a server it was told to forget.
   //

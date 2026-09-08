@@ -666,7 +666,7 @@ describe("writing a name that differs only by case", () => {
 });
 
 /**
- * review finding P17. The adapter's own write truncates the destination and then
+ * The adapter's own write truncates the destination and then
  * fills it, read out of the shipped bundle, so a note used to be able to end up
  * empty with no copy of the old bytes or the new. Every failure below is one a
  * full disk or a killed process produces, and after each the note is either
@@ -678,7 +678,7 @@ const isStaging = (path: string, note = "note.md") =>
 /** The staging copies present, by name. */
 const stagingCopies = (a: FakeAdapter) => a.filePaths().filter((p) => p.includes(".basalt-tmp-"));
 
-describe("landing a note without a moment where it is half written (P17)", () => {
+describe("landing a note without a moment where it is half written", () => {
   const times = { mtime: 1000, ctime: 1000 };
 
   it("a new note arrives by rename, never by a write at its own path", async () => {
@@ -765,12 +765,12 @@ describe("landing a note without a moment where it is half written (P17)", () =>
 });
 
 /**
- * review finding C17, the adapter half. `exists` and then `write` is a gap, and a
+ * `exists` and then `write` is a gap, and a
  * conflict copy or a restore landing in it replaced whatever appeared there.
  * The claim has to be exclusive, and `rename` refusing an occupied destination
  * is what makes it so.
  */
-describe("creating a file only where nothing is (C17)", () => {
+describe("creating a file only where nothing is", () => {
   const times = { mtime: 1000, ctime: 1000 };
 
   it("writes where nothing is, and refuses where something is", async () => {
@@ -801,7 +801,7 @@ describe("creating a file only where nothing is (C17)", () => {
 });
 
 /**
- * P20 and review finding C16. Two raw names in Obsidian's index that normalize
+ *  Two raw names in Obsidian's index that normalize
  * to one path used to be one entry in the map, the second winning silently.
  *
  * That was fixed by throwing out of `list`, and throwing was the wrong half of
@@ -827,7 +827,7 @@ const NBSP = "a\u00A0b.md";
 const NFC = "caf\u00E9.md";
 const NFD = "cafe\u0301.md";
 
-describe("two names the plugin cannot hold apart (P20)", () => {
+describe("two names the plugin cannot hold apart", () => {
   it("names the pair rather than refusing the whole vault", async () => {
     adapter.seed(NBSP, "nbsp");
     adapter.seed(SPACE, "space");
@@ -904,11 +904,11 @@ describe("two names the plugin cannot hold apart (P20)", () => {
 });
 
 /**
- * review finding P21. `matchCase` used to shrug at a listing that failed and write
+ * `matchCase` used to shrug at a listing that failed and write
  * under a spelling nothing had checked, leaving the old spelling on disk while
  * the engine recorded the new one as synced.
  */
-describe("a spelling check that cannot be made (P21)", () => {
+describe("a spelling check that cannot be made", () => {
   it("fails the write and leaves the note alone, then succeeds once it can", async () => {
     const folding = foldingAdapter();
     const v = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
@@ -930,11 +930,11 @@ describe("a spelling check that cannot be made (P21)", () => {
 });
 
 /**
- * review finding P18. The index is written with the same truncating write as a
+ * The index is written with the same truncating write as a
  * note, and an index cut short is not JSON, and an index that is not JSON stops
  * the plugin on every load. A vault whose notes were all fine sat behind it.
  */
-describe("the index, interrupted (P18)", () => {
+describe("the index, interrupted", () => {
   const INDEX = ".obsidian/plugins/basalt/index.json";
   const TEMP = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
   const LOG = ".obsidian/plugins/basalt/index.log";
@@ -1060,11 +1060,11 @@ describe("the index, interrupted (P18)", () => {
 });
 
 /**
- * P28 in TODO-NEW.md. A ranged read that came back short was handed on as if
+ * A ranged read that came back short was handed on as if
  * it were the range, sealed as a chunk it was not, and refused much later by
  * name.
  */
-describe("a ranged read that comes back short (P28)", () => {
+describe("a ranged read that comes back short", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = realFetch;
@@ -1084,11 +1084,11 @@ describe("a ranged read that comes back short (P28)", () => {
 });
 
 /**
- * P29 in TODO-NEW.md. Above a few megabytes the read-back used to trust the
+ * Above a few megabytes the read-back used to trust the
  * length alone, so a staged copy of the right size and the wrong bytes would
  * have become the note.
  */
-describe("a large staged copy with the right length and the wrong bytes (P29)", () => {
+describe("a large staged copy with the right length and the wrong bytes", () => {
   it("is caught by reading every byte back", async () => {
     const big = new Uint8Array(5 * 1024 * 1024);
     for (let i = 0; i < big.length; i += 4096) big[i] = i & 0xff;
@@ -1109,11 +1109,11 @@ describe("a large staged copy with the right length and the wrong bytes (P29)", 
 });
 
 /**
- * P30 in TODO-NEW.md. A staging copy under a fixed name was a name a person
+ * A staging copy under a fixed name was a name a person
  * could have given a real dotfile, which no listing shows and a sync of the
  * note beside it would have overwritten.
  */
-describe("a dotfile of the user's where a staging copy would go (P30)", () => {
+describe("a dotfile of the user's where a staging copy would go", () => {
   it("is never written over", async () => {
     // Every name the staging could pick is taken by a file of the user's:
     // pin the random part so the collision is certain rather than lucky.
@@ -1136,7 +1136,7 @@ describe("a dotfile of the user's where a staging copy would go (P30)", () => {
 });
 
 /**
- * review finding P25. The engine saves the index after `flush`, so the index is
+ * The engine saves the index after `flush`, so the index is
  * never durable ahead of the notes it names, and the plugin's vault had no
  * `flush` at all: on desktop the adapter's writes reached the disk when the
  * operating system felt like it, and the index could be durable first. On
@@ -1186,7 +1186,7 @@ function recordingFs(failDirs = false) {
   return { fs, synced, open };
 }
 
-describe("making a pass durable on desktop (P25)", () => {
+describe("making a pass durable on desktop", () => {
   it("fsyncs every file written this pass and the directories their entries changed in", async () => {
     const desktop = new DesktopAdapter();
     const { fs, synced, open } = recordingFs();

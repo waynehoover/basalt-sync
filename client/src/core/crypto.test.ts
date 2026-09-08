@@ -477,7 +477,7 @@ describe("the data key", () => {
   });
 
   /**
-   * The property the whole indirection exists for, and the one C40 could
+   * The property the whole indirection exists for, and the one a bare `ready` could
    * break: what seals a note is the data key, so two devices that hold
    * different roots but the same data key agree about every byte. A device
    * that fell back to a root-derived schedule would disagree with both while

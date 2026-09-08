@@ -1,5 +1,5 @@
 /**
- * review finding C32. Recovery read entries the server handed back and acted on
+ * Recovery read entries the server handed back and acted on
  * them: a `history` list was shown, a `deleted` list was offered for restore,
  * and a `get` answered with a chunk list that was assembled and written into
  * the vault. None of it was checked against the vault's key. The ordinary
@@ -86,7 +86,7 @@ async function sent(socket: FakeSocket, op: string): Promise<void> {
   throw new Error(`no ${op} was sent`);
 }
 
-describe("recovery against a server that answers with entries nobody wrote (C32)", () => {
+describe("recovery against a server that answers with entries nobody wrote", () => {
   it("refuses a history list holding a version this vault's key did not sign", async () => {
     const { socket, keys, client } = await rig();
     const good = await version(keys, 3, "note.md", "three");

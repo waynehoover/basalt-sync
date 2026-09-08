@@ -595,7 +595,7 @@ export class Client {
    * Refuses a recovery list holding an entry this vault's key did not sign.
    *
    * The same check the sync path runs on every batch entry, which for a while
-   * recovery did not run at all (C32); `mustBeOurs` in the engine holds the
+   * recovery did not run at all; `mustBeOurs` in the engine holds the
    * reason. What is added here is the tail of the sentence: nothing forged is
    * acted on, and nothing forged is put in front of somebody either.
    *
@@ -713,7 +713,7 @@ export class Client {
     // Queued like a pass, because reassembling a version is several
     // requests and a sync starting in the middle of them would collide. The
     // chunk list the signed history entry named is what `get` must answer
-    // with; anything else is not this version (C32).
+    // with; anything else is not this version.
     const content = await this.serial(() =>
       this.engine.contentOf(version.uid, version.contentId, version.size),
     );
@@ -1068,7 +1068,7 @@ export interface ForeverHooks {
  *
  * A batch the engine cannot apply ends the session, the loop reconnects, the
  * server sends the same batch, and round it goes for ever with nothing said
- * (C28). Three identical failures in a row are not a network; they are a
+ * . Three identical failures in a row are not a network; they are a
  * wall, and the person is told where it is.
  */
 export const IDENTICAL_FAILURES_BEFORE_STOPPING = 3;
@@ -1171,7 +1171,7 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
     // The same failure, word for word, on consecutive connections is not a
     // network coming and going; it is something the server sends every time
     // and this device cannot take, and retrying it is a loop that never ends
-    // and never tells anybody why (C28). A dropped connection is excused,
+    // and never tells anybody why. A dropped connection is excused,
     // because that is what a network does, and so is a refusal the server
     // marked retryable, because `busy` on a full vault is the same words
     // every time and is still meant to be waited out. What is left is this
@@ -1211,7 +1211,7 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
  * treating it as fatal would stop a loop that was asked to stop anyway. A
  * refusal the server marked as not retryable will be repeated word for word
  * forever; one it marked retryable, `busy` on a restart above all, is the
- * connection ending for a reason a retry outlives (C27).
+ * connection ending for a reason a retry outlives.
  */
 export function isFatal(cause: Error): boolean {
   return cause instanceof ProtocolError && cause.fatal;
@@ -1486,7 +1486,7 @@ export interface JoiningVault {
  * config can be in that some later command has to recognise and finish.
  *
  * The first two crash points are walked against a real server in
- * cli/state.test.ts, "a vault that was started and never joined (C15)": the
+ * cli/state.test.ts, "a vault that was started and never joined ": the
  * refusal that hands the recovery key back and pairs again with it, notes and
  * all, and the row a failed save leaves for `basalt revoke` to take.
  */

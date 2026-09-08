@@ -80,7 +80,7 @@ describe("the headless client refuses to write where it would never read", () =>
   });
 
   /**
-   * review finding T4: the contract is that any dot-prefixed segment never syncs,
+   * the contract is that any dot-prefixed segment never syncs,
    * in either direction, in both clients. Obsidian's own index never lists
    * one, so a headless client that accepted `.obsidian-notes/n.md` from a
    * peer would hold a file it could never report, and report it deleted.
@@ -117,7 +117,7 @@ describe("the plugin refuses the same paths", () => {
  * A name beginning with two dots is not an escape, and containment must not
  * call it one: the refusal it gets is the dot rule's, which is a different
  * reason with a different message, and the distinction is what tells a person
- * whether a peer is misbehaving or a file simply does not sync (T4).
+ * whether a peer is misbehaving or a file simply does not sync.
  */
 describe("what containment should and should not refuse", () => {
   it("refuses real escapes", async () => {

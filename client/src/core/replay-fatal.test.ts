@@ -1,5 +1,5 @@
 /**
- * review finding C28. A batch the engine cannot apply, an entry that fails its
+ * A batch the engine cannot apply, an entry that fails its
  * authenticator above all, threw out of `acceptBatch`, which ended the
  * session, which the loop read as a dropped connection and retried. The
  * server sent the same batch, the engine threw the same error, and the loop
@@ -15,7 +15,7 @@ import { TEST_DATA_KEY, testKeys } from "./test-keys.ts";
 import { FakeSocket, RIG_SECRET, ready } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
-describe("a batch no reconnection can get past (C28)", () => {
+describe("a batch no reconnection can get past", () => {
   it("stops after three identical failures, naming the cursor and the entry", async () => {
     const keys = await testKeys(RIG_SECRET);
     const forged = {

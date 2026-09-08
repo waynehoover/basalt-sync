@@ -777,7 +777,7 @@ export async function plainDigest(bytes: Uint8Array): Promise<string> {
  *
  * Beside the function that makes one, because the shape is that function's
  * output and nothing else. Three readers check it: a `get`, a recovery list
- * (C32) and the stored index. Each one is about to fetch by the name or key
+ * and the stored index. Each one is about to fetch by the name or key
  * something on it, and each had the pattern written out again.
  */
 export function isChunkName(v: unknown): v is string {

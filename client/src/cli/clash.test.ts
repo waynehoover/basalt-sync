@@ -363,7 +363,7 @@ describe("a folder reorganised while a device was away", () => {
  * deleted on the next pass, and the device that had it deleted its own copy on
  * the word of one that never listed it.
  */
-describe("a never-synced name nested inside an ordinary folder (C3, P2)", () => {
+describe("a never-synced name nested inside an ordinary folder", () => {
   async function memoryDevice(name: string): Promise<{ c: Client; vault: MemoryVault }> {
     const vault = new MemoryVault();
     const c = new Client({

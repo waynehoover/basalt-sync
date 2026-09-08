@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Every doc comment sits on the thing it names (P3, third review round).
+# Every doc comment sits on the thing it names.
 #
 # A declaration inserted between a doc comment and its function leaves the
 # paragraph documenting something else and the function undocumented, and the

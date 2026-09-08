@@ -2,7 +2,7 @@
  * A rename the host reported, and everything the engine has to do with it.
  *
  * Obsidian is the only vault that can report a rename, and until the plugin
- * wired it up nothing exercised this path at all. P24 and P27 in TODO-NEW.md.
+ * wired it up nothing exercised this path at all.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -82,7 +82,7 @@ class SlowReadVault extends MemoryVault {
   }
 }
 
-describe("what a rename moves (P27)", () => {
+describe("what a rename moves", () => {
   it("moves the retry clock and the write-off with the entry, and leaves the server's word where it is", async () => {
     server = new TestServer();
     await server.start();
@@ -137,7 +137,7 @@ describe("what a rename moves (P27)", () => {
   }, 120_000);
 });
 
-describe("a rename reported while a pass is running (P24)", () => {
+describe("a rename reported while a pass is running", () => {
   it("lands between passes, not between one pass's awaits", async () => {
     server = new TestServer();
     await server.start();

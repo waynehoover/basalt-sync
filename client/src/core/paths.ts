@@ -115,7 +115,7 @@ function numbered(base: string): (n: number) => string {
  * the bytes differ. Both vaults report NFC and normalise what they are handed,
  * so NFC is the one keyspace there is; a path off the wire spelled otherwise
  * has to join it before it is used as an identity, or a device holds one file
- * and believes in two (C41).
+ * and believes in two.
  *
  * Here rather than in the engine because both shells need the same answer: the
  * engine folds what arrives, and the headless vault folds what the disk hands
@@ -183,7 +183,7 @@ export function spellOut(name: string): string {
  *
  * The engine classifies a failure by its code and had none for this one, so
  * an inbound path under a folder this device ignores was filed for retry and
- * retried on every pass for ever, each time exiting 1 (C29). The code says
+ * retried on every pass for ever, each time exiting 1. The code says
  * it is a fact about the path.
  *
  * Here rather than in each shell because the string is the interface: the

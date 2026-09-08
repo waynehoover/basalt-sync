@@ -167,7 +167,7 @@ describe("one name spelled NFD on one disk and NFC on another", () => {
     await mac.c.settle();
     // And after the first listing it has it under the spelling every other
     // device uses, because a vault that reports one name and holds another is
-    // a vault two devices do not agree about (C44).
+    // a vault two devices do not agree about.
     expect(await readdir(mac.dir).then((n) => n.filter((f) => !f.startsWith(".")))).toEqual([NFC]);
     await other.c.settle();
     expect(other.vault.paths(), "the other device got the Mac's spelling").toEqual([NFC]);
@@ -190,7 +190,7 @@ describe("one name spelled NFD on one disk and NFC on another", () => {
 });
 
 /**
- * review finding C41. The same name, already on the server in the spelling an
+ * The same name, already on the server in the spelling an
  * older Mac client uploaded, and a device pairing into that vault now.
  *
  * Measured before the fold: the device wrote the note under its NFC name,

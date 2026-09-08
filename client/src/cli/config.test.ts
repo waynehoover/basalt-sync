@@ -1,5 +1,5 @@
 /**
- * review finding C38. `removeState` removed the index and the config and proved
+ * `removeState` removed the index and the config and proved
  * both gone, and did not sync the directory they were in, so a power cut right
  * after an unlink could bring the config back: a vault that reads as paired to
  * a server it was told to forget, with a fresh index built against it on the
@@ -61,7 +61,7 @@ async function paired(): Promise<string> {
   return dir;
 }
 
-describe("forgetting a pairing, durably (C38)", () => {
+describe("forgetting a pairing, durably", () => {
   it("syncs the state directory after removing the config", async () => {
     const dir = await paired();
     synced.length = 0;

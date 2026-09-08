@@ -12,7 +12,7 @@
  *   - a disk returning EIO in the middle of making an unlink durable. The
  *     config can come back after a power cut, and with it a vault that reads
  *     as paired to a server it was told to forget, which is precisely what
- *     C38 added the flush to prevent.
+ *     the flush added to prevent.
  *
  * Both were silence. The second one is now said out loud, and it is said rather
  * than thrown, because by the time the flush runs the files are already gone
