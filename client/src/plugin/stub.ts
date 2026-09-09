@@ -479,6 +479,34 @@ export class TextComponent {
   }
 }
 
+export class DropdownComponent {
+  readonly selectEl = new FakeEl("select");
+  readonly options = new Map<string, string>();
+  private value = "";
+  private change: ((value: string) => unknown) | undefined;
+
+  addOption(value: string, label: string): this {
+    this.options.set(value, label);
+    return this;
+  }
+  setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
+  getValue(): string {
+    return this.value;
+  }
+  onChange(callback: (value: string) => unknown): this {
+    this.change = callback;
+    return this;
+  }
+  choose(value: string): void {
+    if (!this.options.has(value)) throw new Error("Unknown dropdown option");
+    this.value = value;
+    this.change?.(value);
+  }
+}
+
 export class ButtonComponent {
   readonly buttonEl = new FakeEl("button");
   disabled = false;
@@ -529,6 +557,7 @@ export class Setting {
   name = "";
   desc = "";
   readonly texts: TextComponent[] = [];
+  readonly dropdowns: DropdownComponent[] = [];
   readonly buttons: ButtonComponent[] = [];
   readonly settingEl = new FakeEl("div", "setting-item");
   /**
@@ -578,6 +607,13 @@ export class Setting {
   addText(cb: (component: TextComponent) => unknown): this {
     const component = new TextComponent();
     this.texts.push(component);
+    cb(component);
+    return this;
+  }
+
+  addDropdown(cb: (component: DropdownComponent) => unknown): this {
+    const component = new DropdownComponent();
+    this.dropdowns.push(component);
     cb(component);
     return this;
   }

@@ -168,7 +168,7 @@ export default class Screenshots extends Plugin {
           : this.platformClasses.get(cls),
       );
     }
-    this.model = this.makeModel(!["pairing", "join", "setup"].includes(name));
+    this.model = this.makeModel(!["pairing", "join", "join-combine", "setup"].includes(name));
     paintStatus(this.status, this.makeModel().currentState);
     this.backdrop.style.display = name === "status" ? "none" : "";
     this.window.setMinimumSize(320, 480);
@@ -223,11 +223,16 @@ export default class Screenshots extends Plugin {
       button.click();
       return button;
     };
-    if (name === "join") press("Paste an invite");
+    if (name === "join" || name === "join-combine") press("Paste an invite");
+    if (name === "join-combine") {
+      const select = content.querySelector("select");
+      select.value = "combine";
+      select.dispatchEvent(new select.ownerDocument.defaultView.Event("change", { bubbles: true }));
+    }
     if (name === "setup") press("Use a setup line");
-    if (name === "join" || name === "setup") {
+    if (name === "join" || name === "join-combine" || name === "setup") {
       const field = content.querySelector("input");
-      field.value = name === "join" ? "Phone" : "MacBook";
+      field.value = name.startsWith("join") ? "Phone" : "MacBook";
       field.dispatchEvent(new field.ownerDocument.defaultView.Event("input", { bubbles: true }));
     }
     if (name === "invite") {
@@ -326,6 +331,16 @@ export default class Screenshots extends Plugin {
       if (!row.getBoundingClientRect().height) continue;
       const info = row.querySelector(".setting-item-info");
       const input = row.querySelector("input");
+      const select = row.querySelector("select");
+      if (select) {
+        const bounds = select.getBoundingClientRect();
+        if (
+          bounds.height < 44 ||
+          bounds.width < 200 ||
+          bounds.right > host.getBoundingClientRect().right + 1
+        )
+          throw new Error("Phone first-sync choice is too small or clipped");
+      }
       const buttons = [...row.querySelectorAll("button")];
       for (const button of buttons) {
         const b = button.getBoundingClientRect();

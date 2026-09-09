@@ -160,6 +160,12 @@ export function outlineOf(root: FakeEl, rows = rowIndex(), depth = 0): string {
       const value = t.getValue() ? ` value: ${t.getValue()}` : "";
       say("input   ", `placeholder: ${t.placeholder}${value}`);
     }
+    for (const d of row.dropdowns) {
+      say(
+        "select  ",
+        `${d.options.get(d.getValue())}; choices: ${[...d.options.values()].join(" / ")}`,
+      );
+    }
     for (const b of row.buttons) {
       if (b.buttonEl.hidden) continue;
       const marks = [b.cta ? "cta" : "", b.warning ? "warning" : ""].filter(Boolean).join(" ");
@@ -382,6 +388,15 @@ export async function walkPanelStates(
   loaded.push(nobody);
   openPanel(nobody);
   shots.push(shotOfOpenPanel("unpaired", "A fresh install, before anything is paired."));
+  await built
+    .flatMap((s) => s.buttons)
+    .find((b) => b.label === "Paste an invite")!
+    .click();
+  shots.push(shotOfOpenPanel("join-download", "Joining defaults to an empty local vault."));
+  built.find((s) => s.name === "First sync")!.dropdowns[0]!.choose("combine");
+  shots.push(
+    shotOfOpenPanel("join-combine", "Combining existing local files is an explicit setup choice."),
+  );
   closePanel();
 
   // A config that cannot be read. Deliberately shows no pairing form: pairing

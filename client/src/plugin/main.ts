@@ -62,6 +62,7 @@ import { ProtocolError } from "../core/transport.ts";
 import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
+import { checkFirstSync, type FirstSync } from "./first-sync.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
 export type State =
@@ -1027,22 +1028,29 @@ export default class BasaltPlugin extends Plugin {
    * paired, and the first sign of it was a status bar saying stopped, later
    * (I13). See `registerAsDevice`.
    */
-  async pair(pairingString: string, device: string): Promise<void> {
+  async pair(
+    pairingString: string,
+    device: string,
+    firstSync: FirstSync = "download",
+  ): Promise<void> {
     await this.onePairing(async () => {
       const name = deviceName(device);
-      if (isInvite(pairingString))
-        return await this.pairWithInvite(parseInvite(pairingString), name);
-      const pairing = parsePairing(pairingString);
       const mine = this.generation;
+      const invite = isInvite(pairingString) ? parseInvite(pairingString) : undefined;
+      const pairing = invite === undefined ? parsePairing(pairingString) : undefined;
+      await checkFirstSync(this.app.vault.adapter, this.app.vault.configDir, firstSync);
+      if (mine !== this.generation)
+        throw new Error("Pairing was cancelled while checking local files.");
+      if (invite !== undefined) return await this.pairWithInvite(invite, name);
       let registered = false;
       let paired: DeviceConfig;
       try {
         paired = await registerAsDevice(
           {
-            url: pairing.url,
-            vaultId: pairing.vaultId,
+            url: pairing!.url,
+            vaultId: pairing!.vaultId,
             device: name,
-            secret: pairing.secret,
+            secret: pairing!.secret,
           },
           (next) => this.saveDuringRun(mine, next),
           {
@@ -3021,6 +3029,26 @@ class BasaltPanel {
     );
 
     if (this.joining === "invite") {
+      let firstSync: FirstSync = "download";
+      const firstSyncRow = row(
+        contentEl,
+        "First sync",
+        "Download your notes into an empty vault. After setup, changes sync both ways.",
+      );
+      firstSyncRow.addDropdown((d) =>
+        d
+          .addOption("download", "Download server vault")
+          .addOption("combine", "Combine local files")
+          .setValue(firstSync)
+          .onChange((value) => {
+            firstSync = value === "combine" ? "combine" : "download";
+            firstSyncRow.setDesc(
+              firstSync === "download"
+                ? "Download your notes into an empty vault. After setup, changes sync both ways."
+                : "Upload existing local files too. Old copies can bring back files moved or deleted elsewhere.",
+            );
+          }),
+      );
       let pairingField: TextComponent | undefined;
       row(
         contentEl,
@@ -3040,7 +3068,7 @@ class BasaltPanel {
             .setCta()
             .onClick(async () => {
               try {
-                await this.plugin.pair(pairingField?.getValue() ?? "", device());
+                await this.plugin.pair(pairingField?.getValue() ?? "", device(), firstSync);
                 // Reached the server, so this is true. It is syncing only
                 // once the loop says so, and the panel follows the loop.
                 new Notice("Paired. Basalt is connecting.");

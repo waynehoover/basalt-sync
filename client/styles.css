@@ -346,19 +346,20 @@
     color: var(--text-on-accent);
   }
 
-  .basalt-panel .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea) {
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea, select) {
     flex-direction: column;
     align-items: stretch;
   }
 
   .basalt-panel
-    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea)
+    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea, select)
     .setting-item-info {
     align-self: stretch;
   }
 
   .basalt-panel
-    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea)
+    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea, select)
     .setting-item-control {
     width: 100%;
     flex-wrap: nowrap;
@@ -380,6 +381,12 @@
 
   .basalt-panel .setting-item-description {
     overflow-wrap: anywhere;
+  }
+
+  .basalt-panel .setting-item-control select {
+    width: 100%;
+    max-width: 100%;
+    min-height: 44px;
   }
 
   .basalt-add-device,

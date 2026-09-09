@@ -97,6 +97,12 @@ CLI options still form a configuration surface and need explicit documentation
 and combination testing. Avoid adding a second implementation where the same
 behavior can be shared.
 
+Joining an existing vault defaults to downloading into an empty local vault.
+The plugin checks the filesystem before registration or invite redemption;
+unreadable folders refuse pairing. Combining existing local files requires an
+explicit choice. This is a setup precondition, not a lasting merge preference:
+files created after the check participate in normal two-way sync.
+
 ## Refusals
 
 Current scope excludes a second server backend, peer-to-peer sync, teams/shared

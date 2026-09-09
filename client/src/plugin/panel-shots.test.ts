@@ -67,6 +67,8 @@ afterAll(async () => {
 /** Every state the walk is expected to reach, in the order it reaches them. */
 const EXPECTED = [
   "unpaired",
+  "join-download",
+  "join-combine",
   "config-unreadable",
   "paired",
   "fresh-recovery-key",
@@ -132,6 +134,10 @@ describe("the panel walk", () => {
     // And no fields yet: a field belongs to one of the two answers.
     expect(of("unpaired")).not.toContain("Setup string");
     expect(of("unpaired")).not.toContain("Invite or recovery key");
+    expect(prose("join-download")).toContain("Download your notes into an empty vault");
+    expect(prose("join-download")).toContain("select Download server vault");
+    expect(prose("join-combine")).toContain("select Combine local files");
+    expect(prose("join-combine")).toContain("Old copies can bring back files");
 
     // Rule 2: unreadable is not absent. A pairing form here would offer to
     // write over a credential that may be the only copy, so there is none, and

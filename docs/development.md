@@ -114,6 +114,7 @@ published gallery. A failed layout check leaves a `.failed.png` for inspection.
 | Setup choices | [View](assets/screenshots/pairing.png) | [View](assets/screenshots/pairing-dark.png) |
 | First device | [View](assets/screenshots/setup.png) | [View](assets/screenshots/setup-dark.png) |
 | Join a vault | [View](assets/screenshots/join.png) | [View](assets/screenshots/join-dark.png) |
+| Combine existing files | [View](assets/screenshots/join-combine.png) | [View](assets/screenshots/join-combine-dark.png) |
 | QR invite and pairing code | [View](assets/screenshots/invite.png) | [View](assets/screenshots/invite-dark.png) |
 | Server address | [View](assets/screenshots/server.png) | [View](assets/screenshots/server-dark.png) |
 | Device list | [View](assets/screenshots/devices.png) | [View](assets/screenshots/devices-dark.png) |
@@ -130,6 +131,7 @@ Phone layout previews (desktop rendering with mobile styles):
 | Setup choices | [View](assets/screenshots/pairing-phone.png) | [View](assets/screenshots/pairing-phone-dark.png) |
 | First device | [View](assets/screenshots/setup-phone.png) | [View](assets/screenshots/setup-phone-dark.png) |
 | Join a vault | [View](assets/screenshots/join-phone.png) | [View](assets/screenshots/join-phone-dark.png) |
+| Combine existing files | [View](assets/screenshots/join-combine-phone.png) | [View](assets/screenshots/join-combine-phone-dark.png) |
 | QR invite and pairing code | [View](assets/screenshots/invite-phone.png) | [View](assets/screenshots/invite-phone-dark.png) |
 | Server address | [View](assets/screenshots/server-phone.png) | [View](assets/screenshots/server-phone-dark.png) |
 | Device list | [View](assets/screenshots/devices-phone.png) | [View](assets/screenshots/devices-phone-dark.png) |
