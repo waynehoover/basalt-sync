@@ -125,16 +125,22 @@ subsequent maintenance commands.
 
 ## 4. Establish the secure endpoint
 
-Basalt needs a reachable `wss://` endpoint for connections between devices.
-Keep its own HTTP/WebSocket port private.
+Run Basalt behind Tailscale Serve or an HTTPS reverse proxy. It does not provide
+TLS itself; keep its own HTTP/WebSocket port private. Recommend Tailscale Serve
+for a new personal homelab, or preserve the user's existing HTTPS proxy.
 
 - **Existing Tailscale:** check the current Serve configuration, then configure
   `tailscale serve --bg 3003` without replacing unrelated routes. Obtain the
-  actual hostname from its output. Verify the devices can reach the tailnet.
+  actual hostname and HTTPS port from its output, replacing `https://` with
+  `wss://` for the plugin. If the default Serve route is occupied, use a free
+  HTTPS port and include it in the endpoint. Do not use Funnel for tailnet-only
+  access. Verify Tailscale is connected on both the server and every device.
   Tailscale installation, login, or HTTPS enablement may require the user.
 - **Existing domain and proxy:** configure Caddy or the user's existing proxy
   to forward WebSockets to `127.0.0.1:3003`. Preserve unrelated sites. For a new
-  Caddy site, the [server TLS guide](docs/server.md#caddy) gives the configuration.
+  Caddy site, the [secure access guide](docs/server.md#caddy) gives the configuration.
+  A containerized proxy needs a shared private network to reach the Basalt
+  container; its own loopback does not reach the host.
   Validate configuration and certificates before using it.
 
 Check the public endpoint's `/health` over HTTPS from a client device, in

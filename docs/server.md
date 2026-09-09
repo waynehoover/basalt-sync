@@ -6,6 +6,11 @@ Run one server for your personal vault, then connect your devices through the
 Obsidian plugin. The server stores encrypted notes and history; you provide
 storage, a secure connection, and backups.
 
+**Put Tailscale Serve or an HTTPS reverse proxy in front of Basalt.** Your devices
+connect to the proxy; Basalt's own port stays private. For a personal homelab,
+we recommend [Tailscale Serve](#tailscale-recommended). If you already use a domain
+and an HTTPS proxy, [use that instead](#caddy).
+
 You need a Linux or macOS machine with local storage. Docker is the simplest
 route. Keep the data directory off NFS, SMB, and other network filesystems.
 
@@ -35,8 +40,8 @@ docker run -d --name basalt --restart unless-stopped --stop-timeout 30 \
 docker logs basalt
 ```
 
-Use the pinned Compose setup for a server you keep. Both examples need the TLS
-step below before other devices connect.
+Use the pinned Compose setup for a server you keep. Next, configure
+[secure access](#secure-access) before pairing devices.
 
 Named volumes get the required ownership automatically. If you replace one
 with a bind mount, create a dedicated empty directory and make it writable by
@@ -68,26 +73,49 @@ This prints a systemd unit and installation commands; review and follow them.
 It does not install the service itself. The generated unit includes restart
 handling and a 30-second shutdown allowance.
 
-## TLS
+## Secure access
 
-Basalt serves plain HTTP/WebSocket. Keep its port on loopback and expose a
-secure `wss://` address through one of the following. Encryption of notes does
-not replace transport security for device credentials.
+Basalt does not provide HTTPS itself. Tailscale Serve or your reverse proxy
+provides the secure connection:
 
-### Tailscale
+**Your devices → Tailscale Serve or HTTPS proxy → Basalt**
 
-With Tailscale set up on the server and your devices:
+Use the proxy's `wss://` address in the plugin. Keep the raw server port private;
+note encryption does not protect device credentials sent over plain `ws://`.
+
+### Tailscale (recommended)
+
+This keeps Basalt accessible only to devices allowed on your Tailscale network,
+without a public domain or router port forwarding. Install and connect Tailscale
+on the server and each device, including your phone.
+
+On the server, check for existing routes first:
+
+```bash
+tailscale serve status
+```
+
+If the default HTTPS address is free, publish Basalt there:
 
 ```bash
 tailscale serve --bg 3003
+tailscale serve status
 ```
 
-Use the HTTPS hostname Tailscale reports, with `wss://` for Basalt, such as
-`wss://homelab.example.ts.net`. Your devices must be able to reach that tailnet.
+Follow any prompt to enable HTTPS. Use the address Tailscale reports, replacing
+`https://` with `wss://`, for example `wss://homelab.example.ts.net`. Leave Tailscale
+connected on every device when syncing. Use Serve, not Funnel, for tailnet-only
+access. See [Tailscale's Serve guide](https://tailscale.com/docs/reference/tailscale-cli/serve).
+
+If another app already uses that address, choose a free HTTPS port with
+`tailscale serve --bg --https=8443 3003`, and include `:8443` in the plugin's
+address. The final `3003` is Basalt's internal port, not the port you necessarily
+enter on your phone.
 
 ### Caddy
 
-For a domain pointing to your server, configure Caddy:
+For an internet-accessible endpoint, point a domain to your server and let Caddy
+handle HTTPS. With Caddy running on the same host as Basalt, use:
 
 ```caddyfile
 sync.example.org {
@@ -95,8 +123,14 @@ sync.example.org {
 }
 ```
 
-Reload Caddy and use `wss://sync.example.org`. Keep Basalt's own port private;
-Caddy handles the public TLS connection and WebSocket proxying.
+Reload Caddy and use `wss://sync.example.org`. The usual Caddy setup needs ports
+80 and 443 reachable for certificates and HTTPS; keep port 3003 private.
+Caddy handles WebSockets automatically. See [Caddy's reverse-proxy guide](https://caddyserver.com/docs/quick-starts/reverse-proxy).
+
+An existing proxy is fine too: it must provide a trusted HTTPS certificate and
+support WebSockets. If the proxy runs in Docker, connect it to Basalt over a
+private Docker network; `127.0.0.1` inside the proxy container refers to that
+container, not the host.
 
 For a test entirely on one machine, `basaltd serve -localhost` provides a
 loopback `ws://` address. The first-device token is still required.
@@ -185,7 +219,8 @@ The plugin cannot initialize a custom vault name.
 
 | Problem | Check |
 |---|---|
-| Cannot reach the server | Server process, proxy, hostname, and tailnet connectivity. |
+| Cannot reach the server | Server process, proxy, and the proxy's hostname and port. With Tailscale, check it is connected on both server and device. |
+| Works on the server but not the phone | Use the proxy's `wss://` hostname and HTTPS port. `localhost` on the phone is the phone itself. |
 | Setup token rejected | Copy it from this server's log. If already claimed, use an invite. |
 | Protocol mismatch | Update the server and clients to compatible releases. |
 | Device limit reached | Update the server. Older releases capped the number of devices. |

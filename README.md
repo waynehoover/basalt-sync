@@ -51,8 +51,14 @@ you reconnect, and recover earlier versions from inside Obsidian.
 
 ## Get started
 
-1. **[Set up your server](docs/server.md).** Run Basalt, configure a secure
-   connection, and get the setup string for your first device.
+**Run Basalt behind Tailscale Serve or an HTTPS reverse proxy.** Tailscale Serve
+is the recommended option for a personal homelab: only your permitted Tailscale
+devices can reach it. You can also use Caddy or an existing HTTPS proxy with your
+own domain. Keep Basalt's port 3003 private.
+
+1. **[Set up your server](docs/server.md).** Run Basalt, follow the
+   [secure connection setup](docs/server.md#secure-access), and get the setup
+   string for your first device.
 2. **[Install the Obsidian plugin](docs/plugin.md#install).** Start the vault
    with that string and save the recovery key shown during setup.
 3. **[Add your other devices](docs/plugin.md#pairing).** Create an invite, then

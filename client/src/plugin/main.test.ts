@@ -3028,7 +3028,8 @@ describe("what History says after a restore (P-D1)", () => {
   function buttons(): { text: string; click(): void }[] {
     const found: { text: string; click(): void }[] = [];
     const visit = (n: FakeEl): void => {
-      if (n.tag === "button") found.push({ text: n.allText(), click: () => n.fire("click") });
+      if (n.tag === "button" && !n.disabled)
+        found.push({ text: n.allText(), click: () => n.fire("click") });
       for (const c of n.children) visit(c);
     };
     visit(modals[modals.length - 1]!.contentEl);
@@ -3038,7 +3039,7 @@ describe("what History says after a restore (P-D1)", () => {
   async function restoreFromHistory(plugin: Testable): Promise<string> {
     notices.length = 0;
     plugin.openHistory("note.md");
-    await until("a Restore button", () => buttons().some((b) => b.text.includes("Restore")));
+    await until("an enabled Restore button", () => buttons().some((b) => b.text === "Restore"));
     buttons()
       .find((b) => b.text.includes("Restore"))!
       .click();

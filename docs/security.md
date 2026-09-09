@@ -14,7 +14,7 @@ encrypted pieces repeat. Encryption does not hide all metadata.
 
 Use a secure `wss://` connection, normally through Tailscale Serve or a TLS
 proxy. Note encryption alone does not protect the device credentials sent over
-an unencrypted connection. [Server setup](server.md#tls) covers this step.
+an unencrypted connection. [Server setup](server.md#secure-access) covers this step.
 
 ## Keep your recovery key
 

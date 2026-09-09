@@ -34,6 +34,7 @@ export { normalizePath };
 export class FakeEl {
   readonly children: FakeEl[] = [];
   text = "";
+  disabled = false;
 
   constructor(
     readonly tag: string,
