@@ -33,7 +33,7 @@ import {
 } from "./stub.ts";
 import BasaltPlugin, { connectionDetail, describeConnection, describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
-import type { SyncReport } from "../core/engine.ts";
+import { Engine, type SyncReport } from "../core/engine.ts";
 import { Client, redeemInvite } from "../core/client.ts";
 import { ObsidianIndexStore } from "./vault.ts";
 import { parseInvite, parsePairing } from "../core/pairing.ts";
@@ -1292,6 +1292,54 @@ describe("the panel, which is a modal and a settings tab", () => {
 });
 
 describe("on a device with no status bar", () => {
+  it("shows a connected phone loading history before it can sync notes", async () => {
+    await fresh();
+    const desktop = await load();
+    desktop.app.vault.adapter.seed("note.md", "keep this note\n");
+    await startVault(desktop.plugin);
+    await synced(desktop.plugin);
+    const invite = await desktop.plugin.createInvite();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let accepting = false;
+    const accept = Engine.prototype.acceptBatch;
+    const held = vi.spyOn(Engine.prototype, "acceptBatch").mockImplementationOnce(async function (
+      this: Engine,
+      batch,
+    ) {
+      accepting = true;
+      await gate;
+      await accept.call(this, batch);
+    });
+    const phone = await load();
+    try {
+      await phone.plugin.pair(invite.invite, "Phone");
+      await until("the phone to receive history", () => accepting);
+      expect(phone.plugin.currentState.kind).toBe("loading");
+      expect(phone.plugin.connection()?.server?.proto).toBe(PROTO);
+      expect(phone.plugin.cursors()).toEqual({ local: 0, server: 1 });
+      built.length = 0;
+      phone.plugin.ribbonIcons[0]!.callback();
+      expect(built.find((s) => s.name === "Sync status")!.descEl.allText()).toMatch(
+        /Loading sync history/,
+      );
+      expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/Not connected|allow-origin/);
+      const serverDetails = modals
+        .at(-1)!
+        .contentEl.children.find((el) => el.cls === "basalt-server")!;
+      expect(serverDetails.attributes.has("open"), "normal loading expanded diagnostics").toBe(
+        false,
+      );
+      await phone.plugin.syncNow();
+      expect(notices.at(-1)!.message).toMatch(/loading.*history/i);
+    } finally {
+      release();
+      held.mockRestore();
+    }
+    await synced(phone.plugin);
+    expect(await phone.app.vault.adapter.read("note.md")).toBe("keep this note\n");
+  });
+
   /**
    * Obsidian mobile has no status bar, so `addStatusBarItem` returns an
    * element nothing displays and the plugin's only ongoing feedback is the
@@ -1398,7 +1446,7 @@ describe("saying what it is working on", () => {
 
     const seen: string[] = [];
     const stop = plugin.watchState((s) => {
-      if (s.kind === "syncing") seen.push(s.path);
+      if (s.kind === "syncing" && s.path !== undefined) seen.push(s.path);
     });
 
     // Incompressible and large enough that sealing it reliably outlasts the
@@ -1438,7 +1486,7 @@ describe("saying what it is working on", () => {
 
     const seen: string[] = [];
     const stop = plugin.watchState((s) => {
-      if (s.kind === "syncing") seen.push(s.path);
+      if (s.kind === "syncing" && s.path !== undefined) seen.push(s.path);
     });
     await plugin.syncNow();
     stop();

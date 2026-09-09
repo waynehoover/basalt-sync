@@ -80,6 +80,8 @@ const EXPECTED = [
   "history-diff",
   "status-bar-unpaired",
   "status-bar-connecting",
+  "status-bar-loading",
+  "status-bar-syncing-started",
   "status-bar-syncing",
   "status-bar-synced",
   "status-bar-synced-needing-attention",

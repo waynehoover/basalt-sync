@@ -12,13 +12,16 @@
 
 import { describe, expect, it } from "vitest";
 
-import { Client } from "./client.ts";
+import { Client, type ClientOptions } from "./client.ts";
 import { FakeSocket, ready, settle } from "./fake-socket.ts";
 import { TEST_DATA_KEY } from "./test-keys.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 /** A client on a socket that will say `ready` and never say `caught-up`. */
-function clientOnFakeSocket(): { socket: FakeSocket; client: Client } {
+function clientOnFakeSocket(extra: Partial<ClientOptions> = {}): {
+  socket: FakeSocket;
+  client: Client;
+} {
   const socket = new FakeSocket();
   const client = new Client({
     vault: new MemoryVault(),
@@ -31,6 +34,7 @@ function clientOnFakeSocket(): { socket: FakeSocket; client: Client } {
     device: "d",
     timeoutMs: 2000,
     socketFactory: () => socket,
+    ...extra,
   });
   return { socket, client };
 }
@@ -53,6 +57,37 @@ async function settled(p: Promise<unknown>): Promise<boolean> {
 }
 
 describe("connecting only as far as the handshake (R1)", () => {
+  it("reports authenticated history loading before connect finishes", async () => {
+    const progress: { local: number; server: number }[] = [];
+    const { socket, client } = clientOnFakeSocket({ onCatchUp: (at) => progress.push(at) });
+    const connecting = client.connect();
+    connecting.catch(() => undefined);
+    try {
+      await sayReady(socket, 4);
+      // Ready still has to unwrap the vault key; one event-loop tick is not
+      // enough to finish WebCrypto when the full suite is competing for CPU.
+      await expect.poll(() => client.serverLimits?.cursor).toBe(4);
+      expect(progress, "a connected device still looks like a failed connection").toEqual([
+        { local: 0, server: 4 },
+      ]);
+      socket.raw({ op: "batch", from: 1, to: 2, entries: [] });
+      await expect.poll(() => client.transport.appliedCursor).toBe(2);
+      expect(progress.at(-1)).toEqual({ local: 2, server: 4 });
+      expect(await settled(connecting), "progress must not bypass catch-up").toBe(false);
+      socket.raw({ op: "batch", from: 3, to: 4, entries: [] });
+      socket.raw({ op: "caught-up", cursor: 4 });
+      await connecting;
+      expect(progress.at(-1)).toEqual({ local: 4, server: 4 });
+      const count = progress.length;
+      socket.raw({ op: "batch", from: 5, to: 5, entries: [] });
+      await expect.poll(() => client.transport.appliedCursor).toBe(5);
+      expect(progress.length, "live changes restarted initial-loading feedback").toBe(count);
+    } finally {
+      await client.close();
+      await connecting.catch(() => undefined);
+    }
+  });
+
   it("resolves with the server's own cursor without waiting for the backlog", async () => {
     const { socket, client } = clientOnFakeSocket();
     const connecting = client.connect({ waitForBacklog: false });

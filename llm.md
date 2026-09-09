@@ -199,7 +199,12 @@ chosen private location. Press **I have written it down** only after the user
 has saved it, or after verifying a save to a destination they designated for
 this purpose. Wait for pairing and sync to finish.
 
-**Additional device:** on a paired device, choose **Add another device → Create
+**Additional device:** prefer a new empty local vault when the user wants a
+fresh copy from the server. Pairing a populated vault also uploads its local
+notes, so an older copy can reintroduce moved or deleted files. Preserve that
+copy separately; do not clear it automatically.
+
+On a paired device, choose **Add another device → Create
 invite**. On the new device, choose **Paste an invite**, supply a device name and
 the invite, then press **Pair**. Invites expire after ten minutes by default and
 work once. Create one per device. A recovery key is the fallback when no paired

@@ -14,7 +14,7 @@ services for that vault. Each device should have its own local copy.
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from the newest stable
    [plugin release](https://github.com/waynehoover/basalt-sync/releases).
-   Plugin releases use a plain version such as `0.6.2`; skip `server/v…` and `cli/v…`.
+   Plugin releases use a plain version such as `0.6.3`; skip `server/v…` and `cli/v…`.
 2. Create `<vault>/.obsidian/plugins/basalt-sync/` and put the three files there.
    If you use a custom Obsidian configuration folder, use that folder instead
    of `.obsidian`.
@@ -59,6 +59,10 @@ join it with an invite.
 
 ### Add another device
 
+For a fresh copy of your synced notes, start with an empty vault on the new
+device. Pairing an existing vault also uploads its local notes. An older copy
+can bring back files you previously moved or deleted on another device.
+
 1. On a paired device, open **Add another device → Create invite**.
 2. On your phone, install and enable Basalt, then scan the QR code. Or copy the
    pairing code and press **Paste an invite** under **Join an existing vault**
@@ -93,7 +97,7 @@ server address and version, useful when diagnosing a connection problem.
 | Status | What to do |
 |---|---|
 | Unpaired | Pair this vault. |
-| Connecting or syncing | Wait for the current sync. |
+| Connecting, loading history, or syncing | Keep Obsidian open until sync finishes. |
 | Synced | No outstanding work was reported. |
 | Needs attention | Open the panel and follow the reason shown for each file. |
 | Failed or offline | Check the connection and the reported error; Basalt retries temporary failures. |

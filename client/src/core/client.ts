@@ -91,6 +91,8 @@ export interface ClientOptions {
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
+  /** Authenticated history loading, before connect() permits syncing. Cursors are not file counts. */
+  readonly onCatchUp?: (at: { local: number; server: number }) => void;
   /**
    * Called with the report of every pass, whatever started it.
    *
@@ -175,6 +177,7 @@ export class Client {
       onBatch: async (batch) => {
         this.lastBatchAt = Date.now();
         await engine.acceptBatch(batch);
+        this.reportCatchUp();
         // Accepting a batch records what the server has; it does not
         // fetch it. Without this the download waited for the next tick,
         // so a note written on one device took up to thirty seconds to
@@ -302,6 +305,7 @@ export class Client {
     this.lastBatchAt = Date.now();
     this.limits = await this.engine.start();
     if (opts.waitForBacklog === false) return this.limits;
+    this.reportCatchUp();
 
     // An inactivity bound, not a total one. A device that has been away for
     // a while has a long backlog, and over a slow link the whole of it can
@@ -318,6 +322,11 @@ export class Client {
       await sleep(25);
     }
     return this.limits;
+  }
+
+  private reportCatchUp(): void {
+    if (!this.limits || this.caughtUp || this.closing || this.transport.isClosed) return;
+    this.opts.onCatchUp?.({ local: this.engine.status().cursor, server: this.serverCursor });
   }
 
   /**

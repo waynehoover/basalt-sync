@@ -96,12 +96,19 @@ It never connects to a server. Review the images before committing them.
 Use `--scene invite --theme dark` to recapture one view; `--help` lists the scenes.
 Keep the test vault open until cleanup finishes.
 
+Use `--device phone` to preview the settings at phone width with Obsidian's
+mobile styles. The script checks action alignment, field widths, tap targets,
+and horizontal overflow. This is a layout preview, not Android or iOS acceptance.
+Use `--output /tmp/basalt-screenshots` for review images without replacing the
+published gallery. A failed layout check leaves a `.failed.png` for inspection.
+
 <details>
 <summary>Screenshot gallery</summary>
 
 | View | Light | Dark |
 |---|---|---|
 | Status panel | [View](assets/screenshots/panel.png) | [View](assets/screenshots/panel-dark.png) |
+| Loading sync history | [View](assets/screenshots/loading.png) | [View](assets/screenshots/loading-dark.png) |
 | Plugin settings | [View](assets/screenshots/settings.png) | [View](assets/screenshots/settings-dark.png) |
 | Status indicator | [View](assets/screenshots/status.png) | [View](assets/screenshots/status-dark.png) |
 | Setup choices | [View](assets/screenshots/pairing.png) | [View](assets/screenshots/pairing-dark.png) |
@@ -113,6 +120,22 @@ Keep the test vault open until cleanup finishes.
 | Deleted notes | [View](assets/screenshots/deleted.png) | [View](assets/screenshots/deleted-dark.png) |
 | No deleted notes | [View](assets/screenshots/deleted-empty.png) | [View](assets/screenshots/deleted-empty-dark.png) |
 | Version comparison | [View](assets/screenshots/changes.png) | [View](assets/screenshots/changes-dark.png) |
+
+Phone layout previews (desktop rendering with mobile styles):
+
+| View | Light | Dark |
+|---|---|---|
+| Status panel | [View](assets/screenshots/panel-phone.png) | [View](assets/screenshots/panel-phone-dark.png) |
+| Loading sync history | [View](assets/screenshots/loading-phone.png) | [View](assets/screenshots/loading-phone-dark.png) |
+| Setup choices | [View](assets/screenshots/pairing-phone.png) | [View](assets/screenshots/pairing-phone-dark.png) |
+| First device | [View](assets/screenshots/setup-phone.png) | [View](assets/screenshots/setup-phone-dark.png) |
+| Join a vault | [View](assets/screenshots/join-phone.png) | [View](assets/screenshots/join-phone-dark.png) |
+| QR invite and pairing code | [View](assets/screenshots/invite-phone.png) | [View](assets/screenshots/invite-phone-dark.png) |
+| Server address | [View](assets/screenshots/server-phone.png) | [View](assets/screenshots/server-phone-dark.png) |
+| Device list | [View](assets/screenshots/devices-phone.png) | [View](assets/screenshots/devices-phone-dark.png) |
+| Deleted notes | [View](assets/screenshots/deleted-phone.png) | [View](assets/screenshots/deleted-phone-dark.png) |
+| No deleted notes | [View](assets/screenshots/deleted-empty-phone.png) | [View](assets/screenshots/deleted-empty-phone-dark.png) |
+| Version comparison | [View](assets/screenshots/changes-phone.png) | [View](assets/screenshots/changes-phone-dark.png) |
 
 </details>
 

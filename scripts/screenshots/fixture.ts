@@ -49,6 +49,8 @@ export default class Screenshots extends Plugin {
   onload() {
     this.window = this.findWindow(this.app.workspace.containerEl.ownerDocument);
     this.originalBounds = this.window.getBounds();
+    this.originalMinimum = this.window.getMinimumSize();
+    this.platformClasses = new Map();
     this.clipboardBefore = electron.clipboard.readText();
     this.hiddenNotices = new Map();
     this.themes = new Map();
@@ -100,7 +102,7 @@ export default class Screenshots extends Plugin {
       cursors: () => ({ local: 124, server: 124 }),
       connection: () => ({
         url: "wss://sync.example.com",
-        server: { proto: 5, version: __SCREENSHOT_VERSION__ },
+        server: { proto: 5, version: __SCREENSHOT_SERVER_VERSION__ },
       }),
       watchState: (listener) => {
         listener();
@@ -149,17 +151,31 @@ export default class Screenshots extends Plugin {
     };
   }
 
-  async scene(name, theme) {
+  async scene(name, theme, device) {
     this.modal?.close();
     this.modal = undefined;
     if (name !== "settings" || this.lastScene !== "settings") this.app.setting.close();
     this.lastScene = name;
     await settle();
     this.applyTheme(this.app.workspace.containerEl.ownerDocument, theme);
+    const body = this.app.workspace.containerEl.ownerDocument.body;
+    for (const cls of ["is-mobile", "is-phone", "is-tablet", "is-desktop"]) {
+      if (!this.platformClasses.has(cls)) this.platformClasses.set(cls, body.hasClass(cls));
+      body.toggleClass(
+        cls,
+        device === "phone"
+          ? cls === "is-mobile" || cls === "is-phone"
+          : this.platformClasses.get(cls),
+      );
+    }
     this.model = this.makeModel(!["pairing", "join", "setup"].includes(name));
     paintStatus(this.status, this.makeModel().currentState);
     this.backdrop.style.display = name === "status" ? "none" : "";
-    this.window.setContentSize(1080, name === "changes" ? 700 : 1100);
+    this.window.setMinimumSize(320, 480);
+    this.window.setContentSize(
+      device === "phone" ? 412 : 1080,
+      device === "phone" ? 915 : name === "changes" ? 700 : 1100,
+    );
     this.window.show();
     this.window.focus();
     if (name === "status") {
@@ -190,7 +206,13 @@ export default class Screenshots extends Plugin {
       if (name === "deleted-empty")
         this.model.deletedNotes = async () => ({ notes: [], more: false });
       this.modal = new RecoverModal(this.model);
-    } else this.modal = new BasaltModal(this.model);
+    } else {
+      if (name === "loading") {
+        this.model.currentState = { kind: "loading", local: 960, server: 3826 };
+        this.model.cursors = () => ({ local: 960, server: 3826 });
+      }
+      this.modal = new BasaltModal(this.model);
+    }
     this.modal.open();
     this.target = this.modal.modalEl;
     await settle();
@@ -234,14 +256,14 @@ export default class Screenshots extends Plugin {
     }
   }
 
-  capture(name, theme, path) {
-    this.pending = this.captureScene(name, theme, path);
+  capture(name, theme, path, device = "desktop") {
+    this.pending = this.captureScene(name, theme, path, device);
     return this.pending;
   }
 
-  async captureScene(name, theme, path) {
+  async captureScene(name, theme, path, device) {
     try {
-      await this.scene(name, theme);
+      await this.scene(name, theme, device);
       await settle();
       if (electron.clipboard.readText() === invite)
         electron.clipboard.writeText(this.clipboardBefore);
@@ -280,8 +302,57 @@ export default class Screenshots extends Plugin {
       crop.height = Math.min(crop.height, bounds.height - crop.y);
       const picture = await window.webContents.capturePage(crop);
       fs.writeFileSync(path, picture.toPNG());
+      if (device === "phone") this.checkPhoneLayout();
     } catch (err) {
       fs.writeFileSync(path + ".error", String(err.stack ?? err));
+    }
+  }
+
+  checkPhoneLayout() {
+    const host = this.modal?.contentEl ?? this.tab.containerEl;
+    if (this.modal?.modalEl.hasClass("mod-basalt-history")) {
+      const sidebar = host.querySelector(".modal-sidebar").getBoundingClientRect();
+      const pane = host.querySelector(".basalt-history-content-container").getBoundingClientRect();
+      if (sidebar.bottom > pane.top + 1 || pane.height < 160)
+        throw new Error(
+          "Phone version list overlaps the note preview or leaves it too little space: " +
+            JSON.stringify({ sidebar, pane, content: host.getBoundingClientRect() }),
+        );
+    }
+    if (!host.hasClass("basalt-panel")) return;
+    if (host.scrollWidth > host.clientWidth + 1)
+      throw new Error("Phone panel overflows horizontally");
+    for (const row of host.querySelectorAll(".setting-item")) {
+      if (!row.getBoundingClientRect().height) continue;
+      const info = row.querySelector(".setting-item-info");
+      const input = row.querySelector("input");
+      const buttons = [...row.querySelectorAll("button")];
+      for (const button of buttons) {
+        const b = button.getBoundingClientRect();
+        if (b.height < 44)
+          throw new Error("Phone button has a small tap target: " + button.textContent);
+        if (!input && buttons.length === 1 && info?.textContent) {
+          const label = info.getBoundingClientRect();
+          if (b.left < label.right - 1 || b.top >= label.bottom)
+            throw new Error(
+              "Phone action stacks below its label: " +
+                button.textContent +
+                " " +
+                JSON.stringify({
+                  label,
+                  button: b,
+                  viewport: row.ownerDocument.defaultView.innerWidth,
+                  direction: row.ownerDocument.defaultView.getComputedStyle(row).flexDirection,
+                }),
+            );
+        }
+      }
+      if (input && buttons.length === 1) {
+        const field = input.getBoundingClientRect(),
+          button = buttons[0].getBoundingClientRect();
+        if (field.width < 80 || Math.abs(field.top - button.top) > 2)
+          throw new Error("Phone field and button do not share a usable row");
+      }
     }
   }
 
@@ -293,6 +364,9 @@ export default class Screenshots extends Plugin {
       doc.body.classList.toggle("theme-light", !dark);
     }
     this.app.updateTheme();
+    for (const [cls, present] of this.platformClasses)
+      this.app.workspace.containerEl.ownerDocument.body.toggleClass(cls, present);
+    this.window.setMinimumSize(...this.originalMinimum);
     this.window.setBounds(this.originalBounds);
     this.backdrop.remove();
     for (const [el, visibility] of this.hiddenNotices) el.style.visibility = visibility;

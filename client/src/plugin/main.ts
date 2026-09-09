@@ -67,6 +67,7 @@ import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
 export type State =
   | { kind: "unpaired" }
   | { kind: "connecting" }
+  | { kind: "loading"; local: number; server: number }
   /**
    * Settled, with what the last pass found.
    *
@@ -108,7 +109,7 @@ export type State =
    * exactly alike. The path rather than a percentage: what somebody wants to
    * know is whether it is doing something and what.
    */
-  | { kind: "syncing"; path: string; since: number }
+  | { kind: "syncing"; path?: string; since: number }
   /**
    * The last pass did not finish, and this is why.
    *
@@ -436,14 +437,17 @@ export default class BasaltPlugin extends Plugin {
     let fatal: Error | undefined;
     await runForever(await this.clientOptions(config, mine), {
       onConnecting: (client) => {
-        if (current()) this.live = client;
-        else void client.close();
+        if (current()) {
+          this.live = client;
+          this.setState({ kind: "connecting" });
+        } else void client.close();
       },
       onClient: (client) => {
         if (!current()) return;
         this.client = client;
         if (!client) return;
         this.everConnected = true;
+        this.setState({ kind: "syncing", since: Date.now() });
         // Nothing to write back. A connection used to settle which of several
         // credentials had opened the vault, whether the first-run token was
         // spent and what the vault's wrapped data key was; all three are
@@ -557,6 +561,11 @@ export default class BasaltPlugin extends Plugin {
       ...(await credentialsFor(config)),
       onProgress: (path) => {
         if (current()) this.working(path);
+      },
+      onCatchUp: (at) => {
+        if (!current()) return;
+        this.everConnected = true;
+        this.setState({ kind: "loading", ...at });
       },
       // Every pass, from one place, whatever started it. The ticker and an
       // arriving batch start passes this shell never sees begin, and a
@@ -847,6 +856,8 @@ export default class BasaltPlugin extends Plugin {
         return `Basalt has stopped: ${this.state.why}. It will not reconnect until that is fixed.`;
       case "connecting":
         return "still connecting to the server.";
+      case "loading":
+        return "loading sync history. Keep Obsidian open; your notes will sync next.";
       case "unpaired":
         return "this vault is not paired yet.";
       default:
@@ -1851,8 +1862,15 @@ export default class BasaltPlugin extends Plugin {
    * versions; a person looking at these two lines can.
    */
   cursors(): { local: number; server: number } | undefined {
-    if (!this.client) return undefined;
-    return { local: this.client.engine.status().cursor, server: this.client.serverCursor };
+    const client = this.connectedClient();
+    if (!client) return undefined;
+    return { local: client.engine.status().cursor, server: client.serverCursor };
+  }
+
+  /** A completed handshake is connected even while the initial history is loading. */
+  private connectedClient(): Client | undefined {
+    const client = this.client ?? this.live;
+    return client?.serverLimits && !client.transport.isClosed ? client : undefined;
   }
 
   /**
@@ -1868,7 +1886,7 @@ export default class BasaltPlugin extends Plugin {
   connection(): Connection | undefined {
     const url = this.config?.url;
     if (url === undefined) return undefined;
-    const limits = this.client?.serverLimits;
+    const limits = this.connectedClient()?.serverLimits;
     return {
       url,
       ...(limits !== undefined
@@ -2148,6 +2166,7 @@ function iconFor(state: State): string {
     case "unpaired":
       return "link";
     case "connecting":
+    case "loading":
     case "syncing":
       return "refresh-cw";
     case "synced":
@@ -2178,6 +2197,7 @@ function toneFor(state: State): string {
     case "unpaired":
       return "";
     case "connecting":
+    case "loading":
     case "syncing":
       return "basalt-working";
     case "synced":
@@ -2391,10 +2411,11 @@ class BasaltPanel {
       const at = this.plugin.cursors();
       say(cursors, at === undefined ? "" : `Local cursor ${at.local}, server cursor ${at.server}.`);
       const behind = at === undefined ? 0 : Math.max(0, at.server - at.local);
-      serverSummary.setText(behind > 0 ? `Server · ${behind} behind` : "Server");
+      const showBehind = behind > 0 && state.kind !== "loading";
+      serverSummary.setText(showBehind ? `Server · ${behind} behind` : "Server");
       // Opened, not just labelled, the first time it matters: a section that
       // says "42 behind" and stays shut is I11's defect wearing a summary.
-      if (behind > 0) server.setAttribute("open", "true");
+      if (showBehind) server.setAttribute("open", "true");
       const to = this.plugin.connection();
       say(connection, to === undefined ? "" : describeConnection(to));
       say(connectionWarning, to?.url.startsWith("ws://") ? connectionDetail(to) : "");
@@ -2413,22 +2434,21 @@ class BasaltPanel {
       this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
     }
 
-    row(primary, "Recover a deleted note", "Browse deleted notes and restore a copy.").addButton(
-      (b) =>
-        b.setButtonText("Browse deleted").onClick(() => {
-          // Checked at the press as well as by the shape watcher above, because
-          // a panel can be looked at for a while: a click that arrives after the
-          // vault was unlinked elsewhere used to open a recovery modal with no
-          // credential behind it, which then failed inside the modal. A sentence
-          // where the modal would have been, which is what `syncNow` and
-          // `createInvite` already do.
-          if (!this.plugin.paired) {
-            new Notice("Basalt: this vault is not paired yet. There is nothing to recover.");
-            return;
-          }
-          this.dismiss();
-          new RecoverModal(this.plugin).open();
-        }),
+    row(primary, "Recover a deleted note", "Restore a copy.").addButton((b) =>
+      b.setButtonText("Browse deleted").onClick(() => {
+        // Checked at the press as well as by the shape watcher above, because
+        // a panel can be looked at for a while: a click that arrives after the
+        // vault was unlinked elsewhere used to open a recovery modal with no
+        // credential behind it, which then failed inside the modal. A sentence
+        // where the modal would have been, which is what `syncNow` and
+        // `createInvite` already do.
+        if (!this.plugin.paired) {
+          new Notice("Basalt: this vault is not paired yet. There is nothing to recover.");
+          return;
+        }
+        this.dismiss();
+        new RecoverModal(this.plugin).open();
+      }),
     );
 
     // Everything rare, behind one press. Named for what is inside rather than
@@ -3486,8 +3506,13 @@ function longStatus(state: State): string {
       return "Not paired.";
     case "connecting":
       return "Connecting.";
+    case "loading": {
+      const percent =
+        state.server > 0 ? Math.min(100, Math.floor((100 * state.local) / state.server)) : 100;
+      return `Loading sync history… ${percent}%. Keep Obsidian open.`;
+    }
     case "syncing":
-      return `Working on ${state.path}.`;
+      return state.path === undefined ? "Syncing notes." : `Working on ${state.path}.`;
     case "synced": {
       // `summarise` returns a fragment because three of its four callers put
       // it after a colon. This is the fourth, and it opens a sentence: the

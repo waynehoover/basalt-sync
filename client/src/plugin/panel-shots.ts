@@ -292,6 +292,8 @@ function closePanel(): void {
 const STATUSES: { name: string; state: State }[] = [
   { name: "unpaired", state: { kind: "unpaired" } },
   { name: "connecting", state: { kind: "connecting" } },
+  { name: "loading", state: { kind: "loading", local: 50, server: 100 } },
+  { name: "syncing-started", state: { kind: "syncing", since: Date.now() } },
   { name: "syncing", state: { kind: "syncing", path: "Daily/2026-09-04.md", since: Date.now() } },
   {
     name: "synced",

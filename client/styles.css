@@ -26,6 +26,10 @@
   font-size: var(--font-ui-smaller);
 }
 
+.mod-basalt-history .modal-sidebar-list-item.is-active .modal-sidebar-list-item-details {
+  color: inherit;
+}
+
 .mod-basalt-history .basalt-history-content-container {
   display: flex;
   flex-direction: column;
@@ -228,12 +232,193 @@
 }
 
 @media (max-width: 600px) {
-  .basalt-panel .setting-item-control {
-    max-width: 100%;
+  /* History needs a bounded version list above the preview on a phone. */
+  .mod-basalt-history.mod-sidebar-layout .modal-content {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
   }
 
-  .basalt-panel .setting-item-control input {
+  .mod-basalt-history.modal.mod-sidebar-layout .modal-content > * {
+    position: static;
+    height: auto;
+  }
+
+  .mod-basalt-history.mod-sidebar-layout .modal-header {
+    height: auto;
+    flex: 0 0 auto;
+    padding: var(--size-4-4) var(--size-4-12) var(--size-4-4) var(--size-4-4);
+  }
+
+  .mod-basalt-history .modal-title {
+    font-size: var(--font-ui-medium);
+    overflow-wrap: anywhere;
+  }
+
+  .mod-basalt-history .modal-sidebar.mod-history {
+    flex: 0 1 220px;
+    width: 100%;
+    overflow: hidden;
+    border-bottom: 1px solid var(--background-modifier-border);
+  }
+
+  .mod-basalt-history .basalt-history-heading {
+    display: none;
+  }
+
+  .mod-basalt-history .modal-sidebar-list-item {
+    align-items: flex-start;
+    min-height: 44px;
+  }
+
+  .mod-basalt-history .modal-sidebar-list-item-details {
+    padding: 0;
+  }
+
+  .mod-basalt-history .basalt-history-content-container {
+    flex: 1 1 auto;
+    min-height: 160px;
+  }
+
+  .mod-basalt-history .modal-setting-titlebar {
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    padding: var(--size-4-3) 0;
+  }
+
+  .mod-basalt-history .modal-setting-titlebar-actions button {
+    min-height: 44px;
+    font-size: var(--font-ui-small);
+  }
+
+  .basalt-panel {
+    --setting-items-padding-x: var(--size-4-4);
+    --setting-items-padding-y: var(--size-4-3);
+    --setting-items-radius: var(--radius-l);
+  }
+
+  /* Obsidian stacks generic controls on phones. Single actions fit beside
+   * their labels; only rows with fields need a second line. */
+  .basalt-panel .setting-item:not(.setting-item-heading):not(.mod-toggle) {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--size-4-3);
+  }
+
+  .basalt-panel .setting-item:not(.setting-item-heading):not(.mod-toggle) .setting-item-info {
+    align-self: center;
+    margin-inline-end: 0;
+  }
+
+  .basalt-panel .setting-item:not(.setting-item-heading):not(.mod-toggle) .setting-item-control {
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 100%;
+    gap: var(--size-4-2);
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle)
+    .setting-item-control
+    button:not(.clickable-icon) {
+    width: auto;
+    min-height: 44px;
+    padding-inline: var(--size-4-3);
+    font-size: var(--font-ui-small);
+    font-weight: var(--font-medium);
+    background-color: var(--interactive-normal);
+    border-radius: var(--input-radius);
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle)
+    .setting-item-control
+    button.mod-warning {
+    background-color: var(--background-modifier-error);
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle)
+    .setting-item-control
+    button.mod-cta {
+    background-color: var(--interactive-accent);
+    color: var(--text-on-accent);
+  }
+
+  .basalt-panel .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea) {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea)
+    .setting-item-info {
+    align-self: stretch;
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle):has(input, textarea)
+    .setting-item-control {
+    width: 100%;
+    flex-wrap: nowrap;
+  }
+
+  .basalt-panel
+    .setting-item:not(.setting-item-heading):not(.mod-toggle)
+    .setting-item-control
+    input {
+    flex: 1;
+    width: 0;
     min-width: 0;
     max-width: 100%;
+    min-height: 44px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--input-radius);
+    background: var(--background-modifier-form-field);
+  }
+
+  .basalt-panel .setting-item-description {
+    overflow-wrap: anywhere;
+  }
+
+  .basalt-add-device,
+  .basalt-server,
+  .basalt-manage {
+    margin-top: var(--size-4-2);
+  }
+
+  .basalt-panel details > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 44px;
+    padding: var(--size-4-2) 0;
+    list-style: none;
+    color: var(--text-normal);
+  }
+
+  .basalt-panel details > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .basalt-panel details > summary::after {
+    content: "";
+    width: 7px;
+    height: 7px;
+    margin-inline: var(--size-4-3) var(--size-4-1);
+    border-right: 1.5px solid var(--text-muted);
+    border-bottom: 1.5px solid var(--text-muted);
+    transform: rotate(-45deg);
+    flex-shrink: 0;
+  }
+
+  .basalt-panel details[open] > summary::after {
+    transform: rotate(45deg);
+  }
+
+  .basalt-invite-qr {
+    width: 240px;
+    margin-inline: auto;
   }
 }

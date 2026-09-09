@@ -24,21 +24,27 @@ const scenes = [
   "changes",
   "settings",
   "status",
+  "loading",
 ];
 const options = new Map();
 for (const [i, arg] of process.argv.slice(2).entries()) {
   if (arg === "--help") {
     console.log(`Usage: node scripts/screenshots.mjs --vault NAME [--scene NAME] [--theme light|dark]
+  [--device desktop|phone] [--output DIRECTORY]
 
 Use an open test vault in desktop Obsidian with its CLI enabled.
 Requires installed client dependencies. Writes docs/assets/screenshots/*.png.
 Defaults: all scenes, both themes. Scenes: ${scenes.join(", ")}.
+Phone previews use a narrow desktop window and Obsidian's mobile CSS;
+they check layout, not the Android/iOS runtime. Use --output for review captures.
+The status bar and desktop Settings window are desktop-only scenes.
 The temporary preview plugin never connects to a server or reads your notes.
 It restores the theme, window bounds and clipboard, and removes itself afterward.`);
     process.exit(0);
   }
   if (i % 2 === 0) {
-    if (!["--vault", "--scene", "--theme"].includes(arg)) throw new Error(`Unknown option: ${arg}`);
+    if (!["--vault", "--scene", "--theme", "--device", "--output"].includes(arg))
+      throw new Error(`Unknown option: ${arg}`);
     const value = process.argv[i + 3];
     if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
     options.set(arg, value);
@@ -46,17 +52,23 @@ It restores the theme, window bounds and clipboard, and removes itself afterward
 }
 const vault = options.get("--vault");
 if (!vault) throw new Error("Specify an open test vault with --vault NAME. See --help.");
-const chosenScenes = options.has("--scene") ? [options.get("--scene")] : scenes;
 const themes = options.has("--theme") ? [options.get("--theme")] : ["light", "dark"];
+const device = options.get("--device") ?? "desktop";
+const availableScenes =
+  device === "phone" ? scenes.filter((s) => !["status", "settings"].includes(s)) : scenes;
+const chosenScenes = options.has("--scene") ? [options.get("--scene")] : availableScenes;
 if (
-  chosenScenes.some((s) => !scenes.includes(s)) ||
-  themes.some((t) => !["light", "dark"].includes(t))
+  chosenScenes.some((s) => !availableScenes.includes(s)) ||
+  themes.some((t) => !["light", "dark"].includes(t)) ||
+  !["desktop", "phone"].includes(device)
 ) {
   throw new Error("Unknown scene or theme. See --help.");
 }
 const id = "basalt-release-screenshots";
 const scratch = await mkdtemp(join(tmpdir(), "basalt-screenshots-"));
-const out = join(root, "docs/assets/screenshots");
+const out = options.has("--output")
+  ? resolve(options.get("--output"))
+  : join(root, "docs/assets/screenshots");
 const ready = join(scratch, "ready");
 let installed = false;
 let interrupted;
@@ -97,6 +109,10 @@ async function waitFor(path, cleanup = false) {
 
 try {
   const manifest = JSON.parse(await readFile(join(root, "manifest.json"), "utf8"));
+  const serverVersion = (await readFile(join(root, "compose.yaml"), "utf8")).match(
+    /^\s*image:\s*ghcr\.io\/waynehoover\/basalt-sync:([^@\s]+)/m,
+  )?.[1];
+  if (!serverVersion) throw new Error("Cannot read the example server version from compose.yaml");
   const { build } = require("esbuild");
   await build({
     entryPoints: [join(root, "scripts/screenshots/fixture.ts")],
@@ -105,7 +121,7 @@ try {
     format: "cjs",
     external: ["obsidian", "electron", "fs"],
     outfile: join(scratch, "main.js"),
-    define: { __SCREENSHOT_VERSION__: JSON.stringify(manifest.version) },
+    define: { __SCREENSHOT_SERVER_VERSION__: JSON.stringify(serverVersion) },
     plugins: [
       {
         name: "preview-exports",
@@ -147,12 +163,19 @@ try {
   for (const scene of chosenScenes)
     for (const theme of themes) {
       if (interrupted) throw interrupted;
-      const name = `${scene}${theme === "dark" ? "-dark" : ""}.png`;
+      const name = `${scene}${device === "phone" ? "-phone" : ""}${theme === "dark" ? "-dark" : ""}.png`;
       const staged = join(scratch, name);
       evaluate(
-        `void app.plugins.plugins[${JSON.stringify(id)}].capture(${JSON.stringify(scene)},${JSON.stringify(theme)},${JSON.stringify(staged)})`,
+        `void app.plugins.plugins[${JSON.stringify(id)}].capture(${JSON.stringify(scene)},${JSON.stringify(theme)},${JSON.stringify(staged)},${JSON.stringify(device)})`,
       );
-      await waitFor(staged);
+      try {
+        await waitFor(staged);
+      } catch (err) {
+        try {
+          await copyFile(staged, join(out, name.replace(".png", ".failed.png")));
+        } catch {}
+        throw err;
+      }
       // Only replace a previous screenshot after the new capture succeeded.
       await copyFile(staged, join(out, name));
       console.log(`Captured ${name}`);
