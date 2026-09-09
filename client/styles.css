@@ -108,7 +108,8 @@
   align-items: center;
 }
 
-.status-bar-item.plugin-basalt-sync.basalt-attention {
+.status-bar-item.plugin-basalt-sync.basalt-attention,
+.basalt-sync-ribbon.basalt-attention {
   color: var(--text-error);
 }
 

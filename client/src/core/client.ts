@@ -90,6 +90,7 @@ export interface ClientOptions {
   /** Whether this device may send anything to the server. Default false (I29). */
   readonly readOnly?: boolean;
   readonly log?: (message: string, ...rest: unknown[]) => void;
+  readonly activePath?: () => string | undefined;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
   readonly onTransfer?: (activity: TransferActivity | undefined) => void;
@@ -233,6 +234,7 @@ export class Client {
       ...(opts.log !== undefined ? { log: opts.log } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
       ...(opts.onTransfer !== undefined ? { onTransfer: opts.onTransfer } : {}),
+      ...(opts.activePath !== undefined ? { activePath: opts.activePath } : {}),
     });
     this.engine = engine;
   }
@@ -483,10 +485,18 @@ export class Client {
    */
   private async keepalive(): Promise<void> {
     try {
-      await this.transport.ping();
+      await this.serial(() => this.transport.ping());
     } catch {
       /* the connection is gone; the loop around this will hear about it */
     }
+  }
+
+  /** Probe an idle connection without inserting a text frame into an upload. */
+  probe(): Promise<void> {
+    // Between `want` and its final body the server accepts only binary frames.
+    // Use the same queue as sync and keepalive; the short timeout starts only
+    // once the active exchange has finished.
+    return this.serial(() => this.transport.probe());
   }
 
   /**

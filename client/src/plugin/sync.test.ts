@@ -108,6 +108,40 @@ async function converge(a: Device, b: Device, rounds = 5): Promise<void> {
 }
 
 describe("a vault reaching another device", () => {
+  it("keeps the same note open on both devices across alternating edits", async () => {
+    await fresh();
+    const mac = await device("Mac");
+    const phone = await device("Phone");
+    mac.adapter.seed("note.md", "initial\n", 1000);
+    await converge(mac, phone);
+
+    const openPaths = new Map([
+      [mac, "note.md"],
+      [phone, "note.md"],
+    ]);
+    const renames: Promise<void>[] = [];
+    for (const d of [mac, phone]) {
+      d.adapter.afterRename = (from, to) => {
+        if (openPaths.get(d) === from) openPaths.set(d, to);
+        // The plugin forwards Obsidian's rename events to the client. The
+        // previous fake never did, hiding the identity change from the engine.
+        renames.push(d.client.noteRename(from, to));
+      };
+    }
+    for (let i = 0; i < 6; i++) {
+      const writer = i % 2 === 0 ? mac : phone;
+      const text = `edited on ${writer.name}, turn ${i}\n`;
+      writer.adapter.seed(openPaths.get(writer)!, text, 2000 + i * 1000);
+      await converge(mac, phone);
+      await Promise.all(renames);
+      for (const d of [mac, phone]) {
+        expect(openPaths.get(d), `${d.name}'s open note moved`).toBe("note.md");
+        expect(d.notes()).toEqual(["note.md"]);
+        expect(d.text("note.md")).toBe(text);
+      }
+    }
+  });
+
   it("carries notes, folders and an attachment", async () => {
     await fresh();
     const a = await device("a");

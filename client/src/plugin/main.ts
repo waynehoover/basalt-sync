@@ -10,6 +10,7 @@ import {
   SettingGroup,
   setIcon,
   type ButtonComponent,
+  type MarkdownView,
   type TAbstractFile,
   type TextComponent,
 } from "obsidian";
@@ -217,6 +218,7 @@ export default class BasaltPlugin extends Plugin {
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt Sync", () =>
       new BasaltModal(this).open(),
     );
+    this.ribbonEl.addClass("basalt-sync-ribbon");
     // Settings is where somebody looks for a plugin's interface, and Obsidian
     // draws the gear there only for a plugin that registers a tab. Without
     // this the panel existed on the ribbon, the status bar and the command
@@ -432,7 +434,7 @@ export default class BasaltPlugin extends Plugin {
     }
     const work = (async () => {
       try {
-        await client.transport.probe();
+        await client.probe();
         if (mine === this.generation && this.client === client) await client.sync();
       } catch {
         // probe closes an unresponsive transport. The loop drains any writes
@@ -615,6 +617,7 @@ export default class BasaltPlugin extends Plugin {
     });
     return {
       vault,
+      activePath: () => this.app.workspace.getActiveFile()?.path,
       store: this.indexStore(),
       // Which key authenticates and what the vault is bound to, worked out in
       // core so that both shells cannot answer it differently.
@@ -922,6 +925,15 @@ export default class BasaltPlugin extends Plugin {
     let report: SyncReport;
     this.setState({ kind: "syncing", since: Date.now() });
     try {
+      // The editor's autosave has its own delay. A manual sync must include
+      // those buffers, not just the previous version already on disk.
+      for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+        // Deferred background tabs have no editor or save method. A leaf
+        // can also change views while an earlier editor is being saved.
+        const view = leaf.view as Partial<MarkdownView>;
+        if (typeof view.save === "function") await view.save();
+      }
+      if (mine !== this.generation || this.client !== client) return;
       report = await client.settle({ coalesceWrites: false });
     } catch (err) {
       if (mine !== this.generation) return;
@@ -2076,7 +2088,13 @@ export default class BasaltPlugin extends Plugin {
     if (this.statusEl) paintStatus(this.statusEl, state);
     // Where a phone can see it. `aria-label` is what Obsidian renders as a
     // ribbon tooltip, and it is also what a screen reader reads out.
-    this.ribbonEl?.setAttribute("aria-label", `Basalt: ${longStatus(state)}`);
+    if (this.ribbonEl) {
+      setIcon(this.ribbonEl, iconFor(state));
+      this.ribbonEl.removeClass("basalt-attention", "basalt-working");
+      const tone = toneFor(state);
+      if (tone) this.ribbonEl.addClass(tone);
+      this.ribbonEl.setAttribute("aria-label", `Basalt: ${longStatus(state)}`);
+    }
     for (const listener of this.listeners) listener(state);
   }
 

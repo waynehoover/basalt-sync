@@ -176,6 +176,9 @@ export class FakeVault {
   getAllLoadedFiles() {
     return this.adapter.index();
   }
+  getAbstractFileByPath(path: string) {
+    return this.getAllLoadedFiles().find((file) => file.path === normalizePath(path)) ?? null;
+  }
   /** Obsidian's own: "typically `.obsidian` but it could be different". */
   configDir = ".obsidian";
   private readonly handlers = new Map<VaultEvent, ((...args: unknown[]) => void)[]>();
@@ -211,6 +214,13 @@ export class FakeWorkspace {
 
   /** The file the plugin will be told is open. */
   activeFile: { path: string; extension: string } | undefined;
+  readonly markdownLeaves: {
+    isDeferred?: boolean;
+    view: { save?: () => Promise<void> };
+  }[] = [];
+  getLeavesOfType(type: string) {
+    return type === "markdown" ? this.markdownLeaves : [];
+  }
   /** Handlers registered per event name, so a test can fire one. */
   readonly handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
 

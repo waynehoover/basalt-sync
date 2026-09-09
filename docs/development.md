@@ -93,6 +93,17 @@ not imply Node dependencies in the plugin bundle. Shared code uses `globalThis`
 and platform-neutral timers; local-resource `fetch` is used for attachment
 streaming. Review the built plugin and resolved types as well as source scans.
 
+Check actual open-editor behavior in an unpaired test vault:
+
+```bash
+node scripts/open-note-smoke.mjs --vault "Test vault"
+```
+
+This exercises repeated incoming updates, split views, cursor position, unsaved
+typing, and undo/redo. It trashes its temporary notes and removes the test plugin
+afterward. Add `--native-writes` to compare the same editors using Obsidian's
+`Vault.modify` API. Neither mode measures network or Android performance.
+
 ### Refresh the screenshots
 
 Open a test vault in desktop Obsidian and enable its command-line interface.

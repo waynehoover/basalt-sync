@@ -60,7 +60,7 @@ export interface DisplacedFiles {
    * (RR3). The plugin's `DataAdapter.write` truncates in place, so a short
    * write left a log holding `{"at":".` and an inventory of nothing, with the
    * hidden notes those records named still sitting there. That is the same
-   * objection this project used to reject `Vault.process()` for replacing
+   * objection to using `Vault.process()` without a verified backup when replacing
    * notes, and it applies at least as much to the record of where the notes
    * went: it is the only thing that knows.
    *

@@ -299,7 +299,7 @@ export class FakeAdapter implements DataAdapter {
 
   async read(normalizedPath: string): Promise<string> {
     this.check("read", normalizedPath);
-    return new TextDecoder().decode(this.bytesOf(normalizedPath));
+    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(this.bytesOf(normalizedPath));
   }
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
@@ -425,8 +425,11 @@ export class FakeAdapter implements DataAdapter {
     fn: (data: string) => string,
     options?: DataWriteOptions,
   ): Promise<string> {
-    const next = fn(await this.read(normalizedPath));
-    await this.write(normalizedPath, next, options);
+    const previous = await this.read(normalizedPath);
+    const next = fn(previous);
+    // Both shipped adapters skip the write (including its timestamps) when
+    // the callback returns the current text.
+    if (next !== previous) await this.write(normalizedPath, next, options);
     return next;
   }
 
@@ -719,6 +722,10 @@ export class FakeVaultIndex {
 
   getAllLoadedFiles(): TAbstractFile[] {
     return this.adapter.index();
+  }
+
+  getAbstractFileByPath(path: string): TAbstractFile | null {
+    return this.getAllLoadedFiles().find((file) => file.path === normalizePath(path)) ?? null;
   }
 }
 

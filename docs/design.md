@@ -52,23 +52,30 @@ version has been handled.
 
 ## File replacement
 
-Both adapters stage incoming content, check it, preserve displaced bytes, and
-publish only into a destination they can safely claim. A preservation failure
-other than an already-absent source stops the write. Recovery records make
-retained versions discoverable after restart; unreadable inventory is an
-explicit incomplete state.
+Both adapters preserve existing content before replacing it. If preservation
+fails, the write stops. Retained versions are visible files or have recovery
+records that survive restart; unreadable inventory is an explicit incomplete
+state.
 
-The CLI relies on local filesystem link/rename behavior. The plugin relies on
-Obsidian's adapters refusing occupied rename destinations, as inspected in
-Obsidian 1.13.7. Its test adapter models that behavior; it is not a substitute
-for acceptance against a new Obsidian release. The mobile path also rechecks a
-destination before rename, which narrows a race without proving exclusion.
+The CLI uses local filesystem link/rename behavior. For new files and binary
+replacements, the plugin stages content and relies on Obsidian's adapters
+refusing occupied rename destinations, as inspected in Obsidian 1.13.7. The
+mobile path also rechecks a destination before rename, which narrows a race
+without proving exclusion.
 
-`Vault.process()` is not a replacement for staging. In the inspected desktop
-and Capacitor adapters, it reads and writes strings in place. Its operation
-queue serializes adapter calls within Obsidian; it does not make an interrupted
-filesystem write atomic or coordinate an external editor. It also does not
-cover attachment writes, deletion, or restore.
+Text replacements keep the original file at its path so open editors continue
+showing that note. The plugin creates and verifies a visible backup, then uses
+`DataAdapter.process()` to compare and write inside Obsidian's save queue. A
+save that changes the text before that comparison is left alone. The backup
+stays until the new text is verified; desktop also flushes the backup before
+writing and the updated note before removing it. A failed or interrupted write
+leaves the backup available under its conflict-copy name.
+
+`process()` writes strings in place. Its queue serializes Obsidian's saves on
+desktop and mobile; it does not make filesystem writes atomic or coordinate
+external editors. The backup supplies recovery. It cannot replace the binary
+write or deletion paths. Tests of the fake adapter need supplementing with
+open-editor acceptance against supported Obsidian releases.
 
 Desktop can flush through the filesystem; mobile does not expose an equivalent
 flush primitive. Mobile crash/power-loss durability is therefore weaker. A

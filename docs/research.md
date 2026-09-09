@@ -71,6 +71,53 @@ a new note and **100–121 ms for five repeat edits**. These are saved-file to
 server-acknowledgement times, not phone-delivery measurements. All six versions
 were fetched back and matched exactly; the temporary note's deletion synced.
 
+## Open editors and foreground notes — September 9, 2026
+
+A native Obsidian 1.13.7 reproduction found that the 0.7.0 plugin temporarily
+renamed every replaced note into a conflict copy. The open editor followed that
+rename; deleting the temporary copy left an empty tab. Disk-only tests missed
+the effect on Obsidian's file identity and rename listeners.
+
+The installed official Sync implementation updates existing files through
+`Vault.modify`/`modifyBinary`; Obsidian's text view then merges unsaved buffers
+and preserves the open file. Basalt now keeps text files at their original
+paths, using a verified backup and a comparison inside `DataAdapter.process`.
+The [design guide](design.md#file-replacement) describes its recovery limits.
+
+`scripts/open-note-smoke.mjs` verified twelve updates in two actual editors,
+cursor stability, disjoint unsaved typing, and undo/redo. Native application of
+Basalt's updates took **20.6–34.7 ms**; a `Vault.modify` control took **1.5–3.8 ms**.
+The Basalt path includes backup verification and desktop filesystem flushes.
+Both modes include incoming changes in native undo history; redo restored the
+combined text. This is an editor/storage test, not an official Sync network
+benchmark or a test of Android storage.
+
+Basalt also prioritizes the current text note over background notes. With
+3,845 unchanged notes and a simulated 500 ms read of another note,
+`bench:cadence` measured five deliveries at **561–586 ms** without that priority
+and **25–39 ms** with it. The same run's ordinary repeat edits were **32–37 ms**
+with priority enabled. All received contents were checked. Reproduce on an
+Apple M4 Pro with Bun 1.4.2, a real loopback server, and in-memory vaults:
+
+```bash
+cd client
+BASALT_BENCH_NOTES=3845 BASALT_BENCH_PRIORITY=0 bun run bench:cadence
+BASALT_BENCH_NOTES=3845 BASALT_BENCH_PRIORITY=1 bun run bench:cadence
+```
+
+This does not interrupt a transfer already in progress. Automatic sync still
+starts from Obsidian's saved-file events; the editor's own autosave delay is
+separate. **Sync now** saves open Markdown buffers before syncing so a manual
+request includes the text still being edited. The ribbon icon now shows sync,
+offline, and error states visually, including on mobile.
+
+Live PKB verification also exposed a connection race: a foreground probe could
+send a text ping while the server was waiting for an upload's binary bodies.
+Resume probes and periodic keepalives now use the client's existing operation
+queue. Regression tests hold a requested body until released and check that
+neither ping interrupts the upload. Idle resume still uses its short timeout;
+an active transfer keeps its normal progress timeout.
+
 ## Resume and attachment scheduling
 
 The protocol 6 follow-up keeps the same note event batching. Resume now probes

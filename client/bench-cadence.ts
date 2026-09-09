@@ -41,6 +41,8 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const samples: Record<string, number[]> = {};
 const passes: Record<string, number> = {};
 const baselineNotes = Number(process.env["BASALT_BENCH_NOTES"] ?? 0);
+const prioritizeActive = process.env["BASALT_BENCH_PRIORITY"] !== "0";
+let activePath: string | undefined;
 if (!Number.isSafeInteger(baselineNotes) || baselineNotes < 0)
   throw new Error("Invalid BASALT_BENCH_NOTES");
 try {
@@ -58,6 +60,7 @@ try {
       url: server.wsUrl,
       vaultId: "default",
       device,
+      activePath: () => (prioritizeActive ? activePath : undefined),
       // Exercise the same transfer reporting path used by the plugin.
       onTransfer: () => {},
       onPass: () => {
@@ -109,6 +112,20 @@ try {
     await until("the attachment to finish", () => bv.text(path) === "complete attachment bytes\n");
     av.readDelays.delete(path);
   }
+  for (let i = 0; i < 5; i++) {
+    const background = `a-background-note-${i}.md`;
+    activePath = `z-current-note-${i}.md`;
+    av.readDelays.set(background, 500);
+    await av.edit(background, `Background note ${i}.\n`);
+    await send(
+      "current note beside background note (500 ms read)",
+      activePath,
+      `Current note ${i}.\n`,
+    );
+    await until("the background note", () => bv.text(background) === `Background note ${i}.\n`);
+    av.readDelays.delete(background);
+  }
+  activePath = undefined;
   const beforeBurst = { ...passes };
   const burst = performance.now();
   for (let i = 0; i < 200; i++) await av.edit(`burst/note-${i}.md`, `Exact burst content ${i}.\n`);
@@ -138,6 +155,7 @@ try {
           "loopback; real Go server; in-memory vaults; production sync timers; simulated Obsidian events",
         samplesMs: samples,
         baselineNotes,
+        prioritizeActive,
         burstPasses,
         exactContentVerified: true,
       },

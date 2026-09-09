@@ -1612,6 +1612,192 @@ describe("the index write that is skipped because nothing changed (P-D6)", () =>
  * and compares the content.
  */
 describe("writing over a file the pass did not decide about", () => {
+  it("updates an open note without renaming its file or redirecting the editor", async () => {
+    const path = "note.md";
+    let openPath = path;
+    adapter.seed(path, "original\n", 1000);
+    // Obsidian follows the same TFile when the adapter emits a rename. This
+    // used to send an open editor to the temporary conflict copy on every edit.
+    adapter.afterRename = (from, to) => {
+      if (openPath === from) openPath = to;
+    };
+    const out = await vault.replace(
+      path,
+      { contentId: await plainDigest(enc.encode("original\n")), idOf: plainDigest },
+      enc.encode("incoming edit\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(openPath).toBe(path);
+    expect(adapter.text(openPath)).toBe("incoming edit\n");
+    expect(adapter.filePaths()).toEqual([path]);
+  });
+
+  it("retains a complete local backup if an in-place text write is cut short", async () => {
+    adapter.seed("note.md", "unsent local text\n", 1000);
+    adapter.fault = (op, path) => (op === "write" && path === "note.md" ? 3 : undefined);
+    await expect(
+      vault.replace(
+        "note.md",
+        undefined,
+        enc.encode("incoming text\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      ),
+    ).rejects.toThrow("The previous content is at note (kept).md");
+    expect(adapter.text("note.md")).toBe("inc");
+    const restarted = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+    expect((await restarted.list()).map((f) => f.path)).toContain("note (kept).md");
+    expect(dec.decode(await restarted.read("note (kept).md"))).toBe("unsent local text\n");
+  });
+
+  it("flushes the backup before truncation and the new note before removing the backup", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced } = recordingFs();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    desktop.seed("note.md", "original\n", 1000);
+    const checkpoints: string[][] = [];
+    desktop.fault = (op, path) => {
+      if (
+        (op === "write" && path === "note.md") ||
+        (op === "remove" && path === "note (kept).md")
+      ) {
+        checkpoints.push([...synced]);
+      }
+      return undefined;
+    };
+    await v.replace(
+      "note.md",
+      { contentId: await plainDigest(enc.encode("original\n")), idOf: plainDigest },
+      enc.encode("incoming\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    expect(checkpoints).toHaveLength(2);
+    expect(checkpoints[0]).toContain("/home/me/vault/note (kept).md");
+    expect(checkpoints[0]).toContain("/home/me/vault");
+    expect(checkpoints[0]).not.toContain("/home/me/vault/note.md");
+    expect(checkpoints[1]).toContain("/home/me/vault/note.md");
+  });
+
+  it("keeps the original untouched if its backup cannot be flushed", async () => {
+    const desktop = new DesktopAdapter();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs: {
+        promises: {
+          open: async () => {
+            throw new Error("EIO: fsync");
+          },
+        },
+      },
+    });
+    desktop.seed("note.md", "original\n", 1000);
+    await expect(
+      v.replace(
+        "note.md",
+        undefined,
+        enc.encode("incoming\n"),
+        { mtime: 2000, ctime: 1000 },
+        "note (kept).md",
+      ),
+    ).rejects.toThrow("EIO: fsync");
+    expect(desktop.text("note.md")).toBe("original\n");
+    expect(desktop.text("note (kept).md")).toBe("original\n");
+    expect(desktop.calls.some((c) => c.op === "write" && c.path === "note.md")).toBe(false);
+  });
+
+  it("does not truncate a text file if its backup cannot be staged", async () => {
+    adapter.seed("note.md", "unsent local text\n", 1000);
+    adapter.fault = (op, path) =>
+      op === "writeBinary" && path.includes(".basalt-tmp-") ? 2 : undefined;
+    const out = await vault.replace(
+      "note.md",
+      undefined,
+      enc.encode("incoming text\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    expect(out).toEqual({ landed: false });
+    expect(adapter.text("note.md")).toBe("unsent local text\n");
+    expect(adapter.calls.some((c) => c.op === "write" && c.path === "note.md")).toBe(false);
+  });
+
+  it("compares against an editor save inside the text operation, even with matching stats", async () => {
+    const before = "original\n";
+    const edited = "changed!\n";
+    adapter.seed("note.md", before, 1000);
+    adapter.fault = (op, path) => {
+      if (op === "read" && path === "note.md") {
+        adapter.seed(path, edited, 1000);
+        adapter.fault = undefined;
+      }
+      return undefined;
+    };
+    const out = await vault.replace(
+      "note.md",
+      { contentId: await plainDigest(enc.encode(before)), idOf: plainDigest },
+      enc.encode("incoming\n"),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    expect(out.landed).toBe(false);
+    expect(adapter.text("note.md")).toBe(edited);
+    expect(adapter.text("note (kept).md")).toBe(before);
+  });
+
+  it("preserves UTF-8 BOMs and CRLFs when updating an open text file", async () => {
+    const before = "\uFEFF# café\r\n原文\r\n";
+    const after = "\uFEFF# café\r\n原文 🪨\r\n";
+    adapter.seed("note.md", before, 1000);
+    const out = await vault.replace(
+      "note.md",
+      { contentId: await plainDigest(enc.encode(before)), idOf: plainDigest },
+      enc.encode(after),
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).md",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(new Uint8Array(await adapter.readBinary("note.md"))).toEqual(enc.encode(after));
+    expect(adapter.calls.some((c) => c.op === "rename" && c.path === "note.md")).toBe(false);
+  });
+
+  it("applies an intentional case-only rename while updating text", async () => {
+    adapter.insensitive = true;
+    adapter.seed("Note.md", "original\n", 1000);
+    const out = await vault.replace(
+      "NOTE.md",
+      { contentId: await plainDigest(enc.encode("original\n")), idOf: plainDigest },
+      enc.encode("incoming\n"),
+      { mtime: 2000, ctime: 1000 },
+      "NOTE (kept).md",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(adapter.filePaths()).toEqual(["NOTE.md"]);
+    expect(adapter.text("NOTE.md")).toBe("incoming\n");
+    expect(adapter.calls.filter((c) => c.op === "rename" && c.path === "Note.md")).toEqual([
+      { op: "rename", path: "Note.md", to: "NOTE.md" },
+    ]);
+  });
+
+  it("keeps invalid UTF-8 as bytes instead of passing it through text processing", async () => {
+    const before = new Uint8Array([0xff, 0xfe, 0x80]);
+    const after = new Uint8Array([0xfe, 0xff, 0x81]);
+    await adapter.writeBinary("note.bin", before.buffer);
+    const out = await vault.replace(
+      "note.bin",
+      { contentId: await plainDigest(before), idOf: plainDigest },
+      after,
+      { mtime: 2000, ctime: 1000 },
+      "note (kept).bin",
+    );
+    expect(out).toEqual({ landed: true });
+    expect(new Uint8Array(await adapter.readBinary("note.bin"))).toEqual(after);
+    expect(adapter.calls.some((c) => c.op === "write" && c.path === "note.bin")).toBe(false);
+  });
+
   it("keeps what it displaced at a path of its own, not in memory", async () => {
     const enc = new TextEncoder();
     await adapter.write("note.md", "the original line\n", { mtime: 1000 });

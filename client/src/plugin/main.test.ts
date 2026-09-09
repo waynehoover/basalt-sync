@@ -635,6 +635,59 @@ describe("pairing instructions", () => {
 });
 
 describe("syncing while it runs", () => {
+  it.each(["foreground", "keepalive"])(
+    "keeps %s pings out of an upload's binary body exchange",
+    async (trigger) => {
+      const win = new EventTarget();
+      vi.stubGlobal("window", win);
+      const gate = deferred();
+      const entered = deferred();
+      let upload: Promise<void> | undefined;
+      let keepalive: Promise<void> | undefined;
+      try {
+        await fresh();
+        const { plugin, app } = await load();
+        await startVault(plugin);
+        await synced(plugin);
+        const client = (plugin as unknown as { client: Client }).client;
+        const putMany = client.transport.putMany.bind(client.transport);
+        client.transport.putMany = (entries, bodyOf, onBytes) =>
+          putMany(
+            entries,
+            async (name) => {
+              entered.resolve();
+              await gate.promise;
+              return bodyOf(name);
+            },
+            onBytes,
+          );
+        const ping = vi.spyOn(client.transport, "ping");
+        app.vault.adapter.seed("foreground.md", "exact foreground upload\n");
+        upload = plugin.syncNow();
+        await within(entered.promise, "the server to request an upload body");
+        if (trigger === "foreground") win.dispatchEvent(new Event("online"));
+        else keepalive = (client as unknown as { keepalive(): Promise<void> }).keepalive();
+        await nextTurn();
+        expect(ping, "a text ping interrupted the binary upload").not.toHaveBeenCalled();
+        gate.resolve();
+        await upload;
+        await keepalive;
+        await (plugin as unknown as { resuming?: Promise<void> }).resuming;
+        expect(ping).toHaveBeenCalledOnce();
+        expect(client.transport.isClosed).toBe(false);
+        const versions = await client.history("foreground.md", { limit: 1 });
+        expect(new TextDecoder().decode(await client.contentAt(versions[0]!))).toBe(
+          "exact foreground upload\n",
+        );
+      } finally {
+        gate.resolve();
+        await upload;
+        await keepalive;
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("checks for missed saves when the app returns to the foreground", async () => {
     const doc = new EventTarget();
     Object.defineProperty(doc, "visibilityState", { value: "visible" });
@@ -806,6 +859,44 @@ describe("syncing while it runs", () => {
 });
 
 describe("when things go wrong", () => {
+  it("skips deferred tabs and saves loaded editor buffers before Sync now completes", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    await synced(plugin);
+    app.workspace.markdownLeaves.push({ isDeferred: true, view: {} });
+    app.workspace.markdownLeaves.push({
+      view: {
+        save: async () =>
+          app.vault.adapter.write("draft.md", "the paragraph still in the editor\n"),
+      },
+    });
+    await plugin.syncNow();
+    const peer = await load();
+    await peer.plugin.pair(keyOf(plugin), "peer");
+    await synced(peer.plugin);
+    expect(peer.app.vault.adapter.text("draft.md")).toBe("the paragraph still in the editor\n");
+  });
+
+  it("does not report Sync now as successful when the editor cannot save", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    await synced(plugin);
+    app.workspace.markdownLeaves.push({
+      view: {
+        save: async () => {
+          throw new Error("editor disk full");
+        },
+      },
+    });
+    notices.length = 0;
+    await plugin.syncNow();
+    expect(plugin.currentState.kind).toBe("failed");
+    expect(notices.some((n) => n.message.includes("editor disk full"))).toBe(true);
+    expect(notices.some((n) => n.message === "Basalt: up to date")).toBe(false);
+  });
+
   it("shows one busy action and one result for repeated manual sync requests", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1527,6 +1618,7 @@ describe("on a device with no status bar", () => {
     const label = ribbon.el.attributes.get("aria-label") ?? "";
     expect(label, `the ribbon says ${JSON.stringify(label)}`).toMatch(/^Basalt: /);
     expect(label).not.toMatch(/connecting/);
+    expect(ribbon.el.attributes.get("data-icon")).toBe("cloud-check");
   }, 300_000);
 
   /**

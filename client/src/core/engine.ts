@@ -401,6 +401,8 @@ export interface EngineOptions {
   readonly token: string;
   readonly now?: () => number;
   readonly log?: (message: string, ...rest: unknown[]) => void;
+  /** The open note gets its own first batch before background text or attachments. */
+  readonly activePath?: () => string | undefined;
   /** Path preparation, and undefined before the pass flushes files and saves its index. */
   readonly onProgress?: (path: string | undefined) => void;
   /** Transfer activity for a sync batch; undefined when the exchange ends, before local saving. */
@@ -1346,20 +1348,28 @@ export class Engine {
       ...ambiguous.keys(),
     ]);
 
+    const active = this.opts.activePath?.();
     const priority = (path: string) =>
-      onDisk.get(path)?.folder || this.remote.get(path)?.folder ? 0 : looksLikeText(path) ? 1 : 2;
+      onDisk.get(path)?.folder || this.remote.get(path)?.folder
+        ? 0
+        : looksLikeText(path)
+          ? path === active
+            ? 1
+            : 2
+          : 3;
     const ordered = [...paths]
       .map((path) => ({ path, priority: priority(path) }))
       .sort((a, b) => a.priority - b.priority || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    let notesFlushed = false;
+    let previousPriority = 0;
     for (const { path, priority } of ordered) {
-      if (priority === 2 && !notesFlushed) {
-        // Publish queued notes before an attachment can block reading,
-        // chunking, or transfer. All writes retain the same safety checks.
+      if (previousPriority > 0 && priority > previousPriority) {
+        // Publish the current note before background notes, and all notes
+        // before attachments. A slow file must not hold an interactive edit
+        // in an unflushed batch. Every batch retains the same safety checks.
         await this.fill(report);
         await this.flush(report);
-        notesFlushed = true;
       }
+      previousPriority = priority;
       if (this.ignoredPaths.has(path)) {
         // Settled, and settled by the person who configured this device. It
         // is counted every pass so it stays visible, and nothing is fetched

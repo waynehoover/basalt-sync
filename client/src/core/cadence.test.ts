@@ -6,6 +6,7 @@ import type { SyncReport } from "./engine.ts";
 import type { TransferActivity } from "./transfer.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 import { testWrapped } from "./test-keys.ts";
+import { deferred, receiveCommitted, within } from "./test-async.ts";
 import { MemoryIndexStore, MemoryVault, type StoredState } from "./vault.ts";
 
 // Events are delivered explicitly so unrelated writes cannot accidentally wake
@@ -72,6 +73,66 @@ async function pair(
 }
 
 describe("automatic sync cadence", () => {
+  it("sends the current note before a slow background note can hold the pass", async () => {
+    const { a, b, av, bv } = await pair({}, {}, { activePath: () => "z-current.md" });
+    loops.push(b.runUntilClosed());
+    await av.edit("a-background.md", "background note\n");
+    await av.edit("z-current.md", "the note being edited\n");
+    const gate = deferred();
+    const read = av.read.bind(av);
+    av.read = async (path) => {
+      if (path === "a-background.md") await gate.promise;
+      return read(path);
+    };
+    const pass = a.sync();
+    try {
+      await until(
+        "current note before background read",
+        () => bv.text("z-current.md") === "the note being edited\n",
+        1500,
+      );
+      expect(bv.text("a-background.md")).toBeUndefined();
+    } finally {
+      gate.resolve();
+      await pass;
+    }
+    await until("background note", () => bv.text("a-background.md") === "background note\n");
+  });
+
+  it("applies the open note before a background download can block it", async () => {
+    const { a, b, av, bv } = await pair({}, { activePath: () => "z-current.md" });
+    const scanGate = deferred();
+    const list = bv.list.bind(bv);
+    bv.list = async () => {
+      await scanGate.promise;
+      return list();
+    };
+    const gate = deferred();
+    const entered = deferred();
+    const write = bv.write.bind(bv);
+    bv.write = async (path, bytes, times) => {
+      if (path === "a-background.md") {
+        entered.resolve();
+        await gate.promise;
+      }
+      await write(path, bytes, times);
+    };
+    await av.edit("a-background.md", "background note\n");
+    await av.edit("z-current.md", "open note update\n");
+    await a.sync();
+    try {
+      await receiveCommitted(b.transport);
+      scanGate.resolve();
+      await within(entered.promise, "background download to start");
+      expect(bv.text("z-current.md")).toBe("open note update\n");
+    } finally {
+      scanGate.resolve();
+      gate.resolve();
+      await b.sync();
+    }
+    expect(bv.text("a-background.md")).toBe("background note\n");
+  });
+
   it("reports deduplicated batch transfers and remains unconfirmed until the index is saved", async () => {
     const uploads: (TransferActivity | undefined)[] = [];
     const downloads: (TransferActivity | undefined)[] = [];

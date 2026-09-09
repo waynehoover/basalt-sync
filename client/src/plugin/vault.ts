@@ -1,26 +1,16 @@
 /**
  * Obsidian's vault, as a vault.
  *
- * The other half of what makes the headless client the same client. Written
- * against `DataAdapter` rather than the higher-level `Vault` API for one reason
- * that matters: `writeBinary` takes `{ mtime, ctime }`, and the engine's whole
- * decision table compares timestamps. A file written with the moment it landed
- * looks locally edited on the next pass, and the device would upload back what
- * it just received, forever.
+ * Uses `DataAdapter` for staged binary writes and serialized text updates.
+ * Writes carry the incoming timestamps so a download does not look like a
+ * new local edit on the next scan.
  *
- * ## What is not verified
+ * ## Verification
  *
- * Every other file in `core` is tested, most of it against a real server. This
- * one is not, and cannot be: it needs Obsidian running. So it is kept as thin as
- * it can be, with no decisions in it, and the engine above it is tested against
- * an in-memory vault that implements the same interface. What is untested here
- * is the mapping onto Obsidian's API, and it will stay untested until the plugin
- * shell runs in a real vault.
- *
- * docs/design.md says to verify against the artifact and never infer. The
- * signatures used here were read out of `obsidian.d.ts` rather than remembered,
- * and `fake.ts` beside this file implements that interface so everything below
- * can actually be run.
+ * `fake.ts` models the inspected adapter behavior for unit and server-backed
+ * tests. `scripts/open-note-smoke.mjs` also exercises actual Obsidian editors:
+ * a correct file on disk is not enough if its tab follows a temporary rename.
+ * Native Android filesystem and power-loss behavior still need device testing.
  *
  * ## normalizePath is not a formatting function
  *
@@ -751,7 +741,12 @@ export class ObsidianVault implements Vault {
    * Writes over a file, keeping what was there when it is not what the caller
    * expected (R01, R19).
    *
-   * Obsidian's adapter has no hard link, so the headless client's trick of
+   * Text updates use `process` with a verified backup and a comparison inside
+   * the adapter's save queue. Renaming a live note, even temporarily, redirects
+   * its open editors and emits a user-visible rename to every plugin.
+   *
+   * Binary updates use the move-aside path below. Obsidian's adapter has no
+   * binary equivalent of `process` and no hard link, so the headless client's trick of
    * staging the new bytes and linking them into a name that has just been
    * vacated is not available. What it does have is `rename`, and that is
    * enough for the half that matters: the old bytes are moved to a path of
@@ -787,6 +782,22 @@ export class ObsidianVault implements Vault {
   ): Promise<Replaced> {
     const from = this.resolve(path);
     const kept = this.resolve(keepAt);
+
+    const before = await this.readIfThere(path);
+    if (before !== undefined) {
+      const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+      let previous: string | undefined;
+      let next: string | undefined;
+      try {
+        previous = decoder.decode(before);
+        next = decoder.decode(bytes);
+      } catch {
+        // Invalid UTF-8 must stay bytes; decoding it leniently corrupts it.
+      }
+      if (previous !== undefined && next !== undefined) {
+        return this.replaceText(path, from, keepAt, before, previous, next, expect, times);
+      }
+    }
 
     // No baseline is not permission to overwrite (R33).
     //
@@ -849,6 +860,71 @@ export class ObsidianVault implements Vault {
       return { landed: true };
     }
     this.wrote(kept);
+    return { keptAt: keepAt, landed: true };
+  }
+
+  /**
+   * Keep the TFile at its original path so Obsidian updates its open editors.
+   * `process` serializes the comparison and write with Obsidian's other saves
+   * on desktop and mobile. It still writes in place: the backup must exist
+   * before it starts and survive until the destination is verified and flushed.
+   * The backup is visible, so a crash needs no in-memory recovery record.
+   */
+  private async replaceText(
+    path: string,
+    normalized: string,
+    keepAt: string,
+    before: Uint8Array,
+    previous: string,
+    next: string,
+    expect: ExpectedContent | undefined,
+    times: Times,
+  ): Promise<Replaced> {
+    try {
+      const stat = await this.adapter.stat(normalized);
+      if (stat?.type !== "file") return { landed: false };
+      if (!(await this.create(keepAt, before, { mtime: stat.mtime, ctime: stat.ctime }))) {
+        return { landed: false };
+      }
+    } catch (error) {
+      this.log(`could not back up ${path}, so it was left alone`, String(error));
+      return { landed: false };
+    }
+
+    const changed = new Error("the note changed before its update could be applied");
+    try {
+      await this.flush();
+      // A peer may intentionally change only the filename's case. Updating
+      // bytes in place must still apply that rename; ordinary edits use the
+      // loaded index and need no directory listing or rename.
+      if (this.vault.getAbstractFileByPath(normalized)?.path !== normalized) {
+        await this.matchCase(normalized);
+      }
+      await this.adapter.process(
+        normalized,
+        (current) => {
+          // No awaits between this comparison and the queued write. An editor
+          // save made while the backup was being written keeps the original.
+          if (current !== previous) throw changed;
+          return next;
+        },
+        writeOptions(times),
+      );
+      this.wrote(normalized);
+      await verify(this.adapter, normalized, new TextEncoder().encode(next));
+      await this.flush();
+    } catch (error) {
+      if (error === changed) return { keptAt: keepAt, landed: false };
+      throw new Error(
+        `writing ${path} failed: ${String(error)}. The previous content is at ${keepAt}`,
+      );
+    }
+
+    if (expect !== undefined && (await expect.idOf(before)) === expect.contentId) {
+      await this.adapter.remove(this.resolve(keepAt)).catch(() => undefined);
+      this.entryChanged(this.resolve(keepAt));
+      return { landed: true };
+    }
     return { keptAt: keepAt, landed: true };
   }
 
