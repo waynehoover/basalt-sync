@@ -24,6 +24,7 @@ import {
 
 import {
   Client,
+  SYNC_EVENT_DELAY_MS,
   adviseAfterRegistering,
   attentionLines,
   needsAttention,
@@ -42,6 +43,10 @@ import {
   type InviteRow,
   type Version,
 } from "../core/client.ts";
+import { watchResume } from "./resume.ts";
+import type { TransferActivity } from "../core/transfer.ts";
+import { describeTransfer } from "./transfer.ts";
+import { describeDelivery, deliverySummary } from "../core/delivery.ts";
 import { generateSecret } from "../core/crypto.ts";
 import { REJOIN_ADVICE, type RepairReport, type SyncReport } from "../core/engine.ts";
 import {
@@ -102,15 +107,8 @@ export type State =
        */
       recoveryUnknown?: string | undefined;
     }
-  /**
-   * Working, and on what.
-   *
-   * Sending a large attachment is minutes inside one pass, and without this
-   * the status shown is the previous pass's result, so working and idle look
-   * exactly alike. The path rather than a percentage: what somebody wants to
-   * know is whether it is doing something and what.
-   */
-  | { kind: "syncing"; path?: string; since: number }
+  /** Preparation or transfer activity; saving still has to finish. */
+  | { kind: "syncing"; path?: string; transfer?: TransferActivity; since: number }
   /**
    * The last pass did not finish, and this is why.
    *
@@ -163,6 +161,10 @@ export default class BasaltPlugin extends Plugin {
   private unlinking: Promise<void> | undefined;
   private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
   private workingTimer: ReturnType<typeof setTimeout> | undefined;
+  private workingPath: string | undefined;
+  private workingTransfer: TransferActivity | undefined;
+  private workingSince: number | undefined;
+  private manualSync: Promise<void> | undefined;
 
   /**
    * Why the saved settings could not be read, while that is the case.
@@ -193,8 +195,19 @@ export default class BasaltPlugin extends Plugin {
 
   /** Ends the reconnect loop's backoff wait, when there is one to end (I05). */
   private wakeLoop: (() => void) | undefined;
+  private stopResume: (() => void) | undefined;
+  private resuming: Promise<void> | undefined;
+  private readonly panelClosers = new Set<() => void>();
+
+  watchUnload(close: () => void): () => void {
+    this.panelClosers.add(close);
+    return () => {
+      this.panelClosers.delete(close);
+    };
+  }
 
   override async onload(): Promise<void> {
+    this.stopResume = watchResume(() => this.resume());
     // Obsidian mobile has no status bar, and the declaration says so:
     // addStatusBarItem is "not available on mobile". The ribbon is on both,
     // so the state goes there too: its tooltip is the same sentence, and it
@@ -356,6 +369,10 @@ export default class BasaltPlugin extends Plugin {
    * an index behind its notes is safe, an index cut off mid-write is not.
    */
   override onunload(): void {
+    for (const close of this.panelClosers) close();
+    this.panelClosers.clear();
+    this.stopResume?.();
+    this.stopResume = undefined;
     this.running = false;
     this.generation++;
     this.clearTimers();
@@ -401,6 +418,31 @@ export default class BasaltPlugin extends Plugin {
       }
       if (mine === this.generation) this.running = false;
     })();
+  }
+
+  /** Check a resumed socket before trusting its apparent connected state. */
+  private resume(): void {
+    if (!this.running || this.resuming) return;
+    const mine = this.generation;
+    const client = this.client;
+    if (!client) {
+      this.wakeLoop?.();
+      return;
+    }
+    const work = (async () => {
+      try {
+        await client.transport.probe();
+        if (mine === this.generation && this.client === client) await client.sync();
+      } catch {
+        // probe closes an unresponsive transport. The loop drains any writes
+        // before reconnecting; waking it does not create a second writer.
+        if (mine === this.generation) this.wakeLoop?.();
+      }
+    })();
+    this.resuming = work;
+    void work.finally(() => {
+      if (this.resuming === work) this.resuming = undefined;
+    });
   }
 
   /**
@@ -525,17 +567,33 @@ export default class BasaltPlugin extends Plugin {
    *
    * A pass over a settled vault visits every path and does nothing to any of
    * them, so reporting each one would replace a useful summary with a blur.
-   * The state only moves once a path has been held for long enough to be
-   * worth mentioning, which in a quiet vault is never.
+   * Fast passes keep the last result. Sustained work is shown even if no
+   * individual path takes long, with text updates limited to five per second.
    */
   private working(path: string | undefined): void {
-    if (this.workingTimer !== undefined) clearTimeout(this.workingTimer);
-    this.workingTimer = undefined;
-    if (path === undefined) return;
+    this.workingPath = path;
+    if (path === undefined) {
+      this.workingTransfer = undefined;
+      clearTimeout(this.workingTimer);
+      this.workingTimer = undefined;
+      this.workingSince = undefined;
+      return;
+    }
+    this.scheduleWorking();
+  }
+
+  private scheduleWorking(): void {
+    this.workingSince ??= Date.now();
+    if (this.workingTimer !== undefined) return;
     this.workingTimer = setTimeout(() => {
       this.workingTimer = undefined;
-      this.setState({ kind: "syncing", path, since: Date.now() });
-    }, 400);
+      this.setState({
+        kind: "syncing",
+        ...(this.workingPath ? { path: this.workingPath } : {}),
+        ...(this.workingTransfer ? { transfer: this.workingTransfer } : {}),
+        since: this.workingSince!,
+      });
+    }, 200);
   }
 
   private clearTimers(): void {
@@ -560,8 +618,23 @@ export default class BasaltPlugin extends Plugin {
       // Which key authenticates and what the vault is bound to, worked out in
       // core so that both shells cannot answer it differently.
       ...(await credentialsFor(config)),
+      onSyncStart: () => {
+        if (!current()) return;
+        this.working(undefined);
+        this.scheduleWorking();
+      },
       onProgress: (path) => {
-        if (current()) this.working(path);
+        if (!current()) return;
+        // An undefined path ends file transfer, but flushing and saving the
+        // index are still work. Only onPass/onSyncFailed end the busy state.
+        this.workingPath = path;
+        this.scheduleWorking();
+      },
+      onTransfer: (activity) => {
+        if (!current() || this.workingSince === undefined) return;
+        this.workingTransfer = activity;
+        this.workingPath = activity?.path;
+        this.scheduleWorking();
       },
       onCatchUp: (at) => {
         if (!current()) return;
@@ -660,8 +733,9 @@ export default class BasaltPlugin extends Plugin {
    * pass per event and spend the copy re-scanning.
    */
   private nudge(): void {
-    if (!this.client) return;
-    if (this.nudgeTimer !== undefined) clearTimeout(this.nudgeTimer);
+    // Bound the wait from the first event. Resetting on every event let a
+    // busy vault postpone syncing indefinitely until the fallback poll.
+    if (!this.client || this.nudgeTimer !== undefined) return;
     const mine = this.generation;
     // Plain setTimeout rather than window's. Obsidian runs in a renderer
     // where both exist, and the plain one also exists everywhere this can be
@@ -677,7 +751,7 @@ export default class BasaltPlugin extends Plugin {
           this.passFailed("the last pass did not finish; the developer console has the reason");
         }
       });
-    }, 400);
+    }, SYNC_EVENT_DELAY_MS);
   }
 
   /**
@@ -803,7 +877,22 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /** Syncs on demand, and says so, because a command with no feedback is a guess. */
-  async syncNow(): Promise<void> {
+  syncNow(): Promise<void> {
+    if (this.manualSync) return this.manualSync;
+    const work = this.syncOnDemand();
+    this.manualSync = work;
+    void work.then(
+      () => {
+        if (this.manualSync === work) this.manualSync = undefined;
+      },
+      () => {
+        if (this.manualSync === work) this.manualSync = undefined;
+      },
+    );
+    return work;
+  }
+
+  private async syncOnDemand(): Promise<void> {
     if (!this.config) {
       new Notice("Basalt: this vault is not paired yet.");
       new BasaltModal(this).open();
@@ -811,6 +900,12 @@ export default class BasaltPlugin extends Plugin {
     }
     const client = this.client;
     if (!client) {
+      if (this.running && this.state.kind === "offline" && this.wakeLoop) {
+        this.setState({ kind: "connecting" });
+        this.wakeLoop();
+        new Notice("Basalt: reconnecting…");
+        return;
+      }
       new Notice(`Basalt: ${this.whyNoClient()}`);
       return;
     }
@@ -824,6 +919,7 @@ export default class BasaltPlugin extends Plugin {
     // chose "sync now" has said otherwise. Reporting "up to date" while
     // their last paragraph sits unsent is the status rule 7 forbids.
     let report: SyncReport;
+    this.setState({ kind: "syncing", since: Date.now() });
     try {
       report = await client.settle({ coalesceWrites: false });
     } catch (err) {
@@ -1523,6 +1619,10 @@ export default class BasaltPlugin extends Plugin {
     return { ...(await client.devices()), thisDevice: client.deviceId };
   }
 
+  get deliveryReady(): boolean {
+    return this.client?.deliveryReady ?? false;
+  }
+
   /**
    * A single-use invite for another device, from the live connection.
    *
@@ -2141,12 +2241,12 @@ export function describeDeleted(list: DeletedList): string {
   return parts.join(" ");
 }
 
-/** A short name distinguishes this status from other plugins' checkmarks. */
+/** One compact status glyph, with the plugin name and details in its tooltip. */
 function paintStatus(el: HTMLElement, state: State): void {
   el.empty();
   el.removeClass("basalt-attention", "basalt-working");
-  el.createSpan({ cls: "basalt-status-label", text: "Basalt" });
   const icon = el.createSpan({ cls: "basalt-status-icon" });
+  icon.setAttribute("aria-hidden", "true");
   setIcon(icon, iconFor(state));
   // Only when there is one. The settled state has no tone, and addClass with
   // an empty string throws: "The token provided must not be empty", which
@@ -2163,7 +2263,7 @@ function paintStatus(el: HTMLElement, state: State): void {
 /**
  * Which glyph. Settled and working are different glyphs and not the same
  * one spinning or not, because a spin is not something a glance can see.
- * Settled with files that need a person is not the plain check either.
+ * Settled with files that need a person is not the synced cloud either.
  */
 function iconFor(state: State): string {
   switch (state.kind) {
@@ -2176,7 +2276,7 @@ function iconFor(state: State): string {
     case "synced":
       return state.refused > 0 || state.waiting > 0 || state.recoveryUnknown !== undefined
         ? "alert-circle"
-        : "check";
+        : "cloud-check";
     case "offline":
       return "cloud-off";
     case "failed":
@@ -2266,6 +2366,9 @@ function docsLink(el: HTMLElement, text: string): void {
 class BasaltPanel {
   private closed = false;
   private unwatch: (() => void) | undefined;
+  private deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private renderGeneration = 0;
+  private unwatchUnload: () => void;
 
   /**
    * `host` is where it draws and `dismiss` is what "I am done here" means,
@@ -2280,11 +2383,15 @@ class BasaltPanel {
     private readonly dismiss: () => void,
     private readonly incomingInvite?: string,
   ) {
+    this.unwatchUnload = plugin.watchUnload(() => this.teardown());
     if (incomingInvite !== undefined) this.joining = "invite";
   }
 
   teardown(): void {
+    this.unwatchUnload();
     this.closed = true;
+    this.renderGeneration++;
+    clearTimeout(this.deliveryTimer);
     this.joinDraft = undefined;
     this.confirmMerge = false;
     this.unwatch?.();
@@ -2304,6 +2411,8 @@ class BasaltPanel {
   render(): void {
     // A pending settings request may finish after its modal or tab was closed.
     if (this.closed) return;
+    this.renderGeneration++;
+    clearTimeout(this.deliveryTimer);
     this.unwatch?.();
     this.host.empty();
 
@@ -2355,12 +2464,16 @@ class BasaltPanel {
     const primary = settingGroup(contentEl);
     const sync = row(primary, "Sync status");
     const status = sync.descEl;
+    status.addClass("basalt-sync-status");
+    this.renderDelivery(sync.infoEl);
     status.setAttribute("role", "status");
-    sync.addButton((b) =>
+    let syncButton!: ButtonComponent;
+    sync.addButton((b) => {
+      syncButton = b;
       b.setButtonText("Sync now").onClick(async () => {
         await this.plugin.syncNow();
-      }),
-    );
+      });
+    });
 
     const addDevice = contentEl.createEl("details", { cls: "basalt-add-device" });
     addDevice.createEl("summary", { text: "Add another device" });
@@ -2412,6 +2525,21 @@ class BasaltPanel {
       }
       const state = this.plugin.currentState;
       status.setText(longStatus(state));
+      const busy =
+        state.kind === "connecting" || state.kind === "loading" || state.kind === "syncing";
+      syncButton
+        .setDisabled(busy)
+        .setButtonText(
+          state.kind === "offline"
+            ? "Reconnect"
+            : state.kind === "connecting"
+              ? "Connecting…"
+              : state.kind === "loading"
+                ? "Loading…"
+                : state.kind === "syncing"
+                  ? "Syncing…"
+                  : "Sync now",
+        );
       // Both cursors, so "behind and nothing arriving" is something a person
       // can see (I11).
       const at = this.plugin.cursors();
@@ -2617,8 +2745,9 @@ class BasaltPanel {
         // Flagged rather than left as a blank, because a row nothing has ever
         // connected under is the reclaimable one: a pairing that reached the
         // server and then crashed leaves exactly that.
+        const cursor = this.plugin.cursors()?.server;
         const seen =
-          device.lastSeen === 0 ? "Never connected" : `Last seen ${when(device.lastSeen)}`;
+          cursor === undefined ? "Delivery unconfirmed" : describeDelivery(device, cursor);
         const name = device.name || "Unnamed device";
         const row = new Setting(list)
           .setName(`${name}${mine ? " (this device)" : ""}`)
@@ -2690,6 +2819,41 @@ class BasaltPanel {
 
     list = contentEl.createEl("div");
     said = later(contentEl, "basalt-advice");
+  }
+
+  /** Poll only an open, visible panel; update text without redrawing controls. */
+  private renderDelivery(host: HTMLElement): void {
+    const generation = this.renderGeneration;
+    const line = later(host, "setting-item-description basalt-delivery");
+    line.setAttribute("aria-live", "polite");
+    const current = () => !this.closed && this.renderGeneration === generation;
+    const refresh = async () => {
+      try {
+        if (!current() || globalThis.document?.visibilityState === "hidden") return;
+        const state = this.plugin.currentState;
+        if (state.kind !== "synced") {
+          say(line, "Device delivery unconfirmed.");
+          return;
+        }
+        if (!this.plugin.deliveryReady) {
+          say(line, "Waiting for this device to finish syncing.");
+          return;
+        }
+        const answer = await this.plugin.devices();
+        if (!current()) return;
+        const cursor = this.plugin.cursors()?.server;
+        const message =
+          cursor === undefined || !this.plugin.deliveryReady
+            ? "Device delivery unconfirmed."
+            : deliverySummary(answer.devices, answer.thisDevice, cursor);
+        if (line.textContent !== message) say(line, message);
+      } catch {
+        if (current()) say(line, "Device delivery unavailable.");
+      } finally {
+        if (current()) this.deliveryTimer = setTimeout(() => void refresh(), 1000);
+      }
+    };
+    void refresh();
   }
 
   /** Show the QR and a selectable pairing code, with Copy beside the code. */
@@ -3584,6 +3748,7 @@ function longStatus(state: State): string {
       return `Loading sync history… ${percent}%. Keep Obsidian open.`;
     }
     case "syncing":
+      if (state.transfer) return describeTransfer(state.transfer);
       return state.path === undefined ? "Syncing notes." : `Working on ${state.path}.`;
     case "synced": {
       // `summarise` returns a fragment because three of its four callers put

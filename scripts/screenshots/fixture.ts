@@ -95,6 +95,7 @@ export default class Screenshots extends Plugin {
     return {
       app: this.app,
       paired,
+      deliveryReady: true,
       deviceName: "MacBook",
       currentState: paired
         ? { kind: "synced", summary: "up to date", at, refused: 0, waiting: 0 }
@@ -103,17 +104,18 @@ export default class Screenshots extends Plugin {
       cursors: () => ({ local: 124, server: 124 }),
       connection: () => ({
         url: "wss://sync.example.com",
-        server: { proto: 5, version: __SCREENSHOT_SERVER_VERSION__ },
+        server: { proto: 6, version: __SCREENSHOT_SERVER_VERSION__ },
       }),
       watchState: (listener) => {
         listener();
         return () => {};
       },
+      watchUnload: () => () => {},
       syncNow: unavailable,
       devices: async () => ({
         devices: [
-          { id: "sample-macbook", name: "MacBook", createdAt: at - 86400000, lastSeen: at },
-          { id: "sample-phone", name: "Phone", createdAt: at - 7200000, lastSeen: at - 300000 },
+          { id: "sample-macbook", name: "MacBook", createdAt: at - 86400000, lastSeen: at, online: true, applied: 124 },
+          { id: "sample-phone", name: "Phone", createdAt: at - 7200000, lastSeen: at, online: true, applied: 124 },
         ],
         maxDevices: 0,
         invites: [],
@@ -212,6 +214,15 @@ export default class Screenshots extends Plugin {
         this.model.deletedNotes = async () => ({ notes: [], more: false });
       this.modal = new RecoverModal(this.model);
     } else {
+      if (name === "uploading" || name === "downloading") {
+        this.model.deliveryReady = false;
+        this.model.currentState = {
+          kind: "syncing", since: at,
+          transfer: name === "uploading"
+            ? { direction: "upload", files: 1, path: "Attachments/Coastal walk.pdf", bytes: 2_400_000 }
+            : { direction: "download", files: 3, bytes: 8_700_000 },
+        };
+      }
       if (name === "loading") {
         this.model.currentState = { kind: "loading", local: 960, server: 3826 };
         this.model.cursors = () => ({ local: 960, server: 3826 });

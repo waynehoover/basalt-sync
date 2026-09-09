@@ -97,11 +97,10 @@
   color: var(--color-red);
 }
 
-/* The name identifies the plugin; the adjacent icon reports its state. */
+/* One icon wide; the tooltip identifies Basalt and describes its status. */
 .status-bar-item.plugin-basalt-sync {
   display: flex;
   align-items: center;
-  gap: var(--size-4-1);
 }
 
 .status-bar-item.plugin-basalt-sync .basalt-status-icon {
@@ -427,5 +426,20 @@
   .basalt-invite-qr {
     width: 240px;
     margin-inline: auto;
+  }
+}
+
+.basalt-panel .basalt-delivery {
+  margin: var(--size-2-1) 0 0;
+}
+
+/* Long attachment paths stay inside the status row on narrow screens. */
+.basalt-panel .basalt-sync-status {
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-bar-item.plugin-basalt-sync.basalt-working .basalt-status-icon {
+    animation: none;
   }
 }

@@ -484,21 +484,17 @@ export function reconciled(entry: IndexEntry, synchash: string, uid: number, now
 }
 
 /**
- * Whether enough time has passed since this file last synced to sync it again.
- *
- * Obsidian's, at `obsidian-sync-engine.js:930`: ten seconds for a small file,
- * twenty above 10 KiB, thirty above 100 KiB. It is a write-coalescing debounce
- * scaled by size, and the scaling is the insight. Somebody typing in a large
- * note generates a save every few seconds, and re-uploading a large file that
- * often costs more than the delay does.
- *
- * Basalt keeps the shape and the thresholds. Chunking means a re-upload costs
- * far less than Obsidian's whole-file push, which is an argument for a shorter
- * delay; the counter-argument is that each push is still a round trip and an
- * entry in the vault's history, and neither is free.
+ * Earliest repeat binary upload: 1 s up to 10 KiB, 2 s up to 100 KiB,
+ * 5 s above that, to coalesce repeated attachment writes. The engine exempts
+ * notes, other recognized text formats, and incoming reconciliation.
  */
+export function nextUploadTime(entry: IndexEntry): number {
+  if (!entry.synctime) return 0;
+  const delay = entry.size > 102400 ? 5000 : entry.size > 10240 ? 2000 : 1000;
+  return entry.synctime + delay;
+}
+
+/** Whether a repeat upload is due. A clock moved backwards must not stall it. */
 export function readyToSyncAgain(entry: IndexEntry, now: number): boolean {
-  if (!entry.synctime) return true;
-  const seconds = entry.size > 102400 ? 30 : entry.size > 10240 ? 20 : 10;
-  return now - entry.synctime > seconds * 1000;
+  return entry.synctime > now || now >= nextUploadTime(entry);
 }

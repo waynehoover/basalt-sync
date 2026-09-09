@@ -489,6 +489,52 @@ describe("two devices", () => {
 });
 
 describe("concurrent edits, which is where notes get lost", () => {
+  it("keeps both edits when an upload ack overtakes metadata verification", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+    const base = "The original sentence.\n";
+    const onA = "A's completely different sentence.\n";
+    const onB = "B's entirely other sentence.\n";
+    await a.vault.edit("note.md", base);
+    await convergeBoth(a, b);
+    await a.vault.edit("note.md", onA);
+    await b.vault.edit("note.md", onB);
+
+    // The frame arrived before the ack, but its async authentication/path
+    // decryption has not completed. Hold precisely that boundary.
+    let release!: () => void;
+    let entered = false;
+    const gate = new Promise<void>((r) => (release = r));
+    const accept = a.engine.acceptBatch.bind(a.engine);
+    a.engine.acceptBatch = async (batch) => {
+      if (batch.entries.length > 0) {
+        entered = true;
+        await gate;
+      }
+      await accept(batch);
+    };
+    let pass: Promise<SyncReport> | undefined;
+    try {
+      await b.engine.sync();
+      await until("a to start verifying b's edit", () => entered);
+      const before = b.batchesWithEntries;
+      pass = a.engine.sync();
+      await until("a's edit to commit", () => b.batchesWithEntries > before);
+      // Give the already-sent ack its turn while verification remains gated.
+      await new Promise((r) => setTimeout(r, 50));
+    } finally {
+      release();
+      await pass;
+    }
+    await convergeBoth(a, b, 6);
+    for (const d of [a, b]) {
+      const copies = Object.values(d.vault.snapshot());
+      expect(copies, `${d.name} lost A's edit`).toContain(onA);
+      expect(copies, `${d.name} lost B's edit`).toContain(onB);
+    }
+  }, 240_000);
+
   it("merges edits to different parts of one note, keeping both", async () => {
     await fresh();
     const a = await device("a");

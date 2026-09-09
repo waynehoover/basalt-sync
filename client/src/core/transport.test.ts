@@ -33,9 +33,10 @@ async function connected(
     onBatch?: (b: Batch) => void | Promise<void>;
     onCaughtUp?: (c: number) => void;
     timeoutMs?: number;
+    socket?: FakeSocket;
   } = {},
 ) {
-  const socket = new FakeSocket();
+  const socket = opts.socket ?? new FakeSocket();
   const batches: Batch[] = [];
   const t = new Transport("ws://test", {
     onBatch: opts.onBatch ?? ((b) => void batches.push(b)),
@@ -65,6 +66,164 @@ async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
  * none says so here.
  */
 const unsigned = { mac: "", parent: "" };
+
+describe("transfer byte progress", () => {
+  it.each(["put", "putmany"])(
+    "counts wanted bytes in %s, without completing before the ack",
+    async (op) => {
+      class BufferedSocket extends FakeSocket {
+        bufferedAmount = 0;
+        override send(data: string | ArrayBufferLike | Uint8Array): void {
+          super.send(data);
+          if (typeof data !== "string") this.bufferedAmount += data.byteLength;
+        }
+      }
+      const socket = new BufferedSocket();
+      const { t } = await helloed(0, { socket });
+      const body = new Uint8Array(100);
+      const name = await chunkName(body);
+      const reused = await chunkName(new Uint8Array([1]));
+      const seen: number[] = [];
+      const produce = vi.fn(async () => body);
+      const meta = { size: 101, ctime: 0, mtime: 0 };
+      let done = false;
+      const putting = (
+        op === "put"
+          ? t.put("p", meta, [name, reused], produce, unsigned, (n) => seen.push(n))
+          : t.putMany([{ path: "p", meta, names: [name, reused], ...unsigned }], produce, (n) =>
+              seen.push(n),
+            )
+      ).then((r) => {
+        done = true;
+        return r;
+      });
+      try {
+        socket.reply({ res: "want", chunks: [name] });
+        await settle();
+        expect(socket.sentBinary).toEqual([body]);
+        expect(seen).toEqual([0]);
+        socket.bufferedAmount = 60;
+        await new Promise((r) => setTimeout(r, 20));
+        expect(seen.at(-1)).toBe(40);
+        socket.bufferedAmount = 0;
+        await new Promise((r) => setTimeout(r, 20));
+        expect(seen.at(-1)).toBe(100);
+        expect(done).toBe(false);
+        expect(produce).toHaveBeenCalledTimes(1);
+        socket.reply(
+          op === "put" ? { res: "ack", uid: 1 } : { res: "acks", results: [{ uid: 1 }] },
+        );
+        expect(await putting).toMatchObject({ bytes: 100, uploaded: 1 });
+      } finally {
+        t.close();
+        await putting.catch(() => {});
+      }
+    },
+  );
+
+  it("reports received bodies while later bodies are still outstanding", async () => {
+    const { t, socket } = await helloed();
+    const bodies = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])];
+    const seen: number[] = [];
+    let done = false;
+    const fetching = t
+      .fetch(await Promise.all(bodies.map(chunkName)), (n) => seen.push(n))
+      .then((r) => {
+        done = true;
+        return r;
+      });
+    try {
+      socket.reply({ res: "bodies", count: 2 });
+      socket.body(bodies[0]!);
+      await settle();
+      expect(seen).toEqual([0, 3]);
+      expect(done).toBe(false);
+      socket.body(bodies[1]!);
+      expect(await fetching).toEqual(bodies);
+      expect(seen).toEqual([0, 3, 5]);
+    } finally {
+      t.close();
+      await fetching.catch(() => {});
+    }
+  });
+
+  it("keeps progress observers out of transfer failure handling", async () => {
+    const { t, socket } = await helloed();
+    const body = new Uint8Array([1, 2, 3]);
+    const fetching = t.fetch([await chunkName(body)], () => {
+      throw new Error("UI failed");
+    });
+    socket.bodies(body);
+    expect(await fetching).toEqual([body]);
+    expect(t.isClosed).toBe(false);
+    t.close();
+  });
+});
+
+describe("upload acknowledgments behind metadata verification", () => {
+  it.each(["have", "ack", "acks"])("waits for earlier batches before returning %s", async (res) => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let verified = false;
+    const { t, socket } = await helloed(0, {
+      onBatch: async () => {
+        await gate;
+        verified = true;
+      },
+    });
+    const { body, name } = await named(new Uint8Array([1, 2, 3]));
+    const meta = { size: 3, ctime: 1, mtime: 1 };
+    const write =
+      res === "acks"
+        ? t.putMany([{ path: "p", meta, names: [name], ...unsigned }], async () => body)
+        : t.put("p", meta, [name], async () => body, unsigned);
+    let completed = false;
+    const result = write.then((value) => {
+      completed = true;
+      return value;
+    });
+    try {
+      if (res === "ack") {
+        socket.reply({ res: "want", chunks: [name] });
+        await settle();
+      }
+      socket.reply({ op: "batch", from: 1, to: 1, entries: [] });
+      socket.reply(res === "acks" ? { res, results: [{ uid: 2 }] } : { res, uid: 2 });
+      await settle();
+      expect(completed).toBe(false);
+      expect(verified).toBe(false);
+      release();
+      await result;
+      expect(verified).toBe(true);
+      expect(completed).toBe(true);
+    } finally {
+      release();
+      await result;
+      t.close();
+    }
+  });
+
+  it("refuses to mark an upload synced when earlier metadata fails verification", async () => {
+    const { t, socket } = await helloed(0, {
+      onBatch: async () => {
+        await settle();
+        throw new Error("metadata authentication failed");
+      },
+    });
+    const write = t.put(
+      "p",
+      { size: 0, ctime: 1, mtime: 1 },
+      [],
+      async () => new Uint8Array(),
+      unsigned,
+    );
+    const checked = expect(write).rejects.toThrow("metadata authentication failed");
+    socket.reply({ op: "batch", from: 1, to: 1, entries: [] });
+    socket.reply({ res: "have", uid: 2 });
+    await checked;
+    expect(t.isClosed).toBe(true);
+  });
+});
 
 /** A body and the name it travels under, which is a hash of exactly its bytes. */
 async function named(body: Uint8Array): Promise<{ body: Uint8Array; name: string }> {
@@ -1488,6 +1647,38 @@ describe("cutting to the ceiling the server advertised", () => {
  * the vault missing and the client reporting that it had finished.
  */
 describe("the timeout a fetch leaves behind", () => {
+  it("closes an idle socket promptly when a resume probe gets no response", async () => {
+    const { t } = await helloed();
+    await expect(t.probe(20)).rejects.toThrow("after resuming");
+    expect(t.isClosed).toBe(true);
+  });
+
+  it("does not apply the short resume timeout to an active transfer", async () => {
+    const { t, socket } = await helloed();
+    const body = new Uint8Array([1, 2, 3]);
+    const name = await chunkName(body);
+    const fetch = t.fetch([name]);
+    const probe = t.probe(20);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(t.isClosed).toBe(false);
+    socket.bodies(body);
+    socket.reply({ res: "pong" });
+    expect(await fetch).toEqual([body]);
+    await probe;
+    t.close();
+  });
+  it("shares a ping between resume and the periodic keepalive", async () => {
+    const { t, socket } = await helloed();
+    try {
+      const first = t.ping();
+      const second = t.ping();
+      const result = Promise.all([first, second]);
+      socket.reply({ res: "pong" });
+      await expect(result).resolves.toEqual([undefined, undefined]);
+    } finally {
+      t.close();
+    }
+  });
   it("does not close the connection some time after a fetch succeeded", async () => {
     const { t, socket } = await helloed(0, { timeoutMs: 120 });
     const body = new Uint8Array([1, 2, 3]);

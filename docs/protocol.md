@@ -1,4 +1,4 @@
-# Wire protocol, v5
+# Wire protocol, v6
 
 [Developer documentation](development.md) · [Design and threat model](design.md)
 
@@ -29,9 +29,9 @@ A hello selects one of three session types.
 ### Device session
 
 ```text
--> {op:"hello", id, proto:5, vault, deviceId, token, device,
+-> {op:"hello", id, proto:6, vault, deviceId, token, device,
     crypto:"basalt/hkdf-aes-gcm/1", cursor}
-<- {res:"ready", id, proto:5, minProto:5, serverVersion, cursor,
+<- {res:"ready", id, proto:6, minProto:6, serverVersion, cursor,
     perFileMax, chunkMax, maxChunks, maxBatchBytes, maxFetchBytes, wrapped}
 ```
 
@@ -42,8 +42,8 @@ catch-up and includes the vault's wrapped data key.
 ### Registrar session
 
 ```text
--> {op:"hello", id, proto:5, vault, token, device, crypto, claim?, wrapped?}
-<- {res:"registrar", id, proto:5, minProto:5, serverVersion, maxDevices}
+-> {op:"hello", id, proto:6, vault, token, device, crypto, claim?, wrapped?}
+<- {res:"registrar", id, proto:6, minProto:6, serverVersion, maxDevices}
 ```
 
 With no `deviceId`, `token` is the root-derived vault credential. A registrar
@@ -59,7 +59,7 @@ A bootstrap-authenticated registrar cannot rotate the root.
 ### Invite redemption
 
 ```text
--> {op:"hello", id, proto:5, vault, device, crypto, invite, deviceId, auth, name?}
+-> {op:"hello", id, proto:6, vault, device, crypto, invite, deviceId, auth, name?}
 <- {res:"redeemed", id, sealed, deviceId}
 ```
 
@@ -69,9 +69,10 @@ device session. See [invites](#adding-a-device-with-a-single-use-invite).
 
 ### Validation and compatibility
 
-The supported range is currently **5 through 5**. Protocol 5 adds device-label
-`rename`; older protocols are refused with `proto`. Upgrade the server before
-clients. A refusal names supported protocol numbers, not the server release;
+Only **protocol 6** is supported. It adds completed local checkpoints and live
+device delivery state; older protocols are refused with `proto`. Update the
+server and all clients together. Existing vault data and credentials are unchanged.
+A refusal names supported protocol numbers, not the server release;
 `serverVersion` is disclosed only after authentication.
 
 Vault and device names are bounded at 64 bytes and reject control characters.
@@ -283,7 +284,7 @@ Revoking the last device needs a registrar and `allowLast`; a device presenting
 that field is refused with `auth`. A nonexistent device is `nodevice`.
 
 There is no fixed limit on registered devices or authenticated connections.
-`maxDevices: 0` means unlimited; older servers may advertise a positive cap.
+`maxDevices` is `0`; the server imposes no device-count limit.
 Connection-level `busy` indicates pre-authentication admission pressure or
 shutdown and can clear by waiting. Failed pairing can leave an unused device
 row, which remains until explicitly revoked.
@@ -415,10 +416,28 @@ frames missing that field.
 | `nocontent` | Requested version is a folder or deletion. | no | request rejected. |
 | `nochunk` | Content unavailable. | no | request rejected without partial fetch bodies. |
 | `nodevice` | Device ID no longer exists. | no | request rejected. |
-| `full` | Registration limit reached on an older server. | no | update the server or remove an unused device. |
 | `internal` | Server fault; put not committed. | yes | ends during handshake/catch-up, otherwise rejects the request. |
 
-`busy` includes a retry delay for admission pressure or shutdown. `full` is
-retained for compatibility; current servers do not impose a device cap.
-Numeric limits are in
+`busy` includes a retry delay for admission pressure or shutdown. Numeric limits are in
 the [server reference](server-reference.md#ceilings).
+
+## Device delivery confirmation
+
+```text
+-> {op:"applied", id, applied:cursor}
+<- {res:"applied", id, cursor}
+```
+
+Only authenticated device sessions may confirm delivery. A client sends this
+after a successful sync pass saves its files and index, with no pending work,
+refusals, exclusions, held-back changes, or retries. Merely loading metadata or
+opening an inspection connection does not confirm delivery. The server checks
+that the checkpoint is nonnegative, no newer than its own history, and does not
+move backwards on that connection. An invalid checkpoint returns `badentry`.
+
+Each row returned by `devices` includes `online` (boolean) and `applied`
+(nonnegative cursor or null). A connected device with `applied >= target` has
+reported applying all changes through that target. Null means unconfirmed.
+Receipts are held only in memory for the connection's lifetime; disconnect and
+server restart clear them. These are trusted-device claims used for display,
+never authorization, a backup guarantee, or permission to delete history.

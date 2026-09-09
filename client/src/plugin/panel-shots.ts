@@ -302,6 +302,27 @@ const STATUSES: { name: string; state: State }[] = [
   { name: "syncing-started", state: { kind: "syncing", since: Date.now() } },
   { name: "syncing", state: { kind: "syncing", path: "Daily/2026-09-04.md", since: Date.now() } },
   {
+    name: "uploading",
+    state: {
+      kind: "syncing",
+      since: Date.now(),
+      transfer: {
+        direction: "upload",
+        files: 1,
+        path: "Attachments/Coastal walk.pdf",
+        bytes: 2_400_000,
+      },
+    },
+  },
+  {
+    name: "downloading",
+    state: {
+      kind: "syncing",
+      since: Date.now(),
+      transfer: { direction: "download", files: 3, bytes: 8_700_000 },
+    },
+  },
+  {
     name: "synced",
     state: {
       kind: "synced",
@@ -482,7 +503,13 @@ export async function walkPanelStates(
   // somebody asks for it and has no button on its only row.
   openPanel(laptop);
   await pressRow("Devices", "Show devices");
-  await until("the device rows", () => built.some((s) => /Last seen|Never connected/.test(s.desc)));
+  await until("the device rows", () =>
+    built.some((s) =>
+      /Received latest changes|delivery unconfirmed|Waiting for latest changes|Never connected/.test(
+        s.desc,
+      ),
+    ),
+  );
   shots.push(
     shotOfOpenPanel(
       "devices-listed-last-device",
@@ -526,7 +553,12 @@ export async function walkPanelStates(
   await pressRow("Devices", "Show devices");
   await until(
     "two device rows",
-    () => built.filter((s) => /Last seen|Never connected/.test(s.desc)).length >= 2,
+    () =>
+      built.filter((s) =>
+        /Received latest changes|delivery unconfirmed|Waiting for latest changes|Never connected/.test(
+          s.desc,
+        ),
+      ).length >= 2,
   );
   shots.push(
     shotOfOpenPanel(

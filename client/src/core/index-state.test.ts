@@ -3,6 +3,7 @@ import {
   decide,
   needsRehash,
   newEntry,
+  nextUploadTime,
   observe,
   readyToSyncAgain,
   reconciled,
@@ -420,25 +421,39 @@ describe("recording a remote version as dealt with", () => {
   });
 });
 
-describe("the write-coalescing debounce", () => {
+describe("the binary upload cooldown", () => {
   it("lets a never-synced file go immediately", () => {
     expect(readyToSyncAgain(entry({ synctime: 0 }), 1000)).toBe(true);
   });
 
   it("waits longer for larger files", () => {
-    // Obsidian's thresholds: 10 s under 10 KiB, 20 s under 100 KiB, 30 s
-    // above. Somebody typing in a large note saves every few seconds, and
-    // re-uploading costs more than the delay.
+    // Short repeat-upload intervals, scaled by size to limit history churn.
     const small = entry({ size: 1024, synctime: 0 });
     const medium = entry({ size: 50 * 1024, synctime: 0 });
     const large = entry({ size: 500 * 1024, synctime: 0 });
     for (const e of [small, medium, large]) e.synctime = 100_000;
 
-    expect(readyToSyncAgain(small, 100_000 + 11_000)).toBe(true);
-    expect(readyToSyncAgain(medium, 100_000 + 11_000)).toBe(false);
-    expect(readyToSyncAgain(medium, 100_000 + 21_000)).toBe(true);
-    expect(readyToSyncAgain(large, 100_000 + 21_000)).toBe(false);
-    expect(readyToSyncAgain(large, 100_000 + 31_000)).toBe(true);
+    expect(readyToSyncAgain(small, 101_000)).toBe(true);
+    expect(readyToSyncAgain(medium, 101_000)).toBe(false);
+    expect(readyToSyncAgain(medium, 102_000)).toBe(true);
+    expect(readyToSyncAgain(large, 102_000)).toBe(false);
+    expect(readyToSyncAgain(large, 105_000)).toBe(true);
+  });
+
+  it.each([
+    [10240, 1000],
+    [10241, 2000],
+    [102400, 2000],
+    [102401, 5000],
+  ])("makes a %i byte file eligible exactly at its %i ms deadline", (size, delay) => {
+    const e = entry({ size, synctime: 100_000 });
+    expect(nextUploadTime(e)).toBe(100_000 + delay);
+    expect(readyToSyncAgain(e, 100_000 + delay - 1)).toBe(false);
+    expect(readyToSyncAgain(e, 100_000 + delay)).toBe(true);
+  });
+
+  it("does not stall an upload when the clock moved backwards", () => {
+    expect(readyToSyncAgain(entry({ synctime: 200_000 }), 100_000)).toBe(true);
   });
 });
 

@@ -24,14 +24,17 @@ backup leaves the previous completed snapshot available.
 For Compose:
 
 ```bash
-docker compose exec basalt /basaltd backup -to /data/backup
-docker compose exec basalt /basaltd verify -deep -data /data/backup
-docker cp basalt:/data/backup /path/on/another/disk/basalt-backup-copy
+sudo install -d -m 700 -o 65532 -g 65532 /srv/basalt-backups
+docker compose run --rm --no-deps -v /srv/basalt-backups:/backup \
+  basalt backup -to /backup/snapshot
+docker compose run --rm --no-deps -v /srv/basalt-backups:/backup \
+  basalt verify -deep -data /backup/snapshot
 ```
 
-Choose a fresh destination for that last command so directory nesting is
-unambiguous. A backup inside `/data` is still on the server's disk; move a
-verified copy to another disk or machine.
+The destination must be outside the data directory; Basalt refuses nested
+backups. These commands use the image's default user, 65532. Adjust ownership
+if your deployment uses another account. Copy the verified snapshot to another
+disk or backup host as well.
 
 **Keep the recovery key separately.** The server backup is encrypted. You need
 a paired device or the recovery key to read it. Also back up the ordinary

@@ -36,27 +36,16 @@
  * next frame is its reply will read a batch as an answer and hang.
  */
 
+import { notifyTransfer } from "./transfer.ts";
 import { CRYPTO_SUITE, chunkName, isChunkName } from "./crypto.ts";
 
 /**
  * The protocol version this client speaks. A mismatch is refused, not negotiated.
  *
- * Five, and nothing else. Five adds `rename`, so a device's label can change
- * without unlinking and pairing again, and it is a clean break from four rather
- * than a range because nothing was deployed on four outside this repository. A
- * range would be the first dual-path code in the protocol, bought for
- * compatibility nobody needs.
- *
- * Four was not compatible with three and there was no shim either: a hello
- * carries a `deviceId` and the credential beside it is that device's own, where
- * in three it was the vault's, used by every device. A client that guessed
- * would be asking for exactly the sync rights per-device credentials exist to
- * make revocable.
- *
- * The number still travels, and a mismatch still names both ends and the
- * server's version, because that is how the next upgrade gets diagnosed.
+ * Six adds completed local checkpoints and device delivery state. Upgrade
+ * the server and all clients together; there is no older-protocol fallback.
  */
-export const PROTO = 5;
+export const PROTO = 6;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
@@ -162,7 +151,7 @@ export interface ServerLimits {
    * Every vault has one, so this is not optional: see `readReady` for what an
    * absent one would mean. docs/protocol.md, "The data key".
    *
-   * A protocol 4 device does not use it. It was handed the data key itself
+   * A device does not use it. It was handed the data key itself
    * when it was registered, by the session holding the root that could unwrap
    * this, and it has held it ever since. What the field is still good for is
    * the check in `readReady`: a vault with a hash and no data key is one an
@@ -211,6 +200,9 @@ export interface DeviceRow {
   readonly createdAt: number;
   /** Zero until that device has connected once. */
   readonly lastSeen: number;
+  readonly online: boolean;
+  /** Successful local application in a live session; null means unconfirmed. */
+  readonly applied: number | null;
 }
 
 /** Metadata for a put. Mirrors the protocol's `meta` object exactly. */
@@ -542,6 +534,7 @@ export class Transport {
    * one is in flight.
    */
   private pinging: Pending | undefined;
+  private pingPromise: Promise<void> | undefined;
 
   /**
    * The fetch collecting bodies, if one is. The `bodies` header says exactly
@@ -1443,7 +1436,9 @@ export class Transport {
      * nothing here would have said so.
      */
     auth: { mac: string; parent: string },
+    onBytes?: (bytes: number) => void,
   ): Promise<{ uid: number; uploaded: number; bytes: number }> {
+    notifyTransfer(onBytes, 0);
     const reply = await this.request(
       {
         op: "put",
@@ -1457,6 +1452,7 @@ export class Transport {
     );
 
     if (reply["res"] === "have") {
+      await this.drainReceived();
       return { uid: this.uid(reply, "have"), uploaded: 0, bytes: 0 };
     }
     if (reply["res"] !== "want") {
@@ -1472,11 +1468,12 @@ export class Transport {
     // the bodies found the answer already there.
     const id = idOf(reply);
     const ack = this.expectMore(id, "acknowledgement");
-    const bytes = await this.sendBodies(wanted, offered, bodyOf, "put");
+    const bytes = await this.sendBodies(wanted, offered, bodyOf, "put", onBytes);
     const acked = await this.awaitPhase(ack, id);
     if (acked["res"] !== "ack") {
       throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(acked)}`);
     }
+    await this.drainReceived();
     return { uid: this.uid(acked, "ack"), uploaded: wanted.length, bytes };
   }
 
@@ -1502,7 +1499,9 @@ export class Transport {
   async putMany(
     entries: readonly BatchEntry[],
     bodyOf: (name: string) => Promise<Uint8Array>,
+    onBytes?: (bytes: number) => void,
   ): Promise<{ results: BatchResult[]; uploaded: number; bytes: number }> {
+    notifyTransfer(onBytes, 0);
     if (entries.length === 0) return { results: [], uploaded: 0, bytes: 0 };
     if (entries.length > MAX_BATCH_ENTRIES) {
       throw new ProtocolError(
@@ -1538,7 +1537,7 @@ export class Transport {
 
       const id = idOf(reply);
       const pending = this.expectMore(id, "acknowledgement");
-      bytes = await this.sendBodies(wanted, offered, bodyOf, "batch");
+      bytes = await this.sendBodies(wanted, offered, bodyOf, "batch", onBytes);
       uploaded = wanted.length;
       acks = await this.awaitPhase(pending, id);
     }
@@ -1577,7 +1576,26 @@ export class Transport {
       if (r.error?.endsSession) this.die(r.error);
     }
 
+    await this.drainReceived();
     return { results, uploaded, bytes };
+  }
+
+  /**
+   * The server queues earlier commits before this write's ack, but their
+   * authentication and path decryption run asynchronously. Let that work
+   * finish before the engine checks whether its upload was built on a stale
+   * version. Otherwise both writers can mark divergent edits synced and
+   * silently replace them on the next pass.
+   *
+   * Also used before an arrival-triggered pass, so a burst of metadata is
+   * checked together before scanning the vault. Wait only for notifications
+   * already queued; no round trip or timer, and later arrivals cannot extend it.
+   * Handshake and intermediate `want` replies must remain independent:
+   * verification can itself be waiting for the handshake's keys.
+   */
+  async drainReceived(): Promise<void> {
+    await this.notifying;
+    if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
   }
 
   /**
@@ -1592,8 +1610,22 @@ export class Transport {
     offered: ReadonlySet<string>,
     bodyOf: (name: string) => Promise<Uint8Array>,
     what: string,
+    onBytes?: (bytes: number) => void,
   ): Promise<number> {
     let bytes = 0;
+    let reported = 0;
+    const progress =
+      onBytes === undefined
+        ? undefined
+        : () => {
+            // bufferedAmount includes bodies still waiting on the connection. With
+            // adapters that do not expose it, only handoff to the socket is known.
+            const sent = Math.max(0, bytes - (this.socket?.bufferedAmount ?? 0));
+            if (sent > reported) {
+              reported = sent;
+              notifyTransfer(onBytes, sent);
+            }
+          };
     for (const name of wanted) {
       if (!offered.has(name)) {
         // Already checked when the reply was read; kept because this is
@@ -1606,12 +1638,12 @@ export class Transport {
       const body = await bodyOf(name);
       this.send(body);
       bytes += body.length;
-      await this.drained(UPLOAD_HIGH_WATER);
+      await this.drained(UPLOAD_HIGH_WATER, progress);
     }
     // Every body is with the socket before the clock on the ack starts. The
     // ack follows the last body, so a timer armed while bodies were still
     // queued measured the upload rather than the server.
-    await this.drained(0);
+    await this.drained(0, progress);
     return bytes;
   }
 
@@ -1629,7 +1661,8 @@ export class Transport {
    * A stall, meaning the buffer has not shrunk in a whole timeout, is the
    * connection being dead, and is treated as one.
    */
-  private async drained(below: number): Promise<void> {
+  private async drained(below: number, progress?: () => void): Promise<void> {
+    progress?.();
     const socket = this.socket;
     if (!socket || socket.bufferedAmount === undefined) return;
     let last = socket.bufferedAmount;
@@ -1638,6 +1671,7 @@ export class Transport {
       if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
       await sleep(DRAIN_POLL_MS);
       const now = socket.bufferedAmount;
+      progress?.();
       if (now < last) {
         last = now;
         movedAt = Date.now();
@@ -1818,7 +1852,7 @@ export class Transport {
    * The caller keeps within `maxFetchBytes` and `MAX_FETCH_NAMES`; this
    * refuses a list over the count, which is the one bound it can see whole.
    */
-  async fetch(names: readonly string[]): Promise<Uint8Array[]> {
+  async fetch(names: readonly string[], onBytes?: (bytes: number) => void): Promise<Uint8Array[]> {
     if (names.length === 0) return [];
     if (names.length > MAX_FETCH_NAMES) {
       throw new Error(
@@ -1844,6 +1878,8 @@ export class Transport {
       armed: false,
     };
     const got: Uint8Array[] = [];
+    let received = 0;
+    notifyTransfer(onBytes, 0);
     this.collecting = { pending: collector, want: names.length, got, bytes: 0 };
     const checks: Promise<void>[] = [];
 
@@ -1884,6 +1920,8 @@ export class Transport {
         // Whichever comes first: the next body, or a body already received
         // turning out to be the wrong bytes.
         const next = await Promise.race([this.body(i), aborted]);
+        received += next.length;
+        notifyTransfer(onBytes, received);
         // Hashed alongside the next body rather than in front of it.
         //
         // The bodies arrive in order and must be read in order, but
@@ -2077,6 +2115,14 @@ export class Transport {
     };
   }
 
+  /** A completed local checkpoint, separate from the received metadata cursor. */
+  async applied(cursor: number): Promise<void> {
+    const reply = await this.request({ op: "applied", applied: cursor }, "applied");
+    if (reply["res"] !== "applied" || this.count(reply, "cursor", "applied") !== cursor) {
+      throw this.malformed("an applied reply that does not match the checkpoint");
+    }
+  }
+
   /** One invite, read as strictly as a device row and for the same reason. */
   private inviteRow(raw: unknown, i: number): InviteRow {
     const row = raw as Record<string, unknown>;
@@ -2102,6 +2148,18 @@ export class Transport {
       throw this.malformed(`a devices reply whose entry ${i} has no id`);
     }
     const name = row["name"];
+    if (
+      typeof row["online"] !== "boolean" ||
+      !(
+        row["applied"] === null ||
+        (typeof row["applied"] === "number" &&
+          Number.isSafeInteger(row["applied"]) &&
+          row["applied"] >= 0)
+      ) ||
+      (row["online"] === false && row["applied"] !== null)
+    ) {
+      throw this.malformed(`a devices reply with invalid delivery state at entry ${i}`);
+    }
     const num = (key: string): number => {
       const v = row[key];
       return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
@@ -2111,6 +2169,8 @@ export class Transport {
       name: typeof name === "string" ? name : "",
       createdAt: num("createdAt"),
       lastSeen: num("lastSeen"),
+      online: row["online"],
+      applied: row["applied"] as number | null,
     };
   }
 
@@ -2287,8 +2347,36 @@ export class Transport {
    * matched by position: a pong answers the ping in flight, and there is at
    * most one.
    */
-  async ping(): Promise<void> {
-    if (this.pinging) throw new Error("a ping is already in flight");
+  ping(): Promise<void> {
+    if (this.pingPromise) return this.pingPromise;
+    const work = this.sendPing();
+    this.pingPromise = work;
+    void work.then(
+      () => {
+        this.pingPromise = undefined;
+      },
+      () => {
+        this.pingPromise = undefined;
+      },
+    );
+    return work;
+  }
+
+  /** Detect an idle socket stranded by sleep, without timing out active transfers. */
+  async probe(timeoutMs = 2000): Promise<void> {
+    const timer = setTimeout(() => {
+      if (this.pinging && this.pending.size === 0 && !this.collecting) {
+        this.die(new ConnectionError("the connection did not respond after resuming"));
+      }
+    }, timeoutMs);
+    try {
+      await this.ping();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async sendPing(): Promise<void> {
     this.requestsSent++;
     const reply = await new Promise<Reply>((resolve, reject) => {
       if (this.closed) {

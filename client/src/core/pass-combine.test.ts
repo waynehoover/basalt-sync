@@ -40,6 +40,13 @@ function report(over: Partial<SyncReport>): SyncReport {
 }
 
 describe("two passes of one sync, combined", () => {
+  it("keeps only the latest pass's upload deadline", () => {
+    const first = report({ waiting: 2, nextUploadAt: 1000 });
+    const later = report({ waiting: 1, nextUploadAt: 2000 });
+    expect(combinePasses(first, later).nextUploadAt).toBe(2000);
+    expect(combinePasses(first, report({ waiting: 0 })).nextUploadAt).toBeUndefined();
+  });
+
   it("adds what happened and keeps the last word on how the vault looks", () => {
     const first = report({
       uploaded: 2,
@@ -117,7 +124,7 @@ describe("what counts as work worth another pass (C-D6)", () => {
  */
 describe("the one-line summary (N1)", () => {
   it("does not say a vault is up to date while a save is still owed", () => {
-    // Tens of seconds of write debounce, during which the pass is honest and
+    // Seconds of write debounce, during which the pass is honest and
     // the summary was not. Rule 7.
     expect(summarise(report({ waiting: 1 }))).toBe("1 waiting");
     expect(summarise(report({ unchanged: 100, waiting: 2 }))).toBe("2 waiting");

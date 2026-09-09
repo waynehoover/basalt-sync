@@ -86,6 +86,52 @@ The compression implementation and chunking parameters affect content names.
 Changing them can trigger re-upload or require a migration. See
 [historical measurements and evaluations](research.md) before changing them.
 
+## Sync scheduling
+
+Local events and remote arrivals schedule sync on the next event-loop turn.
+Events delivered together share a pass; there is no fixed 50 ms wait. An arrival
+pass first finishes checking the metadata already received, without waiting for
+future frames. Initial sync waits for the complete catch-up history. Notes and
+other recognized text formats (including canvases) have no per-file cooldown,
+regardless of size.
+Repeat binary uploads wait 1 second for files up to 10 KiB, 2 seconds up to
+100 KiB, and 5 seconds above that, measured from the previous successful sync.
+New files and incoming reconciliation have no upload cooldown. “Sync now”
+bypasses the binary upload cooldown.
+
+Each pass reports the earliest deferred upload deadline. A running client wakes
+at that deadline, replaces it when an earlier one appears, and cancels it when
+the work clears or the client closes. All passes use the existing serial queue.
+The 30-second scan and keepalive remain a fallback; they do not set the normal
+cadence. One-shot and inspection clients do not start deadline timers.
+
+Foreground, focus, and network-online events check the socket immediately and
+interrupt local reconnect backoff. An idle socket gets a two-second probe;
+active transfers keep their normal progress timeouts. Sync passes remain serial.
+Folders and text files are processed before binary attachments, and queued
+notes are transferred before attachment reading and chunking starts.
+
+A completed local checkpoint is reported only after a clean pass flushes files
+and saves the index. The device list exposes this separately from metadata
+receipt. An open panel refreshes delivery status once per second; hidden or
+closed panels do not poll. Receipts expire with the connection and are not
+stored in SQLite, avoiding a database write per edit.
+
+Manual sync interrupts reconnect backoff when offline. Repeated requests share
+the same work, and the panel shows a disabled busy action while connecting,
+loading, or visibly syncing. Automatic passes shorter than 200 ms keep the last
+status; sustained work updates at most five times per second, including scanning
+and saving the index.
+
+During sync transfers, the panel reports upload or download activity, the file
+or batch count, and encrypted body bytes sent or received. Reused chunks are
+excluded. Upload counts subtract the socket buffer when the adapter exposes it;
+otherwise they measure handoff to the socket. There is no percentage or ETA:
+compression and deduplication change the wire size, and downloads do not know
+that size in advance. Counters span split fetches within a batch. Receiving
+bytes does not imply verification or a saved file; only the completed pass can
+report reconciliation. Display callbacks cannot interrupt an exchange.
+
 ## Simplicity
 
 Keep sync decisions in the shared engine. Adapters provide file operations;

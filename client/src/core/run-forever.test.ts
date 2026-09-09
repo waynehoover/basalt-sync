@@ -29,6 +29,35 @@ let server: TestServer;
 const open: Client[] = [];
 const loops: Promise<void>[] = [];
 
+it("remembers a resume requested while a failed connection is still unwinding", async () => {
+  server = new TestServer();
+  await server.start();
+  const opts = await options("resume", new MemoryVault());
+  await server.stop();
+  let running = true;
+  let attempts = 0;
+  let wake = () => {};
+  const loop = runForever(opts, {
+    keepGoing: () => running,
+    onWaiting: (fn) => {
+      wake = fn;
+    },
+    onUnreachable: () => {
+      attempts++;
+      if (attempts === 1) wake();
+      else running = false;
+    },
+    sleep: () => new Promise(() => {}),
+  });
+  try {
+    await until("the resumed connection attempt", () => attempts === 2, 1500);
+  } finally {
+    running = false;
+    wake();
+    await loop;
+  }
+});
+
 afterEach(async () => {
   while (open.length) await open.pop()!.close();
   await Promise.all(loops.splice(0));

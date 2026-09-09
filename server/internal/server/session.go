@@ -64,6 +64,8 @@ type Session struct {
 	// afterwards by whoever is revoking that device, so the hub's lock is what
 	// publishes it; see Hub.sessionsOf.
 	deviceID string
+	// Zero is unknown; otherwise the last applied cursor plus one.
+	applied atomic.Int64
 
 	// registrar is true when this session authenticated with the *vault's*
 	// credential rather than a device's. Such a session may register a device
@@ -668,7 +670,7 @@ var deviceOps = map[string]bool{
 	// rename is a device relabelling itself, so it needs a device's own
 	// credential by construction: there is no field naming which row to
 	// change. A registrar has no row of its own and is told so here.
-	"rename": true,
+	"rename": true, "applied": true,
 	// resend writes bodies the vault already refers to and nothing else: no
 	// entry, no uid, no authenticator. A device is the only thing that can
 	// have them, so it is the only thing that can repair them (I14).
@@ -755,6 +757,8 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handleUninvite(m)
 	case "devices":
 		return s.handleDevices(m)
+	case "applied":
+		return s.handleApplied(m)
 	case "revoke":
 		return s.handleRevoke(m)
 	case "rename":
@@ -2460,7 +2464,7 @@ func (s *Session) handleDevices(m wire.In) error {
 		return s.reject(wire.CodeInternal, errors.New("the invite list could not be read: "+err.Error()))
 	}
 	return s.writeJSON(wire.DeviceList{
-		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: 0, Invites: invites,
+		Res: "devices", ID: s.reqID, Devices: s.srv.hub.deviceStatus(s.vaultID, ds), MaxDevices: 0, Invites: invites,
 	})
 }
 

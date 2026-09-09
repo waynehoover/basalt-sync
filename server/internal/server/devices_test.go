@@ -40,6 +40,7 @@ func TestTheVaultCredentialCannotSync(t *testing.T) {
 		{Op: "history", Path: "secret.md"},
 		{Op: "deleted"},
 		{Op: "invite", Invite: testInvite, Sealed: testSealed},
+		{Op: "applied"},
 	} {
 		reg.sendJSON(op)
 		msg := reg.expectErr(wire.CodeAuth)

@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import { Client, type ClientOptions } from "./client.ts";
 import { FakeSocket, ready, settle } from "./fake-socket.ts";
 import { TEST_DATA_KEY } from "./test-keys.ts";
+import { macEntry, sealPath } from "./crypto.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 /** A client on a socket that will say `ready` and never say `caught-up`. */
@@ -57,6 +58,112 @@ async function settled(p: Promise<unknown>): Promise<boolean> {
 }
 
 describe("connecting only as far as the handshake (R1)", () => {
+  it("groups already-received metadata before scanning the vault", async () => {
+    const vault = new MemoryVault();
+    let scans = 0;
+    const list = vault.list.bind(vault);
+    vault.list = async () => {
+      scans++;
+      return list();
+    };
+    const { socket, client } = clientOnFakeSocket({ vault });
+    const connecting = client.connect();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let verifying = false;
+    const accept = client.engine.acceptBatch.bind(client.engine);
+    client.engine.acceptBatch = async (batch) => {
+      if (batch.to === 2) {
+        verifying = true;
+        await gate;
+      }
+      await accept(batch);
+    };
+    try {
+      await sayReady(socket, 0);
+      socket.raw({ op: "caught-up", cursor: 0 });
+      await connecting;
+      socket.autoReply = (frame, s) => {
+        if (frame["op"] === "applied") s.reply({ res: "applied", cursor: frame["applied"] });
+      };
+      const batches = await Promise.all(
+        [1, 2].map(async (uid) => {
+          const facts = {
+            path: await sealPath(client.keys, `Folder ${uid}`),
+            size: 0,
+            ctime: 1,
+            mtime: 1,
+            folder: true,
+            deleted: false,
+            chunks: [],
+            parent: "",
+          };
+          return {
+            op: "batch",
+            from: uid,
+            to: uid,
+            entries: [{ uid, ...facts, mac: await macEntry(client.keys, facts), device: "peer" }],
+          };
+        }),
+      );
+      for (const batch of batches) socket.raw(batch);
+      await expect.poll(() => verifying).toBe(true);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(scans, "started a pass while received metadata was still being checked").toBe(0);
+      release();
+      await expect.poll(() => client.deliveryReady).toBe(true);
+      expect((await list()).map((f) => f.path).sort()).toEqual(["Folder 1", "Folder 2"]);
+      expect(scans).toBe(1);
+    } finally {
+      release();
+      await client.close();
+      await connecting.catch(() => undefined);
+    }
+  });
+  it("does not start a sync from a partial initial backlog", async () => {
+    const vault = new MemoryVault();
+    await vault.edit("local.md", "local content must wait for complete history\n");
+    let scans = 0;
+    const list = vault.list.bind(vault);
+    vault.list = async () => {
+      scans++;
+      return list();
+    };
+    const { socket, client } = clientOnFakeSocket({ vault });
+    const connecting = client.connect();
+    void connecting.catch(() => undefined);
+    try {
+      await sayReady(socket, 2);
+      await expect.poll(() => client.serverLimits?.cursor).toBe(2);
+      const facts = {
+        path: await sealPath(client.keys, "Remote folder"),
+        size: 0,
+        ctime: 1,
+        mtime: 1,
+        folder: true,
+        deleted: false,
+        chunks: [],
+        parent: "",
+      };
+      socket.raw({
+        op: "batch",
+        from: 1,
+        to: 1,
+        entries: [{ uid: 1, ...facts, mac: await macEntry(client.keys, facts), device: "peer" }],
+      });
+      await expect.poll(() => client.transport.appliedCursor).toBe(1);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(scans, "a partial backlog started reconciling the vault").toBe(0);
+      expect(vault.text("local.md")).toBe("local content must wait for complete history\n");
+      expect(socket.sentText.map((m) => m["op"])).toEqual(["hello"]);
+      socket.raw({ op: "batch", from: 2, to: 2, entries: [] });
+      socket.raw({ op: "caught-up", cursor: 2 });
+      await connecting;
+    } finally {
+      await client.close();
+      await connecting.catch(() => undefined);
+    }
+  });
   it("reports authenticated history loading before connect finishes", async () => {
     const progress: { local: number; server: number }[] = [];
     const { socket, client } = clientOnFakeSocket({ onCatchUp: (at) => progress.push(at) });

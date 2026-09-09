@@ -75,8 +75,7 @@ vault as a backup. Basalt does not clear or move existing files during pairing.
 
 An invite works once and expires after ten minutes. If it expires, create a new
 one. If no paired device remains, paste the recovery key into the same field.
-There is no fixed device limit. Older servers may still enforce their previous
-limit; update the server to remove it.
+There is no fixed device limit.
 
 <details>
 <summary>See the QR code and pairing code</summary>
@@ -91,10 +90,16 @@ limit; update the server to remove it.
 ## What it does
 
 Basalt syncs shortly after edits and checks periodically while Obsidian is open.
-It reconnects after a dropped connection. You can also press **Sync now**.
+It reconnects after a dropped connection. Press **Sync now** to sync immediately,
+or **Reconnect** to retry an offline connection without waiting.
 
 Open the panel for the result and any files needing attention. It includes the
 server address and version, useful when diagnosing a connection problem.
+On desktop, the status bar shows a cloud with a check when synced. Hover for
+details or click it to open the panel.
+
+During longer transfers, the panel shows which file is uploading or downloading
+and how much data has moved. Keep Obsidian open until sync finishes.
 
 | Status | What to do |
 |---|---|

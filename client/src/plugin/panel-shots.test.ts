@@ -85,6 +85,8 @@ const EXPECTED = [
   "status-bar-loading",
   "status-bar-syncing-started",
   "status-bar-syncing",
+  "status-bar-uploading",
+  "status-bar-downloading",
   "status-bar-synced",
   "status-bar-synced-needing-attention",
   "status-bar-synced-with-a-version-waiting",
@@ -286,7 +288,7 @@ describe("the panel walk", () => {
   it("puts the device rows below the row that offers them", () => {
     const body = of("devices-listed");
     const offer = body.indexOf("name    Devices");
-    const first = body.indexOf("Last seen ");
+    const first = body.indexOf("Received latest changes");
     expect(offer, "there is no Devices row at all").toBeGreaterThan(-1);
     expect(first, "no device rows were drawn").toBeGreaterThan(-1);
     expect(first, `the rows came out above the row that offers them:\n${body}`).toBeGreaterThan(
@@ -300,7 +302,7 @@ describe("the panel walk", () => {
 
   it("keeps the one-device vault's row buttonless without command-line instructions", () => {
     const body = of("devices-listed-last-device");
-    expect(body).toContain("Last seen ");
+    expect(body).toContain("Received latest changes");
     // No revoke here: the last row is the one revocation no device can undo.
     expect(body).not.toContain("button  [Revoke]");
     expect(prose("devices-listed-last-device")).toContain("1 device");

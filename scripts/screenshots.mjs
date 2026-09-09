@@ -26,6 +26,8 @@ const scenes = [
   "settings",
   "status",
   "loading",
+  "uploading",
+  "downloading",
 ];
 const options = new Map();
 for (const [i, arg] of process.argv.slice(2).entries()) {

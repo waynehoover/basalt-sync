@@ -152,6 +152,10 @@ Server, plugin, and CLI release numbers are separate; protocol compatibility
 determines whether they can connect. An incompatible client stops with a
 protocol error instead of syncing partially.
 
+Version 0.7.0 uses protocol 6. Upgrade the server to 0.7.0 before updating the
+plugin and CLI to 0.7.0 on every device. Existing pairings and vault history stay
+in place; older clients cannot connect to the upgraded server.
+
 For Compose, update both the image tag and digest from the chosen server
 release, then run `docker compose pull` and `docker compose up -d`. Preserve
 the data volume and any customized flags, especially the file-size limit.

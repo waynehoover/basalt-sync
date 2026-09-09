@@ -400,7 +400,7 @@ describe("pairing", () => {
 
     expect(plugin.paired).toBe(true);
     expect(plugin.deviceName).toBe("laptop");
-    expect(statusIcon(plugin)).toBe("check");
+    expect(statusIcon(plugin)).toBe("cloud-check");
     expect(status(plugin)).toMatch(/^Basalt Sync: 1 sent, as of /);
     // Saved in a form that survives the JSON round trip Obsidian does.
     // No token: the vault has one secret, and what authenticates is derived
@@ -630,6 +630,80 @@ describe("pairing instructions", () => {
 });
 
 describe("syncing while it runs", () => {
+  it("checks for missed saves when the app returns to the foreground", async () => {
+    const doc = new EventTarget();
+    Object.defineProperty(doc, "visibilityState", { value: "visible" });
+    vi.stubGlobal("document", doc);
+    vi.stubGlobal("window", new EventTarget());
+    try {
+      await fresh();
+      const a = await load();
+      await startVault(a.plugin);
+      await synced(a.plugin);
+      const b = await load();
+      await b.plugin.pair(keyOf(a.plugin), "peer");
+      await synced(b.plugin);
+      a.app.vault.adapter.seed("resumed.md", "saved while the app was asleep\n");
+      doc.dispatchEvent(new Event("visibilitychange"));
+      await until(
+        "the missed edit to arrive after resume",
+        () => b.app.vault.adapter.text("resumed.md") === "saved while the app was asleep\n",
+        2000,
+      );
+      expect(a.app.vault.adapter.text("resumed.md")).toBe("saved while the app was asleep\n");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 300_000);
+  it("batches a burst of saved edits and delivers its complete final contents", async () => {
+    await fresh();
+    const a = await load();
+    await startVault(a.plugin);
+    await synced(a.plugin);
+    const b = await load();
+    await b.plugin.pair(keyOf(a.plugin), "peer");
+    await synced(b.plugin);
+    const client = (a.plugin as unknown as { client: Client }).client;
+    let body = "# Saved edits\n";
+    for (let burst = 0; burst < 3; burst++) {
+      for (let i = 0; i < 20; i++) {
+        body += `\nKept paragraph ${burst}-${i}.\n`;
+        a.app.vault.adapter.seed("burst.md", body);
+        a.app.vault.fire("modify");
+      }
+      await until(
+        "all paragraphs in the burst to arrive automatically",
+        () => b.app.vault.adapter.text("burst.md") === body,
+        3000,
+      );
+      expect(a.app.vault.adapter.text("burst.md")).toBe(body);
+    }
+    // Sixty saves within three event batches should not make sixty versions.
+    expect(await client.history("burst.md")).toHaveLength(3);
+  }, 300_000);
+
+  it("starts syncing during a continuous stream of vault events", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    await synced(plugin);
+    const peer = await load();
+    await peer.plugin.pair(keyOf(plugin), "peer");
+    await synced(peer.plugin);
+    app.vault.adapter.seed("busy.md", "a saved note during a busy vault\n");
+    const events = setInterval(() => app.vault.fire("modify"), 20);
+    try {
+      await until(
+        "delivery while events are still arriving",
+        () => peer.app.vault.adapter.text("busy.md") === "a saved note during a busy vault\n",
+        3000,
+      );
+      expect(app.vault.adapter.text("busy.md")).toBe("a saved note during a busy vault\n");
+    } finally {
+      clearInterval(events);
+    }
+  }, 300_000);
+
   it("syncs when Obsidian says a file changed", async () => {
     await fresh();
     const a = await load();
@@ -646,15 +720,16 @@ describe("syncing while it runs", () => {
     a.app.vault.adapter.seed("fresh.md", "written just now");
     a.app.vault.fire("create");
 
-    // The nudge coalesces for 400ms before it looks, so this waits for the
+    // The nudge briefly coalesces events, so this waits for the
     // state to move rather than for a state it is already in.
     await until("A to act on the event", () => a.plugin.currentState !== before);
 
-    // B has to be told. Its own backstop is 30 seconds away, so it is asked.
-    for (let i = 0; i < 10 && b.app.vault.adapter.text("fresh.md") === undefined; i++) {
-      await b.plugin.syncNow();
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    // Arrival must wake B automatically, well before its 30 second backstop.
+    await until(
+      "B to receive the saved note",
+      () => b.app.vault.adapter.text("fresh.md") === "written just now",
+      8000,
+    );
     expect(b.app.vault.adapter.text("fresh.md")).toBe("written just now");
   }, 300_000);
 
@@ -713,8 +788,6 @@ describe("syncing while it runs", () => {
       await b.plugin.syncNow();
     }
 
-    const said = notices.map((n) => n.message).join(" ");
-    expect(said, `notices were: ${said}`).toMatch(/Conflicted copy/);
     const all = b.app.vault.adapter
       .filePaths()
       .filter((p) => !p.startsWith(".obsidian/"))
@@ -722,10 +795,98 @@ describe("syncing while it runs", () => {
       .join("\n");
     expect(all).toContain("A's completely different sentence");
     expect(all).toContain("B's entirely other sentence");
+    const said = notices.map((n) => n.message).join(" ");
+    expect(said, `notices were: ${said}`).toMatch(/Conflicted copy/);
   }, 300_000);
 });
 
 describe("when things go wrong", () => {
+  it("shows one busy action and one result for repeated manual sync requests", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin);
+    await synced(plugin);
+    plugin.ribbonIcons[0]!.callback();
+    const button = built.find((s) => s.name === "Sync status")!.buttons[0]!;
+    const client = (plugin as unknown as { client: Client }).client;
+    const list = client.vault.list.bind(client.vault);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    client.vault.list = async () => {
+      await gate;
+      return list();
+    };
+    notices.length = 0;
+    const first = plugin.syncNow();
+    const second = plugin.syncNow();
+    try {
+      expect(button.label).toBe("Syncing…");
+      expect(button.disabled).toBe(true);
+      release();
+      await Promise.all([first, second]);
+      expect(notices.filter((n) => n.message === "Basalt: up to date")).toHaveLength(1);
+      expect(button.label).toBe("Sync now");
+      expect(button.disabled).toBe(false);
+      expect(app.vault.adapter.filePaths().filter((p) => !p.startsWith(".obsidian/"))).toEqual([]);
+    } finally {
+      release();
+      await Promise.all([first, second]);
+      client.vault.list = list;
+    }
+  }, 300_000);
+
+  it("retries the connection immediately when Sync now is pressed offline", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    const port = server.port;
+    await server.stop();
+    await until("the disconnect", () => plugin.currentState.kind === "offline");
+    app.vault.adapter.seed("offline.md", "saved while offline\n");
+    await server.start(port);
+    await plugin.syncNow();
+    await until(
+      "manual retry to reconnect before backoff expires",
+      () => plugin.currentState.kind === "synced",
+      1500,
+    );
+    const peer = await load();
+    await peer.plugin.pair(keyOf(plugin), "peer");
+    await until(
+      "the offline edit to reach the peer",
+      () => peer.app.vault.adapter.text("offline.md") === "saved while offline\n",
+    );
+    expect(app.vault.adapter.text("offline.md")).toBe("saved while offline\n");
+  }, 300_000);
+
+  it("shows sustained sync activity even when individual paths finish quickly", async () => {
+    const { plugin } = await load();
+    const subject = plugin as unknown as {
+      working(path: string | undefined): void;
+      setState(state: unknown): void;
+    };
+    subject.setState({
+      kind: "synced",
+      summary: "up to date",
+      at: Date.now(),
+      refused: 0,
+      waiting: 0,
+    });
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 8; i++) {
+        subject.working(`note-${i}.md`);
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      expect(plugin.currentState.kind).toBe("syncing");
+      expect(statusIcon(plugin)).toBe("refresh-cw");
+    } finally {
+      subject.working(undefined);
+      vi.useRealTimers();
+    }
+  });
+
   /**
    * A dead connection has to be forgotten, not just noticed.
    *
@@ -745,7 +906,11 @@ describe("when things go wrong", () => {
 
     notices.length = 0;
     await plugin.syncNow();
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/not connected/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/reconnecting/);
+    await until(
+      "the unsuccessful retry to report offline",
+      () => plugin.currentState.kind === "offline",
+    );
     expect(statusIcon(plugin)).toBe("cloud-off");
     expect(status(plugin)).toMatch(/^Basalt Sync: Offline:/);
   }, 300_000);
@@ -1151,7 +1316,11 @@ describe("the panel, which is a modal and a settings tab", () => {
     built.length = 0;
     await row.buttons[0]!.click();
     await until("the list to arrive", () =>
-      built.some((s) => /Last seen|Never connected/.test(s.desc)),
+      built.some((s) =>
+        /Received latest changes|delivery unconfirmed|Waiting for latest changes|Never connected/.test(
+          s.desc,
+        ),
+      ),
     );
     const listed = built.find((s) => s.name.startsWith("laptop"))!;
     expect(listed.name).toMatch(/\(this device\)/);
@@ -1428,15 +1597,88 @@ describe("on a device with no status bar", () => {
 });
 
 describe("saying what it is working on", () => {
+  it.each(["upload", "download"] as const)(
+    "shows %s bytes while the transfer is still pending",
+    async (direction) => {
+      await fresh();
+      const a = await load();
+      await startVault(a.plugin, "sender");
+      await synced(a.plugin);
+      const b = await load();
+      await b.plugin.pair(keyOf(a.plugin), "receiver");
+      await synced(b.plugin);
+      const subject = direction === "upload" ? a.plugin : b.plugin;
+      const client = (subject as unknown as { client: Client }).client;
+      const wire = client.transport;
+      const putMany = wire.putMany.bind(wire);
+      const fetch = wire.fetch.bind(wire);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      if (direction === "upload")
+        wire.putMany = async (...args) => {
+          const result = await putMany(...args);
+          await gate;
+          return result;
+        };
+      else
+        wire.fetch = async (...args) => {
+          const result = await fetch(...args);
+          await gate;
+          return result;
+        };
+      subject.ribbonIcons[0]!.callback();
+      const row = built.filter((s) => s.name === "Sync status").at(-1)!;
+      const original = "Exact attachment content while a transfer waits.\n";
+      a.app.vault.adapter.seed("attachment.pdf", original);
+      const sending = a.plugin.syncNow();
+      try {
+        await until(
+          "visible transfer progress",
+          () => {
+            const state = subject.currentState;
+            return state.kind === "syncing" && state.transfer?.direction === direction;
+          },
+          10_000,
+        );
+        const state = subject.currentState;
+        if (state.kind !== "syncing") throw new Error("not syncing");
+        expect(state.transfer!.bytes).toBeGreaterThan(0);
+        expect(state.transfer!.path).toBe("attachment.pdf");
+        expect(row.descEl.allText()).toMatch(
+          direction === "upload"
+            ? /Uploading attachment\.pdf… .* sent\./
+            : /Downloading attachment\.pdf… .* received\./,
+        );
+        expect(row.descEl.allText()).not.toMatch(/%|up to date/i);
+        expect(row.buttons[0]!.disabled).toBe(true);
+        expect(subject.deliveryReady).toBe(false);
+        release();
+        await sending;
+        await until(
+          "exact attachment landing",
+          () => b.app.vault.adapter.text("attachment.pdf") === original,
+        );
+        await until("completed sync status", () => subject.currentState.kind === "synced");
+        expect(a.app.vault.adapter.text("attachment.pdf")).toBe(original);
+        expect(b.app.vault.adapter.text("attachment.pdf")).toBe(original);
+        expect(row.buttons[0]!.disabled).toBe(false);
+      } finally {
+        release();
+        await sending;
+        wire.putMany = putMany;
+        wire.fetch = fetch;
+      }
+    },
+    300_000,
+  );
+
   /**
    * A large attachment is minutes inside one pass. Without a state for it the
    * status shows the previous pass's result the whole time, so working and
    * idle look exactly alike, which is rule 7 with the two conditions that
    * matter most collapsed.
    *
-   * Not a percentage. What somebody wants to know is whether it is doing
-   * something and what, and a byte counter for one file out of forty answers
-   * a question nobody asked.
+   * Preparation is activity too, before any transfer bytes exist to report.
    */
   it("reports the file it is on, once it has been on it a while", async () => {
     await fresh();
@@ -2870,14 +3112,14 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
  * check as a clean vault.
  */
 describe("synced, with files that need a person", () => {
-  it("is not the plain check", async () => {
+  it("is not the synced cloud", async () => {
     const { plugin } = await load();
     const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
     set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000, refused: 0 });
-    expect(statusIcon(plugin)).toBe("check");
+    expect(statusIcon(plugin)).toBe("cloud-check");
     expect(plugin.statusBarItems[0]!.cls).not.toContain("basalt-attention");
     set({ kind: "synced", summary: "1 stuck", at: 1_700_000_000_000, refused: 1 });
-    expect(statusIcon(plugin)).not.toBe("check");
+    expect(statusIcon(plugin)).not.toBe("cloud-check");
     expect(plugin.statusBarItems[0]!.cls).toContain("basalt-attention");
     expect(status(plugin)).toMatch(/1 file needs attention/);
   });
@@ -2989,7 +3231,8 @@ describe("what the status bar shows", () => {
       ).not.toThrow();
       const icon = statusIcon(plugin);
       expect(icon, `${state.kind} chose no glyph`).not.toBe("");
-      expect(plugin.statusBarItems[0]!.children[0]!.text).toBe("Basalt");
+      expect(plugin.statusBarItems[0]!.allText()).toBe("");
+      expect(plugin.statusBarItems[0]!.children).toHaveLength(1);
       expect(status(plugin), `${state.kind} has no tooltip`).toMatch(/^Basalt Sync: \S/);
       seen.add(icon);
     }
@@ -3961,7 +4204,7 @@ describe("the device list in the panel", () => {
     ).toEqual([]);
 
     expect(built.find((s) => s.name === "Devices")!.desc).toBe("1 device");
-    expect(row.desc).toMatch(/^Last seen /);
+    expect(row.desc).toBe("Received latest changes");
     expect(row.desc).not.toContain((await plugin.devices()).thisDevice);
     expect(panelText()).not.toMatch(/--allow-last|Revoking stops|at most/);
     expect(built.find((s) => s.name === "Unlink this vault")!.buttons[0]!.label).toBe("Unlink");
@@ -4066,7 +4309,11 @@ describe("the device list in the panel", () => {
     first.plugin.ribbonIcons[0]!.callback();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
     await until("the list to arrive", () =>
-      built.some((s) => /Last seen|Never connected/.test(s.desc)),
+      built.some((s) =>
+        /Received latest changes|delivery unconfirmed|Waiting for latest changes|Never connected/.test(
+          s.desc,
+        ),
+      ),
     );
 
     const stranded = built.find((s) => s.name === "the-one-that-crashed")!;
@@ -4074,7 +4321,7 @@ describe("the device list in the panel", () => {
     expect(stranded.desc).toBe("Never connected");
     // And this device, which has connected, is not flagged: a marker on every
     // row says nothing.
-    expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toMatch(/Last seen/);
+    expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toBe("Received latest changes");
     expect(built.find((s) => s.name === "Devices")!.desc).toBe("2 devices");
   }, 300_000);
 

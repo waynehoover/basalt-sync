@@ -64,6 +64,11 @@ For a bug fix, demonstrate that its regression test fails without the fix and
 passes with it. Test preservation of the actual edited bytes, not just agreement
 between devices. Keep fault and stress tests in scope for durability changes.
 
+Measure interactive sync separately from bulk transfers with
+`cd client && bun run bench:cadence`. It checks exact contents after new notes,
+rapid edits, and incoming updates, using the production timers and a local test
+server. Its in-memory adapters do not measure a phone's filesystem or network.
+
 ## Plugin testing
 
 Tests use the real Obsidian declarations with a `DataAdapter` fake and a runtime
@@ -94,6 +99,8 @@ and pairing details in both themes. It writes `docs/assets/screenshots/`, then
 removes its temporary preview plugin and restores the window and appearance.
 It never connects to a server. Review the images before committing them.
 Use `--scene invite --theme dark` to recapture one view; `--help` lists the scenes.
+The `uploading` and `downloading` scenes show transfer activity, including in
+phone previews.
 Keep the test vault open until cleanup finishes.
 
 Use `--device phone` to preview the settings at phone width with Obsidian's

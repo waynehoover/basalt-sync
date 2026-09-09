@@ -1,6 +1,6 @@
 {
   "name": "basalt-sync",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Fast, secure, self-hosted sync for Obsidian. Simple setup.",
   "keywords": [
     "obsidian",
@@ -31,6 +31,7 @@
   "scripts": {
     "bench": "bun run bench.ts",
     "bench:sync": "bun run bench-sync.ts",
+    "bench:cadence": "bun run bench-cadence.ts",
     "build": "node esbuild.config.mjs production",
     "build:cli": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",

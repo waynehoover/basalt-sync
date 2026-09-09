@@ -15,6 +15,7 @@
  * below: `Client` is one connection, and `runForever` is the loop.
  */
 
+import type { TransferActivity } from "./transfer.ts";
 import {
   Engine,
   checkEntryShape,
@@ -91,6 +92,7 @@ export interface ClientOptions {
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
+  readonly onTransfer?: (activity: TransferActivity | undefined) => void;
   /** Authenticated history loading, before connect() permits syncing. Cursors are not file counts. */
   readonly onCatchUp?: (at: { local: number; server: number }) => void;
   /**
@@ -103,6 +105,8 @@ export interface ClientOptions {
    * nothing here; the error goes to whoever asked for it.
    */
   readonly onPass?: (report: SyncReport) => void;
+  /** The serial pass is starting, including its initial filesystem scan. */
+  readonly onSyncStart?: () => void;
   /**
    * A pass that failed outright, rather than a file within one (F16).
    *
@@ -143,10 +147,10 @@ export interface ClientOptions {
 /**
  * How long to wait after a batch arrives before fetching what it named.
  *
- * Long enough that a burst of catch-up batches becomes one pass, short enough
- * that two devices side by side look immediate.
+ * Yield one event-loop turn so events delivered together share a pass, with
+ * no fixed latency window on either end of a saved edit.
  */
-const ARRIVAL_DELAY_MS = 150;
+export const SYNC_EVENT_DELAY_MS = 0;
 
 /** One connection, from hello to close. */
 export class Client {
@@ -154,6 +158,11 @@ export class Client {
   readonly transport: Transport;
   private limits: ServerLimits | undefined;
   private soonTimer: ReturnType<typeof setTimeout> | undefined;
+  private uploadTimer: ReturnType<typeof setTimeout> | undefined;
+  private nextUploadAt: number | undefined;
+  private reportedCursor: number | undefined;
+  private confirmedPass = false;
+  private watching = false;
   private caughtUp = false;
   /** When the last batch arrived, for the catch-up wait in `connect`. */
   private lastBatchAt = Date.now();
@@ -219,6 +228,7 @@ export class Client {
       ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
+      ...(opts.onTransfer !== undefined ? { onTransfer: opts.onTransfer } : {}),
     });
     this.engine = engine;
   }
@@ -265,6 +275,11 @@ export class Client {
    */
   get serverCursor(): number {
     return Math.max(this.limits?.cursor ?? 0, this.transport.appliedCursor);
+  }
+
+  /** False while local work is running, refused, or newer metadata is unapplied. */
+  get deliveryReady(): boolean {
+    return !this.closing && this.confirmedPass && this.reportedCursor === this.serverCursor;
   }
 
   /**
@@ -362,7 +377,16 @@ export class Client {
       // after the drain, ran a pass against the closed transport, and saved
       // the index that unlink had just removed.
       if (this.closing) throw new ConnectionError("this client has been closed");
+      this.confirmedPass = false;
+      this.opts.onSyncStart?.();
       const report = await this.engine.sync(opts);
+      if (report.appliedCursor !== undefined && report.appliedCursor !== this.reportedCursor) {
+        await this.transport.applied(report.appliedCursor);
+        this.reportedCursor = report.appliedCursor;
+      }
+      this.confirmedPass = report.appliedCursor !== undefined;
+      this.nextUploadAt = report.nextUploadAt;
+      this.scheduleUpload();
       this.opts.onPass?.(report);
       return report;
     });
@@ -396,6 +420,8 @@ export class Client {
    */
   async runUntilClosed(tickMs = 30_000): Promise<Error> {
     if (this.endedWith) return this.endedWith;
+    this.watching = true;
+    this.scheduleUpload();
     const stop = this.opts.vault.watch?.(() => void this.sync());
     // A sync with nothing to do sends nothing, so a settled vault is a
     // silent connection, and the server closes a silent one after five
@@ -415,6 +441,8 @@ export class Client {
         this.notifyEnded = resolve;
       });
     } finally {
+      this.watching = false;
+      this.clearUploadTimer();
       clearInterval(ticker);
       stop?.();
     }
@@ -448,11 +476,47 @@ export class Client {
    * immediate to somebody watching two devices.
    */
   private soon(): void {
-    if (this.soonTimer !== undefined) return;
+    // Initial sync belongs to the caller after connect finishes. A partial
+    // backlog cannot safely decide which files exist only on this device.
+    if (!this.caughtUp || this.soonTimer !== undefined) return;
     this.soonTimer = setTimeout(() => {
-      this.soonTimer = undefined;
-      void this.sync();
-    }, ARRIVAL_DELAY_MS);
+      // Retain the scheduled marker until this snapshot finishes checking.
+      // Per-entry crypto may still be working through frames already on the
+      // socket; scanning between those entries repeats the same vault walk.
+      void this.transport.drainReceived().then(
+        () => {
+          this.soonTimer = undefined;
+          if (!this.closing) void this.sync();
+        },
+        () => {
+          this.soonTimer = undefined;
+        },
+      );
+    }, SYNC_EVENT_DELAY_MS);
+  }
+
+  private clearUploadTimer(): void {
+    clearTimeout(this.uploadTimer);
+    this.uploadTimer = undefined;
+  }
+
+  /** One deadline, re-evaluated by each pass; never a poll of the whole vault. */
+  private scheduleUpload(): void {
+    this.clearUploadTimer();
+    if (
+      !this.watching ||
+      this.closing ||
+      this.transport.isClosed ||
+      this.nextUploadAt === undefined
+    )
+      return;
+    this.uploadTimer = setTimeout(
+      () => {
+        this.uploadTimer = undefined;
+        if (this.watching && !this.closing && !this.transport.isClosed) void this.sync();
+      },
+      Math.max(0, this.nextUploadAt - Date.now()),
+    );
   }
 
   /**
@@ -967,6 +1031,7 @@ export class Client {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.clearUploadTimer();
     // Or a pass fires against a closed transport after the caller has
     // finished with this client, which in a test is a leak and in a plugin
     // is a sync running after the vault was unlinked.
@@ -1125,7 +1190,6 @@ export const IDENTICAL_FAILURES_BEFORE_STOPPING = 3;
  */
 export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}): Promise<void> {
   const backoff = new Backoff(0, 300_000, 5_000, true);
-  const sleeper = hooks.sleep ?? sleep;
 
   /**
    * The backoff wait, which `stop` can end (I05).
@@ -1143,13 +1207,21 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
    * and long enough that a five-minute wait is not three hundred wakeups.
    */
   let wakeUp: (() => void) | undefined;
+  let wakeRequested = false;
   const wait = async (ms: number): Promise<void> => {
     if (!(hooks.keepGoing?.() ?? true)) return;
+    if (wakeRequested) {
+      wakeRequested = false;
+      return;
+    }
     await new Promise<void>((go) => {
       let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = (): void => {
         if (done) return;
         done = true;
+        clearTimeout(timer);
+        wakeRequested = false;
         wakeUp = undefined;
         go();
       };
@@ -1159,13 +1231,18 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
       // returns instantly, the wall clock never advances, and the slicing
       // loop spins for ever. The sleeper is the clock here, and code that
       // assumes otherwise is code that only works against a real one.
-      void sleeper(ms).then(finish);
+      if (hooks.sleep) void hooks.sleep(ms).then(finish);
+      else timer = setTimeout(finish, ms);
     });
   };
   // Handed out so a shell can end the wait the instant it decides to stop.
   // Without it the loop still checks `keepGoing` either side of the wait, as
   // it always did; what it cannot then do is cut a five-minute backoff short.
-  hooks.onWaiting?.(() => wakeUp?.());
+  hooks.onWaiting?.(() => {
+    backoff.success();
+    wakeRequested = true;
+    wakeUp?.();
+  });
   let lastFailure = "";
   let repeats = 0;
 
@@ -1923,7 +2000,7 @@ export function refuseUnlessAhead(at: { local: number; server: number }): void {
  * Whether a pass did anything that could produce more work.
  *
  * `waiting` is not on the list, and used to be. A waiting file is one whose
- * write debounce has not run out, which is tens of seconds; counting it here
+ * write debounce has not run out, which lasts several seconds; counting it here
  * had `settle` re-stat the whole vault eight times at 60 ms intervals to find
  * the same file still waiting, and then return anyway. The follow-on work that
  * is real is handled inside a pass by `again`, which reruns while there is
@@ -1948,7 +2025,7 @@ export function didSomething(r: SyncReport): boolean {
  *
  * Every counter the report has, because the plugin paints this string into
  * its state and nothing else of the pass reaches the panel. `waiting` was
- * left out, so a file still inside its write debounce, which is tens of
+ * left out, so a file still inside its write debounce, which lasts several
  * seconds, produced "up to date" while a save was owed: rule 7, and the kind
  * of lie a person acts on by closing the laptop. `foldersCreated` was left
  * out with it, and a pass that only made folders said nothing at all.

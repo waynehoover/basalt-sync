@@ -21,20 +21,12 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // ship here is a device that connects and syncs under a credential nobody can
 // revoke.
 //
-// Both are 5, so the range is one version wide and nothing older is carried.
-// The range stays in the handshake because the next version needs somewhere to
-// say so.
-//
-// 5 adds `rename`, so that a device's label can be changed without unlinking
-// and pairing again. It is a clean break rather than a 4..5 range because
-// nothing is deployed on 4 outside this repository: a two-version range would
-// be the first dual-path code in the protocol, bought for compatibility nobody
-// needs. The upgrade order is the one the range exists for and is unchanged,
-// server first and then each client, and a 4 client meeting a 5 server is
-// refused with `proto` naming both numbers rather than half-working.
+// Protocol 6 adds completed local checkpoints to the device list. Only version
+// 6 is supported; update the server and every client together. Vault data and
+// device credentials use the same formats as before.
 const (
-	Proto    = 5
-	MinProto = 5
+	Proto    = 6
+	MinProto = 6
 )
 
 // MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
@@ -147,6 +139,8 @@ type In struct {
 	Device string `json:"device"`
 	Crypto string `json:"crypto"`
 	Cursor int64  `json:"cursor"`
+	// Applied is a device's completed local checkpoint, never a metadata receipt.
+	Applied *int64 `json:"applied,omitempty"`
 	// DeviceID names the row in the vault's device list that this connection
 	// claims to be, and Token is then that device's auth key rather than the
 	// vault's. Present is what makes a hello a device connecting: absent, the
@@ -431,7 +425,9 @@ type Registered struct {
 	Wrapped  string `json:"wrapped,omitempty"`
 }
 
-// DeviceList answers a devices request with every device that may reach this
+// DeviceStatus describes a registered device with its live delivery checkpoint.
+//
+// The device list answers a devices request with every device that may reach this
 // vault, and every invite that could still add one.
 //
 // Neither slice is ever null, for the same reason Batch.Entries is not: a
@@ -444,10 +440,24 @@ type Registered struct {
 // because they are one subject. "What can reach my notes" is answered by the
 // rows plus the strings that have not been redeemed yet, and a client that had
 // to ask twice would be a client that could show half the answer.
+type DeviceStatus struct {
+	store.Device
+	Online  bool   `json:"online"`
+	Applied *int64 `json:"applied"`
+}
+
+// Applied acknowledges a checkpoint held for this connection's lifetime.
+type Applied struct {
+	Res    string `json:"res"`
+	ID     int64  `json:"id"`
+	Cursor int64  `json:"cursor"`
+}
+
+// DeviceList answers devices with access and live delivery state.
 type DeviceList struct {
 	Res        string         `json:"res"` // "devices"
 	ID         int64          `json:"id,omitempty"`
-	Devices    []store.Device `json:"devices"`
+	Devices    []DeviceStatus `json:"devices"`
 	MaxDevices int            `json:"maxDevices"`
 	Invites    []store.Invite `json:"invites"`
 }

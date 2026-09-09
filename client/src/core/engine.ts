@@ -41,6 +41,7 @@
  * rule 10 of docs/design.md in its natural habitat.
  */
 
+import { notifyTransfer, type TransferActivity } from "./transfer.ts";
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
 import { drawingGate, looksLikeExcalidraw } from "./excalidraw.ts";
 import { looksLikeMarkupPath, wellFormedMarkup } from "./markup.ts";
@@ -62,6 +63,7 @@ import {
   decide,
   needsRehash,
   newEntry,
+  nextUploadTime,
   observe,
   readyToSyncAgain,
   renamed,
@@ -399,24 +401,15 @@ export interface EngineOptions {
   readonly token: string;
   readonly now?: () => number;
   readonly log?: (message: string, ...rest: unknown[]) => void;
-  /**
-   * Called with the path being worked on, and undefined when a pass ends.
-   *
-   * Sending a large attachment is minutes of one await inside one pass, and
-   * without this a shell has nothing to say for the whole of it: the status
-   * it shows is the result of the *previous* pass, so working and idle look
-   * exactly alike. That is rule 7 of docs/design.md, two conditions that
-   * must be told apart collapsed into one.
-   *
-   * A path rather than a percentage. What somebody wants to know is whether
-   * it is doing something and what, and a byte counter for a file that is
-   * one of forty in a pass answers a question nobody asked.
-   */
+  /** Path preparation, and undefined before the pass flushes files and saves its index. */
   readonly onProgress?: (path: string | undefined) => void;
+  /** Transfer activity for a sync batch; undefined when the exchange ends, before local saving. */
+  readonly onTransfer?: (activity: TransferActivity | undefined) => void;
   /** Whether a path may be three-way merged. Defaults to text extensions. */
   readonly mergeable?: (path: string) => boolean;
   /**
-   * Whether to hold back a file that was written moments ago.
+   * Whether to hold back a binary attachment that was written moments ago.
+   * Notes and other recognized text formats never wait on this cooldown.
    *
    * On by default, which is right for a client that keeps running. A one-shot
    * sync turns it off: deferring to a next pass that will never happen would
@@ -526,6 +519,10 @@ export interface SyncReport {
    * the exact lie that rule is about.
    */
   waiting: number;
+  /** Earliest deferred upload deadline; absent when no timed upload remains. */
+  nextUploadAt?: number;
+  /** All server entries through this cursor were applied and the local pass saved. */
+  appliedCursor?: number;
   /** Files that failed and will be tried again. */
   retrying: number;
   /** Files that can never work and will not be tried again. */
@@ -1349,7 +1346,20 @@ export class Engine {
       ...ambiguous.keys(),
     ]);
 
-    for (const path of [...paths].sort()) {
+    const priority = (path: string) =>
+      onDisk.get(path)?.folder || this.remote.get(path)?.folder ? 0 : looksLikeText(path) ? 1 : 2;
+    const ordered = [...paths]
+      .map((path) => ({ path, priority: priority(path) }))
+      .sort((a, b) => a.priority - b.priority || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    let notesFlushed = false;
+    for (const { path, priority } of ordered) {
+      if (priority === 2 && !notesFlushed) {
+        // Publish queued notes before an attachment can block reading,
+        // chunking, or transfer. All writes retain the same safety checks.
+        await this.fill(report);
+        await this.flush(report);
+        notesFlushed = true;
+      }
       if (this.ignoredPaths.has(path)) {
         // Settled, and settled by the person who configured this device. It
         // is counted every pass so it stays visible, and nothing is fetched
@@ -1464,6 +1474,21 @@ export class Engine {
     // durable here. Rule 3 in another form.
     await this.opts.vault.flush?.();
     await this.save();
+    if (
+      this.pending.size === 0 &&
+      report.waiting === 0 &&
+      report.retrying === 0 &&
+      report.skipped === 0 &&
+      report.blocked === 0 &&
+      report.ignored === 0 &&
+      report.heldBack === 0 &&
+      report.conflicted === 0 &&
+      [...this.remote].every(
+        ([path, remote]) => (this.entries.get(path)?.syncuid ?? -1) >= remote.uid,
+      )
+    ) {
+      report.appliedCursor = this.cursor;
+    }
     report.needsAttention = this.attentionList(report);
     return report;
   }
@@ -1591,18 +1616,19 @@ export class Engine {
 
     if (
       coalesce &&
-      action.kind !== "nothing" &&
+      action.kind === "upload" &&
+      this.sending &&
       local &&
       !stat?.folder &&
+      !looksLikeText(path) &&
       !readyToSyncAgain(entry, now)
     ) {
-      // Written very recently. Obsidian's size-scaled debounce: somebody
-      // typing generates a save every few seconds, and acting on each one
-      // costs more than waiting does.
-      //
-      // Turned off by a client that syncs once and exits, where there is no
-      // next pass to defer to and the person asking has just said "now".
+      // Only repeat binary uploads wait. Notes already have the client's
+      // event batching; another per-file delay holds back saved edits.
+      // Incoming updates also reach the editor without this cooldown.
+      // Give the client a deadline so this cannot wait for the 30 s poll.
       report.waiting++;
+      report.nextUploadAt = Math.min(report.nextUploadAt ?? Infinity, nextUploadTime(entry));
       return;
     }
 
@@ -2104,27 +2130,41 @@ export class Engine {
     };
     let out;
     try {
-      const alone = batch.length === 1 ? batch[0]! : undefined;
-      if (
-        alone !== undefined &&
-        entryBudget(alone.size, alone.entry.names.length) > this.batchCap
-      ) {
-        // One large file is a `put`, not a batch of one. The server caps a
-        // batched write by budget and says so in its refusal: split the
-        // batch, and send a file over the limit on its own with put. A
-        // single put is bounded only by the per-file limit.
-        const { entry } = alone;
-        const one = await this.opts.transport.put(entry.path, entry.meta, entry.names, bodyOf, {
-          mac: entry.mac,
-          parent: entry.parent,
-        });
-        out = { results: [{ uid: one.uid }], uploaded: one.uploaded, bytes: one.bytes };
-      } else {
-        out = await this.opts.transport.putMany(
-          batch.map((q) => q.entry),
-          bodyOf,
-        );
-      }
+      out = await this.transferring(
+        "upload",
+        batch.filter((q) => q.entry.names.length > 0).map((q) => q.path),
+        async (onBytes) => {
+          const alone = batch.length === 1 ? batch[0]! : undefined;
+          if (
+            alone !== undefined &&
+            entryBudget(alone.size, alone.entry.names.length) > this.batchCap
+          ) {
+            // One large file is a `put`, not a batch of one. The server caps a
+            // batched write by budget and says so in its refusal: split the
+            // batch, and send a file over the limit on its own with put. A
+            // single put is bounded only by the per-file limit.
+            const { entry } = alone;
+            const one = await this.opts.transport.put(
+              entry.path,
+              entry.meta,
+              entry.names,
+              bodyOf,
+              {
+                mac: entry.mac,
+                parent: entry.parent,
+              },
+              onBytes,
+            );
+            return { results: [{ uid: one.uid }], uploaded: one.uploaded, bytes: one.bytes };
+          } else {
+            return await this.opts.transport.putMany(
+              batch.map((q) => q.entry),
+              bodyOf,
+              onBytes,
+            );
+          }
+        },
+      );
     } catch (err) {
       // The exchange itself failed, so nothing in it committed. Every path
       // in the batch is retried, exactly as it would have been alone.
@@ -2414,7 +2454,11 @@ export class Engine {
     const held = new Map<string, Uint8Array>();
     if (wanted.length > 0) {
       try {
-        const bodies = await this.fetchAll(wanted, (name) => budgets.get(name)!);
+        const bodies = await this.fetchAll(
+          wanted,
+          (name) => budgets.get(name)!,
+          batch.filter((d) => !local.has(d)).map((d) => d.path),
+        );
         for (let i = 0; i < wanted.length; i++) held.set(wanted[i]!, bodies[i]!);
       } catch (err) {
         // The fetch failed, so no file in it arrived. Each is retried,
@@ -2679,7 +2723,7 @@ export class Engine {
   /** The chunks for one entry, asked for on their own. */
   private async fetchFor(d: Incoming): Promise<Map<string, Uint8Array>> {
     const each = perChunkBudget(d.remote.size, d.chunks.length);
-    const bodies = await this.fetchAll([...d.chunks], () => each);
+    const bodies = await this.fetchAll([...d.chunks], () => each, [d.path]);
     const held = new Map<string, Uint8Array>();
     d.chunks.forEach((name, i) => held.set(name, bodies[i]!));
     return held;
@@ -2699,13 +2743,45 @@ export class Engine {
   private async fetchAll(
     names: readonly string[],
     budgetOf: (name: string) => number,
+    paths: readonly string[] = [],
   ): Promise<Uint8Array[]> {
-    const out: Uint8Array[] = [];
-    for (const ask of planFetches(names, budgetOf, this.fetchCap, MAX_FETCH_NAMES)) {
-      const bodies = await this.opts.transport.fetch(ask);
-      for (const b of bodies) out.push(b);
+    // History previews call this without paths: they are not a sync pass and
+    // must not leave the vault's sync status busy after the preview closes.
+    return this.transferring("download", paths, async (onBytes) => {
+      const out: Uint8Array[] = [];
+      let received = 0;
+      for (const ask of planFetches(names, budgetOf, this.fetchCap, MAX_FETCH_NAMES)) {
+        const bodies = await this.opts.transport.fetch(
+          ask,
+          onBytes === undefined ? undefined : (n) => onBytes(received + n),
+        );
+        for (const b of bodies) {
+          out.push(b);
+          received += b.length;
+        }
+      }
+      return out;
+    });
+  }
+
+  private async transferring<T>(
+    direction: TransferActivity["direction"],
+    paths: readonly string[],
+    work: (onBytes: ((bytes: number) => void) | undefined) => Promise<T>,
+  ): Promise<T> {
+    if (paths.length === 0 || this.opts.onTransfer === undefined) return work(undefined);
+    const details = {
+      direction,
+      files: paths.length,
+      ...(paths.length === 1 ? { path: paths[0]! } : {}),
+    };
+    const progress = (bytes: number) => notifyTransfer(this.opts.onTransfer, { ...details, bytes });
+    progress(0);
+    try {
+      return await work(progress);
+    } finally {
+      notifyTransfer(this.opts.onTransfer, undefined);
     }
-    return out;
   }
 
   /**
@@ -3325,7 +3401,7 @@ export class Engine {
    * The name carries the device and the time to the minute, so two conflicts
    * on one path from one device inside the same minute produced the same
    * name, and the second write replaced the first. Two passes inside a minute
-   * is ordinary: the write debounce is measured in tens of seconds.
+   * is ordinary: the write debounce is measured in seconds.
    *
    * That lost a note. A conflict copy is the only surviving record of one
    * side of a divergence, and quietly overwriting it is the failure the
@@ -3642,6 +3718,8 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     bytesSent: a.bytesSent + b.bytesSent,
     unchanged: b.unchanged,
     waiting: b.waiting,
+    ...(b.nextUploadAt !== undefined ? { nextUploadAt: b.nextUploadAt } : {}),
+    ...(b.appliedCursor !== undefined ? { appliedCursor: b.appliedCursor } : {}),
     retrying: b.retrying,
     skipped: b.skipped,
     skippedPaths: b.skippedPaths,
