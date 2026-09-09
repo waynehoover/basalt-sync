@@ -224,7 +224,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --draft=false --latest=true --repo "$GITHUB_REPOSITORY"
           echo "$TAG is public, with the files that were just checked and signed"
 
   server:
@@ -255,15 +255,21 @@ jobs:
         env:
           TAG: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
           version="${TAG#server/v}"
-          mkdir -p attested
+          # Keep every build output outside the checkout until all targets
+          # finish, so earlier binaries do not mark later builds as modified.
+          build_dir=$(mktemp -d "$RUNNER_TEMP/basalt-attest.XXXXXX")
+          trap 'rm -rf "$build_dir"' EXIT
           for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
             goos="${target%/*}"
             goarch="${target#*/}"
             ( cd server && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
                 go build -trimpath -ldflags "-s -w -X main.version=$version" \
-                -o "../attested/basaltd-$goos-$goarch" ./cmd/basaltd )
+                -o "$build_dir/basaltd-$goos-$goarch" ./cmd/basaltd )
           done
+          mkdir -p attested
+          cp "$build_dir"/basaltd-* attested/
           ls -l attested
 
       # Generated here rather than uploaded from a laptop, so it says something
@@ -305,5 +311,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --draft=false --latest=false --repo "$GITHUB_REPOSITORY"
           echo "$TAG is public, with the files that were just checked and signed"

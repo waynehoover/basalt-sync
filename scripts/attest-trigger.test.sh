@@ -101,6 +101,107 @@ else
   fail "two runs on one tag can clobber each other's assets while a third step publishes"
 fi
 
+# Execute the shipped run blocks, so these checks cover what publishing and
+# building actually do rather than whether a comment mentions the right flag.
+run_block() {
+  awk -v job="$1" -v step="$2" '
+    /^  [^ #]/ { in_job = ($0 == "  " job ":") }
+    in_job && /^      - / { in_step = ($0 == "      - name: " step); in_run = 0 }
+    in_job && in_step && /^        run: \|/ { in_run = 1; next }
+    in_run && /^          / { sub(/^          /, ""); print; next }
+    in_run && NF { in_run = 0 }
+  ' "$workflow"
+}
+
+scratch=$(mktemp -d) || exit 1
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/bin" "$scratch/runner"
+
+# GitHub promotes a newly published release by default, including a server
+# draft originally created with --latest=false. Model that publication step.
+cat > "$scratch/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1 $2" == "release edit" ]] || exit 2
+tag=$3
+shift 3
+latest=true
+published=false
+for arg in "$@"; do
+  case "$arg" in
+    --latest=*) latest=${arg#--latest=} ;;
+    --draft=false) published=true ;;
+  esac
+done
+[[ "$published" == true ]] || exit 3
+if [[ "$latest" == true ]]; then
+  printf '%s\n' "$tag" > "$LATEST_RELEASE"
+fi
+SH
+chmod +x "$scratch/bin/gh"
+
+echo "publishing the attested releases:"
+for job in plugin server; do
+  case "$job" in
+    plugin) tag=0.6.2 ;;
+    server) tag=server/v0.6.2 ;;
+  esac
+  run_block "$job" publish > "$scratch/publish.sh"
+  if [[ ! -s "$scratch/publish.sh" ]] || ! (
+    PATH="$scratch/bin:$PATH" LATEST_RELEASE="$scratch/latest" \
+      GITHUB_REPOSITORY=example/basalt TAG="$tag" \
+      bash -euo pipefail "$scratch/publish.sh" > "$scratch/publish.log" 2>&1
+  ); then
+    fail "$job publication did not execute successfully"
+    cat "$scratch/publish.log" >&2
+  elif [[ "$(cat "$scratch/latest" 2>/dev/null)" != 0.6.2 ]]; then
+    fail "$job publication left GitHub latest pointing away from the plugin"
+  else
+    ok "$job publication leaves the plugin as GitHub latest"
+  fi
+done
+
+# Build a tiny real Go program in a clean temporary checkout, using all four
+# commands from the workflow. Its build metadata must name that clean commit;
+# generating one binary inside the checkout used to dirty the next three.
+echo "building attested server binaries:"
+fixture="$scratch/checkout"
+mkdir -p "$fixture/server/cmd/basaltd"
+printf 'module example.test/attest-fixture\n\ngo 1.22\n' > "$fixture/server/go.mod"
+cat > "$fixture/server/cmd/basaltd/main.go" <<'GO'
+package main
+
+var version = "dev"
+
+func main() { println(version) }
+GO
+git -c init.templateDir= init -q "$fixture" || exit 1
+git -C "$fixture" add server || exit 1
+git -C "$fixture" -c user.name=Test -c user.email=test@example.test \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm fixture || exit 1
+revision=$(git -C "$fixture" rev-parse HEAD) || exit 1
+run_block server build > "$scratch/build.sh"
+if [[ ! -s "$scratch/build.sh" ]] || ! (
+  cd "$fixture" && RUNNER_TEMP="$scratch/runner" TAG=server/v0.6.2 \
+    bash -euo pipefail "$scratch/build.sh" > "$scratch/build.log" 2>&1
+); then
+  fail "the extracted server build did not execute successfully"
+  cat "$scratch/build.log" >&2
+else
+  for target in linux-amd64 linux-arm64 darwin-arm64 darwin-amd64; do
+    binary="$fixture/attested/basaltd-$target"
+    if ! go version -m "$binary" > "$scratch/metadata" 2>&1; then
+      fail "$target has no readable Go build metadata"
+    elif ! grep -Fq "vcs.revision=$revision" "$scratch/metadata"; then
+      fail "$target does not identify the checked commit"
+    elif ! grep -Fq 'vcs.modified=false' "$scratch/metadata"; then
+      fail "$target incorrectly records modified source"
+    else
+      ok "$target identifies the clean checked commit"
+    fi
+  done
+fi
+
 if [ "$fails" != 0 ]; then
   echo "$fails check(s) failed"
   exit 1

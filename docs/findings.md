@@ -180,9 +180,33 @@ the referenced logo is unchanged.
 The review's broader runs passed 403 CLI tests, 335 client/plugin tests, and the
 full Go race-enabled suite. The complete local gate then passed: 1,523 client
 tests, 24 stress tests, server race tests, the restore rehearsal, package/build
-checks, and Docker checks. Exact-commit CI is still required before publication.
+checks, and Docker checks. All 11 CI jobs passed on the
+[release commit](https://github.com/waynehoover/basalt-sync/actions/runs/34294787886)
+before publication.
 
 The screenshot script captured 12 views in both themes in desktop Obsidian
 1.13.7, using sample data. Its interrupted-run cleanup was exercised too.
 Android and iOS acceptance were not performed during this review; existing
 platform and threat-model limits remain as documented in [the design](design.md).
+
+### Release verification follow-up
+
+The public 0.6.2 downloads passed checksum and provenance checks for all seven
+plugin/server assets. The container ran on Linux amd64 and arm64, its moving
+tags matched the versioned image, and the published CLI installed and ran under
+Node 22. Two release-automation defects were also corrected:
+
+- Publishing the server draft made GitHub's **latest release** point away from
+  the plugin. The public link was corrected to 0.6.2; future publication now
+  explicitly selects the plugin and excludes the server from that label.
+- Building successive server binaries inside the checkout marked later builds
+  as `vcs.modified=true` because earlier build outputs were untracked. Future
+  builds stage outside the checkout before gathering the assets. Some published
+  0.6.2 binaries retain that misleading stamp; their source revision and
+  attestations identify the verified release commit. Published bytes were kept
+  unchanged.
+
+[attest-trigger.test.sh](../scripts/attest-trigger.test.sh) now executes the
+workflow's publication commands and four real Go builds in a temporary Git
+repository. The latest-release check and three clean-build checks failed before
+these workflow fixes and passed afterward.

@@ -24,8 +24,8 @@ services:
     # fail every client-only release for no reason.
     #
     # The digest came from:
-    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.6.0
-    image: ghcr.io/waynehoover/basalt-sync:0.6.0@sha256:8edc87129011c692b3aca2a20b5e4120013d7438ab34791512eeae33693d5762
+    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.6.2
+    image: ghcr.io/waynehoover/basalt-sync:0.6.2@sha256:97d17b199d308cbe8244ac008db907e52a262a99c75d2081034091bb2ce47ff6
     container_name: basalt
     restart: unless-stopped
 
