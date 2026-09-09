@@ -122,7 +122,8 @@ Version history keeps only the selected preview in memory, sharing an in-flight
 download and reusing it when switching between text and changes. Comparisons
 always reread the local note. Closing the window discards the preview and stops
 late page responses from starting further downloads. Repeated Restore taps
-cannot start another restore while the first is running.
+cannot start another restore while the first is running. Deleted-note recovery
+uses the same busy behavior, and refreshing Settings disposes the previous panel.
 
 Manual sync interrupts reconnect backoff when offline. Repeated requests share
 the same work, and the panel shows a disabled busy action while connecting,

@@ -3527,6 +3527,7 @@ class BasaltSettingTab extends PluginSettingTab {
   override display(): void {
     // Nothing to close: leaving the tab is the person's own business, and a
     // panel that closed Settings out from under them would be a surprise.
+    this.panel?.teardown();
     this.panel = new BasaltPanel(this.plugin, this.containerEl, () => {});
     this.panel.render();
   }
@@ -3545,7 +3546,9 @@ class BasaltSettingTab extends PluginSettingTab {
  * in a bad afternoon, and it should not be a thing to learn.
  */
 class RecoverModal extends Modal {
-  /** How many to ask for; undefined is the server's default. */
+  private closed = false;
+  private rendering: Promise<void> | undefined;
+  private readonly restoring = new Set<number>();
   /** The oldest uid of the page before this one, or undefined for the newest. */
   private before: number | undefined;
 
@@ -3561,17 +3564,30 @@ class RecoverModal extends Modal {
   }
 
   override onClose(): void {
+    this.closed = true;
     this.contentEl.empty();
   }
 
-  private async render(): Promise<void> {
+  private render(): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (this.rendering) return this.rendering;
+    this.rendering = this.renderPage().finally(() => {
+      this.rendering = undefined;
+    });
+    return this.rendering;
+  }
+
+  private async renderPage(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
+    contentEl.createEl("p", { cls: "basalt-advice", text: "Loading deleted notes…" });
 
     let deleted: DeletedList;
     try {
       deleted = await this.plugin.deletedNotes(PAGE_SIZE, this.before);
     } catch (err) {
+      if (this.closed) return;
+      contentEl.empty();
       // Not an empty list. "There is nothing to recover" and "I could not
       // ask" are different answers and this is the worst place to confuse
       // them.
@@ -3581,6 +3597,9 @@ class RecoverModal extends Modal {
       });
       return;
     }
+
+    if (this.closed) return;
+    contentEl.empty();
 
     if (deleted.notes.length === 0) {
       contentEl.createEl("p", { cls: "basalt-advice", text: "No deleted notes to restore." });
@@ -3636,12 +3655,18 @@ class RecoverModal extends Modal {
             .setButtonText("Restore")
             .setCta()
             .onClick(async () => {
+              if (this.closed || this.restoring.has(version.uid)) return;
+              this.restoring.add(version.uid);
+              b.setDisabled(true).setButtonText("Restoring…");
               try {
                 const done = await this.plugin.recover(version);
                 new Notice(describeRestore(version, done), done.sent ? undefined : 10_000);
                 await this.render();
               } catch (err) {
                 new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+              } finally {
+                this.restoring.delete(version.uid);
+                b.setDisabled(false).setButtonText("Restore");
               }
             }),
         );

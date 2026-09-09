@@ -972,7 +972,7 @@ describe("recovering a deleted note from the app", () => {
     await plugin.runCommand("recover-deleted");
     await until(
       "the list to load",
-      () => modals.at(-1)!.contentEl.allText().length > "Deleted notes".length,
+      () => built.some((setting) => setting.name === "gone.md"),
       15_000,
     );
     const row = built.find((s) => s.name === "gone.md");
@@ -2684,6 +2684,17 @@ describe("pairing honestly", () => {
  * and was called unguarded.
  */
 describe("on a phone", () => {
+  it("disposes the previous settings panel when Obsidian redraws the tab", async () => {
+    const { plugin } = await load();
+    const tab = plugin.settingTabs[0]!;
+    const callbacks = () => (plugin as unknown as { panelClosers: Set<unknown> }).panelClosers.size;
+    tab.display();
+    tab.display();
+    tab.display();
+    expect(callbacks()).toBe(1);
+    tab.hide();
+    expect(callbacks()).toBe(0);
+  });
   it("stops delivery timers while hidden and refreshes on return", async () => {
     const { plugin } = await load();
     vi.spyOn(plugin, "paired", "get").mockReturnValue(true);
@@ -2743,6 +2754,56 @@ describe("on a phone", () => {
       Platform.isMobileApp = false;
     }
   }, 300_000);
+});
+
+describe("recovery taps and late responses", () => {
+  const version = {
+    uid: 1,
+    path: "gone.md",
+    contentId: "gone",
+    size: 4,
+    ctime: 0,
+    mtime: 1,
+    folder: false,
+    deleted: true,
+    device: "phone",
+    chunks: 1,
+    restorable: 1,
+  };
+
+  it("restores a deleted note only once for repeated taps", async () => {
+    const { plugin } = await load();
+    const listed = vi
+      .spyOn(plugin, "deletedNotes")
+      .mockResolvedValue({ notes: [version], more: false });
+    const done = deferred<{ path: string; sent: boolean }>();
+    const recover = vi.spyOn(plugin, "recover").mockReturnValue(done.promise);
+    await plugin.runCommand("recover-deleted");
+    await nextTurn();
+    const button = built.find((s) => s.name === "gone.md")!.buttons[0]!;
+    const first = button.click();
+    const second = button.click();
+    done.resolve({ path: "gone.md", sent: true });
+    await Promise.all([first, second]);
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(listed).toHaveBeenCalledTimes(2);
+    modals.at(-1)!.close();
+    vi.restoreAllMocks();
+  });
+
+  it("does not rebuild a closed deleted-notes window", async () => {
+    const { plugin } = await load();
+    const page = deferred<{ notes: (typeof version)[]; more: boolean }>();
+    vi.spyOn(plugin, "deletedNotes").mockReturnValue(page.promise);
+    await plugin.runCommand("recover-deleted");
+    const modal = modals.at(-1)!;
+    const loading = (modal as unknown as { render(): Promise<void> }).render();
+    modal.close();
+    page.resolve({ notes: [version], more: false });
+    await loading;
+    expect(modal.contentEl.allText()).toBe("");
+    vi.restoreAllMocks();
+  });
 });
 
 /**
