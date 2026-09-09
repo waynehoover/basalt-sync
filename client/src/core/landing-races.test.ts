@@ -12,12 +12,14 @@
  * engine already has for a divergence; the bug was that it never asked.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
 import { FakeSocket, engineOnFakeSocket, settle } from "./fake-socket.ts";
 import type { WireEntry } from "./transport.ts";
 import { MemoryVault } from "./vault.ts";
+
+afterEach(() => vi.useRealTimers());
 
 const enc = new TextEncoder();
 
@@ -223,6 +225,10 @@ describe("a client connected only to look (F08)", () => {
     socket.reply(ready({ cursor: 0 }));
     await connecting;
 
+    socket.raw({ op: "caught-up", cursor: 0 });
+    await client.transport.drainReceived();
+    vi.useFakeTimers();
+
     // A note arrives while this command is still printing its answer, which
     // is all it takes: catch-up delivers batches to whoever is connected.
     servingWith(socket, bodies);
@@ -232,8 +238,8 @@ describe("a client connected only to look (F08)", () => {
       to: 1,
       entries: [await entryFor(keys, 1, "arrived.md", "not asked for", bodies)],
     });
-    // Well past the arrival delay a syncing client would have fired on.
-    await new Promise((r) => setTimeout(r, 400));
+    await client.transport.drainReceived();
+    await vi.advanceTimersByTimeAsync(1);
 
     expect(looking.paths(), "a command that only looks downloaded a note into the vault").toEqual(
       [],

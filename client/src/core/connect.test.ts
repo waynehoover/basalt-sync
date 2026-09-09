@@ -10,7 +10,7 @@
  * of the backlog before printing one line.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { Client, type ClientOptions } from "./client.ts";
 import { FakeSocket, ready, settle } from "./fake-socket.ts";
@@ -58,6 +58,44 @@ async function settled(p: Promise<unknown>): Promise<boolean> {
 }
 
 describe("connecting only as far as the handshake (R1)", () => {
+  it.each(["catch-up", "disconnect", "timeout"] as const)(
+    "ends the backlog wait on %s and clears its inactivity deadline",
+    async (ending) => {
+      vi.useFakeTimers();
+      const { socket, client } = clientOnFakeSocket();
+      const connecting = client.connect();
+      const result = connecting.catch((error: Error) => error);
+      try {
+        socket.open();
+        await vi.waitFor(() => expect(socket.sentText.some((m) => m["op"] === "hello")).toBe(true));
+        socket.reply(ready({ cursor: 1 }));
+        await vi.waitFor(() => expect(client.serverLimits?.cursor).toBe(1));
+        await vi.advanceTimersByTimeAsync(1500);
+        socket.raw({ op: "batch", from: 1, to: 1, entries: [] });
+        await client.transport.drainReceived();
+        await vi.advanceTimersByTimeAsync(1900);
+        // Total time exceeds the timeout; the last batch reset the deadline.
+        expect(vi.getTimerCount()).toBe(1);
+        if (ending === "catch-up") {
+          socket.raw({ op: "caught-up", cursor: 1 });
+          expect((await connecting).cursor).toBe(1);
+        } else if (ending === "disconnect") {
+          socket.hangUp(1006, "lost connection");
+          expect(await result).toBeInstanceOf(Error);
+        } else {
+          await vi.advanceTimersByTimeAsync(100);
+          expect(await result).toMatchObject({
+            message: "the server never finished sending what it already had",
+          });
+        }
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        await client.close();
+        await result;
+        vi.useRealTimers();
+      }
+    },
+  );
   it("groups already-received metadata before scanning the vault", async () => {
     const vault = new MemoryVault();
     let scans = 0;

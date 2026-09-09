@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { JsonIndexStore, NodeVault, TEMP_MARK, isTemporary, writeDurably } from "./vault.ts";
 import { removeTree } from "../core/test-server.ts";
+import { deferred, within } from "../core/test-async.ts";
 
 let root: string;
 
@@ -29,6 +30,27 @@ afterEach(async () => {
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+
+it("reports a filesystem edit through the watcher", async () => {
+  const changed = deferred();
+  const vault = new NodeVault(root);
+  const stop = vault.watch(() => {
+    // Platforms may report the directory instead of the individual file.
+    // What matters is that a triggered scan can observe the saved content.
+    void vault.read("watched.md").then(
+      (bytes) => {
+        if (dec.decode(bytes) === "saved note\n") changed.resolve();
+      },
+      () => {}, // An earlier directory event can arrive before the file exists.
+    );
+  });
+  try {
+    await writeFile(join(root, "watched.md"), "saved note\n");
+    await within(changed.promise, "the watcher to observe the saved note", 10_000);
+  } finally {
+    stop();
+  }
+});
 
 describe("listing", () => {
   it("reports files and the folders above them", async () => {
@@ -385,10 +407,11 @@ describe("the index on disk", () => {
     // fsyncs to record that nothing happened.
     const store = new JsonIndexStore(file);
     expect(await store.load()).toEqual(state(7));
-    const before = (await stat(file)).mtimeMs;
-    await new Promise((r) => setTimeout(r, 10));
+    const before = await stat(file);
     await store.save(state(7));
-    expect((await stat(file)).mtimeMs, "an identical index was written again").toBe(before);
+    const after = await stat(file);
+    expect(after.ino, "an identical index was replaced").toBe(before.ino);
+    expect(after.mtimeMs, "an identical index was written again").toBe(before.mtimeMs);
 
     // And if it goes from under the session, the next save puts it back
     // rather than skipping for ever and starting cold next time.
@@ -815,12 +838,11 @@ describe("the index is not rewritten when it has not changed", () => {
     const store = new JsonIndexStore(file);
     await store.save(state);
     const first = await stat(file);
-
-    // Far enough apart that a rewrite would be visible in the timestamps.
-    await new Promise((r) => setTimeout(r, 20));
     await store.save(state);
     const second = await stat(file);
 
+    // A staged replacement must have a different inode, even at the same timestamp.
+    expect(second.ino, "an identical index was replaced").toBe(first.ino);
     expect(second.mtimeMs, "the index was rewritten with the same bytes").toBe(first.mtimeMs);
   });
 
@@ -833,11 +855,10 @@ describe("the index is not rewritten when it has not changed", () => {
     const store = new JsonIndexStore(file);
     await store.save(state);
     const first = await stat(file);
-
-    await new Promise((r) => setTimeout(r, 20));
     await store.save({ ...(state as object), cursor: 8 } as never);
     const second = await stat(file);
 
+    expect(second.ino, "an ordinary pass replaced the snapshot").toBe(first.ino);
     expect(second.mtimeMs, "an ordinary pass rewrote the whole index").toBe(first.mtimeMs);
     expect((await stat(log)).size, "the change did not reach the journal").toBeGreaterThan(0);
     expect((await store.load())?.cursor).toBe(8);

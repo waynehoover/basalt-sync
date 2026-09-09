@@ -1,3 +1,4 @@
+import { receiveCommitted } from "../core/test-async.ts";
 /**
  * A path that is a file on one device and a folder on another.
  *
@@ -182,7 +183,7 @@ describe("a path that is a file here and a folder there", () => {
 
     for (let i = 0; i < 5; i++) {
       await a.c.settle();
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(b.c.transport);
       await b.c.settle();
     }
 
@@ -245,7 +246,7 @@ describe("a path that is a file here and a folder there", () => {
 
     for (let i = 0; i < 5; i++) {
       await a.c.settle();
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(b.c.transport);
       await b.c.settle();
     }
 
@@ -289,7 +290,7 @@ describe("a path that is a file here and a folder there", () => {
     await rename(join(a.dir, "notes"), join(a.dir, "notes.md"));
     for (let i = 0; i < 5; i++) {
       await a.c.settle();
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(b.c.transport);
       await b.c.settle();
     }
 
@@ -420,7 +421,7 @@ describe("a never-synced name nested inside an ordinary folder", () => {
     await expect(readFile(join(b.dir, "proj", ".hidden", "note.md"))).rejects.toThrow();
 
     const r2 = await b.c.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(a.c.transport);
     await a.c.settle();
     expect(r2.deletedRemotely, "b reported a deletion it never made").toBe(0);
     expect(a.vault.text("proj/node_modules/readme.md"), "device a lost the file").toBe(
@@ -509,9 +510,9 @@ describe("two notes that differ only by case, one written on each device", () =>
     let macReport = await mac.c.settle();
     await linux.c.settle();
     for (let i = 0; i < 4; i++) {
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(mac.c.transport);
       macReport = await mac.c.settle();
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(linux.c.transport);
       await linux.c.settle();
     }
 

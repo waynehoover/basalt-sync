@@ -12,6 +12,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { deferred, receiveCommitted } from "./test-async.ts";
 
 import {
   Engine,
@@ -103,7 +104,7 @@ class Device {
     let last = await this.engine.sync();
     for (let i = 1; i < rounds; i++) {
       // Let anything the server relayed arrive before deciding again.
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(this.transport);
       last = await this.engine.sync();
     }
     return last;
@@ -138,8 +139,12 @@ async function device(
 class GatedVault extends MemoryVault {
   gate: Promise<void> = Promise.resolve();
   gatePath = "";
+  onRead?: () => void;
   override async read(path: string): Promise<Uint8Array> {
-    if (path === this.gatePath) await this.gate;
+    if (path === this.gatePath) {
+      this.onRead?.();
+      await this.gate;
+    }
     return super.read(path);
   }
 }
@@ -295,12 +300,12 @@ afterEach(async () => {
 async function convergeBoth(a: Device, b: Device, rounds = 5): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await a.engine.sync();
-    await new Promise((r) => setTimeout(r, 60));
+    await receiveCommitted(b.transport);
     await b.engine.sync();
-    await new Promise((r) => setTimeout(r, 60));
+    await receiveCommitted(a.transport);
   }
   await a.engine.sync();
-  await new Promise((r) => setTimeout(r, 60));
+  await receiveCommitted(b.transport);
   await b.engine.sync();
 }
 
@@ -521,8 +526,8 @@ describe("concurrent edits, which is where notes get lost", () => {
       const before = b.batchesWithEntries;
       pass = a.engine.sync();
       await until("a's edit to commit", () => b.batchesWithEntries > before);
-      // Give the already-sent ack its turn while verification remains gated.
-      await new Promise((r) => setTimeout(r, 50));
+      // The pong follows the upload ack while metadata verification stays gated.
+      await a.transport.ping();
     } finally {
       release();
       await pass;
@@ -656,14 +661,16 @@ describe("concurrent edits, which is where notes get lost", () => {
     av.gate = new Promise<void>((r) => (release = r));
     await av.edit("zz-gate.md", "g1\n");
     const seenBefore = a.batchesWithEntries;
+    const reading = deferred();
+    av.onRead = reading.resolve;
     const aPass = a.engine.sync();
-    await new Promise((r) => setTimeout(r, 300));
+    await reading.promise;
 
     // B commits while A is mid-pass, and A receives the batch.
     const bReport = await b.engine.sync();
     expect(bReport.uploaded).toBe(1);
     await until("a to receive b's version", () => a.batchesWithEntries > seenBefore);
-    await new Promise((r) => setTimeout(r, 100));
+    await receiveCommitted(a.transport);
 
     release();
     const aReport = await aPass;
@@ -712,7 +719,7 @@ describe("a case-only rename on a receiving device", () => {
       await a.vault.edit(`n${String(i).padStart(3, "0")}.md`, `v2 ${i}\n`);
     }
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
 
     const report = await b.engine.sync();
     return { b, report };
@@ -756,7 +763,7 @@ describe("a case-only rename onto a vault that cannot say what one file is (C-D1
     await a.vault.remove("Note.md");
     await a.vault.edit("NOTE.md", "the only copy of this text\n");
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
 
     const report = await b.engine.sync();
     // The note is kept, both times: nothing here is allowed to lose it.
@@ -1061,7 +1068,7 @@ describe("folders and renames", () => {
 
     const before = b.batches.length;
     await a.engine.sync();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
     // Each file travelled as a rename, which is the `prev` field on the wire.
     const renames = b.batches
       .slice(before)
@@ -1095,7 +1102,7 @@ describe("two notes the receiving disk cannot hold apart", () => {
     await a.vault.edit(first, `the ${first} text\n`);
     await a.vault.edit(second, `the ${second} text\n`);
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
 
     const report = await b.engine.sync();
     // Neither is written, both are named, and nothing is called synced.
@@ -1174,7 +1181,6 @@ describe("one name a peer spells in another normal form", () => {
     const old = await device("old");
     await old.vault.edit(NFD, "from the old client\n");
     await old.engine.sync();
-    await new Promise((r) => setTimeout(r, 200));
     old.close();
 
     // A current device pairs into that vault. Its own keyspace is NFC, so
@@ -1207,7 +1213,6 @@ describe("one name a peer spells in another normal form", () => {
     const old = await device("old");
     await old.vault.edit("Note\u0301s/cafe\u0301.md", "in a folder\n");
     await old.engine.sync();
-    await new Promise((r) => setTimeout(r, 200));
     old.close();
 
     const now = await device("now", undefined, new CaseKeepingVault());
@@ -1222,7 +1227,6 @@ describe("one name a peer spells in another normal form", () => {
     const old = await device("old");
     await old.vault.edit(NFD, "to be deleted\n");
     await old.engine.sync();
-    await new Promise((r) => setTimeout(r, 200));
     old.close();
 
     const now = await device("now", undefined, new CaseKeepingVault());
@@ -1257,7 +1261,6 @@ describe("one name a peer spells in another normal form", () => {
     const old = await device("old");
     await old.vault.edit(NFD, "first\n");
     await old.engine.sync();
-    await new Promise((r) => setTimeout(r, 200));
     old.close();
 
     const a = await device("a", undefined, new CaseKeepingVault());
@@ -1290,7 +1293,7 @@ describe("a conflict copy whose name is taken in the gap", () => {
     await a.vault.edit("note.md", "A's rewrite\n");
     await b.vault.edit("note.md", "B's rewrite\n");
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
 
     const report = await b.engine.sync();
     expect(report.conflicted).toBe(1);
@@ -1339,7 +1342,7 @@ describe("a note edited while the other side of its merge is in flight (F01)", (
     // Both sides edit a different paragraph, which is an ordinary clean merge.
     await a.vault.edit("note.md", base.replace("First paragraph.", "First, from a."));
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
     await b.vault.edit("note.md", base.replace("Second paragraph.", "Second, from b."));
 
     // And the editor saves again the moment the merge has read the file.
@@ -1375,7 +1378,7 @@ describe("a merge against an ancestor that has been purged", () => {
     // a moves on and syncs; b edits the other paragraph but does not sync.
     await a.vault.edit("note.md", base.replace("First paragraph.", "First, from a."));
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
     await b.vault.edit("note.md", base.replace("Second paragraph.", "Second, from b."));
 
     // The server forgets everything but the newest version of each path,
@@ -1593,13 +1596,13 @@ describe("the guards the happy path hides", () => {
 
     // A publishes first, so it is B that finds the conflict.
     await a.engine.sync();
-    await new Promise((r) => setTimeout(r, 120));
+    await receiveCommitted(b.transport);
     const report = await b.engine.sync();
     expect(report.conflicted, "B was meant to be the one that conflicted").toBe(1);
 
     // And B is gone. One pass, no second chance.
     b.close();
-    await new Promise((r) => setTimeout(r, 120));
+    await receiveCommitted(a.transport);
 
     await a.settle(6);
 
@@ -1690,7 +1693,7 @@ describe("the guards the happy path hides", () => {
     ].join("\n");
     await a.vault.edit("note.md", base);
     await a.engine.sync();
-    await new Promise((r) => setTimeout(r, 150));
+    await receiveCommitted(b.transport);
 
     await b.engine.sync();
     expect(b.vault.text("note.md"), "B was meant to have downloaded it by now").toBe(base);
@@ -1870,7 +1873,7 @@ describe("what the index forgets", () => {
     b.vault.failRemoveOnce = "locked.md";
     await a.vault.remove("locked.md");
     await a.settle();
-    await new Promise((r) => setTimeout(r, 80));
+    await receiveCommitted(b.transport);
     // One pass, not a settle: a settle would retry within the same call and
     // the window being tested would close before it could be looked at.
     await b.engine.sync();
@@ -2785,7 +2788,7 @@ describe("a move is not a download", () => {
     await a.vault.remove("Notes/big.md");
     await a.vault.write("Archive/big.md", body, { mtime: a.clock + 1000, ctime: a.clock + 1000 });
     await a.engine.sync();
-    await new Promise((r) => setTimeout(r, 120));
+    await receiveCommitted(b.transport);
 
     // Now the server cannot serve a single byte of it.
     const { rm, readdir } = await import("node:fs/promises");
@@ -3223,7 +3226,7 @@ describe("an Excalidraw drawing two devices both drew on", () => {
     // into many on both sides.
     await a.vault.edit(path, drawing([shape("from-a", 10)]));
     await a.settle();
-    await new Promise((r) => setTimeout(r, 200));
+    await receiveCommitted(b.transport);
     await b.vault.edit(path, drawing([shape("from-b", 500)]));
 
     const report = await b.engine.sync();

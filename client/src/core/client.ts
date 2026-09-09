@@ -166,6 +166,7 @@ export class Client {
   private caughtUp = false;
   /** When the last batch arrived, for the catch-up wait in `connect`. */
   private lastBatchAt = Date.now();
+  private readonly backlogWaiters = new Set<() => void>();
   private endedWith: Error | undefined;
   private notifyEnded: ((cause: Error) => void) | undefined;
 
@@ -185,6 +186,7 @@ export class Client {
     this.transport = new Transport(opts.url, {
       onBatch: async (batch) => {
         this.lastBatchAt = Date.now();
+        this.backlogChanged();
         await engine.acceptBatch(batch);
         this.reportCatchUp();
         // Accepting a batch records what the server has; it does not
@@ -205,9 +207,11 @@ export class Client {
       },
       onCaughtUp: () => {
         this.caughtUp = true;
+        this.backlogChanged();
       },
       onClosed: (cause) => {
         this.endedWith = cause;
+        this.backlogChanged();
         this.notifyEnded?.(cause);
       },
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
@@ -328,15 +332,34 @@ export class Client {
     // time. Bounding the total made that device reconnect into the same
     // backlog for ever; what a timeout is for is a server that has stopped
     // talking, and that is measured from the last thing it said.
-    const timeout = this.opts.timeoutMs ?? 30_000;
-    while (!this.caughtUp) {
-      if (this.endedWith) throw this.endedWith;
-      if (Date.now() - this.lastBatchAt > timeout) {
-        throw new Error("the server never finished sending what it already had");
-      }
-      await sleep(25);
-    }
+    await this.waitForBacklog();
     return this.limits;
+  }
+
+  private backlogChanged(): void {
+    for (const changed of this.backlogWaiters) changed();
+  }
+
+  /** Wake on a batch, catch-up, or disconnect; only inactivity needs a timer. */
+  private waitForBacklog(): Promise<void> {
+    const timeout = this.opts.timeoutMs ?? 30_000;
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const changed = () => {
+        clearTimeout(timer);
+        const remaining = timeout - (Date.now() - this.lastBatchAt);
+        if (!this.caughtUp && !this.endedWith && remaining > 0) {
+          timer = setTimeout(changed, remaining);
+          return;
+        }
+        this.backlogWaiters.delete(changed);
+        if (this.endedWith) reject(this.endedWith);
+        else if (this.caughtUp) resolve();
+        else reject(new Error("the server never finished sending what it already had"));
+      };
+      this.backlogWaiters.add(changed);
+      changed();
+    });
   }
 
   private reportCatchUp(): void {
@@ -358,7 +381,6 @@ export class Client {
     let pass = await this.pass(opts);
     let total = pass;
     for (let i = 0; i < maxPasses && didSomething(pass); i++) {
-      await sleep(60);
       pass = await this.pass(opts);
       total = combinePasses(total, pass);
     }
@@ -373,8 +395,8 @@ export class Client {
       // (I05).
       onStart?.();
       // A closed client starts no pass. `close` drains the queue, and a
-      // settle sleeping between two passes was not in the queue: it woke
-      // after the drain, ran a pass against the closed transport, and saved
+      // settle between two passes may not be in the queue: it could continue
+      // after the drain, run a pass against the closed transport, and save
       // the index that unlink had just removed.
       if (this.closing) throw new ConnectionError("this client has been closed");
       this.confirmedPass = false;
@@ -2108,5 +2130,3 @@ export function attentionLines(r: SyncReport, indent = ""): string[] {
   if (rest > 0) lines.push(`${indent}and ${rest} more.`);
   return lines;
 }
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

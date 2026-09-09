@@ -7,11 +7,11 @@
  * a restore never overwrites, and paging asks for what it does not already have.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { Client } from "../core/client.ts";
 import { testWrapped } from "../core/test-keys.ts";
-import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { TestServer, cleanupBinary, serverBinary, until } from "../core/test-server.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 import { App, notices } from "./stub.ts";
@@ -152,7 +152,7 @@ describe("version history", () => {
     const { source } = await device();
     const modal = new HistoryModal(new App() as never, source, "never-existed.md");
     modal.open();
-    await settle();
+    await until("the empty history response", () => /no history/i.test(rendered(modal)));
 
     expect(rendered(modal)).toMatch(/no history/i);
   });
@@ -163,7 +163,7 @@ describe("version history", () => {
 
     const modal = new HistoryModal(new App() as never, source, "note.md");
     modal.open();
-    await settle();
+    await until("the newest version text", () => rendered(modal).includes("one\ntwo\n"));
 
     // Opens on the newest version, so the pane is never dead space and the
     // common case takes no clicks. "Select a version to see it." as the
@@ -174,17 +174,12 @@ describe("version history", () => {
     expect(rendered(modal)).toContain("Restore");
 
     rows(modal)[1]!.click();
-    await settle();
+    await until("the selected version text", () => !rendered(modal).includes("Loading…"));
     const text = rendered(modal);
     expect(text).toContain("Restore");
     expect(text).toContain("one\n");
   });
 });
-
-/** Lets the modal's queued reads finish. */
-async function settle(): Promise<void> {
-  for (let i = 0; i < 30; i++) await new Promise((r) => setTimeout(r, 20));
-}
 
 function rendered(modal: HistoryModal): string {
   return (modal.contentEl as unknown as { allText(): string }).allText();
@@ -230,15 +225,15 @@ it("marks up added and removed lines so the stylesheet can colour them", async (
 
   const modal = new HistoryModal(new App() as never, source, "note.md");
   modal.open();
-  await settle();
+  await until("the newest version text", () => rendered(modal).includes("one\nthree\n"));
 
   // The oldest version, against what is on disk now.
   rows(modal)[1]!.click();
-  await settle();
+  await until("the older version text", () => rendered(modal).includes("one\ntwo\n"));
   const toggle = buttons(modal).find((b) => b.text.includes("Show changes"));
   expect(toggle, "no toggle to switch to the diff").toBeDefined();
   toggle!.click();
-  await settle();
+  await until("the version diff", () => classesIn(modal).has("basalt-added"));
 
   const classes = classesIn(modal);
   expect(classes).toContain("basalt-removed");
@@ -274,7 +269,6 @@ it("names the note whose history it is showing", async () => {
 
   const modal = new HistoryModal(new App() as never, source, "Projects/note.md");
   modal.open();
-  await settle();
 
   // In the body, not just in titleEl, because titleEl is the part that does
   // not render.
@@ -339,7 +333,6 @@ describe("selections that finish out of order", () => {
     const source: HistorySource = {
       history: async () => {
         historyCalls++;
-        await new Promise((r) => setTimeout(r, 30));
         return pages.shift() ?? [];
       },
       contentAt: (v) =>
@@ -352,6 +345,7 @@ describe("selections that finish out of order", () => {
     return {
       source,
       finish: (uid: number) => pending.get(uid)!(`text of ${uid}`),
+      reading: (uid: number) => pending.has(uid),
       calls: () => historyCalls,
     };
   }
@@ -359,19 +353,23 @@ describe("selections that finish out of order", () => {
   it("shows the version chosen last, whichever read finished last", async () => {
     const a = version(2);
     const b = version(1);
-    const { source, finish } = controlled([[a, b]]);
+    const { source, finish, reading } = controlled([[a, b]]);
     const modal = new HistoryModal(new App() as never, source, "note.md");
+    const choices = vi.spyOn(
+      modal as unknown as { choose(version: Version): Promise<void> },
+      "choose",
+    );
     modal.open();
-    await settle();
+    await until("the first content request", () => reading(2));
     // The modal opened on A and is waiting for its text. Pick B.
     rows(modal)[1]!.click();
-    await settle();
+    await until("the second content request", () => reading(1));
     // B answers first, then A, deliberately reversed.
     finish(1);
-    await settle();
+    await choices.mock.results[1]!.value;
     expect(rendered(modal)).toContain("text of 1");
     finish(2);
-    await settle();
+    await choices.mock.results[0]!.value;
     const text = rendered(modal);
     expect(text, "the slower read for A overwrote B's pane").toContain("text of 1");
     expect(text).not.toContain("text of 2");
@@ -380,19 +378,19 @@ describe("selections that finish out of order", () => {
   it("asks for a page once however many times Load more is pressed", async () => {
     const first = Array.from({ length: PAGE }, (_, i) => version(100 - i));
     const second = [version(5)];
-    const { source, finish, calls } = controlled([first, second]);
+    const { source, finish, calls, reading } = controlled([first, second]);
     const modal = new HistoryModal(new App() as never, source, "note.md");
     modal.open();
-    await settle();
+    await until("the newest content request", () => reading(100));
     finish(100);
-    await settle();
+    await until("the newest content response", () => rendered(modal).includes("text of 100"));
     expect(calls()).toBe(1);
 
     const more = () => buttons(modal).find((b) => b.text.includes("Load more"));
     expect(more(), "no Load more button for a full first page").toBeDefined();
     more()!.click();
     more()!.click();
-    await settle();
+    await until("the second history page", () => rows(modal).length === PAGE + 1);
     expect(calls(), "two presses became two requests for the same page").toBe(2);
     expect(rows(modal).length).toBe(PAGE + 1);
   });
@@ -432,7 +430,7 @@ describe("a history page that does not arrive (P-D7)", () => {
 
     const modal = new HistoryModal(new App() as never, source, "note.md");
     modal.open();
-    await settle();
+    await until("the history error", () => rendered(modal).includes("could not be read"));
 
     // Not "the server holds no history for this note": that is an answer,
     // and no answer was given.
@@ -442,7 +440,7 @@ describe("a history page that does not arrive (P-D7)", () => {
 
     fail = false;
     again()!.click();
-    await settle();
+    await until("the retried history response", () => rendered(modal).includes("the text"));
     expect(rows(modal).length).toBe(1);
     expect(rendered(modal)).toContain("the text");
     expect(rendered(modal)).not.toMatch(/could not be read/);

@@ -77,7 +77,9 @@ gofmt_clean() {
 # ---- server ----------------------------------------------------------------
 run "gofmt" server gofmt_clean
 run "vet" server go vet ./...
-run "test" server go test -race ./...
+# Tests also read repository docs outside the Go module; the Go result cache
+# does not track those inputs. Always execute the release gate's server tests.
+run "test" server go test -race -count=1 ./...
 run "the systemd unit verifies" server go test -race -run 'TestService' ./cmd/basaltd/
 
 # ---- systemd's own opinion of that unit -------------------------------------

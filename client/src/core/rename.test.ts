@@ -11,6 +11,7 @@ import { Client, type ClientOptions } from "./client.ts";
 import { testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
+import { deferred } from "./test-async.ts";
 
 const SECRET = new Uint8Array(32).fill(33);
 let wrapped: string;
@@ -76,7 +77,9 @@ function stateOf(client: Client) {
 /** A vault whose reads wait until the test says go. */
 class SlowReadVault extends MemoryVault {
   gate: Promise<void> = Promise.resolve();
+  readonly reading = deferred();
   override async read(path: string): Promise<Uint8Array> {
+    this.reading.resolve();
     await this.gate;
     return super.read(path);
   }
@@ -153,9 +156,8 @@ describe("a rename reported while a pass is running", () => {
     });
     // The pass starts, lists A.md, and blocks reading it.
     const pass = c.sync();
-    await new Promise((r) => setTimeout(r, 100));
+    await vault.reading.promise;
     const renamed = c.noteRename("A.md", "B.md");
-    await new Promise((r) => setTimeout(r, 100));
     // Not yet: the pass has A.md in hand.
     expect(stateOf(c).entries).not.toContain("B.md");
 

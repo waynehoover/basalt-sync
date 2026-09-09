@@ -14,7 +14,11 @@
  * files are the same subject from opposite directions and neither is redundant.
  */
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { deferred, nextTurn } from "./test-async.ts";
+
+afterEach(() => vi.useRealTimers());
+
 import { chunkName } from "./crypto.ts";
 import { FakeSocket, RIG_SECRET, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import { testKeys } from "./test-keys.ts";
@@ -103,11 +107,9 @@ describe("transfer byte progress", () => {
         expect(socket.sentBinary).toEqual([body]);
         expect(seen).toEqual([0]);
         socket.bufferedAmount = 60;
-        await new Promise((r) => setTimeout(r, 20));
-        expect(seen.at(-1)).toBe(40);
+        await expect.poll(() => seen.at(-1)).toBe(40);
         socket.bufferedAmount = 0;
-        await new Promise((r) => setTimeout(r, 20));
-        expect(seen.at(-1)).toBe(100);
+        await expect.poll(() => seen.at(-1)).toBe(100);
         expect(done).toBe(false);
         expect(produce).toHaveBeenCalledTimes(1);
         socket.reply(
@@ -319,16 +321,24 @@ describe("batches from a server that skips one", () => {
     // Two batches arriving together must not overlap: the second's
     // continuity check depends on the first having finished.
     const order: number[] = [];
+    const held = deferred();
+    const entered = deferred();
     const { t, socket } = await helloed(0, {
       onBatch: async (b) => {
         order.push(b.from);
-        await new Promise((r) => setTimeout(r, 5));
+        if (b.from === 1) {
+          entered.resolve();
+          await held.promise;
+        }
         order.push(-b.from);
       },
     });
     socket.reply({ op: "batch", from: 1, to: 1, entries: [] });
     socket.reply({ op: "batch", from: 2, to: 2, entries: [] });
-    await new Promise((r) => setTimeout(r, 60));
+    await entered.promise;
+    expect(order).toEqual([1]);
+    held.resolve();
+    await t.drainReceived();
 
     expect(order).toEqual([1, -1, 2, -2]);
     expect(t.appliedCursor).toBe(2);
@@ -1649,7 +1659,10 @@ describe("cutting to the ceiling the server advertised", () => {
 describe("the timeout a fetch leaves behind", () => {
   it("closes an idle socket promptly when a resume probe gets no response", async () => {
     const { t } = await helloed();
-    await expect(t.probe(20)).rejects.toThrow("after resuming");
+    vi.useFakeTimers();
+    const result = expect(t.probe(20)).rejects.toThrow("after resuming");
+    await vi.advanceTimersByTimeAsync(20);
+    await result;
     expect(t.isClosed).toBe(true);
   });
 
@@ -1657,9 +1670,10 @@ describe("the timeout a fetch leaves behind", () => {
     const { t, socket } = await helloed();
     const body = new Uint8Array([1, 2, 3]);
     const name = await chunkName(body);
+    vi.useFakeTimers();
     const fetch = t.fetch([name]);
     const probe = t.probe(20);
-    await new Promise((r) => setTimeout(r, 50));
+    await vi.advanceTimersByTimeAsync(50);
     expect(t.isClosed).toBe(false);
     socket.bodies(body);
     socket.reply({ res: "pong" });
@@ -1684,33 +1698,35 @@ describe("the timeout a fetch leaves behind", () => {
     const body = new Uint8Array([1, 2, 3]);
     const name = await chunkName(body);
 
+    vi.useFakeTimers();
     const fetching = t.fetch([name]);
-    await settle();
+
     socket.bodies(body);
     expect(await fetching).toHaveLength(1);
 
     // Well past the timeout that was armed for the reply.
-    await new Promise((r) => setTimeout(r, 300));
+    await vi.advanceTimersByTimeAsync(300);
     expect(t.isClosed, "the connection died after a fetch that had already succeeded").toBe(false);
 
     // And it is still usable, which is the property that matters.
     const pinging = t.ping();
-    await settle();
+
     socket.reply({ res: "pong" });
     await expect(pinging).resolves.toBeUndefined();
   });
 
   it("does not leave one behind when a fetch fails either", async () => {
     const { t, socket } = await helloed(0, { timeoutMs: 120 });
+    vi.useFakeTimers();
     const fetching = t.fetch(["a".repeat(64)]);
-    await settle();
+
     socket.reply({ res: "err", code: "nochunk", msg: "not held", retryable: false });
     await expect(fetching).rejects.toMatchObject({ code: "nochunk" });
 
-    await new Promise((r) => setTimeout(r, 300));
+    await vi.advanceTimersByTimeAsync(300);
     // A refusal is not a reason to close, and the timer must not make it one.
     const pinging = t.ping();
-    await settle();
+
     socket.reply({ res: "pong" });
     await expect(pinging).resolves.toBeUndefined();
   });
@@ -2048,7 +2064,7 @@ describe("a corrupt body early in a fetch", () => {
 
       await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
       // Waited for, because an unhandled rejection is reported a turn later.
-      await new Promise((r) => setTimeout(r, 50));
+      await nextTurn();
       expect(
         unhandled,
         `the corrupt body rejected with nobody watching: ${String(unhandled[0])}`,

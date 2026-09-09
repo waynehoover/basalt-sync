@@ -18,6 +18,7 @@ import { createServer } from "node:net";
 import { promisify } from "node:util";
 
 import { Registrar } from "./client.ts";
+import { deferred, within } from "./test-async.ts";
 import { authToken, deriveRootKeys, deviceAuthToken, generateDeviceSecret } from "./crypto.ts";
 import { generateDeviceId } from "./pairing.ts";
 
@@ -178,22 +179,32 @@ export class TestServer {
     );
     this.proc.stderr?.on("data", (b: Buffer) => this.stderr.push(b.toString()));
 
-    // Waited for rather than slept through.
-    const deadline = Date.now() + 30_000;
-    for (;;) {
-      // A process that has already exited will never answer, and waiting
-      // the full timeout to say so turns one clear error into a slow one.
-      if (this.proc.exitCode !== null) {
-        throw new Error(`server exited with ${this.proc.exitCode}: ${this.stderr.join("")}`);
-      }
-      if (Date.now() > deadline) throw new Error(`server did not start: ${this.stderr.join("")}`);
-      try {
-        const res = await fetch(`http://127.0.0.1:${this.port}/health`);
-        if (res.ok) break;
-      } catch {
-        await new Promise((r) => setTimeout(r, 50));
-      }
+    // The banner is printed only after the listener is bound. Use that event
+    // instead of opening a health connection every 50 ms during startup.
+    const listening = deferred();
+    const proc = this.proc;
+    let banner = "";
+    const output = (data: Buffer) => {
+      banner += data.toString();
+      if (/^basaltd .* listening on /m.test(banner)) listening.resolve();
+    };
+    const exited = (code: number | null) =>
+      listening.reject(new Error(`server exited with ${code}: ${this.stderr.join("")}`));
+    const failed = (error: Error) => listening.reject(error);
+    proc.stdout!.on("data", output);
+    proc.once("exit", exited);
+    proc.once("error", failed);
+    try {
+      await within(listening.promise, "the test server to listen", 30_000);
+    } finally {
+      proc.stdout!.off("data", output);
+      proc.off("exit", exited);
+      proc.off("error", failed);
     }
+    const res = await fetch(`http://127.0.0.1:${this.port}/health`, {
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`server health check failed: ${res.status}`);
     this.token = (await readFile(join(this.dataDir, "auth-token"), "utf8")).trim();
   }
 
@@ -288,7 +299,13 @@ export class TestServer {
     if (this.proc && this.proc.exitCode === null) {
       const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
       this.proc.kill("SIGTERM");
-      await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
+      try {
+        await within(ended, "the test server to exit");
+      } catch (error) {
+        this.proc.kill("SIGKILL");
+        await within(ended, "the test server to exit after SIGKILL");
+        throw error;
+      }
     }
     this.proc = undefined;
   }
@@ -305,7 +322,7 @@ export class TestServer {
     if (this.proc && this.proc.exitCode === null) {
       const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
       this.proc.kill("SIGKILL");
-      await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
+      await within(ended, "the test server to exit");
     }
     this.proc = undefined;
   }

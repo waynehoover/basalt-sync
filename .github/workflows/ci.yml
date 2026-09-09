@@ -41,7 +41,7 @@ jobs:
       # the kind of fault that shows up as a lost note rather than a crash.
       - name: test
         working-directory: server
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       # The systemd unit `basaltd service` prints is a deployment artifact, so
       # it is rendered here and checked by systemd itself rather than by eye.

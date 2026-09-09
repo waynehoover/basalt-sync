@@ -2070,10 +2070,8 @@ export class NodeVault implements Vault {
    * can be built on recursive `fs.watch` at all, which is documented as
    * best-effort and is not available on every platform.
    *
-   * Coalesced on a short timer because saving one file in an editor produces
-   * several events, and because a folder copied into the vault produces one
-   * per file. Without it the engine would start a pass per event and spend the
-   * copy re-scanning.
+   * Events delivered together share the next event-loop turn. More events
+   * cannot keep postponing the scan while a folder is being copied.
    */
   watch(onChange: (path: string) => void): () => void {
     let timer: NodeJS.Timeout | undefined;
@@ -2090,11 +2088,11 @@ export class NodeVault implements Vault {
         if (this.neverSynced(path)) return;
         if (isTemporary(basename(path), join(this.root, path))) return;
         last = path;
-        if (timer) clearTimeout(timer);
+        if (timer) return;
         timer = setTimeout(() => {
           timer = undefined;
           onChange(last);
-        }, 150);
+        }, 0);
       });
       watcher.on("error", () => {
         // A watch that fails is a vault that gets scanned on a timer

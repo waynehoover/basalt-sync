@@ -97,9 +97,6 @@ const (
 	// with both sides reporting success. It is refused instead, because a
 	// refusal is reversible and silent divergence is not.
 	CodeCursor = "cursor"
-	// CodeFull is retained for older servers that capped device registrations.
-	// Current servers do not emit it. It remains non-retryable.
-	CodeFull = "full"
 	// CodeRotated is a rotate that lost the race: the vault's credential is no
 	// longer the one this session authenticated under, because another device
 	// rotated first.

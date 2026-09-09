@@ -1,3 +1,4 @@
+import { nextTurn } from "./test-async.ts";
 /**
  * The long-running loop, and what a shell can rely on from it.
  *
@@ -145,7 +146,12 @@ describe("a connection that ends while a pass is running", () => {
     // The connection drops under the running pass. The pass is let go
     // shortly after, as a slow disk would.
     live!.transport.close();
-    setTimeout(release, 700);
+    try {
+      await nextTurn();
+      expect(goneWithWritesFinished).toBe(-1);
+    } finally {
+      release();
+    }
     await until("the loop to report b gone", () => goneWithWritesFinished >= 0, 20_000);
 
     expect(goneWithWritesFinished, "reported gone while its pass was still writing").toBe(1);
@@ -176,7 +182,6 @@ describe("a settle that is between passes when the client closes", () => {
     await c.close();
     const saves = store.saves;
     await settling.catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 300));
     expect(store.saves, "a pass ran after close had resolved").toBe(saves);
   }, 60_000);
 });

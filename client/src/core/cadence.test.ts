@@ -1,5 +1,5 @@
 /** Production sync timing, real clients and a real server; no manual retry loop. */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { Client, type ClientOptions } from "./client.ts";
 import type { SyncReport } from "./engine.ts";
@@ -17,7 +17,6 @@ class ManualVault extends MemoryVault {
 }
 
 const secret = new Uint8Array(32).fill(93);
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const clients: Client[] = [];
 const loops: Promise<Error>[] = [];
 let server: TestServer;
@@ -67,8 +66,8 @@ async function pair(
   const b = await make("receiver", bv, receiverOptions);
   await b.settle({ coalesceWrites: false });
   for (const [path, body] of Object.entries(seed)) expect(bv.text(path)).toBe(body);
-  // Drain the startup arrival nudge before testing the absence of later events.
-  await sleep(200);
+  // Startup metadata must be verified; connect no longer schedules a catch-up nudge.
+  await Promise.all([a.transport.drainReceived(), b.transport.drainReceived()]);
   return { a, b, av, bv, reports };
 }
 
@@ -340,29 +339,43 @@ describe("automatic sync cadence", () => {
 
   it("does not retry a deferred upload after the client has closed", async () => {
     const { a, av, bv, reports } = await pair();
-    loops.push(a.runUntilClosed());
-    await av.edit("file.bin", "unsent local edit\n");
-    expect((await a.sync())?.waiting).toBe(1);
-    await a.close();
-    const passes = reports.length;
-    await sleep(1300);
-    expect(reports).toHaveLength(passes);
-    expect(bv.text("file.bin")).toBe("original\n");
-    expect(av.text("file.bin")).toBe("unsent local edit\n");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      loops.push(a.runUntilClosed());
+      await av.edit("file.bin", "unsent local edit\n");
+      expect((await a.sync())?.waiting).toBe(1);
+      await a.close();
+      const passes = reports.length;
+      const sync = vi.spyOn(a.engine, "sync");
+      await vi.advanceTimersByTimeAsync(1300);
+      expect(sync).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(passes);
+      expect(bv.text("file.bin")).toBe("original\n");
+      expect(av.text("file.bin")).toBe("unsent local edit\n");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels the deadline when the edit is undone and leaves the idle vault alone", async () => {
     const { a, av, bv, reports } = await pair();
-    loops.push(a.runUntilClosed());
-    await av.edit("file.bin", "temporary edit\n");
-    expect((await a.sync())?.waiting).toBe(1);
-    await av.edit("file.bin", "original\n");
-    expect((await a.sync())?.waiting).toBe(0);
-    const passes = reports.length;
-    await sleep(1300);
-    expect(reports).toHaveLength(passes);
-    expect(av.text("file.bin")).toBe("original\n");
-    expect(bv.text("file.bin")).toBe("original\n");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      loops.push(a.runUntilClosed());
+      await av.edit("file.bin", "temporary edit\n");
+      expect((await a.sync())?.waiting).toBe(1);
+      await av.edit("file.bin", "original\n");
+      expect((await a.sync())?.waiting).toBe(0);
+      const passes = reports.length;
+      const sync = vi.spyOn(a.engine, "sync");
+      await vi.advanceTimersByTimeAsync(1300);
+      expect(sync).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(passes);
+      expect(av.text("file.bin")).toBe("original\n");
+      expect(bv.text("file.bin")).toBe("original\n");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("preserves every paragraph through rapid consecutive note uploads", async () => {
@@ -374,7 +387,6 @@ describe("automatic sync cadence", () => {
       body += `kept paragraph ${i}\n`;
       await av.edit("note.md", body);
       await a.sync();
-      await sleep(50);
     }
     await until("every saved paragraph", () => bv.text("note.md") === body, 8000);
     expect(av.text("note.md")).toBe(body);
@@ -394,13 +406,20 @@ describe("automatic sync cadence", () => {
 
   it("does not turn a one-shot client's deferred pass into a background upload", async () => {
     const { a, av, bv, reports } = await pair();
-    await av.edit("file.bin", "local one-shot edit\n");
-    expect((await a.sync())?.waiting).toBe(1);
-    const passes = reports.length;
-    await sleep(1300);
-    expect(reports).toHaveLength(passes);
-    expect(av.text("file.bin")).toBe("local one-shot edit\n");
-    expect(bv.text("file.bin")).toBe("original\n");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      await av.edit("file.bin", "local one-shot edit\n");
+      expect((await a.sync())?.waiting).toBe(1);
+      const passes = reports.length;
+      const sync = vi.spyOn(a.engine, "sync");
+      await vi.advanceTimersByTimeAsync(1300);
+      expect(sync).not.toHaveBeenCalled();
+      expect(reports).toHaveLength(passes);
+      expect(av.text("file.bin")).toBe("local one-shot edit\n");
+      expect(bv.text("file.bin")).toBe("original\n");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("preserves both devices' paragraphs when note uploads overlap", async () => {

@@ -351,7 +351,9 @@ type Server struct {
 	// while every session was still open and the store was closed under them.
 	sessMu   sync.Mutex
 	sessions map[*Session]struct{}
-	closing  bool
+	// Closed when the current group of admitted sessions has finished.
+	sessionsDone chan struct{}
+	closing      bool
 }
 
 // errShuttingDown is the reason a peer is given when the server is stopping.
@@ -377,6 +379,9 @@ func (s *Server) admit(sess *Session) error {
 	}
 	if s.sessions == nil {
 		s.sessions = make(map[*Session]struct{})
+	}
+	if len(s.sessions) == 0 {
+		s.sessionsDone = make(chan struct{})
 	}
 	s.sessions[sess] = struct{}{}
 	sess.counted = true
@@ -404,6 +409,9 @@ func (s *Server) forget(sess *Session) {
 		return
 	}
 	delete(s.sessions, sess)
+	if len(s.sessions) == 0 {
+		close(s.sessionsDone)
+	}
 	if sess.counted {
 		sess.counted = false
 		s.preAuth--
@@ -475,7 +483,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for sess := range s.sessions {
 		peers = append(peers, sess)
 	}
+	done := s.sessionsDone
 	s.sessMu.Unlock()
+	if len(peers) == 0 {
+		return nil
+	}
 
 	// In parallel, because each idle peer is given a moment to read its reason
 	// and eight of them in series would spend the whole budget on the first.
@@ -489,14 +501,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	wg.Wait()
 
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for s.Sessions() > 0 {
-		select {
-		case <-tick.C:
-			continue
-		case <-ctx.Done():
-		}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
 		// Out of time. What is left is mid-request; it is cut off, unacked, and
 		// the client retries. The count is taken here, under the lock and at
 		// the moment of the kill, so what is reported is what was actually
@@ -507,6 +515,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			left = append(left, sess)
 		}
 		s.sessMu.Unlock()
+		if len(left) == 0 {
+			return nil
+		}
 		for _, sess := range left {
 			sess.kill(errors.New("shutdown deadline reached with a request in flight"))
 		}
@@ -521,12 +532,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		// A session that never unwinds hangs the stop, which systemd ends with
 		// SIGKILL; that leaves the database to recover from its journal, which
 		// it is built to do, and is the safer of the two failures.
-		for s.Sessions() > 0 {
-			<-tick.C
-		}
+		<-done
 		return fmt.Errorf("shutdown: %d sessions cut off mid-request", len(left))
 	}
-	return nil
 }
 
 func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {

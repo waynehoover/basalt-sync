@@ -1,3 +1,4 @@
+import { receiveCommitted } from "../core/test-async.ts";
 /**
  * The same note created on a Mac and on anything else.
  *
@@ -114,9 +115,9 @@ describe("one name spelled NFD on one disk and NFC on another", () => {
     let mine = await mac.c.settle();
     let theirs = await other.c.settle();
     for (let i = 0; i < 4; i++) {
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(mac.c.transport);
       mine = await mac.c.settle();
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(other.c.transport);
       theirs = await other.c.settle();
     }
 
@@ -221,7 +222,7 @@ describe("a peer that spells the name NFD", () => {
     const first = mine;
     expect(first.deletedRemotely, "the new device deleted a note on the server").toBe(0);
     for (let i = 0; i < 4; i++) {
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(mac.c.transport);
       mine = await mac.c.settle();
     }
 
@@ -240,7 +241,7 @@ describe("a peer that spells the name NFD", () => {
     const next = await memoryDevice("next");
     let theirs = await next.c.settle();
     for (let i = 0; i < 3; i++) {
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(next.c.transport);
       theirs = await next.c.settle();
     }
     expect(
@@ -282,7 +283,7 @@ describe("a peer that spells the name NFD", () => {
     const next = await memoryDevice("next");
     let theirs = await next.c.settle();
     for (let i = 0; i < 3; i++) {
-      await new Promise((r) => setTimeout(r, 60));
+      await receiveCommitted(next.c.transport);
       theirs = await next.c.settle();
     }
     expect(theirs.blocked, `blocked: ${JSON.stringify(theirs.inTheWay)}`).toBe(0);

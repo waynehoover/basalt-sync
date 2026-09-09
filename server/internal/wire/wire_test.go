@@ -31,7 +31,7 @@ func TestI2RetryableMatchesTheProtocolDoc(t *testing.T) {
 	}
 	for _, code := range []string{CodeProto, CodeAuth, CodeCursor, CodeRotated, CodeBusy, CodeProtoState,
 		CodeBadChunk, CodeBadEntry, CodeBadName, CodeToolarge, CodeNoSpace, CodeNoUID, CodeNoContent,
-		CodeNoChunk, CodeNoDevice, CodeFull, CodeInternal} {
+		CodeNoChunk, CodeNoDevice, CodeInternal} {
 		if !seen[code] {
 			t.Errorf("code %q has no row in the doc's error table", code)
 		}

@@ -1,3 +1,4 @@
+import { deferred, nextTurn, within } from "../core/test-async.ts";
 /**
  * The plugin, run.
  *
@@ -105,8 +106,6 @@ afterEach(async () => {
   if (server) await server.cleanup();
 });
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 async function fresh(): Promise<void> {
   server = new TestServer();
   await server.start();
@@ -163,10 +162,11 @@ async function until(what: string, cond: () => boolean, ms = 90_000): Promise<vo
  * after 300000ms" five minutes later, with nothing about what was waiting.
  */
 async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promise<void> {
-  const pending = Symbol("pending");
-  const later = new Promise((r) => setTimeout(() => r(pending), ms));
-  const first = await Promise.race([work.then(() => "done").catch(() => "done"), later]);
-  if (first === pending) throw new Error(what);
+  await within(
+    work.catch(() => undefined),
+    what,
+    ms,
+  );
 }
 
 /**
@@ -394,6 +394,10 @@ describe("pairing", () => {
     const { plugin, app } = await load();
     app.vault.adapter.seed("note.md", "# Hello\n");
 
+    const summaries: string[] = [];
+    plugin.watchState((state) => {
+      if (state.kind === "synced") summaries.push(state.summary);
+    });
     const pairing = await startVault(plugin, "laptop");
     expect(pairing).toMatch(/^basalt3_/);
     await synced(plugin);
@@ -401,7 +405,8 @@ describe("pairing", () => {
     expect(plugin.paired).toBe(true);
     expect(plugin.deviceName).toBe("laptop");
     expect(statusIcon(plugin)).toBe("cloud-check");
-    expect(status(plugin)).toMatch(/^Basalt Sync: 1 sent, as of /);
+    expect(summaries).toContain("1 sent");
+    expect(status(plugin)).toMatch(/^Basalt Sync: (?:1 sent|Up to date), as of /);
     // Saved in a form that survives the JSON round trip Obsidian does.
     // No token: the vault has one secret, and what authenticates is derived
     // from it. The server's first-run token is kept only until the vault has
@@ -1100,7 +1105,7 @@ describe("unlinking", () => {
     const second = plugin.unlink();
     try {
       await until("unlink to reach the settings file", () => clears > 0);
-      await sleep(25);
+      await nextTurn();
       expect(clears, "two unlink operations can erase settings after the first one returns").toBe(
         1,
       );
@@ -1580,7 +1585,6 @@ describe("on a device with no status bar", () => {
 
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
-    await sleep(100);
     expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
   }, 300_000);
 
@@ -1760,22 +1764,30 @@ function recordSockets(): { sockets: WebSocket[]; restore: () => void } {
   };
 }
 
-/** Slows the plugin's index load, which runs inside `connect()`, so a test can act during the handshake. */
-function slowIndexLoad(app: App, ms: number): { began: Promise<void> } {
+/** Hold the handshake's index read until the test explicitly resumes it. */
+function holdIndexLoad(plugin: Testable, app: App) {
   const adapter = app.vault.adapter;
   const realExists = adapter.exists.bind(adapter);
-  let begin!: () => void;
-  const began = new Promise<void>((r) => {
-    begin = r;
-  });
+  const began = deferred();
+  const gate = deferred();
+  let held = false;
+  const runs = vi.spyOn(
+    plugin as unknown as { runLoop(config: unknown, generation: number): Promise<void> },
+    "runLoop",
+  );
   adapter.exists = async (path: string) => {
-    if (path.endsWith("/index.json")) {
-      begin();
-      await sleep(ms);
+    if (path.endsWith("/index.json") && !held) {
+      held = true;
+      began.resolve();
+      await gate.promise;
     }
     return realExists(path);
   };
-  return { began };
+  return {
+    began: began.promise,
+    release: gate.resolve,
+    finished: () => runs.mock.results[0]!.value,
+  };
 }
 
 /**
@@ -1792,7 +1804,7 @@ describe("unlinking during the handshake", () => {
     try {
       const { plugin, app } = await load();
       app.vault.adapter.seed("secret-note.md", "must never reach the old server after unlink");
-      const { began } = slowIndexLoad(app, 1500);
+      const { began, release, finished } = holdIndexLoad(plugin, app);
 
       const oldPairing = await startVault(plugin, "laptop");
       await began;
@@ -1805,8 +1817,9 @@ describe("unlinking during the handshake", () => {
         expect(s.readyState, "a socket was still open after unlink").toBeGreaterThanOrEqual(2);
       expect(plugin.paired).toBe(false);
 
-      // And after the slow handshake would have finished, still nothing.
-      await sleep(2500);
+      // Resume the retired handshake and wait for its actual completion.
+      release();
+      await finished();
       expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
       expect(plugin.currentState.kind).toBe("unpaired");
 
@@ -1843,7 +1856,7 @@ describe("unlinking during the handshake", () => {
     const { sockets, restore } = recordSockets();
     try {
       const { plugin, app } = await load();
-      const { began } = slowIndexLoad(app, 1000);
+      const { began, release, finished } = holdIndexLoad(plugin, app);
       await startVault(plugin, "laptop");
       await began;
       const seen: string[] = [];
@@ -1851,7 +1864,8 @@ describe("unlinking during the handshake", () => {
       plugin.onunload();
       await plugin.closing;
       for (const s of sockets) expect(s.readyState).toBeGreaterThanOrEqual(2);
-      await sleep(2000);
+      release();
+      await finished();
       // The retired run said nothing: the only state seen is the one the
       // watcher was handed on subscribing.
       expect(seen).toEqual(["connecting"]);
@@ -1941,28 +1955,32 @@ describe("unlink, in order and all the way", () => {
     await synced(b.plugin);
 
     // A download on b that takes a while, and an unlink in the middle of it.
-    let writing!: () => void;
-    const began = new Promise<void>((r) => {
-      writing = r;
-    });
+    const began = deferred();
+    const writeGate = deferred();
     const adapter = b.app.vault.adapter;
     const realWrite = adapter.writeBinary.bind(adapter);
     adapter.writeBinary = async (path, data, options) => {
       if (path.includes("slow.md")) {
-        writing();
-        await sleep(1500);
+        began.resolve();
+        await writeGate.promise;
       }
       return realWrite(path, data, options);
     };
     a.app.vault.adapter.seed("slow.md", "arrives slowly");
     await a.plugin.syncNow();
-    await began;
+    await began.promise;
 
-    await b.plugin.unlink();
+    const unlinking = b.plugin.unlink();
+    try {
+      await nextTurn();
+      expect(await adapter.exists(INDEX)).toBe(true);
+    } finally {
+      writeGate.resolve();
+      await unlinking;
+    }
     expect(b.plugin.paired).toBe(false);
     // The pass finished before the index was removed, so nothing of it comes
     // back afterwards.
-    await sleep(2500);
     expect(await adapter.exists(INDEX)).toBe(false);
     expect(await adapter.exists(STAGED)).toBe(false);
     expect(b.plugin.savedData).toBe(null);
@@ -2033,10 +2051,15 @@ describe("unlink, in order and all the way", () => {
     const { plugin } = await load();
     await startVault(plugin, "laptop");
     await synced(plugin);
-    (plugin as unknown as { working(p: string): void }).working("big.bin");
-    await plugin.unlink();
-    await sleep(600);
-    expect(plugin.currentState.kind).toBe("unpaired");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      (plugin as unknown as { working(p: string): void }).working("big.bin");
+      await plugin.unlink();
+      await vi.advanceTimersByTimeAsync(600);
+      expect(plugin.currentState.kind).toBe("unpaired");
+    } finally {
+      vi.useRealTimers();
+    }
   }, 300_000);
 });
 
@@ -2308,8 +2331,9 @@ describe("passes the plugin did not start", () => {
     const b = await load();
     const adapter = b.app.vault.adapter;
     const realWrite = adapter.writeBinary.bind(adapter);
+    const writeGate = deferred();
     adapter.writeBinary = async (path, data, options) => {
-      if (path.includes("slow.md")) await sleep(700);
+      if (path.includes("slow.md")) await writeGate.promise;
       return realWrite(path, data, options);
     };
     await b.plugin.pair(keyOf(a.plugin), "desktop");
@@ -2319,6 +2343,11 @@ describe("passes the plugin did not start", () => {
     b.plugin.watchState((s) => void seen.push(s.kind));
     a.app.vault.adapter.seed("slow.md", "takes a while to land");
     await a.plugin.syncNow();
+    try {
+      await until("b to report the held download", () => b.plugin.currentState.kind === "syncing");
+    } finally {
+      writeGate.resolve();
+    }
     await until("b to receive it", () => adapter.text("slow.md") !== undefined, 30_000);
     await until("b to settle", () => b.plugin.currentState.kind === "synced", 5_000);
     expect(seen, "b never said it was working").toContain("syncing");
@@ -2354,9 +2383,14 @@ describe("what is announced, and how often", () => {
     expect(notices.filter((n) => /cannot sync/.test(n.message))).toHaveLength(0);
 
     // And a save, which syncs through the nudge, says nothing new either.
+    const beforeSave = plugin.cursors()!.local;
     app.vault.adapter.seed("fine.md", "edited", 9_000_000_000_000);
     app.vault.fire("modify");
-    await sleep(1500);
+    await until(
+      "the edit to upload and its pass to finish",
+      () => plugin.cursors()!.local > beforeSave && plugin.currentState.kind === "synced",
+      120_000,
+    );
     expect(notices.filter((n) => /cannot sync/.test(n.message))).toHaveLength(0);
     // The status still says so, because a status describes the vault.
     expect(status(plugin)).toMatch(/attention/);
@@ -2984,16 +3018,23 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
       saveDuringRun(mine: number, config: unknown): Promise<void>;
     };
     const config = decodeConfig(plugin.savedData, "test");
+    const saveGate = deferred();
     let saves = 0;
     const realSave = plugin.saveData.bind(plugin);
     plugin.saveData = async (data: unknown) => {
-      if (++saves === 1) await sleep(300);
+      if (++saves === 1) await saveGate.promise;
       return realSave(data);
     };
 
     const settling = inner.saveDuringRun(inner.generation, config).catch(() => undefined);
-    await plugin.unlink();
-    await settling;
+    const unlinking = plugin.unlink();
+    try {
+      await nextTurn();
+      expect(plugin.savedData).not.toBe(null);
+    } finally {
+      saveGate.resolve();
+      await Promise.all([unlinking, settling]);
+    }
 
     // The one that matters: what a restart would read. A pairing here means
     // the next start syncs a vault the person removed.
@@ -3023,17 +3064,25 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
 
     // The first save is the slow one and the second is quick, so the newest
     // is not the one still in the air when unlink asks.
+    const saveGate = deferred();
     let saves = 0;
     const realSave = plugin.saveData.bind(plugin);
     plugin.saveData = async (data: unknown) => {
-      if (++saves === 1) await sleep(400);
+      if (++saves === 1) await saveGate.promise;
       return realSave(data);
     };
 
     const first = inner.saveDuringRun(inner.generation, config).catch(() => undefined);
     const second = inner.saveDuringRun(inner.generation, config).catch(() => undefined);
-    await plugin.unlink();
-    await Promise.all([first, second]);
+    await second;
+    const unlinking = plugin.unlink();
+    try {
+      await nextTurn();
+      expect(plugin.savedData).not.toBe(null);
+    } finally {
+      saveGate.resolve();
+      await Promise.all([unlinking, first]);
+    }
 
     expect(plugin.savedData, "an older save landed on top of the unlink").toBe(null);
     expect(plugin.paired).toBe(false);
@@ -4064,7 +4113,7 @@ describe("changing the server address", () => {
     await expect(plugin.changeServerAddress(server.wsUrl)).rejects.toThrow(/in progress/);
     const unlinking = plugin.unlink();
     try {
-      await sleep(0);
+      await nextTurn();
       expect(forgotten, "unlink forgot the pairing before its pending save finished").toBe(false);
     } finally {
       release();
@@ -4450,7 +4499,7 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
       unlinked = true;
     });
     try {
-      await sleep(25);
+      await nextTurn();
       expect(
         unlinked,
         "unlink returned while rejoin could still remove its next pairing's index",
@@ -4487,7 +4536,7 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     await until("the rejoin index reset", () => resetting);
     const unlinking = plugin.unlink();
     // Quiet has begun waiting for the reset when its write reports failure.
-    await sleep(25);
+    await nextTurn();
     fail(new Error("temporary reset error"));
     await unlinking;
     expect(await rejoining).toBeInstanceOf(Error);
@@ -4675,10 +4724,12 @@ describe("handing over the first recovery key", () => {
     const { plugin } = await load();
 
     let release: (() => void) | undefined;
+    const offered = deferred<string>();
     let shown = "";
     const pairing = plugin
       .pairFirst(server.setup, "laptop", async (key: string) => {
         shown = key;
+        offered.resolve(key);
         await new Promise<void>((go) => {
           release = go;
         });
@@ -4686,12 +4737,12 @@ describe("handing over the first recovery key", () => {
       .catch(() => undefined);
 
     // Wait for the key to be offered.
-    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+    await offered.promise;
     expect(shown, "no key was offered before the claim").toMatch(/^basalt/);
 
     // Still waiting, so nothing has been registered: the config holds the root
     // and no device credential.
-    await new Promise((r) => setTimeout(r, 50));
+    await nextTurn();
     expect(
       plugin.pendingFirstPairing(),
       "the pairing went ahead before anybody said they had the key",
@@ -4712,14 +4763,16 @@ describe("handing over the first recovery key", () => {
     await fresh();
     const { plugin } = await load();
 
+    const offered = deferred<string>();
     let shown = "";
     void plugin
       .pairFirst(server.setup, "laptop", async (key: string) => {
         shown = key;
+        offered.resolve(key);
         await new Promise<void>(() => {}); // the panel was closed
       })
       .catch(() => undefined);
-    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+    await offered.promise;
 
     const again = plugin.pendingFirstPairing();
     expect(again, "an interrupted pairing left no way back to the key").toBeDefined();
@@ -4947,24 +5000,25 @@ describe("handing over a replacement recovery key", () => {
     const key = keyOf(plugin);
 
     let release: (() => void) | undefined;
+    const offered = deferred<string>();
     let shown = "";
     const rotating = plugin
       .rotate(key, async (candidate: string) => {
         shown = candidate;
+        offered.resolve(candidate);
         await new Promise<void>((go) => {
           release = go;
         });
       })
       .catch((err: Error) => err);
 
-    for (let i = 0; i < 200 && shown === ""; i++) await new Promise((r) => setTimeout(r, 5));
+    await offered.promise;
     expect(shown, "no candidate was offered").toMatch(/^basalt/);
 
     // Still waiting, so the vault must still answer to the *old* key. That is
     // the direct observation: rotation retires it, and a device credential
     // keeps working either way, so asking the vault anything as a device
     // proves nothing at all.
-    await new Promise((r) => setTimeout(r, 150));
     const { Registrar } = await import("../core/client.ts");
     const { parsePairing } = await import("../core/pairing.ts");
     const old = parsePairing(key);

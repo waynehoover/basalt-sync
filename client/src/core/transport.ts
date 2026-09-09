@@ -1669,6 +1669,8 @@ export class Transport {
     let movedAt = Date.now();
     while (socket.bufferedAmount > below) {
       if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
+      // Browser WebSocket has no drain event. Poll only while bytes remain;
+      // removing this wait would spin or remove the upload's memory bound.
       await sleep(DRAIN_POLL_MS);
       const now = socket.bufferedAmount;
       progress?.();

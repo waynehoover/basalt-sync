@@ -1,3 +1,4 @@
+import { receiveCommitted } from "../core/test-async.ts";
 /**
  * Two Obsidian vaults, through a real server.
  *
@@ -100,9 +101,9 @@ afterEach(async () => {
 async function converge(a: Device, b: Device, rounds = 5): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await a.client.settle();
-    await new Promise((r) => setTimeout(r, 60));
+    await receiveCommitted(b.client.transport);
     await b.client.settle();
-    await new Promise((r) => setTimeout(r, 60));
+    await receiveCommitted(a.client.transport);
   }
 }
 
@@ -377,9 +378,9 @@ describe("a dotfile a headless peer holds", () => {
     try {
       for (let i = 0; i < 5; i++) {
         await cli.settle();
-        await new Promise((r) => setTimeout(r, 60));
+        await receiveCommitted(plugin.transport);
         await plugin.settle();
-        await new Promise((r) => setTimeout(r, 60));
+        await receiveCommitted(cli.transport);
       }
       // Rule 10: the property is that the peer keeps its file and this side
       // never held it, not that the two agree.

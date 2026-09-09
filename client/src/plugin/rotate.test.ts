@@ -1,3 +1,4 @@
+import { within } from "../core/test-async.ts";
 /**
  * Rotation from the plugin, against a real server.
  *
@@ -145,10 +146,11 @@ async function started(): Promise<{ plugin: Testable; app: App; key: string }> {
  * with nothing about what was waiting.
  */
 async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promise<void> {
-  const pending = Symbol("pending");
-  const later = new Promise((r) => setTimeout(() => r(pending), ms));
-  const first = await Promise.race([work.then(() => "done").catch(() => "done"), later]);
-  if (first === pending) throw new Error(what);
+  await within(
+    work.catch(() => undefined),
+    what,
+    ms,
+  );
 }
 
 /**

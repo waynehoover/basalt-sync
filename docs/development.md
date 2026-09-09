@@ -64,6 +64,14 @@ For a bug fix, demonstrate that its regression test fails without the fix and
 passes with it. Test preservation of the actual edited bytes, not just agreement
 between devices. Keep fault and stress tests in scope for durability changes.
 
+Wait for completion signals rather than guessed sleep intervals. Tests can use
+`core/test-async.ts`: `deferred` holds a race window, `receiveCommitted` waits for
+an acknowledged peer write to arrive, and `within` adds a cancelled-on-completion
+failure deadline. Use fake clocks for timer behavior. Real delays belong in slow
+link simulations; bounded polling is a fallback when an external process or
+filesystem provides no completion signal. Keep awaits that order reads, writes,
+acknowledgements, and index saves.
+
 Measure interactive sync separately from bulk transfers with
 `cd client && bun run bench:cadence`. It checks exact contents after new notes,
 rapid edits, and incoming updates, using the production timers and a local test

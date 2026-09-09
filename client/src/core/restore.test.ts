@@ -1,3 +1,4 @@
+import { nextTurn } from "./test-async.ts";
 /**
  * Putting a version back beside what is already there.
  *
@@ -79,7 +80,7 @@ describe("restoring onto an occupied path", () => {
       closed = true;
     });
     try {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await nextTurn();
       expect(closed, "the client closed while its restore could still publish into the vault").toBe(
         false,
       );
