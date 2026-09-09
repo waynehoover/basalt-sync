@@ -80,6 +80,42 @@ not imply Node dependencies in the plugin bundle. Shared code uses `globalThis`
 and platform-neutral timers; local-resource `fetch` is used for attachment
 streaming. Review the built plugin and resolved types as well as source scans.
 
+### Refresh the screenshots
+
+Open a test vault in desktop Obsidian and enable its command-line interface.
+With client dependencies installed, run from the repository root:
+
+```bash
+node scripts/screenshots.mjs --vault "Screenshot vault"
+```
+
+The script captures the actual plugin panels with sample notes, device names,
+and pairing details in both themes. It writes `docs/assets/screenshots/`, then
+removes its temporary preview plugin and restores the window and appearance.
+It never connects to a server. Review the images before committing them.
+Use `--scene invite --theme dark` to recapture one view; `--help` lists the scenes.
+Keep the test vault open until cleanup finishes.
+
+<details>
+<summary>Screenshot gallery</summary>
+
+| View | Light | Dark |
+|---|---|---|
+| Status panel | [View](assets/screenshots/panel.png) | [View](assets/screenshots/panel-dark.png) |
+| Plugin settings | [View](assets/screenshots/settings.png) | [View](assets/screenshots/settings-dark.png) |
+| Status indicator | [View](assets/screenshots/status.png) | [View](assets/screenshots/status-dark.png) |
+| Setup choices | [View](assets/screenshots/pairing.png) | [View](assets/screenshots/pairing-dark.png) |
+| First device | [View](assets/screenshots/setup.png) | [View](assets/screenshots/setup-dark.png) |
+| Join a vault | [View](assets/screenshots/join.png) | [View](assets/screenshots/join-dark.png) |
+| QR invite and pairing code | [View](assets/screenshots/invite.png) | [View](assets/screenshots/invite-dark.png) |
+| Server address | [View](assets/screenshots/server.png) | [View](assets/screenshots/server-dark.png) |
+| Device list | [View](assets/screenshots/devices.png) | [View](assets/screenshots/devices-dark.png) |
+| Deleted notes | [View](assets/screenshots/deleted.png) | [View](assets/screenshots/deleted-dark.png) |
+| No deleted notes | [View](assets/screenshots/deleted-empty.png) | [View](assets/screenshots/deleted-empty-dark.png) |
+| Version comparison | [View](assets/screenshots/changes.png) | [View](assets/screenshots/changes-dark.png) |
+
+</details>
+
 ## Performance work
 
 From `client/`, use `bun run bench`, `bun run bench:sync`, `bun run scale`, and

@@ -52,6 +52,57 @@ async function ready(): Promise<{ client: Client; vault: MemoryVault }> {
 }
 
 describe("restoring onto an occupied path", () => {
+  it("waits for a restore's local write before closing the client", async () => {
+    const { client: c, vault } = await ready();
+    await vault.edit("note.md", "the old text\n");
+    await c.settle();
+    const old = (await c.history("note.md"))[0]!;
+    await vault.edit("note.md", "the text now\n");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let writing!: () => void;
+    const began = new Promise<void>((resolve) => {
+      writing = resolve;
+    });
+    const create = vault.create.bind(vault);
+    vault.create = async (...args) => {
+      writing();
+      await gate;
+      return create(...args);
+    };
+    const restoring = c.restore(old);
+    await began;
+    let closed = false;
+    const closing = c.close().then(() => {
+      closed = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(closed, "the client closed while its restore could still publish into the vault").toBe(
+        false,
+      );
+    } finally {
+      release();
+      await closing;
+    }
+    const done = await restoring;
+    expect(vault.text(done.path)).toBe("the old text\n");
+    expect(vault.text("note.md")).toBe("the text now\n");
+  });
+
+  it("refuses a local folder restore after the client has closed", async () => {
+    const { client: c, vault } = await ready();
+    await vault.mkdir("folder");
+    await c.settle();
+    const folder = (await c.history("folder"))[0]!;
+    expect(folder.folder).toBe(true);
+    await c.close();
+    await expect(c.restore(folder, "another-folder")).rejects.toThrow(/closed/);
+    expect(await vault.exists("another-folder")).toBe(false);
+  });
+
   it("numbers a second restored copy rather than writing over the first", async () => {
     const { client: c, vault } = await ready();
     await vault.edit("note.md", "the old text\n");

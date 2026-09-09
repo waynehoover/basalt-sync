@@ -167,12 +167,15 @@ A server serves one vault, named by `-vault` (default `default`). To use another
 name, set it on the server and initialize the first device with the CLI:
 
 ```bash
-basalt init 'wss://homelab.example.ts.net#TOKEN' --vault-id work --dir ~/vault
-basalt invite --dir ~/vault
+basalt init 'wss://homelab.example.ts.net#TOKEN' --vault-id work --dir ~/basalt-setup
+basalt invite --dir ~/basalt-setup
 ```
 
 Run the server with `-vault work`. Other devices, including the plugin, learn
-the name from the invite. The plugin cannot initialize a custom vault name.
+the name from the invite. Use a separate setup directory, not a vault the plugin
+syncs. Save the recovery key, pair the plugin, then run
+`basalt unlink --dir ~/basalt-setup` and revoke that setup device from the plugin.
+The plugin cannot initialize a custom vault name.
 
 ## Connection troubleshooting
 
@@ -181,7 +184,7 @@ the name from the invite. The plugin cannot initialize a custom vault name.
 | Cannot reach the server | Server process, proxy, hostname, and tailnet connectivity. |
 | Setup token rejected | Copy it from this server's log. If already claimed, use an invite. |
 | Protocol mismatch | Update the server and clients to compatible releases. |
-| Device limit reached | Revoke unused rows in the plugin's **Devices** list. The limit is eight. |
+| Device limit reached | Update the server. Older releases capped the number of devices. |
 | Browser origin rejected | Check the exact origin in the server log and the plugin's hint. Add only that required origin with `-allow-origin`. |
 | Stopped after restoring a backup | Follow [server restoration](server-operations.md#restore), then use **Rejoin this server**. |
 | File too large | Check the default 64 MiB limit and [how to change it](server-reference.md#serve). |

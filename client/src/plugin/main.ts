@@ -1,25 +1,4 @@
-/**
- * The plugin, which is a shell and nothing else.
- *
- * It assembles the same four objects the headless client assembles, hands them
- * to the same `Client` in core, and spends the rest of its life drawing a status
- * bar. Every sync decision is a layer down, in code that two engines and a real
- * Go server exercise in tests. If a decision ever appears in this file, it is in
- * the wrong file, because this is the one file that cannot be tested.
- *
- * ## There is no settings tab
- *
- * On purpose, and docs/design.md says why: every option multiplies a state
- * space nobody tested. There is one modal, it exists to pair a vault and to say
- * what is happening, and it has no options in it. Pairing is not a setting; it
- * happens once and then never again.
- *
- * ## What is not verified
- *
- * This file, and `vault.ts` beside it. Both need Obsidian running. Every
- * signature used here was read out of `obsidian.d.ts` rather than remembered,
- * which is as close as it gets until it runs in a vault.
- */
+/** Obsidian plugin: lifecycle, platform adapter, and sync/recovery interfaces. */
 
 import {
   Modal,
@@ -28,7 +7,9 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  SettingGroup,
   setIcon,
+  type ButtonComponent,
   type TAbstractFile,
   type TextComponent,
 } from "obsidian";
@@ -54,6 +35,7 @@ import {
   runForever,
   summarise,
   credentialsFor,
+  proveDeviceConnects,
   type ClientOptions,
   type DeletedList,
   type DeviceRow,
@@ -68,6 +50,7 @@ import {
   encodeConfig,
   formatPairing,
   isInvite,
+  normaliseUrl,
   parseInvite,
   parseSetup,
   parsePairing,
@@ -78,6 +61,7 @@ import { rotateVault } from "../core/rotation.ts";
 import { ProtocolError } from "../core/transport.ts";
 import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
+import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
 export type State =
@@ -173,6 +157,8 @@ export default class BasaltPlugin extends Plugin {
    * when it has.
    */
   private generation = 0;
+  private editingConnection = false;
+  private unlinking: Promise<void> | undefined;
   private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
   private workingTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -195,7 +181,7 @@ export default class BasaltPlugin extends Plugin {
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
   /**
-   * Every settle save in flight, so `unlink` cannot be overtaken by one.
+   * Every config save or index reset in flight, so `unlink` cannot be overtaken by one.
    *
    * All of them, not the newest. Two reconnects inside one unlink window
    * start two saves, and holding only the second left the first free to land
@@ -336,9 +322,24 @@ export default class BasaltPlugin extends Plugin {
       this.unreadable = (err as Error).message;
       this.setState({ kind: "stopped", why: this.unreadable });
       new Notice(`Basalt: ${this.unreadable}`, 10_000);
-      return;
     }
 
+    this.registerObsidianProtocolHandler(INVITE_ACTION, (params) => {
+      try {
+        this.refuseUnlessPairable();
+        const invite = params["invite"]?.trim() ?? "";
+        try {
+          parseInvite(invite);
+        } catch {
+          throw new Error("This invite link is invalid. Create a new invite on the other device.");
+        }
+        new BasaltModal(this, invite).open();
+      } catch (err) {
+        new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+      }
+    });
+
+    if (this.unreadable !== undefined) return;
     if (this.config) this.start();
     else this.setState({ kind: "unpaired" });
   }
@@ -361,7 +362,7 @@ export default class BasaltPlugin extends Plugin {
     this.wakeLoop?.();
     this.wakeLoop = undefined;
     const { live, client } = this.retireClients();
-    this.closing = Promise.all([live?.close(), client?.close()])
+    this.closing = Promise.all([live?.close(), client?.close(), this.unlinking, ...this.settling])
       .then(() => undefined)
       .catch(() => undefined);
   }
@@ -709,35 +710,86 @@ export default class BasaltPlugin extends Plugin {
    * copies of one divergence would be named differently.
    */
   async renameDevice(name: string): Promise<string> {
-    const client = this.client;
-    if (!client) throw new Error(this.whyNoClient());
-    const config = this.config;
-    if (!config) throw new Error("this vault is not paired yet.");
-
-    const said = await client.rename(name);
+    if (this.unlinking) throw new Error("This vault is being unlinked.");
+    if (this.editingConnection) throw new Error("Another settings change is in progress.");
+    this.editingConnection = true;
     try {
-      await this.saveVerified({ ...config, device: said });
-    } catch (err) {
-      // Both halves. "Renamed" and "written down here" are different facts and
-      // the visible consequence of the second failing is conflict copies that
-      // still say the old name, which is not something to discover from a
-      // filename later.
-      throw new Error(
-        `the device list now says ${said}, and this device could not write it down: ` +
-          `${(err as Error).message}. Conflict copies made here will still say ` +
-          `${config.device} until this is done again.`,
-      );
-    }
-    this.config = { ...config, device: said };
+      const client = this.client;
+      if (!client) throw new Error(this.whyNoClient());
+      const config = this.config;
+      if (!config) throw new Error("this vault is not paired yet.");
+      const mine = this.generation;
 
-    // `quiet` and then `start`, which is what rotate and rebase do and for a
-    // related reason: a run that is merely disconnected reconnects, and a pass
-    // in flight is still writing under the old name. `stop` is not the way to
-    // do this, because it puts "Basalt has stopped" and a cause on screen, and
-    // nothing here has gone wrong.
-    await this.quiet();
-    this.start();
-    return said;
+      const said = await client.rename(name);
+      try {
+        await this.saveDuringRun(mine, { ...config, device: said });
+      } catch (err) {
+        // Both halves. "Renamed" and "written down here" are different facts and
+        // the visible consequence of the second failing is conflict copies that
+        // still say the old name, which is not something to discover from a
+        // filename later.
+        throw new Error(
+          `the device list now says ${said}, and this device could not write it down: ` +
+            `${(err as Error).message}. Conflict copies made here will still say ` +
+            `${config.device} until this is done again.`,
+        );
+      }
+      if (mine !== this.generation)
+        throw new Error("the pairing changed while renaming this device");
+      this.config = { ...config, device: said };
+
+      // `quiet` and then `start`, which is what rotate and rebase do and for a
+      // related reason: a run that is merely disconnected reconnects, and a pass
+      // in flight is still writing under the old name. `stop` is not the way to
+      // do this, because it puts "Basalt has stopped" and a cause on screen, and
+      // nothing here has gone wrong.
+      await this.quiet();
+      if (this.generation === mine + 1) this.start();
+      return said;
+    } finally {
+      this.editingConnection = false;
+    }
+  }
+
+  /** Move this pairing to a new address without resetting its sync history. */
+  async changeServerAddress(address: string): Promise<void> {
+    if (this.unlinking) throw new Error("This vault is being unlinked.");
+    if (this.editingConnection) throw new Error("Another settings change is in progress.");
+    this.editingConnection = true;
+    try {
+      const config = this.config;
+      if (!config || !this.paired) throw new Error("this vault is not paired yet.");
+      const next = { ...config, url: normaliseUrl(address) };
+      if (next.url === config.url) return;
+      let mine = this.generation;
+      const stillCurrent = () => mine === this.generation && this.config === config;
+
+      // Authenticate with the existing device credential. This connection applies
+      // no changes, so an incorrect address cannot replace the pairing or index.
+      await proveDeviceConnects(next, { timeoutMs: 15_000 });
+      if (!stillCurrent()) throw new Error("the pairing changed while checking the server address");
+
+      mine++;
+      await this.quiet();
+      if (!stillCurrent()) throw new Error("the pairing changed while updating the server address");
+      try {
+        // Unlink waits for a save already in flight; a retired run cannot start one.
+        await this.saveDuringRun(mine, next);
+      } catch (err) {
+        if (mine === this.generation) {
+          this.setState({
+            kind: "stopped",
+            why: `the server address could not be saved and verified: ${(err as Error).message}. Reopen Obsidian to reload the saved settings`,
+          });
+        }
+        throw err;
+      }
+      if (!stillCurrent()) throw new Error("the pairing changed while saving the server address");
+      this.config = next;
+      this.start();
+    } finally {
+      this.editingConnection = false;
+    }
   }
 
   /** Syncs on demand, and says so, because a command with no feedback is a guess. */
@@ -911,6 +963,7 @@ export default class BasaltPlugin extends Plugin {
    * secrets, the second winning on disk while the first was the one running.
    */
   private refuseUnlessPairable(): void {
+    if (this.unlinking) throw new Error("This vault is being unlinked.");
     if (this.unreadable !== undefined) {
       throw new Error(
         `the saved settings at ${this.dataPath} could not be read (${this.unreadable}), ` +
@@ -1193,8 +1246,8 @@ export default class BasaltPlugin extends Plugin {
         // credential that landed has replaced it, and there is then nothing on
         // the panel to write down. The row this may have left is named by the
         // same counsellor the pairing form above uses, because a phone sent
-        // straight back to pairing registers a second row and spends another
-        // of the vault's eight slots.
+        // straight back to pairing registers a second row without learning
+        // about the first.
         // The key, either way, and most of all when the credential landed.
         // That is the case where the root is gone from disk, so the copy the
         // panel is holding is the only one left in the world; saying nothing
@@ -1432,8 +1485,8 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * Every device that may reach this vault, the cap on how many there may be,
-   * and every invite that could still add one.
+   * Every device that may reach this vault, any limit reported by an older
+   * server, and every invite that could still add one.
    *
    * Needs a connection, and says so rather than showing an empty list. "There
    * are no other devices" and "I could not ask" are different answers, and
@@ -1491,11 +1544,9 @@ export default class BasaltPlugin extends Plugin {
   /**
    * Stops one device connecting, and closes whatever it has open.
    *
-   * Both, and the reply means both. What it does not do is un-read what that
-   * device already read: it still holds the vault's key for every note it had
-   * synced, so a device that was stolen rather than lost wants a new vault
-   * secret as well. Every surface that offers this has to say so, and the
-   * panel does.
+   * The device retains its notes and data key. Rotating an exposed recovery
+   * key prevents reuse of that recovery key; it does not change the data key
+   * or prevent decryption of ciphertext obtained elsewhere.
    *
    * No `allowLast`, and it is not an omission. Emptying the vault takes the
    * recovery key, no device holds one, and a plugin that offered the flag
@@ -1573,34 +1624,50 @@ export default class BasaltPlugin extends Plugin {
    * gets one back is by reaching the server.
    */
   async rebase(): Promise<SyncReport> {
-    const config = this.config;
-    if (!config) throw new Error("this vault is not paired yet.");
-    if (this.pairing) throw new Error("a pairing is already in progress");
-    refuseUnlessAhead(await this.rejoinCursors());
-
-    await this.quiet();
-    const mine = this.generation;
-    this.setState({ kind: "connecting" });
-
+    if (this.unlinking) throw new Error("This vault is being unlinked.");
+    if (this.editingConnection) throw new Error("Another settings change is in progress.");
+    this.editingConnection = true;
     try {
-      // Inside the try, so that a removal that fails halfway still leaves the
-      // loop running. It leaves this device where it was, refused by the
-      // server, which is a state the panel offers this same row for; leaving
-      // it stopped and not running would be a device that has to be reloaded
-      // before it will even try again.
-      await this.indexStore().remove();
-      const client = new Client(await this.clientOptions(config, mine));
+      const config = this.config;
+      if (!config) throw new Error("this vault is not paired yet.");
+      if (this.pairing) throw new Error("a pairing is already in progress");
+      let mine = this.generation;
+      const current = () => mine === this.generation && this.config === config;
+      const requireCurrent = () => {
+        if (!current()) throw new Error("the pairing changed while rejoining the server");
+      };
+      refuseUnlessAhead(await this.rejoinCursors());
+      requireCurrent();
+
+      mine++;
+      await this.quiet();
+      requireCurrent();
+      this.setState({ kind: "connecting" });
+
       try {
-        await client.connect();
-        // The write debounce is off, as it is for every pass a person asked
-        // for by name: reporting "up to date" over an unsent paragraph is the
-        // status rule 7 forbids.
-        return await client.settle({ coalesceWrites: false });
+        // Unlink must wait for an already-started reset, or this operation
+        // could remove the index of a new pairing after unlink has returned.
+        await this.trackStateWrite(this.indexStore().remove());
+        requireCurrent();
+        const options = await this.clientOptions(config, mine);
+        requireCurrent();
+        const client = new Client(options);
+        // The recovery client has the same lifecycle as the normal loop:
+        // unlink and unload can close it, including during its handshake.
+        this.live = client;
+        try {
+          await client.connect();
+          requireCurrent();
+          return await client.settle({ coalesceWrites: false });
+        } finally {
+          await client.close();
+          if (this.live === client) this.live = undefined;
+        }
       } finally {
-        await client.close();
+        if (current()) this.start();
       }
     } finally {
-      if (mine === this.generation) this.start();
+      this.editingConnection = false;
     }
   }
 
@@ -1700,7 +1767,9 @@ export default class BasaltPlugin extends Plugin {
     const { live, client } = this.retireClients();
     await live?.close();
     await client?.close();
-    await Promise.all([...this.settling]);
+    // Their callers report failures. Shutdown needs completion, including a
+    // failed write, so unlink can perform and verify its own cleanup next.
+    await Promise.allSettled([...this.settling]);
   }
 
   /**
@@ -1725,10 +1794,14 @@ export default class BasaltPlugin extends Plugin {
       // what it belongs to should stop rather than finish writing.
       return Promise.reject(new Error("this vault is no longer paired"));
     }
-    const saving = this.saveVerified(config);
-    this.settling.add(saving);
-    void saving.catch(() => undefined).finally(() => this.settling.delete(saving));
-    return saving;
+    return this.trackStateWrite(this.saveVerified(config));
+  }
+
+  /** Let unlink/unload drain a state write that has already started. */
+  private trackStateWrite(writing: Promise<void>): Promise<void> {
+    this.settling.add(writing);
+    void writing.catch(() => undefined).finally(() => this.settling.delete(writing));
+    return writing;
   }
 
   /**
@@ -1822,6 +1895,16 @@ export default class BasaltPlugin extends Plugin {
    * vault paired and stopped, says so, and can be tried again.
    */
   async unlink(): Promise<void> {
+    if (this.unlinking) return this.unlinking;
+    this.unlinking = this.unlinkVault();
+    try {
+      await this.unlinking;
+    } finally {
+      this.unlinking = undefined;
+    }
+  }
+
+  private async unlinkVault(): Promise<void> {
     // Retires every run in flight, closes their clients, and waits for every
     // settle save that is already past its generation check, because each of
     // those is a write to the same file this is about to empty. See `quiet`.
@@ -1834,6 +1917,9 @@ export default class BasaltPlugin extends Plugin {
     }
     try {
       await this.saveData(null);
+      if ((await this.readConfig()) !== undefined) {
+        throw new Error("the pairing was not cleared when read back");
+      }
     } catch (err) {
       throw this.unlinkFailed(
         `the pairing could not be removed from ${this.dataPath}: ${(err as Error).message}`,
@@ -2033,17 +2119,11 @@ export function describeDeleted(list: DeletedList): string {
   return parts.join(" ");
 }
 
-/**
- * An icon and a tooltip, which is what Obsidian's own status items are.
- *
- * Text in the status bar was a whole sentence competing with the word count for
- * a strip that is one line tall, and it read as noise next to the icons either
- * side of it. The state is a glyph now and the sentence is the tooltip, which is
- * where somebody looks when the glyph is not enough.
- */
+/** A short name distinguishes this status from other plugins' checkmarks. */
 function paintStatus(el: HTMLElement, state: State): void {
   el.empty();
   el.removeClass("basalt-attention", "basalt-working");
+  el.createSpan({ cls: "basalt-status-label", text: "Basalt" });
   const icon = el.createSpan({ cls: "basalt-status-icon" });
   setIcon(icon, iconFor(state));
   // Only when there is one. The settled state has no tone, and addClass with
@@ -2110,118 +2190,17 @@ function toneFor(state: State): string {
 /** The panel's own document, which is where the long form of all of this lives. */
 const DOCS = "https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md";
 
-/**
- * The detail a one-line description cannot carry, behind a hover.
- *
- * Obsidian renders `aria-label` as its own tooltip, which the ribbon icon and
- * the status bar item already rely on, so this needs no component and no state.
- *
- * One per row, on the row's own label. The panel carried a line of prose under
- * every control and the six rows that matter were lost inside it; cutting the
- * lines to fifteen words each made it shorter without making it scannable,
- * because the shape was still label-prose-label-prose. A label and a control
- * is scannable, and the prose is one hover away for the row that needs it.
- * A sentence or two, and anything longer belongs in `DOCS`.
- */
-/**
- * The `?` beside a label, and the detail it reveals.
- *
- * `aria-label` alone used to be the whole of this, which Obsidian renders as a
- * hover tooltip. A phone does not hover, so every `?` in the panel was dead on
- * the platform this plugin is most used on, and because `row` deliberately
- * keeps explanations out of the description slot the detail was not reachable
- * there at all: the panel read as a column of terse labels each wearing a glyph
- * that did nothing. Reported from a phone, and it explains most of what "the
- * plugin screen is confusing" meant.
- *
- * So the mark is a button and the detail is a paragraph it shows and hides. The
- * hover tooltip stays for the desktop, where it was the only thing that worked.
- * Keyboard users get the tooltip rather than the toggle, because a span with
- * `role="button"` does not receive a synthetic click from Enter and the panel
- * has no keyboard story worth half-building here.
- */
-function help(el: HTMLElement, detail: string, into?: HTMLElement): void {
-  const mark = el.createSpan({ cls: "basalt-help", text: "?" });
-  // Kept, because on a desktop it worked and costs nothing.
-  mark.setAttribute("aria-label", detail);
-  mark.setAttribute("role", "button");
-  mark.setAttribute("tabindex", "0");
-
-  const shown = (into ?? el).createEl("p", { cls: "basalt-detail", text: detail });
-  shown.hide();
-  let open = false;
-  mark.addEventListener("click", () => {
-    open = !open;
-    shown.toggle(open);
-  });
+/** Native settings groups on current Obsidian; flat rows on older releases. */
+function settingGroup(host: HTMLElement): HTMLElement {
+  return typeof SettingGroup === "function" ? new SettingGroup(host).listEl : host.createDiv();
 }
 
-/**
- * A `?` for a line that is rewritten on every state change.
- *
- * `help` captures its detail once, which is right for a label. The connection
- * line is not one: it says which server answered, under what scheme, at what
- * protocol, and all of that changes. Its badge was therefore built by hand as a
- * bare span with an `aria-label`, which meant it never got the click handler
- * `help` grew and stayed a hover-only tooltip after every other one stopped
- * being one. Reported as "the ? next to the connected to line doesn't work",
- * which it did not.
- */
-function liveHelp(
-  el: HTMLElement,
-  into: HTMLElement,
-): { detail: (text: string) => void; show: (on: boolean) => void } {
-  const mark = el.createSpan({ cls: "basalt-help", text: "?" });
-  mark.setAttribute("role", "button");
-  mark.setAttribute("tabindex", "0");
-  const shown = into.createEl("p", { cls: "basalt-detail" });
-  shown.hide();
-  let open = false;
-  let text = "";
-  mark.addEventListener("click", () => {
-    open = !open;
-    shown.setText(text);
-    shown.toggle(open);
-  });
-  return {
-    detail: (t: string) => {
-      text = t;
-      mark.setAttribute("aria-label", t);
-      if (open) shown.setText(t);
-    },
-    show: (on: boolean) => {
-      mark.toggle(on);
-      if (!on) {
-        open = false;
-        shown.hide();
-      }
-    },
-  };
-}
-
-/**
- * A row: its label, its `?`, and the detail that `?` reveals.
- *
- * `setDesc` is still not used for the explanation, because a description under
- * every row is what made this panel unreadable the first time; it survives only
- * where the text is the row's *content* rather than an explanation of it, which
- * is every list: a device row without its id and last seen, or a deleted note
- * without when it went, is a row that says nothing.
- *
- * The detail goes in `descEl` all the same, hidden until the `?` is pressed. So
- * the row is one line until somebody asks, and what they are told arrives in
- * the slot Obsidian already lays out under the name rather than in a tooltip
- * half the platforms cannot show.
- */
-function row(host: HTMLElement, name: string, detail: string): Setting {
+/** A native row, with a short description only when the action needs context. */
+function row(host: HTMLElement, name: string, description = ""): Setting {
   const setting = new Setting(host).setName(name);
-  help(setting.nameEl, detail, setting.descEl);
+  if (description) setting.setDesc(description);
   return setting;
 }
-// Do not call `setDesc` on what this returns. The `?` detail is a child of
-// `descEl` and `setDesc` writes that element's text, so the two silently
-// overwrite each other. Every current `setDesc` caller builds its Setting
-// directly, which is why nothing is broken today and why this is written down.
 
 /**
  * A paragraph that is filled later, and takes no room until it is.
@@ -2259,36 +2238,9 @@ function docsLink(el: HTMLElement, text: string): void {
   el.createEl("a", { text }).setAttribute("href", DOCS);
 }
 
-/**
- * The whole interface: what is happening, and pairing when there is none.
- *
- * Deliberately not a settings tab. There are no options here, and there is not
- * going to be a place to put any.
- *
- * ## A label and one line
- *
- * Every description in here was justified on its own and together they buried
- * the panel: sixteen of them, five hundred words, and the six rows that matter
- * somewhere inside it. The rule now is a short label, one short line, and a `?`
- * or `DOCS` for anybody who wants the rest. What could not be cut was compressed
- * rather than deleted: revoking does not un-read, the recovery key is written
- * down and is not how a device is added, an invite adds one device once, and a
- * `ws://` hop has nothing in front of it. Each of those is still on screen.
- *
- * ## Two altitudes
- *
- * design.md: a thing that matters only when something specific happens appears
- * in that moment. Syncing, adding a device and recovering a note are what a
- * panel is opened for; devices, the recovery key, replacing the secret and
- * unlinking are rare and three of the four are destructive. So the rare four
- * sit inside one `<details>`, closed until it is wanted. A `<details>` and not
- * a tab, a second modal or a toggle, because it is the only one of the four
- * that needs no code, no state and no styling to work.
- *
- * What never hides: the status lines, and the rejoin row a refused device
- * grows. A device the server has stopped talking to has to say so on open.
- */
+/** Shared settings and modal content. Recovery notices remain visible when needed. */
 class BasaltPanel {
+  private closed = false;
   private unwatch: (() => void) | undefined;
 
   /**
@@ -2302,9 +2254,13 @@ class BasaltPanel {
     private readonly plugin: BasaltPlugin,
     private readonly host: HTMLElement,
     private readonly dismiss: () => void,
-  ) {}
+    private readonly incomingInvite?: string,
+  ) {
+    if (incomingInvite !== undefined) this.joining = "invite";
+  }
 
   teardown(): void {
+    this.closed = true;
     this.unwatch?.();
     // The wait for "I have written it down" needs an answer on every way out
     // of it, and closing the panel is one of them (R40).
@@ -2320,25 +2276,13 @@ class BasaltPanel {
   }
 
   render(): void {
+    // A pending settings request may finish after its modal or tab was closed.
+    if (this.closed) return;
     this.unwatch?.();
     this.host.empty();
 
-    // A class on the host, because the same panel is drawn into two hosts that
-    // style it differently. Obsidian gives a modal's content separators between
-    // rows and a settings tab's content none, so the same three rows read as a
-    // list in one place and as three things adrift in whitespace in the other,
-    // and the screenshot in docs/ is of the modal. Reported as "the settings
-    // screen doesn't look like the screenshot", which it did not.
-    //
-    // The first version of this wrapped everything in a div of its own, on the
-    // grounds that the host belongs to Obsidian. It also put a level between
-    // the host and the panel, which three tests walk directly, and they said so
-    // immediately: `contentEl.children.find(el => el.tag === "details")` found
-    // a div. A class is the smaller liberty of the two, and this already calls
-    // `empty()` on the same element.
     this.host.addClass("basalt-panel");
     const contentEl = this.host;
-    contentEl.createEl("h2", { text: "Basalt Sync" });
 
     const problem = this.plugin.configProblem;
     if (problem !== undefined) {
@@ -2382,7 +2326,19 @@ class BasaltPanel {
       return;
     }
 
-    const status = contentEl.createEl("p");
+    const primary = settingGroup(contentEl);
+    const sync = row(primary, "Sync status");
+    const status = sync.descEl;
+    status.setAttribute("role", "status");
+    sync.addButton((b) =>
+      b.setButtonText("Sync now").onClick(async () => {
+        await this.plugin.syncNow();
+      }),
+    );
+
+    const addDevice = contentEl.createEl("details", { cls: "basalt-add-device" });
+    addDevice.createEl("summary", { text: "Add another device" });
+    this.renderInvite(settingGroup(addDevice));
 
     // The two cursors and what answered them, behind a disclosure.
     //
@@ -2397,19 +2353,10 @@ class BasaltPanel {
     const server = contentEl.createEl("details", { cls: "basalt-server" });
     const serverSummary = server.createEl("summary");
     const cursors = later(server, "basalt-advice");
-    // What it is talking to, under what it is doing. The panel said "up to
-    // date, cursor 66" and nothing at all about the other end, which is the
-    // first thing wanted when it is not working: whether this device is
-    // pointed where it should be, whether the hop is protected, and which
-    // build is answering.
-    // The sentence and its `?` are separate spans inside the paragraph,
-    // because the sentence is refreshed with `setText` on every state change
-    // and that takes every child of the element with it: a badge appended to
-    // the paragraph would survive exactly until the first update.
-    const connection = server.createEl("p", { cls: "basalt-advice" });
-    const connectionText = connection.createSpan();
-    const connectionHelp = liveHelp(connection, server);
-    const advice = later(contentEl, "basalt-advice");
+    const connection = later(server, "basalt-advice");
+    const connectionWarning = later(server, "basalt-advice");
+    this.renderServerAddress(settingGroup(server));
+    const advice = later(primary, "basalt-advice");
     // Which rows this pass drew, so that a panel left open when the state
     // changes under it grows the recovery it now needs. Everything else here
     // is text a listener can update; a row is not, and a panel that was open
@@ -2449,28 +2396,15 @@ class BasaltPanel {
       // says "42 behind" and stays shut is I11's defect wearing a summary.
       if (behind > 0) server.setAttribute("open", "true");
       const to = this.plugin.connection();
-      connectionText.setText(to === undefined ? "" : describeConnection(to));
-      // Hidden rather than empty when there is nothing to explain, so the
-      // badge is never a lone glyph beside a blank line.
-      connectionHelp.show(to !== undefined);
-      if (to !== undefined) connectionHelp.detail(connectionDetail(to));
+      say(connection, to === undefined ? "" : describeConnection(to));
+      say(connectionWarning, to?.url.startsWith("ws://") ? connectionDetail(to) : "");
       say(advice, originAdvice(state));
     });
-
-    row(
-      contentEl,
-      "Sync now",
-      "Basalt syncs on its own, on a timer and on every change. This is for being sure.",
-    ).addButton((b) =>
-      b.setButtonText("Sync").onClick(async () => {
-        await this.plugin.syncNow();
-      }),
-    );
 
     // Only while it is the answer to something, and never inside the
     // disclosure below: a device the server has refused has to say so, and
     // offer the way out, without anybody opening anything first.
-    if (offersRejoin(this.plugin.currentState)) this.renderRejoin(contentEl);
+    if (offersRejoin(this.plugin.currentState)) this.renderRejoin(primary);
 
     // A key this panel has just produced, still on screen until somebody says
     // they have it (R02). The unfinished-pairing case is drawn in the unpaired
@@ -2479,61 +2413,37 @@ class BasaltPanel {
       this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
     }
 
-    // Adding a device and recovering a note: the two things somebody comes
-    // here to do that are not "is it working".
-    this.renderInvite(contentEl);
-
-    row(
-      contentEl,
-      "Recover a deleted note",
-      "The server keeps every version, including of notes you have deleted, until a purge.",
-    ).addButton((b) =>
-      b.setButtonText("Browse deleted").onClick(() => {
-        // Checked at the press as well as by the shape watcher above, because
-        // a panel can be looked at for a while: a click that arrives after the
-        // vault was unlinked elsewhere used to open a recovery modal with no
-        // credential behind it, which then failed inside the modal. A sentence
-        // where the modal would have been, which is what `syncNow` and
-        // `createInvite` already do.
-        if (!this.plugin.paired) {
-          new Notice("Basalt: this vault is not paired yet. There is nothing to recover.");
-          return;
-        }
-        this.dismiss();
-        new RecoverModal(this.plugin).open();
-      }),
+    row(primary, "Recover a deleted note", "Browse deleted notes and restore a copy.").addButton(
+      (b) =>
+        b.setButtonText("Browse deleted").onClick(() => {
+          // Checked at the press as well as by the shape watcher above, because
+          // a panel can be looked at for a while: a click that arrives after the
+          // vault was unlinked elsewhere used to open a recovery modal with no
+          // credential behind it, which then failed inside the modal. A sentence
+          // where the modal would have been, which is what `syncNow` and
+          // `createInvite` already do.
+          if (!this.plugin.paired) {
+            new Notice("Basalt: this vault is not paired yet. There is nothing to recover.");
+            return;
+          }
+          this.dismiss();
+          new RecoverModal(this.plugin).open();
+        }),
     );
 
     // Everything rare, behind one press. Named for what is inside rather than
     // "Advanced", which says nothing and reads as a dare.
     const manage = contentEl.createEl("details", { cls: "basalt-manage" });
-    const summary = manage.createEl("summary", { text: "Manage this vault" });
-    help(
-      summary,
-      "The recovery key is not on this device and cannot be shown again: a device that held it " +
-        "could register itself again after being revoked, so revoking would stop nothing. " +
-        "Replacing the vault's secret keeps every device syncing and cannot un-read what was " +
-        "already read.",
-    );
-
-    this.renderThisDeviceName(manage);
-    this.renderDevices(manage);
-
-    // Said, not shown, because there is nothing to show: this device holds a
-    // credential for one row and not the vault's root, which is what makes the
-    // rows above revocable. Why that is, and why no device can print the key
-    // again, is on the `?` beside the summary.
-    row(
-      manage,
-      "Recovery key",
-      "Written down, not kept here, and it cannot be shown again. An invite adds a device; " +
-        "this is for the day no device is left to make one.",
-    );
+    manage.createEl("summary", { text: "Manage this vault" });
+    const management = settingGroup(manage);
+    this.renderThisDeviceName(management);
+    this.renderDevices(management);
+    row(management, "Recovery key", "Not stored on this device. Keep your saved copy safe.");
 
     // Beside the recovery key, because it is the same secret and the same
     // warning, and behind two presses, because it is the one action here that
     // retires the key somebody wrote down.
-    this.renderRotate(manage);
+    this.renderRotate(management);
 
     // Beside the device list rather than under recovery, because it is a thing
     // done to the server and not to this vault, and it is here at all for the
@@ -2541,10 +2451,9 @@ class BasaltPanel {
     // nothing. A phone may hold the only remaining copy of a body the server
     // has lost, and it has no shell to run `basalt repair` in (I14).
     row(
-      manage,
+      management,
       "Send back what the server has lost",
-      "If a note will not download and never finishes, the server may have lost the file " +
-        "behind it. This offers everything this device holds. It writes no new versions.",
+      "Repair missing server content using notes on this device.",
     ).addButton((b) =>
       b.setButtonText("Send").onClick(async () => {
         b.setDisabled(true).setButtonText("Sending");
@@ -2579,10 +2488,9 @@ class BasaltPanel {
     );
 
     row(
-      manage,
+      management,
       "Unlink this vault",
-      "Stops syncing and takes this device off the server's list. Every note stays where it " +
-        "is, here and on the server.",
+      "Stop syncing on this device. Local and server notes are kept.",
     ).addButton((b) =>
       b
         .setButtonText("Unlink")
@@ -2597,25 +2505,41 @@ class BasaltPanel {
         }),
     );
 
-    docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How all of this works");
+    docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "Basalt documentation");
   }
 
-  /**
-   * Every device that may reach this vault, and one button each to cut one off.
-   *
-   * Loaded on a press rather than on open. It is a request to the server, and
-   * a panel that made one every time it was drawn would make one every time
-   * somebody looked at the sync status.
-   *
-   * The honesty line is not decoration and it is not optional. Revoking stops
-   * a device connecting and does not un-read what it already read: the revoked
-   * device still holds the vault's key for every note it had synced. A panel
-   * that let somebody believe otherwise would have them skip the rotation,
-   * which is the one thing that actually helps after a theft, and this feature
-   * would be worse than not having it. It was a paragraph and is now a
-   * sentence, and it stays here, beside the buttons it is about, rather than
-   * moving to a tooltip or the docs.
-   */
+  private renderServerAddress(contentEl: HTMLElement): void {
+    let address!: TextComponent;
+    const setting = row(
+      contentEl,
+      "Server address",
+      "Update this if your server moves to a new address.",
+    );
+    const said = later(contentEl, "basalt-advice");
+    setting
+      .addText((text) => {
+        address = text;
+        text.setPlaceholder("wss://sync.example.com").setValue(this.plugin.connection()?.url ?? "");
+        text.inputEl.setAttribute("aria-label", "Server address");
+      })
+      .addButton((button) =>
+        button.setButtonText("Save").onClick(async () => {
+          button.setDisabled(true).setButtonText("Checking…");
+          say(said, "");
+          try {
+            await this.plugin.changeServerAddress(address.getValue());
+            new Notice("Basalt: server address saved.");
+            this.render();
+          } catch (err) {
+            say(said, (err as Error).message);
+          } finally {
+            button.setDisabled(false).setButtonText("Save");
+          }
+        }),
+      );
+  }
+
+  /** Load devices on demand; explain revocation at the confirmation step. */
   private renderDevices(contentEl: HTMLElement): void {
     // Declared here and created below the setting that fills them, for the
     // same reason renderInvite does it: created first, the rows rendered
@@ -2624,8 +2548,12 @@ class BasaltPanel {
     // which is a better reviewer of layout than a test.
     let list!: HTMLElement;
     let said!: HTMLElement;
+    let loading = false;
+    let refresh!: ButtonComponent;
     const show = async () => {
-      list.empty();
+      if (loading) return;
+      loading = true;
+      refresh.setDisabled(true);
       say(said, "");
       let answer: {
         devices: DeviceRow[];
@@ -2638,25 +2566,38 @@ class BasaltPanel {
       } catch (err) {
         say(said, (err as Error).message);
         return;
+      } finally {
+        loading = false;
+        refresh.setDisabled(false);
       }
+      list.empty();
       // The last row is the vault's last device, and it is always this one:
       // reading the list at all means this device connected. Emptying the
       // vault is the recovery key's to do, so there is no button for it here.
       // A button that could only ever be refused is worse than none.
       const last = answer.devices.length === 1;
+      heading.setDesc(
+        answer.maxDevices > 0
+          ? `${answer.devices.length} of ${answer.maxDevices} devices`
+          : `${answer.devices.length} ${answer.devices.length === 1 ? "device" : "devices"}`,
+      );
+      const names = new Map<string, number>();
+      for (const device of answer.devices) {
+        const name = device.name || "Unnamed device";
+        names.set(name, (names.get(name) ?? 0) + 1);
+      }
       for (const device of answer.devices) {
         const mine = device.id === answer.thisDevice;
         // Flagged rather than left as a blank, because a row nothing has ever
         // connected under is the reclaimable one: a pairing that reached the
-        // server and then crashed leaves exactly that, and it holds a slot.
+        // server and then crashed leaves exactly that.
         const seen =
-          device.lastSeen === 0 ? "never connected" : `last seen ${when(device.lastSeen)}`;
+          device.lastSeen === 0 ? "Never connected" : `Last seen ${when(device.lastSeen)}`;
+        const name = device.name || "Unnamed device";
         const row = new Setting(list)
-          .setName(`${device.name || "unnamed"}${mine ? " (this device)" : ""}`)
-          // The id as well as the name, because the name is not an identity:
-          // two laptops may both be called laptop, and the id is what says
-          // which one this row would cut off.
-          .setDesc(`${device.id} · added ${when(device.createdAt)} · ${seen}`);
+          .setName(`${name}${mine ? " (this device)" : ""}`)
+          // Keep identical names distinguishable before a destructive action.
+          .setDesc(names.get(name)! > 1 ? `${seen} · ID ${device.id}` : seen);
         if (last) continue;
         let confirmed = false;
         row.addButton((b) =>
@@ -2669,21 +2610,15 @@ class BasaltPanel {
                 b.setButtonText("Yes, revoke");
                 say(
                   said,
-                  mine
-                    ? "This device will stop syncing at once. Press again to revoke it."
-                    : `"${device.name || device.id}" will stop syncing at once and cannot connect ` +
-                        `again until it is added with an invite. Press again.`,
+                  `${mine ? "This device" : `"${name}"`} will stop syncing. ` +
+                    "It keeps its decryption key and can still read copies of your notes. " +
+                    "Press again to revoke.",
                 );
                 return;
               }
               try {
                 await this.plugin.revoke(device.id);
-                new Notice(
-                  "Revoked. It cannot reach this server again. It keeps the vault's key, so it " +
-                    "can still read any copy of the notes it gets hold of another way; replacing " +
-                    "the vault's secret does not change that.",
-                  10_000,
-                );
+                new Notice("Device revoked. Existing notes on that device are kept.", 10_000);
                 this.render();
               } catch (err) {
                 say(said, (err as Error).message);
@@ -2700,7 +2635,7 @@ class BasaltPanel {
       for (const invite of answer.invites) {
         const row = new Setting(list)
           .setName("Outstanding invite")
-          .setDesc(`${invite.id} · adds one device · expires ${when(invite.expiresAt)}`);
+          .setDesc(`Expires ${when(invite.expiresAt)}`);
         row.addButton((b) =>
           b
             .setButtonText("Cancel")
@@ -2708,11 +2643,7 @@ class BasaltPanel {
             .onClick(async () => {
               try {
                 await this.plugin.uninvite(invite.id);
-                new Notice(
-                  "Cancelled. That string no longer adds a device. If somebody redeemed it " +
-                    "already, the device it added is a row above, and Revoke is what stops that.",
-                  10_000,
-                );
+                new Notice("Invite cancelled. It can no longer add a device.", 10_000);
                 this.render();
               } catch (err) {
                 say(said, (err as Error).message);
@@ -2720,92 +2651,77 @@ class BasaltPanel {
             }),
         );
       }
-
-      const never = answer.devices.filter((d) => d.lastSeen === 0).length;
-      say(
-        said,
-        `${answer.devices.length} of at most ${answer.maxDevices} devices. Revoking stops a ` +
-          `device reaching this server. It keeps the vault's key either way, so it can still ` +
-          `read any copy of the notes it gets hold of another way.` +
-          (never > 0
-            ? ` ${never} ${never === 1 ? "has" : "have"} never connected and still ` +
-              `${never === 1 ? "holds" : "hold"} a slot.`
-            : "") +
-          (answer.invites.length > 0
-            ? ` ${answer.invites.length} outstanding ` +
-              (answer.invites.length === 1
-                ? `invite, which adds one device.`
-                : `invites, each adding one device.`)
-            : "") +
-          (last
-            ? ` The vault's last device: removing its row takes basalt revoke ID --allow-last ` +
-              `--recovery-key. To stop syncing here, use Unlink this vault below.`
-            : ""),
-      );
     };
 
-    row(
+    const heading = row(
       contentEl,
       "Devices",
-      "Who else can reach this vault. Add one with an invite, above. Revoking stops a device " +
-        "reaching this server. It keeps the vault's key, so it can still read any copy of the " +
-        "notes it gets hold of another way, and replacing the vault's secret does not change " +
-        "that either.",
-    ).addButton((b) => b.setButtonText("Show devices").onClick(show));
+      "View connected devices and manage their access.",
+    ).addButton((b) => {
+      refresh = b;
+      b.setButtonText("Show devices").onClick(show);
+    });
 
     list = contentEl.createEl("div");
     said = later(contentEl, "basalt-advice");
   }
 
-  /**
-   * Where an invite goes: on screen, always, because the string is the whole
-   * of what the other device needs and a phone may have no clipboard to put it
-   * in.
-   *
-   * The two paragraphs are created after the setting that fills them, so they
-   * land under it. Created first, they rendered above the "Add another device"
-   * row and the invite appeared to belong to whatever setting sat above it.
-   */
+  /** Show the QR and a selectable pairing code, with Copy beside the code. */
   private renderInvite(contentEl: HTMLElement): void {
     let currentInvite = "";
+    let codeField!: TextComponent;
     row(
       contentEl,
       "Add another device",
-      "An invite adds one device, works once, and expires. It carries the vault's data key and " +
-        "no root secret, so the new device gets a credential of its own that you can revoke " +
-        "later without touching any other. The recovery key is not needed.",
-    )
-      .addButton((b) =>
-        b.setButtonText("Create invite").onClick(async () => {
+      "Create a one-time invite. Expires in 10 minutes.",
+    ).addButton((b) =>
+      b.setButtonText("Create invite").onClick(async () => {
+        try {
+          const issued = await this.plugin.createInvite();
+          currentInvite = issued.invite;
+          codeField.setValue(issued.invite);
+          codeField.inputEl.scrollLeft = 0;
+          codeRow.settingEl.show();
+          let scanAdvice = "Copy the invite into Basalt on the new device.";
           try {
-            const issued = await this.plugin.createInvite();
-            currentInvite = issued.invite;
-            say(shown, issued.invite);
-            say(
-              expiry,
-              `Paste it into Basalt on the new device. It works once and expires at ${when(issued.expiresAt)}.`,
-            );
-            await copyToClipboard(
-              issued.invite,
-              "Copied. Paste it into Basalt on the other device.",
-            );
-          } catch (err) {
-            new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+            qr.setAttribute("src", inviteQrImage(issued.invite));
+            qr.show();
+            scanAdvice =
+              "Scan with your phone's camera. Basalt must be installed and enabled in Obsidian.";
+          } catch {
+            // Long server addresses can exceed QR capacity. Copy still works.
+            qr.hide();
           }
-        }),
-      )
-      .addButton((b) =>
-        b.setButtonText("Copy").onClick(async () => {
-          if (currentInvite === "") {
-            new Notice("Create an invite first.");
-            return;
-          }
-          await copyToClipboard(currentInvite, "Copied. Paste it into Basalt on the other device.");
-        }),
-      );
+          say(expiry, `${scanAdvice} Expires at ${when(issued.expiresAt)}.`);
+          await copyToClipboard(issued.invite, "Copied. Paste it into Basalt on the other device.");
+        } catch (err) {
+          new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+        }
+      }),
+    );
 
-    const shown = later(contentEl, "basalt-pairing");
+    const qr = contentEl.createEl("img", { cls: "basalt-invite-qr" });
+    qr.setAttribute("alt", "Scan to open this invite in Obsidian");
+    qr.hide();
     const expiry = later(contentEl, "basalt-advice");
+    const codeRow = row(contentEl, "Pairing code", "Paste this into Basalt on your other device.");
+    codeRow.settingEl.addClass("basalt-invite-code");
+    codeRow.settingEl.hide();
+    codeRow
+      .addText((text) => {
+        codeField = text;
+        text.inputEl.setAttribute("readonly", "");
+        text.inputEl.setAttribute("aria-label", "Pairing code");
+        text.inputEl.addEventListener("focus", () => text.inputEl.select());
+      })
+      .addButton((button) => {
+        button.setButtonText("Copy");
+        button.buttonEl.setAttribute("aria-label", "Copy pairing code");
+        button.onClick(async () => {
+          if (currentInvite === "") return;
+          await copyToClipboard(currentInvite, "Copied. Paste it into Basalt on the other device.");
+        });
+      });
   }
 
   /**
@@ -2823,8 +2739,7 @@ class BasaltPanel {
     row(
       contentEl,
       "Rejoin this server",
-      "The server lost history this device has, which is what a restore from an older backup " +
-        "looks like. Nothing is deleted; back the server up first.",
+      "The server has older history. Back it up before rejoining; local notes are kept.",
     ).addButton((b) =>
       b
         .setButtonText("Rejoin")
@@ -2873,8 +2788,7 @@ class BasaltPanel {
    * register itself again after being revoked. So this is a field rather than
    * a button, and somebody who has not got the key cannot do it from here,
    * which is correct and is what the one-line description says: paste the
-   * vault's current recovery key. Why no device has one is on the `?` beside
-   * the disclosure this row sits in.
+   * vault's current recovery key.
    *
    * Two presses, because it retires the old key the moment it commits, and the
    * new key goes on screen before the second press: the server commits, closes
@@ -2902,9 +2816,7 @@ class BasaltPanel {
     const setting = row(
       contentEl,
       "This device's name",
-      "What the device list, a note's history and conflict copies call this device. Changing it " +
-        "renames nothing already written: copies made before now keep the old name, and older " +
-        "versions in a note's history keep the name that wrote them.",
+      "Shown in the device list and future sync activity.",
     );
     setting.addText((t) => {
       t.setPlaceholder("laptop");
@@ -2941,51 +2853,51 @@ class BasaltPanel {
     row(
       contentEl,
       "Replace the vault's secret",
-      "For a leaked recovery key or a stolen device. Paste the vault's current recovery key. " +
-        "Every device keeps syncing across this, and it cannot un-read what was already read.",
-    ).addText((t) => {
-      t.setPlaceholder("basalt3_...");
-      keyField = t;
-    });
-    new Setting(contentEl).addButton((b) =>
-      b
-        .setButtonText("Replace the secret")
-        .setWarning()
-        .onClick(async () => {
-          const given = keyField?.getValue() ?? "";
-          if (given.trim() === "") {
-            say(said, "Paste the vault's current recovery key first.");
-            return;
-          }
-          try {
-            // Rendered before the request rather than after it returns: a
-            // rotation that commits and loses its reply has already changed
-            // the vault, and a key that only exists in a resolved promise is
-            // one a crash takes with it.
-            const { settled } = await this.plugin.rotate(given, async (key) => {
-              this.freshRecoveryKey = key;
+      "Replace an exposed recovery key. Existing devices keep syncing.",
+    )
+      .addText((t) => {
+        t.setPlaceholder("Current recovery key");
+        keyField = t;
+      })
+      .addButton((b) =>
+        b
+          .setButtonText("Replace the secret")
+          .setWarning()
+          .onClick(async () => {
+            const given = keyField?.getValue() ?? "";
+            if (given.trim() === "") {
+              say(said, "Paste the vault's current recovery key first.");
+              return;
+            }
+            try {
+              // Rendered before the request rather than after it returns: a
+              // rotation that commits and loses its reply has already changed
+              // the vault, and a key that only exists in a resolved promise is
+              // one a crash takes with it.
+              const { settled } = await this.plugin.rotate(given, async (key) => {
+                this.freshRecoveryKey = key;
+                this.render();
+                // Held here until somebody says they have it (R24). Nothing has
+                // been sent yet, so abandoning this costs only the candidate:
+                // the vault still has the key that was typed in above.
+                await this.writtenDown;
+              });
+              new Notice(
+                settled
+                  ? "The vault has a new secret. Write down the new recovery key shown in the panel. " +
+                      "Every device keeps syncing."
+                  : "The vault may already have the new secret: the server never answered. Write down " +
+                      "the new recovery key shown in the panel, keep the old one until you know, and " +
+                      "try each of them here.",
+                0,
+              );
               this.render();
-              // Held here until somebody says they have it (R24). Nothing has
-              // been sent yet, so abandoning this costs only the candidate:
-              // the vault still has the key that was typed in above.
-              await this.writtenDown;
-            });
-            new Notice(
-              settled
-                ? "The vault has a new secret. Write down the new recovery key shown in the panel. " +
-                    "Every device keeps syncing."
-                : "The vault may already have the new secret: the server never answered. Write down " +
-                    "the new recovery key shown in the panel, keep the old one until you know, and " +
-                    "try each of them here.",
-              0,
-            );
-            this.render();
-          } catch (err) {
-            say(said, "");
-            new Notice(`Basalt: ${(err as Error).message}`, 10_000);
-          }
-        }),
-    );
+            } catch (err) {
+              say(said, "");
+              new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+            }
+          }),
+      );
   }
 
   /**
@@ -3026,19 +2938,13 @@ class BasaltPanel {
    * opening it again starts at the question, which is right, because somebody
    * who left is somebody who was not sure.
    */
-  private renderPairing(contentEl: HTMLElement): void {
+  private renderPairing(host: HTMLElement): void {
+    new Setting(host).setName("Set up sync").setHeading();
+    const contentEl = settingGroup(host);
     if (this.joining === undefined) {
-      contentEl.createEl("p", { text: "Not paired yet. Which is this device?" });
-
-      // `new Setting` and `setDesc` rather than `row`, deliberately: this text
-      // is what somebody reads to choose, so it cannot be behind a `?`. See the
-      // note under `row`, which is the other half of the same rule.
       const joinRow = new Setting(contentEl)
-        .setName("It is joining a vault I already have")
-        .setDesc(
-          "Make an invite on a device that already has it, under Add another device, and paste " +
-            "it here. The vault's recovery key works too.",
-        )
+        .setName("Join an existing vault")
+        .setDesc("Use an invite from another device, or your saved recovery key.")
         .addButton((b) =>
           b
             .setButtonText("Paste an invite")
@@ -3050,10 +2956,9 @@ class BasaltPanel {
         );
 
       const firstRow = new Setting(contentEl)
-        .setName("It is the first device on a new vault")
+        .setName("Set up a new vault")
         .setDesc(
-          "You will need the setup line the server printed on its first run, like " +
-            "host:3003#TOKEN. Do this once; every device after it joins with an invite.",
+          "Use the setup string from your server. Other devices can join later with an invite.",
         )
         .addButton((b) =>
           // Not "Start a new vault", which is what the button at the end of
@@ -3073,7 +2978,7 @@ class BasaltPanel {
       // problem and centring the control is the whole fix.
       for (const r of [joinRow, firstRow]) r.settingEl.addClass("basalt-choice");
 
-      docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How pairing works");
+      docsLink(host.createEl("p", { cls: "basalt-advice" }), "How pairing works");
       return;
     }
 
@@ -3087,27 +2992,23 @@ class BasaltPanel {
     // not a value, so the honest thing to do with the field was leave it
     // alone, and every device ended up named after the app rather than after
     // itself. What is offered is what will be used, and it can be typed over.
-    row(
-      contentEl,
-      "Device name",
-      "Shown in the device list, in history and on conflict copies. Type over it. It can be " +
-        "changed later, under Manage this vault.",
-    ).addText((t) => {
-      t.setPlaceholder("laptop");
-      t.setValue(suggestedDeviceName());
-      deviceField = t;
-    });
+    row(contentEl, "Device name", "Shown in the device list and future sync activity.").addText(
+      (t) => {
+        t.setPlaceholder("laptop");
+        t.setValue(suggestedDeviceName());
+        deviceField = t;
+      },
+    );
 
     if (this.joining === "invite") {
       let pairingField: TextComponent | undefined;
       row(
         contentEl,
         "Invite or recovery key",
-        "An invite is made on a device that already has the vault, under Add another device, and " +
-          "works once. The recovery key is for the day no device is left to make one. Either way " +
-          "this device keeps a credential of its own.",
+        "Paste an invite from a paired device, or use your saved recovery key.",
       ).addText((t) => {
         t.setPlaceholder("basalt3i_...");
+        if (this.incomingInvite !== undefined) t.setValue(this.incomingInvite);
         pairingField = t;
       });
 
@@ -3135,8 +3036,7 @@ class BasaltPanel {
       row(
         contentEl,
         "Setup string",
-        "The line the server printed on first run, like host:3003#TOKEN. Behind TLS, use that " +
-          "hostname instead.",
+        "Paste your server's setup string, including its secure address.",
       ).addText((t) => {
         t.setPlaceholder("homelab:3003#K7M2PQR4-...");
         setupField = t;
@@ -3178,7 +3078,7 @@ class BasaltPanel {
         );
     }
 
-    docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How pairing works");
+    docsLink(host.createEl("p", { cls: "basalt-advice" }), "How pairing works");
   }
 
   /** Which pairing path the panel is showing, or the question if neither. */
@@ -3238,17 +3138,13 @@ class BasaltPanel {
       // rejection, and does not stop a real awaiter seeing it.
       void this.writtenDown.catch(() => undefined);
     }
-    contentEl.createEl("h3", { text: "Write this down" });
-    const said = contentEl.createEl("p", {
+    new Setting(contentEl).setName("Write this down").setHeading();
+    contentEl.createEl("p", {
+      cls: "basalt-advice",
       text:
-        "Shown once; no device keeps it. Write it down and keep it offline: anyone who has it " +
-        "has the vault. ",
+        "Save this key somewhere safe and separate. It is the only way back if every device " +
+        "is lost. Anyone with it can access your vault.",
     });
-    help(
-      said,
-      "An invite adds a device, not this. The recovery key replaces the vault's secret and is " +
-        "the only way back if every device is lost.",
-    );
     // The key and its Copy on one row, so the button is beside the thing it
     // copies rather than under the next paragraph.
     //
@@ -3312,12 +3208,22 @@ class BasaltPanel {
 class BasaltModal extends Modal {
   private panel: BasaltPanel | undefined;
 
-  constructor(private readonly plugin: BasaltPlugin) {
+  constructor(
+    private readonly plugin: BasaltPlugin,
+    private readonly incomingInvite?: string,
+  ) {
     super(plugin.app);
   }
 
   override onOpen(): void {
-    this.panel = new BasaltPanel(this.plugin, this.contentEl, () => this.close());
+    this.setTitle("Basalt Sync");
+    this.modalEl.addClass("mod-basalt-panel");
+    this.panel = new BasaltPanel(
+      this.plugin,
+      this.contentEl,
+      () => this.close(),
+      this.incomingInvite,
+    );
     this.panel.render();
   }
 
@@ -3380,6 +3286,9 @@ class RecoverModal extends Modal {
   }
 
   override onOpen(): void {
+    this.setTitle("Deleted notes");
+    this.modalEl.addClass("mod-basalt-panel");
+    this.contentEl.addClass("basalt-panel");
     void this.render();
   }
 
@@ -3390,7 +3299,6 @@ class RecoverModal extends Modal {
   private async render(): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl("h2", { text: "Deleted notes" });
 
     let deleted: DeletedList;
     try {
@@ -3399,16 +3307,19 @@ class RecoverModal extends Modal {
       // Not an empty list. "There is nothing to recover" and "I could not
       // ask" are different answers and this is the worst place to confuse
       // them.
-      contentEl.createEl("p", { text: `Cannot ask the server: ${(err as Error).message}` });
+      contentEl.createEl("p", {
+        cls: "basalt-advice",
+        text: `Cannot ask the server: ${(err as Error).message}`,
+      });
       return;
     }
 
     if (deleted.notes.length === 0) {
-      contentEl.createEl("p", { text: "Nothing has been deleted from this vault." });
+      contentEl.createEl("p", { cls: "basalt-advice", text: "No deleted notes to restore." });
       return;
     }
 
-    contentEl.createEl("p", { text: describeDeleted(deleted) });
+    contentEl.createEl("p", { cls: "basalt-advice", text: describeDeleted(deleted) });
     if (this.before !== undefined) {
       // Somewhere to go back to. Paging forward without a way back is a list
       // somebody can walk off the end of.
@@ -3555,11 +3466,7 @@ export function describeConnection(at: Connection): string {
  * What the line above cannot carry: whether the hop is protected, and what
  * that does and does not cover.
  *
- * On the `?` rather than in the sentence, because it is the same two clauses
- * on every open and the sentence is read on every open. The part somebody
- * needs at a glance is which server answered and which build it is; the part
- * they need once is what a plaintext hop exposes, and it is exactly wrong to
- * make them read the second to get to the first.
+ * The panel shows this in connection details for an unprotected hop.
  */
 export function connectionDetail(at: Connection): string {
   return at.url.startsWith("wss://")

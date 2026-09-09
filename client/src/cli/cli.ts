@@ -467,8 +467,7 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
     // states get the same four answers wherever a registration stops. This one
     // used to say only "unlink here, and pair with that key", which left out
     // the row the registration may already have committed: pairing again
-    // registers a second one, and each retry spends a slot nothing accounts
-    // for. state.test.ts, "names the row a failed init left".
+    // registers a second one without explaining the abandoned registration. state.test.ts, "names the row a failed init left".
     const remains = await whatTheDiskHolds(() => loadConfig(args.dir));
     io.err("basalt: the vault was started but this device could not register itself with it:");
     io.err(`  ${(err as Error).message}`);
@@ -804,9 +803,8 @@ const NO_RECOVERY_KEY =
  *
  * Two commands take one. Revoking the last device needs it, because that is
  * the one revocation nothing on a device can undo. Listing accepts it for the
- * vault that has no device left to ask: eight rows that never connected refuse
- * every registration, and the ids to revoke off them have to come from
- * somewhere.
+ * vault that has no paired device left to ask: unused registrations can
+ * still be inspected and revoked.
  *
  * The key names its own server and vault, so this works in a directory that
  * was never paired. When there is a config here it has to agree, or a key
@@ -823,7 +821,11 @@ async function asRecoveryKey(given: string, args: Args): Promise<Registrar> {
     );
   }
   return Registrar.open({
-    url: key.url,
+    // A paired directory chooses the target, as it does for rotation. Most
+    // servers call their vault "default", so the name alone cannot distinguish
+    // a key pasted from another server. This also keeps old recovery keys
+    // usable after updating the saved server address.
+    url: config?.url ?? key.url,
     vaultId: key.vaultId,
     device: config?.device ?? "recovery-key",
     secret: key.secret,
@@ -870,20 +872,27 @@ async function cmdDevices(args: Args, io: Console): Promise<number> {
       );
     }
     io.out("");
-    io.out(`${devices.length} of at most ${maxDevices} devices. basalt revoke ID stops one.`);
+    const count =
+      maxDevices > 0
+        ? `${devices.length} of at most ${maxDevices} devices`
+        : `${devices.length} ${devices.length === 1 ? "device" : "devices"}`;
+    io.out(`${count}. basalt revoke ID stops one.`);
     const stale = devices.filter((d) => d.lastSeen === 0);
     if (stale.length > 0) {
       io.out(
         `${stale.length} of them ${stale.length === 1 ? "has" : "have"} never connected. A pairing ` +
-          `that reached the server and then crashed leaves a row like that, and it holds one of ` +
-          `the ${maxDevices} slots until somebody revokes it.`,
+          `that reached the server and then crashed can leave a row like that.`,
       );
     }
     io.out(
       "Revoking stops a device connecting. It does not un-read what that device already read:",
     );
-    io.out("it still holds the vault's key for every note it had synced. A device that was stolen");
-    io.out("rather than lost wants basalt rotate as well.");
+    io.out(
+      "it still holds the vault's key and can decrypt later encrypted content obtained elsewhere.",
+    );
+    io.out(
+      "If the recovery key was exposed, use basalt rotate. Rotation does not change the data key.",
+    );
     // The invites, beside the rows, because they are the same question. A row
     // is a device that was added and an outstanding invite is one about to be:
     // a string issued on a device somebody has just lost is the thing worth
@@ -1142,14 +1151,16 @@ async function cmdRevoke(args: Args, io: Console): Promise<number> {
   }
   io.out(`Revoked ${deviceId}. Its sessions are closed and it cannot connect again.`);
   io.out(
-    "It still holds the vault's key for every note it had already synced. Revoking cannot " +
-      "un-read those; basalt rotate RECOVERY-KEY is the answer to a device that was stolen.",
+    "It still holds the vault's key and can decrypt later encrypted content obtained elsewhere.",
+  );
+  io.out(
+    "If the recovery key was exposed, use basalt rotate. Rotation does not change the data key.",
   );
   if (self) {
     io.out("");
     io.out(
       `That was this device. It has stopped syncing; run basalt unlink here to forget the pairing, ` +
-        `or basalt pair RECOVERY-KEY to add it again.`,
+        `then basalt pair RECOVERY-KEY to add it again if needed.`,
     );
   }
   return 0;
@@ -1515,6 +1526,10 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
       },
     },
     {
+      onClient: (client) => {
+        watching = client;
+        settled = false;
+      },
       onSynced: (report, serverCursor) => {
         renderReport(
           report,
@@ -2050,10 +2065,49 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
     }
 
     const done = await client.restore(version, args.to);
+    const sayRestored = (): void => {
+      io.out(
+        `Restored version ${version.uid} of ${path} to ${done.path} ` +
+          `(${bytes(done.bytes)}, from ${when(version.mtime)}).`,
+      );
+      if (done.path !== (args.to ?? path)) {
+        io.out(`Written to ${done.path}, because something is already at ${args.to ?? path}.`);
+      }
+    };
     // Sent straight away rather than left for the next sync. Somebody who
     // has just recovered a note should not have to know that it is only on
     // this device until something else happens.
-    const report = await client.settle({ coalesceWrites: false });
+    let report: SyncReport;
+    try {
+      report = await client.settle({ coalesceWrites: false });
+    } catch (err) {
+      // A failed sync cannot undo the completed local restore. Report the
+      // retained path so a caller retries sync instead of creating more copies.
+      const error = withRecovery(err);
+      const outcome = outcomeOf(undefined, { why: error, offline: err instanceof ConnectionError });
+      const sent = client.engine.serverHasOurs(done.path);
+      if (args.json) {
+        io.out(
+          JSON.stringify({
+            ok: false,
+            restored: true,
+            path: done.path,
+            uid: version.uid,
+            bytes: done.bytes,
+            sent,
+            outcome,
+            error,
+          }),
+        );
+      } else {
+        sayRestored();
+        io.err(
+          `The restored copy is on this device, but sync did not finish: ${error}. Run basalt sync to retry.`,
+        );
+      }
+      return 1;
+    }
+    const sent = client.engine.serverHasOurs(done.path);
 
     if (args.json) {
       // `ok` from the same place the exit code comes from (RR8).
@@ -2073,6 +2127,7 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
         JSON.stringify({
           ok: code === 0,
           restored: true,
+          sent,
           outcome,
           path: done.path,
           uid: version.uid,
@@ -2083,13 +2138,26 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
       );
       return code;
     }
-    io.out(
-      `Restored version ${version.uid} of ${path} (${bytes(done.bytes)}, from ${when(version.mtime)}).`,
-    );
-    if (done.path !== (args.to ?? path)) {
-      io.out(`Written to ${done.path}, because something is already at ${args.to ?? path}.`);
+    sayRestored();
+    if (sent) io.out("Sent to the server, so your other devices will pick it up.");
+    else if (args.readOnly || config.readOnly === true) {
+      io.out("The restored copy stays on this device because it is read-only.");
+    } else {
+      io.out(
+        "The restored copy has not been acknowledged by the server. Run basalt sync to retry.",
+      );
     }
-    if (report.uploaded > 0) io.out("Sent to the server, so your other devices will pick it up.");
+    if (exitCodeFor(report, client.vault) !== 0) {
+      renderReport(
+        report,
+        args,
+        io,
+        client.serverCursor,
+        client.vault.stranded ?? [],
+        client.vault.displaced ?? [],
+        unknownRecovery(client.vault),
+      );
+    }
     // The restore itself succeeded, and the sync after it is a sync: a file
     // that can never sync, or one still failing when the pass gave up, is
     // the same unsuccessful run here as it is under `sync` and `rebase`. The
@@ -2126,15 +2194,16 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
 async function cmdUnlock(args: Args, io: Console): Promise<number> {
   const outcome = await unlockVault(args.dir, args.force);
   if (args.json) {
+    const ok = outcome.did === "nothing" || outcome.did === "removed";
     io.out(
       JSON.stringify({
-        ok: outcome.did !== "refused",
+        ok,
         did: outcome.did,
         why: outcome.why,
         ...(outcome.did === "nothing" ? {} : { holder: outcome.was ?? null }),
       }),
     );
-    return outcome.did === "refused" ? 1 : 0;
+    return ok ? 0 : 1;
   }
   switch (outcome.did) {
     case "nothing":
@@ -2461,8 +2530,7 @@ interface Args {
    *
    * Revoking the last device needs it, because that is the one revocation
    * nothing on a device can undo. Listing takes it for the vault with no
-   * device left to ask: eight rows that never connected refuse every
-   * registration, and the ids to revoke have to come from somewhere.
+   * paired device left to ask, so abandoned registrations can be removed.
    */
   recoveryKey?: string;
   /** How long an invite lasts, in milliseconds; undefined is the server's default. */
@@ -2684,7 +2752,8 @@ export function parseArgs(argv: readonly string[]): Args {
         args.help = true;
         break;
       default:
-        if (arg.startsWith("-")) throw new Error(`no such option: ${arg}`);
+        // A lone dash is the documented standard-input argument for secrets.
+        if (arg !== "-" && arg.startsWith("-")) throw new Error(`no such option: ${arg}`);
         if (args.command === undefined) args.command = arg;
         else args.rest.push(arg);
     }

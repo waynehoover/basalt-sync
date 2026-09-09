@@ -50,11 +50,7 @@ type rig struct {
 	devices map[string]string // client name -> device id
 }
 
-func newRig(t *testing.T) *rig { return newRigWithPeers(t, DefaultMaxPeers) }
-
-func newRigWithPeers(t *testing.T, maxPeers int) *rig {
-	return newRigWith(t, maxPeers, nil)
-}
+func newRig(t *testing.T) *rig { return newRigWith(t, nil) }
 
 // newRigDerived is a rig whose authenticator is the real one: a bootstrap token
 // claims the vault, and only the claimed key opens it afterwards. testToken is
@@ -64,13 +60,13 @@ func newRigWithPeers(t *testing.T, maxPeers int) *rig {
 // with it.
 func newRigDerived(t *testing.T) *rig {
 	var r *rig
-	r = newRigWith(t, DefaultMaxPeers, func(st *store.Store) Authenticator {
+	r = newRigWith(t, func(st *store.Store) Authenticator {
 		return DerivedAuth(st, testVault, testToken, func() int64 { return r.srv.now().UnixMilli() })
 	})
 	return r
 }
 
-func newRigWith(t *testing.T, maxPeers int, auth func(*store.Store) Authenticator) *rig {
+func newRigWith(t *testing.T, auth func(*store.Store) Authenticator) *rig {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
@@ -90,7 +86,7 @@ func newRigWith(t *testing.T, maxPeers int, auth func(*store.Store) Authenticato
 	if auth != nil {
 		a = auth(st)
 	}
-	srv := NewWithLimit(st, a, log, maxPeers)
+	srv := New(st, a, log)
 
 	// A device row needs a claimed vault, and StaticTokens claims nothing: it
 	// is a token map, and the vault's auth_hash was never part of how it
@@ -146,9 +142,7 @@ func deviceID(name string) string {
 // Seeded straight through the store rather than over the wire, the way r.seed
 // puts an entry there: what a test wants is a device that exists, and making
 // every one of them redeem the registration handshake first would put the
-// registration path inside every unrelated test. The cap is raised for the
-// same reason, so that a test wanting nine peers is not silently a test about
-// the device limit; the cap has its own tests, which go through the wire.
+// registration path inside every unrelated test.
 func (r *rig) device(name string) (id, key string) {
 	r.t.Helper()
 	r.devMu.Lock()
@@ -161,7 +155,7 @@ func (r *rig) device(name string) (id, key string) {
 	if err != nil || vaultHash == "" {
 		r.t.Fatalf("the test vault is not claimed, so no device can be registered: %q %v", vaultHash, err)
 	}
-	err = r.st.RegisterDevice(testVault, id, name, hashOf(key), vaultHash, 1000, 1)
+	err = r.st.RegisterDevice(testVault, id, name, hashOf(key), vaultHash, 1)
 	if err != nil && !errors.Is(err, store.ErrDeviceExists) {
 		r.t.Fatalf("registering device %q: %v", name, err)
 	}

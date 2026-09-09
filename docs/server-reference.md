@@ -124,8 +124,8 @@ These are implementation limits for operators and client authors.
 
 | Limit | Value |
 |---|---|
-| Registered devices per vault | 8; another registration returns `full`. |
-| Connected devices per vault | 8; excess connections return retryable `busy`. |
+| Registered devices per vault | No fixed limit. |
+| Authenticated connections per vault | No fixed limit. |
 | File | 64 MiB default; configurable up to 256 MiB. |
 | Chunk body | 1 MiB. |
 | Chunks per entry or fetch | 65,536. |

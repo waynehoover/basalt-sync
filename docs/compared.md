@@ -19,7 +19,7 @@ The biggest choice is how much you want to manage yourself.
 | Cost model | Free MIT software; you cover hosting and maintenance | Subscription | Open-source software; hosting costs depend on your setup |
 
 Obsidian's [Sync overview](https://obsidian.md/sync),
-[encryption guide](https://obsidian.md/help/sync/migrate), and
+[encryption guide](https://obsidian.md/help/sync/security), and
 [settings guide](https://obsidian.md/help/sync/settings), and the
 [LiveSync documentation](https://github.com/vrtmrz/obsidian-livesync) describe
 those options. Comparison checked September 8, 2026; see their documentation
@@ -38,7 +38,7 @@ ones. LiveSync also uses chunking; it is not unique to Basalt.
 restore a copy. When edits cannot be merged, Basalt keeps both versions for you
 to review. History stays until you explicitly purge it on the server.
 
-**A focused setup.** One server per vault, up to eight devices, and a panel for
+**A focused setup.** One server per vault, no fixed device limit, and a panel for
 sync and recovery. There is no database service to install alongside Basalt.
 
 ## When another option fits better

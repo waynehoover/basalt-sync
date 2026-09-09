@@ -127,8 +127,9 @@ A conflict exits 0 because both versions were preserved. Ignored files and
 changes held back by read-only mode also do not make a sync fail. Inspect those
 fields if your job needs a stricter condition. Incomplete recovery is a failure.
 
-Restore separates `restored` (the local file was written) from `ok` (the overall
-operation succeeded). Check both before retrying it.
+Restore separates `restored` (the local file was written), `sent` (that copy was
+acknowledged by the server), and `ok` (the overall operation succeeded). If the
+copy was restored but sync failed, retry `basalt sync` to avoid creating another copy.
 
 To keep setup strings, invites, and recovery keys out of command arguments, use
 an existing private file or standard input:

@@ -16,12 +16,9 @@
  * - The application is proprietary and is not redistributable, so no runner
  *   installs it. The local recipe is Electron's `capturePage` inside a running
  *   copy, on a machine somebody logged into.
- * - Every pixel of the panel's appearance comes from Obsidian's own theme.
- *   `styles.css` in this repository styles the history modal and the status
- *   bar glyph and nothing else, and the two classes the panel does apply,
- *   `basalt-advice` and `basalt-pairing`, are not in it at all. The modal
- *   chrome, the `.setting-item` name/description/control layout and the
- *   button variants are all theirs.
+ * - Native groups, rows, buttons and modal chrome come from Obsidian's theme.
+ *   `styles.css` adds scoped layout for disclosures, recovery keys and narrow
+ *   screens, so the complete appearance still needs the running application.
  * - So a headless browser would need that stylesheet to draw anything true,
  *   and approximating it would produce a picture of a panel that does not
  *   exist. Rule: verify against the artifact, never infer. A rendering that
@@ -91,12 +88,7 @@ function rowIndex(): Map<FakeEl, Setting> {
 /**
  * A string as lines that fit, rather than a string cut short.
  *
- * Truncating was the first attempt and it was wrong in a way worth recording:
- * the panel's longest strings are its most important ones. The device list's
- * summary is where "revoking does not un-read what that device already read"
- * lives, and the last-device row is where the `--allow-last` instruction
- * lives, and both sit well past the ninetieth character. A dump that cut them
- * off held every row of the panel and none of its warnings.
+ * Preserve complete recovery and confirmation messages when wrapping the outline.
  */
 function wrap(text: string, width: number): string[] {
   const out: string[] = [];
@@ -150,7 +142,10 @@ export function outlineOf(root: FakeEl, rows = rowIndex(), depth = 0): string {
 
   const cls = root.cls ? `.${root.cls.trim().split(/\s+/).join(".")}` : "";
   lines.push(`${pad}<${root.tag}${cls}>`);
-  for (const [name, value] of root.attributes) say(`@${name}  `, value);
+  for (const [name, value] of root.attributes) {
+    // Image bytes are verified separately; this artifact describes the UI.
+    say(`@${name}  `, name === "src" && value.startsWith("data:image/") ? "[local image]" : value);
+  }
   if (root.text) say("text    ", root.text);
 
   const row = rows.get(root);
@@ -166,6 +161,7 @@ export function outlineOf(root: FakeEl, rows = rowIndex(), depth = 0): string {
       say("input   ", `placeholder: ${t.placeholder}${value}`);
     }
     for (const b of row.buttons) {
+      if (b.buttonEl.hidden) continue;
       const marks = [b.cta ? "cta" : "", b.warning ? "warning" : ""].filter(Boolean).join(" ");
       say("button  ", `[${b.label}]${marks ? ` (${marks})` : ""}`);
     }
@@ -457,7 +453,7 @@ export async function walkPanelStates(
   // somebody asks for it and has no button on its only row.
   openPanel(laptop);
   await pressRow("Devices", "Show devices");
-  await until("the device rows", () => built.some((s) => s.desc.includes("added ")));
+  await until("the device rows", () => built.some((s) => /Last seen|Never connected/.test(s.desc)));
   shots.push(
     shotOfOpenPanel(
       "devices-listed-last-device",
@@ -471,7 +467,9 @@ export async function walkPanelStates(
   openPanel(laptop);
   await pressRow("Add another device", "Create invite");
   await until("the invite string", () =>
-    modals.at(-1)!.contentEl.allText().includes(INVITE_PREFIX),
+    built.some(
+      (s) => s.name === "Pairing code" && s.texts[0]?.getValue().startsWith(INVITE_PREFIX),
+    ),
   );
   shots.push(
     shotOfOpenPanel(
@@ -479,11 +477,7 @@ export async function walkPanelStates(
       "After pressing Create invite. The string is shown rather than only copied, because a phone may have no clipboard.",
     ),
   );
-  const issued = modals
-    .at(-1)!
-    .contentEl.allText()
-    .split(/\s+/)
-    .find((word) => word.startsWith(INVITE_PREFIX));
+  const issued = built.find((s) => s.name === "Pairing code")?.texts[0]?.getValue();
   if (!issued) throw new Error("the panel showed no invite to redeem");
   closePanel();
 
@@ -501,7 +495,10 @@ export async function walkPanelStates(
 
   openPanel(laptop);
   await pressRow("Devices", "Show devices");
-  await until("two device rows", () => built.filter((s) => s.desc.includes("added ")).length >= 2);
+  await until(
+    "two device rows",
+    () => built.filter((s) => /Last seen|Never connected/.test(s.desc)).length >= 2,
+  );
   shots.push(
     shotOfOpenPanel(
       "devices-listed",

@@ -17,10 +17,12 @@ import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { run, type Console } from "./cli.ts";
+import { Client } from "../core/client.ts";
+import { NodeVault } from "./vault.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -256,6 +258,82 @@ describe("the list of what is gone", () => {
 });
 
 describe("restoring", () => {
+  it.each([false, true])(
+    "reports the saved copy when sync fails after restoring (json=%s)",
+    async (json) => {
+      const dir = await paired();
+      await write(dir, "note.md", "the preserved original\n");
+      expect((await cli("sync", "--dir", dir)).code).toBe(0);
+      await write(dir, "note.md", "the current local edit\n");
+      const settle = vi
+        .spyOn(Client.prototype, "settle")
+        .mockRejectedValueOnce(new Error("sync connection dropped"));
+      let result: Run;
+      try {
+        result = await cli(
+          "restore",
+          "note.md",
+          "--dir",
+          dir,
+          "--to",
+          "recovered.md",
+          ...(json ? ["--json"] : []),
+        );
+      } finally {
+        settle.mockRestore();
+      }
+      expect(await read(dir, "recovered.md")).toBe("the preserved original\n");
+      expect(await read(dir, "note.md")).toBe("the current local edit\n");
+      expect(result.code).toBe(1);
+      if (json) {
+        expect(result.json()).toMatchObject({
+          ok: false,
+          restored: true,
+          path: "recovered.md",
+          sent: false,
+          outcome: { kind: "passFailed" },
+        });
+      } else {
+        expect(result.stdout).toMatch(/Restored/);
+        expect(result.all).toMatch(/recovered\.md/);
+        expect(result.all).toMatch(/sync connection dropped/);
+        expect(result.all).toMatch(/basalt sync/);
+      }
+      expect((await cli("sync", "--dir", dir)).code).toBe(0);
+      expect(await read(dir, "recovered.md")).toBe("the preserved original\n");
+    },
+    60_000,
+  );
+
+  it("does not call a restored note sent because another file uploaded", async () => {
+    const dir = await paired();
+    await write(dir, "note.md", "a version to restore\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    await write(dir, "another.md", "this file can be sent\n");
+    const real = NodeVault.prototype.read;
+    const readNote = vi.spyOn(NodeVault.prototype, "read").mockImplementation(async function (
+      this: NodeVault,
+      path,
+    ) {
+      if (path === "recovered.md") throw new Error("cannot read the restored file yet");
+      return real.call(this, path);
+    });
+    let result: Run;
+    try {
+      result = await cli("restore", "note.md", "--dir", dir, "--to", "recovered.md");
+    } finally {
+      readNote.mockRestore();
+    }
+    expect(await read(dir, "recovered.md")).toBe("a version to restore\n");
+    const otherHistory = await cli("history", "another.md", "--dir", dir, "--json");
+    expect(otherHistory.json()["versions"]).toHaveLength(1);
+    const restoredHistory = await cli("history", "recovered.md", "--dir", dir, "--json");
+    expect(restoredHistory.json()["versions"]).toHaveLength(0);
+    expect(result.code).toBe(1);
+    expect(result.stdout).not.toMatch(/Sent to the server/);
+    expect(result.all).toMatch(/not been acknowledged/);
+  }, 60_000);
+
   it("brings a deleted note back", async () => {
     const dir = await paired();
     await write(dir, "gone.md", "# Gone\n\nBut not forgotten.\n");

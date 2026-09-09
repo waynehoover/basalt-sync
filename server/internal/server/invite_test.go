@@ -211,66 +211,33 @@ func TestTheRecoveryKeySeesAndCancelsInvites(t *testing.T) {
 	}
 }
 
-// Eight pairings that crashed fill the vault, and the refusal points at them.
-//
-// A redemption deliberately saves nothing on the new device before the server
-// answers, so a crash in that window strands a server row rather than a device
-// that believes it is paired. That is the right way round and it must not
-// change; what it costs is this, and eight of them, or eight an attacker minted
-// invites for, refuse every registration and redemption afterwards.
-//
-// Nothing reclaims them on its own. A server deleting somebody's device row
-// because it looks unused is the failure the cap decision already refused, for
-// the reason in store.MaxDevices. What the refusal can do is say which rows are
-// worth looking at, so that "the vault is full" is an instruction rather than a
-// dead end, and `basalt devices` flags the same rows.
-func TestPairingsThatCrashFillTheVaultAndTheRefusalSaysSo(t *testing.T) {
+// Interrupted pairings remain visible without preventing another device joining.
+func TestCrashedPairingsDoNotPreventMoreDevicesJoining(t *testing.T) {
 	r := newRigDerived(t)
 	a := claimed(t, r, "a")
-
-	// Seven redemptions that reached the server, each registering a row, none
-	// of which ever connects. This is the accident, played out over the wire.
-	for i := 0; i < store.MaxDevices-1; i++ {
+	for i := 0; i < 24; i++ {
 		invite := fmt.Sprintf("crashed-invite-%d", i)
 		issue(t, a, invite)
 		if f := redeem(t, r, invite, fmt.Sprintf("crashed-%d", i)); f["res"] != "redeemed" {
-			t.Fatalf("redemption %d was answered %v", i, f)
+			t.Fatalf("redemption %d: %v", i, f)
 		}
 	}
-	ds := mustDevices(t, r)
-	if len(ds) != store.MaxDevices {
-		t.Fatalf("%d rows after seven crashed pairings, want the cap %d", len(ds), store.MaxDevices)
+	issue(t, a, "the-real-one")
+	if f := redeem(t, r, "the-real-one", "phone"); f["res"] != "redeemed" {
+		t.Fatalf("joining after crashed pairings: %v", f)
+	}
+	rows := mustDevices(t, r)
+	if len(rows) != 26 {
+		t.Fatalf("%d device rows, want 26", len(rows))
 	}
 	never := 0
-	for _, d := range ds {
-		if d.LastSeen == 0 {
+	for _, row := range rows {
+		if row.LastSeen == 0 {
 			never++
 		}
 	}
-	if never != store.MaxDevices-1 {
-		t.Fatalf("%d rows nothing ever connected under, want %d", never, store.MaxDevices-1)
-	}
-
-	// The eighth is refused, and the refusal counts them.
-	issue(t, a, "the-real-one")
-	f := redeem(t, r, "the-real-one", "phone")
-	msg, _ := f["msg"].(string)
-	if f["code"] != wire.CodeFull {
-		t.Fatalf("redeeming onto a vault full of stranded rows was answered %v, want full", f)
-	}
-	if !strings.Contains(msg, "7 of them have never connected") {
-		t.Fatalf("the refusal does not count the rows worth reclaiming: %q", msg)
-	}
-	if !strings.Contains(msg, "revoke") {
-		t.Fatalf("the refusal does not say what to do about them: %q", msg)
-	}
-
-	// Acting on it works, which is what makes it an instruction: revoke one of
-	// the rows it named and the same string pairs.
-	a.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("crashed-0")})
-	a.recvInto("revoked", &wire.Revoked{})
-	if f := redeem(t, r, "the-real-one", "phone"); f["res"] != "redeemed" {
-		t.Fatalf("the invite did not redeem into the reclaimed slot: %v", f)
+	if never != 25 {
+		t.Fatalf("%d unseen devices, want 25", never)
 	}
 }
 
@@ -629,41 +596,6 @@ func TestARedeemThatCannotRegisterLeavesTheInviteUnspent(t *testing.T) {
 		}
 	})
 
-	t.Run("a vault already at its device cap", func(t *testing.T) {
-		r := newRigDerived(t)
-		a := claimed(t, r, "a")
-		issue(t, a, testInvite)
-		// Up to the cap. The rig seeds rows straight through the store, which
-		// is what it does everywhere: this test is about what the redemption
-		// does when it finds the vault full, not about how it filled.
-		for i := len(mustDevices(t, r)); i < store.MaxDevices; i++ {
-			r.device(fmt.Sprintf("filler-%d", i))
-		}
-		f := redeem(t, r, testInvite, "phone")
-		if f["res"] != "err" || f["code"] != wire.CodeFull {
-			// `full` and not `busy`: waiting never makes room, and `busy`
-			// means come back later.
-			t.Fatalf("redeeming onto a full vault was answered %v, want full", f)
-		}
-		// And it names the rows nothing has connected under, which the filler
-		// rows are: see TestPairingsThatCrashFillTheVaultAndTheRefusalSaysSo.
-		if msg, _ := f["msg"].(string); !strings.Contains(msg, "never connected") {
-			t.Fatalf("the refusal does not point at the reclaimable rows: %q", msg)
-		}
-		if n := len(mustDevices(t, r)); n != store.MaxDevices {
-			t.Fatalf("%d devices after a refused redemption, want the cap %d", n, store.MaxDevices)
-		}
-		if n, _ := r.st.OutstandingInvites(testVault, r.srv.now().UnixMilli()); n != 1 {
-			t.Fatalf("%d outstanding invites after a refused redemption, want 1", n)
-		}
-		// Revoke one, and the same string still works. That is what makes the
-		// refusal something a person can act on rather than a lost invite.
-		a.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("filler-1")})
-		a.recvInto("revoked", &wire.Revoked{})
-		if f := redeem(t, r, testInvite, "phone"); f["res"] != "redeemed" {
-			t.Fatalf("the invite no longer redeems after room was made: %v", f)
-		}
-	})
 }
 
 // mustDevices is the vault's device list or a failed test.

@@ -265,8 +265,9 @@ not reach the server in plaintext.
 <- {res:"revoked", id, deviceId, self}
 ```
 
-A device row contains its ID, readable name, auth-key hash, creation time, and
-last-seen time. IDs establish identity; names need not be unique.
+A stored device row contains its ID, readable name, auth-key hash, creation
+time, and last-seen time. The device-list response omits the auth-key hash.
+IDs establish identity; names need not be unique.
 
 Registering the same ID and key again succeeds, allowing retry after a lost
 reply. The same ID with a different key is `badentry`. `name` defaults to the
@@ -281,10 +282,11 @@ are ordered so a revoked device cannot remain attached between those steps.
 Revoking the last device needs a registrar and `allowLast`; a device presenting
 that field is refused with `auth`. A nonexistent device is `nodevice`.
 
-The registration cap is eight. `full` requires removing a device, whereas
-connection-level `busy` can clear by waiting. Failed pairing can leave a row
-that never connected; it still counts. The cap does not retroactively remove
-rows if a store already contains more.
+There is no fixed limit on registered devices or authenticated connections.
+`maxDevices: 0` means unlimited; older servers may advertise a positive cap.
+Connection-level `busy` indicates pre-authentication admission pressure or
+shutdown and can clear by waiting. Failed pairing can leave an unused device
+row, which remains until explicitly revoked.
 
 ### The data key, and rotating a leaked secret
 
@@ -334,7 +336,7 @@ Redeeming at hello atomically spends the invite and inserts the new device row.
 The `sealed` data key is returned, not the root-wrapped key. A refused insertion
 leaves the invite unspent. Unknown, expired, used, or malformed redemption
 credentials return `auth`; malformed fields return format errors. Duplicate
-device IDs return `badentry`, and the registration cap returns `full`.
+device IDs return `badentry`.
 
 Device listings expose outstanding invite IDs and expiration times, never the
 sealed value or invite key. Canceling an unknown/expired/used invite returns
@@ -402,7 +404,7 @@ frames missing that field.
 | `auth` | Invalid credentials or an operation not allowed to this session. | no | ends at hello, otherwise rejects the operation. |
 | `cursor` | Client is ahead of server history. | no | ends. |
 | `rotated` | Registrar credential was retired. | no | ends. |
-| `busy` | Connection capacity or shutdown. | yes | ends with a delay hint. |
+| `busy` | Pre-authentication admission pressure or shutdown. | yes | ends with a delay hint. |
 | `protostate` | Unexpected message/state or invalid framing. | no | generally ends. Unknown ops and invalid history pagination reject that request. |
 | `badchunk` | Invalid name or body hash. | no | ends for bad bodies mid-upload, otherwise rejects the request. |
 | `badentry` | Invalid entry or request incompatible with current state. | no | rejects the request, or ends for malformed claims at hello. |
@@ -413,10 +415,10 @@ frames missing that field.
 | `nocontent` | Requested version is a folder or deletion. | no | request rejected. |
 | `nochunk` | Content unavailable. | no | request rejected without partial fetch bodies. |
 | `nodevice` | Device ID no longer exists. | no | request rejected. |
-| `full` | Registration limit reached. | no | remove a device before retrying. |
+| `full` | Registration limit reached on an older server. | no | update the server or remove an unused device. |
 | `internal` | Server fault; put not committed. | yes | ends during handshake/catch-up, otherwise rejects the request. |
 
-`busy` suggests 30 seconds at connection capacity and 5 seconds during shutdown.
-It remains one code because both cases require reconnecting later. `full` is
-separate because waiting cannot free a registration slot. Numeric limits are in
+`busy` includes a retry delay for admission pressure or shutdown. `full` is
+retained for compatibility; current servers do not impose a device cap.
+Numeric limits are in
 the [server reference](server-reference.md#ceilings).

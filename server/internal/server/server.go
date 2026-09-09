@@ -23,13 +23,6 @@ import (
 )
 
 const (
-	// DefaultMaxPeers caps simultaneous devices on one vault.
-	//
-	// Deliberately small. Basalt targets one person's devices: fan-out is
-	// O(peers) per commit and every connection holds a send queue and a read
-	// buffer. Refusing past the limit is honest; degrading quietly is not.
-	DefaultMaxPeers = 8
-
 	// ReadLimit bounds one incoming frame once a session has authenticated, and
 	// HelloReadLimit bounds the first frame, which has to be a hello.
 	//
@@ -50,7 +43,7 @@ const (
 	// 32 MiB is twice the largest of those, so a frame between the advertised
 	// cap and the read limit is read in full and refused with `toolarge`, and
 	// only a frame at twice the cap, which no client that read `ready` sends,
-	// meets the bare disconnect. The cost is bounded at maxPeers * 32 MiB.
+	// meets the bare disconnect. This bounds each session's incoming frame.
 	//
 	// Before hello nothing has been authenticated, so the limit is 64 KiB: a
 	// hello is a vault and device of 64 bytes each, a token, a claim of 43 and
@@ -62,20 +55,15 @@ const (
 
 	// MaxPreAuth caps connections that have not completed hello, across every
 	// vault, and HelloTimeout is how long one may take to send it (S19). The
-	// device limit bounds joined sessions per vault, but a connection that never
-	// says hello joined nothing, so nothing bounded it: a port scanner opening
+	// cap applies before authentication: a port scanner opening
 	// sockets held a goroutine and a buffer each for ever. Past the cap a new
 	// connection is refused with `busy`; past the deadline a silent one is told
 	// `protostate` and closed. Both are generous for anything that is a device.
 	MaxPreAuth   = 32
 	HelloTimeout = 10 * time.Second
 
-	// DeviceLimitRetryAfter and ShutdownRetryAfter are the `retryAfterMs` hints
-	// sent with `busy`. A device refused for the limit needs another device to
-	// go away, which takes a while; one refused for a shutdown needs the
-	// process to come back, which a restart does in seconds.
-	DeviceLimitRetryAfter = 30 * time.Second
-	ShutdownRetryAfter    = 5 * time.Second
+	// ShutdownRetryAfter tells a device when to retry a restarting server.
+	ShutdownRetryAfter = 5 * time.Second
 
 	// DefaultInviteTTL is how long an invite lives when the issuing device does
 	// not say, and MaxInviteTTL the most it may ask for. Ten minutes is long
@@ -197,8 +185,6 @@ type Server struct {
 	auth Authenticator
 	log  *slog.Logger
 
-	maxPeers int
-
 	// servedVault is the one vault this server answers for, or empty when it
 	// has not been told (which is every test that builds a server directly).
 	//
@@ -288,6 +274,10 @@ type Server struct {
 	// window in which a retired root would otherwise buy itself a permanent
 	// device.
 	beforeRegister func()
+
+	// beforeRegistrarPublish pauses a registrar hello after validating the
+	// vault keys but before publishing the session to rotation's eviction list.
+	beforeRegistrarPublish func()
 
 	// beforeRotate runs inside a rotate, just before the store is asked to swap
 	// the credential, and is nil in every non-test build. It is how a test
@@ -427,15 +417,15 @@ func (s *Server) forget(sess *Session) {
 // there is nothing it may be sent. The session list can, and it is the same
 // list Shutdown fans its notices out over.
 //
-// Reading registrar and vaultID from another session's goroutine is safe
-// because both are written before that session calls authenticated, which
-// takes this mutex, so this acquisition happens after those writes.
+// Skip sessions still in the pre-auth count before reading their fields.
+// authenticated publishes registrar and vaultID under this mutex; an admitted
+// session can still be initializing both until that publication happens.
 func (s *Server) registrarsOn(vaultID string, except *Session) []*Session {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	var out []*Session
 	for sess := range s.sessions {
-		if sess != except && sess.registrar && sess.vaultID == vaultID {
+		if sess != except && !sess.counted && sess.registrar && sess.vaultID == vaultID {
 			out = append(out, sess)
 		}
 	}
@@ -540,21 +530,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {
-	return NewWithLimit(st, auth, log, DefaultMaxPeers)
-}
-
-func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeers int) *Server {
-	if maxPeers <= 0 {
-		maxPeers = DefaultMaxPeers
-	}
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Server{
 		st: st, hub: NewHub(), auth: auth, log: log,
-		maxPeers: maxPeers, perFileMax: store.DefaultPerFileMax,
-		version:   "dev",
-		pingEvery: PingInterval, pongWait: PongWait, writeWait: WriteWait,
+		perFileMax: store.DefaultPerFileMax,
+		version:    "dev",
+		pingEvery:  PingInterval, pongWait: PongWait, writeWait: WriteWait,
 		maxPreAuth: MaxPreAuth, helloTimeout: HelloTimeout,
 		maxBatchBytes: wire.MaxBatchBytes, maxFetchBytes: wire.MaxFetchBytes,
 		now: time.Now, batchSize: BatchSize,

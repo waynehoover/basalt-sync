@@ -343,9 +343,7 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 	}
 
 	observer := newSession()
-	if _, ok := r.srv.hub.joinIfRoom(testVault, observer, 8); !ok {
-		t.Fatal("observer could not join")
-	}
+	r.srv.hub.join(testVault, observer)
 	a, b := newSession(), newSession()
 
 	secondAssigned := make(chan struct{})

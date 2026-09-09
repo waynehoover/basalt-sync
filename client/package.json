@@ -1,6 +1,6 @@
 {
   "name": "basalt-sync",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Fast, secure, self-hosted sync for Obsidian. Simple setup.",
   "keywords": [
     "obsidian",
@@ -52,9 +52,10 @@
     "esbuild": "^0.28.1",
     "fflate": "0.8.3",
     "obsidian": "^1.13.1",
+    "prettier": "^3.6.2",
+    "qrcode-generator": "2.0.4",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.8",
-    "prettier": "^3.6.2"
+    "vitest": "^4.1.8"
   },
   "bin": {
     "basalt": "./dist/basalt.mjs"

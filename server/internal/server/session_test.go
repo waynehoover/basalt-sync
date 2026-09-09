@@ -138,20 +138,6 @@ func TestAClientAheadOfTheServerIsRefused(t *testing.T) {
 	t.Logf("refusal read: %s", msg)
 }
 
-func TestVaultDeviceLimitIsRefusedNotDegraded(t *testing.T) {
-	r := newRigWithPeers(t, 2)
-	r.dial("a").hello(0)
-	r.dial("b").hello(0)
-
-	third := r.dial("c")
-	third.sendJSON(third.deviceHello(0))
-	third.expectErr(wire.CodeBusy)
-
-	if got := r.srv.Peers(testVault); got != 2 {
-		t.Fatalf("%d peers joined, limit is 2", got)
-	}
-}
-
 /* ---------------------------------------------------------------- *
  * Catch-up
  * ---------------------------------------------------------------- */

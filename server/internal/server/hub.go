@@ -21,24 +21,16 @@ func NewHub() *Hub {
 	return &Hub{byVault: make(map[string]map[*Session]struct{})}
 }
 
-// joinIfRoom admits the session unless the vault is at its device limit.
-//
-// The count and the admission are taken under one lock. Checking then joining
-// as two steps lets two devices both observe "one slot left" and both take it,
-// which is how a limit of 8 quietly becomes 9.
-func (h *Hub) joinIfRoom(vaultID string, s *Session, max int) (int, bool) {
+// join adds an authenticated session before its backlog is read.
+func (h *Hub) join(vaultID string, s *Session) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	m := h.byVault[vaultID]
-	if len(m) >= max {
-		return len(m), false
-	}
 	if m == nil {
 		m = make(map[*Session]struct{})
 		h.byVault[vaultID] = m
 	}
 	m[s] = struct{}{}
-	return len(m), true
 }
 
 func (h *Hub) leave(vaultID string, s *Session) {

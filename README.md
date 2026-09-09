@@ -21,7 +21,7 @@ you reconnect, and recover earlier versions from inside Obsidian.
     <td align="center">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
-        <img src="docs/assets/screenshots/panel.png" alt="Basalt's panel with sync status, Sync now, Add another device, and Recover a deleted note.">
+        <img src="docs/assets/screenshots/panel.png" alt="Basalt's panel with Sync now and Browse deleted, plus collapsed sections for pairing, server settings, and vault management.">
       </picture>
     </td>
     <td align="center">
@@ -46,8 +46,8 @@ you reconnect, and recover earlier versions from inside Obsidian.
   notes. Restoring creates a separate copy when a file already exists.
 - **Handle conflicting edits.** Basalt combines edits when its merge checks
   pass and keeps both versions when they do not.
-- **Add devices with an invite.** Pair up to eight of your devices and revoke
-  a lost device from another one.
+- **Add devices with an invite.** Scan a QR code or copy a pairing code. There
+  is no fixed device limit, and you can revoke a lost device from another one.
 
 ## Get started
 
@@ -55,8 +55,8 @@ you reconnect, and recover earlier versions from inside Obsidian.
    connection, and get the setup string for your first device.
 2. **[Install the Obsidian plugin](docs/plugin.md#install).** Start the vault
    with that string and save the recovery key shown during setup.
-3. **[Add your other devices](docs/plugin.md#pairing).** Create an invite on a
-   paired device and paste it into Basalt on the next one.
+3. **[Add your other devices](docs/plugin.md#pairing).** Create an invite, then
+   scan its QR code or paste the pairing code into Basalt on the next device.
 
 **Prefer to have your agent handle setup?** Give it [llm.md](llm.md). The guide
 covers the server, plugin, pairing, and checks that sync works.

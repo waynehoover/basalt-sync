@@ -1319,18 +1319,19 @@ describe("the device list", () => {
       expect(d["lastSeen"] as number, `${String(d["name"])} was never seen`).toBeGreaterThan(0);
     }
     expect(listed.json()["thisDevice"]).toBe(devices.find((d) => d["name"] === "a")!["id"]);
-    expect(listed.json()["maxDevices"]).toBe(8);
+    expect(listed.json()["maxDevices"]).toBe(0);
   }, 60_000);
 
   it("says, in the listing, that revoking does not un-read anything", async () => {
-    // Not decoration. Somebody who reads "revoked" as "the vault is safe
-    // again" skips the rotation, which is the one thing that actually helps
-    // after a theft, and this feature is then worse than not having it.
+    // Rotation changes the recovery key, not the encryption key retained by
+    // a revoked device. Its limitations must be clear at the point of use.
     await fresh();
     const { a } = await twoDevices();
     const listed = await cli("devices", "--dir", a);
     expect(listed.stdout).toMatch(/does not un-read/);
     expect(listed.stdout).toMatch(/basalt rotate/);
+    expect(listed.stdout).toMatch(/later encrypted content/);
+    expect(listed.stdout).toMatch(/recovery key was exposed/);
   }, 60_000);
 
   it("stops a revoked device connecting, and says why in words to act on", async () => {
@@ -1349,6 +1350,8 @@ describe("the device list", () => {
     expect(revoked.code, revoked.all).toBe(0);
     expect(revoked.stdout).toMatch(/cannot connect again/);
     expect(revoked.stdout).toMatch(/still holds the vault's key/);
+    expect(revoked.stdout).toMatch(/later encrypted content/);
+    expect(revoked.stdout).toMatch(/recovery key was exposed/);
 
     const refused = await cli("sync", "--dir", b);
     expect(refused.code).toBe(1);
@@ -1526,7 +1529,7 @@ describe("the device list", () => {
     expect(listed.code, listed.all).toBe(0);
     expect(listed.stdout).toMatch(/never connected/);
     expect(listed.stdout).toMatch(/1 of them has never connected/);
-    expect(listed.stdout).toMatch(/holds one of the 8 slots/);
+    expect(listed.stdout).toMatch(/crashed can leave a row like that/);
 
     // The two working devices are not flagged, which is the half that makes
     // the flag worth reading.
@@ -1773,6 +1776,54 @@ describe("what the CLI says about itself and the vault", () => {
     const bare = await cli("status", "--dir", a);
     expect(bare.out).toContainEqual(expect.stringMatching(/^ignore\s+nothing beyond the dot rule/));
   });
+
+  it("keeps recovery-key administration on the paired server when vault names match", async () => {
+    await fresh();
+    const { dir: a } = await startedWithKey();
+    const other = new TestServer();
+    await other.start();
+    try {
+      const b = await vaultDir("another-server");
+      const started = await cli("init", other.setup, "--dir", b, "--json");
+      expect(started.code, started.all).toBe(0);
+      const wrongKey = String(started.json()["recoveryKey"]);
+      const before = await cli("devices", "--dir", b, "--json");
+      const deviceId = String((before.json()["devices"] as { id: string }[])[0]!.id);
+      const issued = await cli("invite", "--dir", b, "--json");
+      const inviteId = Buffer.from(parseInvite(String(issued.json()["invite"])).id).toString(
+        "base64url",
+      );
+
+      for (const command of [
+        ["devices"],
+        ["revoke", deviceId, "--allow-last"],
+        ["uninvite", inviteId],
+      ]) {
+        const result = await cli(...command, "--recovery-key", wrongKey, "--dir", a, "--json");
+        expect(result.code, result.all).toBe(1);
+        expect(result.json()["error"]).toMatch(/not authorised/);
+      }
+      const still = await cli("devices", "--dir", b, "--json");
+      expect((still.json()["devices"] as { id: string }[]).map((device) => device.id)).toEqual([
+        deviceId,
+      ]);
+      expect((still.json()["invites"] as { id: string }[]).map((invite) => invite.id)).toContain(
+        inviteId,
+      );
+    } finally {
+      await other.cleanup();
+    }
+  }, 60_000);
+
+  it("uses the saved address when a recovery key still names the old server address", async () => {
+    await fresh();
+    const { dir: a, recoveryKey } = await startedWithKey();
+    const { formatPairing, parsePairing } = await import("../core/pairing.ts");
+    const oldAddress = formatPairing({ ...parsePairing(recoveryKey), url: "ws://127.0.0.1:1" });
+    const result = await cli("devices", "--recovery-key", oldAddress, "--dir", a, "--json");
+    expect(result.code, result.all).toBe(0);
+    expect(result.json()["devices"]).toHaveLength(1);
+  }, 60_000);
 
   it("gives a default device name a tail, so two laptops with one hostname differ (I15)", async () => {
     await fresh();

@@ -170,7 +170,7 @@ func TestTheRecoveryKeyAdministersTheDeviceListAndReadsNoNote(t *testing.T) {
 	reg.sendJSON(wire.In{Op: "devices", ID: 11})
 	var list wire.DeviceList
 	reg.recvInto("devices", &list)
-	if len(list.Devices) != 2 || list.MaxDevices != store.MaxDevices {
+	if len(list.Devices) != 2 || list.MaxDevices != 0 {
 		t.Fatalf("the recovery key was answered %+v", list)
 	}
 
@@ -321,63 +321,6 @@ func TestARegistrarWithNoVaultCredentialRegistersNothing(t *testing.T) {
  * The cap
  * ---------------------------------------------------------------- */
 
-// The ninth registration is refused, with a code of its own and a message that
-// says what to do. Not `busy`: `busy` means come back later and this never
-// becomes true by waiting, so a client treating it as `busy` would retry a
-// registration that can only ever be refused.
-func TestTheNinthRegistrationIsRefusedWithFull(t *testing.T) {
-	r := newRigDerived(t)
-	claimed(t, r, "a").conn.CloseNow()
-	reg := registrarWith(t, r, "recovery-key", longKey)
-
-	// One device already exists, from the claim.
-	for i := 1; i < store.MaxDevices; i++ {
-		id := deviceID(string(rune('b' + i)))
-		reg.sendJSON(wire.In{Op: "register", DeviceID: id, Auth: deviceKey(id)})
-		reg.recvInto("registered", &wire.Registered{})
-	}
-	reg.sendJSON(wire.In{Op: "register", ID: 99, DeviceID: "one-too-many", Auth: deviceKey("z")})
-	m := reg.recv()
-	if m["res"] != "err" || m["code"] != wire.CodeFull || m["id"] != float64(99) {
-		t.Fatalf("the ninth registration was answered %v, want full", m)
-	}
-	if m["retryable"] != false {
-		t.Fatalf("full is retryable, so a client would loop on a cap only a person can clear: %v", m)
-	}
-	msg, _ := m["msg"].(string)
-	if !strings.Contains(msg, "revoke") {
-		t.Fatalf("the refusal does not say what to do about it: %q", msg)
-	}
-	// Seven of these were registered and never connected, which is exactly
-	// what a pairing that crashed leaves, so the refusal names them rather
-	// than leaving somebody to pick one of their working devices.
-	if !strings.Contains(msg, "7 of them have never connected") {
-		t.Fatalf("the refusal does not point at the reclaimable rows: %q", msg)
-	}
-	if ds, _ := r.st.Devices(testVault); len(ds) != store.MaxDevices {
-		t.Fatalf("%d devices after the refusal, want %d", len(ds), store.MaxDevices)
-	}
-	// The session survives: a registrar with a second device to add may still
-	// add it once somebody makes room.
-	reg.sendJSON(wire.In{Op: "ping"})
-	reg.recvInto("pong", &wire.Pong{})
-}
-
-// The cap a vault may register and the cap on devices connected at once are
-// the same number, and a test says so rather than two constants happening to
-// agree.
-//
-// If the registry allowed more than the fan-out does, the extra device would
-// register, connect, and be refused with `busy` for ever with nothing saying
-// why: a limit nobody chose, discovered as a connection that will not open.
-func TestTheRegistryCapAndTheConnectionCapAgree(t *testing.T) {
-	if store.MaxDevices != DefaultMaxPeers {
-		t.Fatalf("a vault may register %d devices and connect %d at once; "+
-			"the difference is a device that registers and can never connect",
-			store.MaxDevices, DefaultMaxPeers)
-	}
-}
-
 /* ---------------------------------------------------------------- *
  * Listing
  * ---------------------------------------------------------------- */
@@ -395,14 +338,14 @@ func TestTheDeviceListIsUsableAndCarriesNoCredential(t *testing.T) {
 	// A second device under the same name, registered straight into the store
 	// so that the two really do collide.
 	if err := r.st.RegisterDevice(testVault, "twin", "a", hashOf(deviceKey("twin")),
-		hashOf(testToken), store.MaxDevices, 5); err != nil {
+		hashOf(testToken), 5); err != nil {
 		t.Fatalf("registering a second device called a: %v", err)
 	}
 
 	a.sendJSON(wire.In{Op: "devices", ID: 40})
 	var got wire.DeviceList
 	a.recvInto("devices", &got)
-	if got.ID != 40 || got.MaxDevices != store.MaxDevices {
+	if got.ID != 40 || got.MaxDevices != 0 {
 		t.Fatalf("the listing was %+v", got)
 	}
 	if len(got.Devices) != 3 {

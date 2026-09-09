@@ -93,10 +93,11 @@
   color: var(--color-red);
 }
 
-/* The status bar item: a glyph the size of its neighbours, tinted by state. */
+/* The name identifies the plugin; the adjacent icon reports its state. */
 .status-bar-item.plugin-basalt-sync {
   display: flex;
   align-items: center;
+  gap: var(--size-4-1);
 }
 
 .status-bar-item.plugin-basalt-sync .basalt-status-icon {
@@ -116,39 +117,6 @@
   to {
     transform: rotate(360deg);
   }
-}
-
-/* The panel's one disclosure. Everything rare and mostly irreversible lives
- * behind it: devices, the recovery key, replacing the secret, unlinking. A
- * <details> because it needs no code and no state to work; these rules only
- * make the summary look like something to press. */
-.basalt-manage {
-  margin-top: 12px;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.basalt-manage > summary {
-  cursor: pointer;
-  padding: 12px 0;
-  font-weight: var(--font-medium);
-  color: var(--text-muted);
-}
-
-/* The detail a one-line description cannot carry.
- *
- * `cursor: pointer` and not `help`, because it is a button now: aria-label
- * alone made it a hover tooltip, and a phone does not hover, so every one of
- * these was dead on the platform this plugin is most used on. The tooltip
- * stays for the desktop and pressing it reveals the same text in the row. */
-.basalt-help {
-  cursor: pointer;
-  user-select: none;
-  margin-left: 6px;
-  padding: 0 5px;
-  border-radius: 50%;
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  background: var(--background-modifier-border);
 }
 
 /* A recovery key or an invite: shown precisely so it can be taken off this
@@ -178,52 +146,94 @@
   background: var(--background-secondary);
 }
 
-/* The detail behind a `?`, revealed in place rather than on hover. Muted and
- * indented so a row that has been asked about still reads as one row. */
-.basalt-detail {
-  margin: 4px 0 0;
+/* Rows and groups use Obsidian's own settings layout in both hosts. */
+.basalt-panel {
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+}
+
+.mod-basalt-panel {
+  width: min(640px, calc(100vw - 32px));
+}
+
+.basalt-panel .setting-item-control {
+  flex-wrap: wrap;
+}
+
+.basalt-panel .basalt-advice {
+  margin: var(--size-4-2) 0;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
 }
 
-/* The panel is not styled row by row, and that is deliberate.
- *
- * It appears in a modal and in the Settings tab, and Obsidian styles those two
- * containers differently: since 1.13 a settings-tab row is a rounded card with
- * its own background and padding, where a modal's rows are flat with
- * separators. This file briefly tried to make the two agree, with a border-top
- * and a padding on every `.setting-item` inside the panel. In the tab that drew
- * a line across the inside of each card and made every row taller than the app
- * makes its own, which is what "the padding looks off" meant.
- *
- * So the rows are Obsidian's. The screenshot in docs/ is of the modal and the
- * tab legitimately does not match it; that is a thing for the docs to say
- * rather than for this file to override. What is left below is only what the
- * app has no opinion about: a key that has to be selectable, and the detail a
- * `?` reveals.
- */
-
-/* A key or an invite inside a row's description column: block, so it wraps
- * across the full width instead of being clipped to one line. */
-/* The server numbers, folded away. The summary is a control, so it looks like
- * one, and matches the disclosure the panel already has. */
-.basalt-server {
-  margin: 4px 0 12px;
+.basalt-panel .setting-items > .basalt-advice,
+.basalt-panel .setting-items > .basalt-pairing {
+  margin-inline: var(--size-4-5);
 }
 
-.basalt-server > summary {
+.basalt-invite-qr {
+  display: block;
+  width: 288px;
+  max-width: calc(100% - 2 * var(--size-4-5));
+  height: auto;
+  margin: var(--size-4-3) var(--size-4-5);
+  background: white;
+}
+
+.basalt-invite-code {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--size-4-2);
+}
+
+.basalt-invite-code .setting-item-info {
+  margin-inline-end: 0;
+}
+
+.basalt-invite-code .setting-item-control input {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+  font-family: var(--font-monospace);
+}
+
+.basalt-server > .setting-group {
+  margin-top: var(--size-4-3);
+}
+
+.basalt-add-device,
+.basalt-server,
+.basalt-manage {
+  margin-top: var(--size-4-4);
+}
+
+.basalt-add-device > summary,
+.basalt-server > summary,
+.basalt-manage > summary {
   cursor: pointer;
   color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+  padding: var(--size-4-2) 0;
 }
 
 .basalt-server > p {
-  margin: 6px 0 0;
+  margin: var(--size-4-2) 0 0;
 }
 
-/* The two rows an unpaired device chooses between. Their control is centred
- * rather than top-aligned, because each carries two lines of the sentence
- * somebody reads to choose and Obsidian pins a control to the top. */
 .basalt-choice {
   align-items: center;
+}
+
+@media (max-width: 600px) {
+  .basalt-panel .setting-item-control {
+    max-width: 100%;
+  }
+
+  .basalt-panel .setting-item-control input {
+    min-width: 0;
+    max-width: 100%;
+  }
 }

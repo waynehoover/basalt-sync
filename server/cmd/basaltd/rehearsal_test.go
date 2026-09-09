@@ -180,7 +180,7 @@ func seedLiveVault(t *testing.T) (string, seededVault) {
 		t.Fatalf("claiming: ok=%v err=%v", ok, err)
 	}
 	if err := st.RegisterDevice(rehearsalVault, rehearsalDevice, "rehearsal",
-		hashHex(rehearsalKey), vaultHash, store.MaxDevices, 1); err != nil {
+		hashHex(rehearsalKey), vaultHash, 1); err != nil {
 		t.Fatalf("registering the rehearsal device: %v", err)
 	}
 

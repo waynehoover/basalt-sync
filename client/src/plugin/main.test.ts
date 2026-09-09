@@ -34,8 +34,10 @@ import {
 import BasaltPlugin, { connectionDetail, describeConnection, describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
 import type { SyncReport } from "../core/engine.ts";
-import { redeemInvite } from "../core/client.ts";
+import { Client, redeemInvite } from "../core/client.ts";
+import { ObsidianIndexStore } from "./vault.ts";
 import { parseInvite, parsePairing } from "../core/pairing.ts";
+import { INVITE_ACTION, inviteLink, inviteQrImage } from "./invite-qr.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -217,26 +219,21 @@ const synced = (p: Testable, ms?: number) =>
  */
 const status = (p: Testable) => p.statusBarItems[0]?.attributes.get("aria-label") ?? "";
 
-/**
- * Every `?` tooltip in the panel that is open, joined.
- *
- * Each description in the panel is one line now, and the detail that used to
- * be inside them is on an `aria-label` beside the section it belongs to, which
- * is what Obsidian draws as a hover tooltip. The assertions that used to read
- * a `desc` and now read this did not go anywhere: they followed their sentence.
- * Deleting them instead would have made the cut unfalsifiable.
- */
-const tooltips = (): string => {
-  const found: string[] = [];
-  const walk = (el: FakeEl): void => {
-    const label = el.attributes.get("aria-label");
-    if (label !== undefined) found.push(label);
-    for (const child of el.children) walk(child);
+/** Readable panel copy, including native descriptions in the settings stub. */
+const panelText = (): string => {
+  const walk = (el: FakeEl): string => {
+    if (el.hidden) return "";
+    const setting = built.find((s) => s.settingEl === el);
+    return [el.text, setting?.name, setting?.desc, ...el.children.map(walk)]
+      .filter(Boolean)
+      .join("\n");
   };
   const modal = modals.at(-1);
-  if (modal) walk(modal.contentEl);
-  return found.join("\n");
+  return modal ? walk(modal.contentEl) : "";
 };
+
+const containsElement = (root: FakeEl, target: FakeEl): boolean =>
+  root === target || root.children.some((child) => containsElement(child, target));
 
 /** Which glyph it chose, which is the other half of what it says. */
 const statusIcon = (p: Testable) =>
@@ -495,7 +492,7 @@ describe("pairing", () => {
    * credential and register itself again after being revoked, so revoking
    * would stop nothing. The panel says so where the key used to be.
    */
-  it("does not keep the recovery key, and the panel says why", async () => {
+  it("does not keep the recovery key, and the panel says so", async () => {
     await fresh();
     const { plugin } = await load();
     await startVault(plugin, "laptop");
@@ -508,9 +505,9 @@ describe("pairing", () => {
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Recovery key")!;
-    expect(tooltips()).toMatch(/not kept here/);
-    // And the reason, on the section's `?`, where the sentence went.
-    expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
+    expect(panelText()).toMatch(/Not stored on this device/);
+    // The description points to the user's saved copy.
+    expect(panelText()).toMatch(/Keep your saved copy safe/);
     // And no button, because there is nothing for one to do.
     expect(row.buttons, "the panel offers to show a key it does not have").toEqual([]);
   }, 300_000);
@@ -620,47 +617,15 @@ describe("renaming this device from the panel", () => {
   }, 300_000);
 });
 
-describe("the `?` beside a label", () => {
-  /**
-   * Reported from a phone: "the ? tooltips don't work".
-   *
-   * They were an `aria-label`, which Obsidian shows on hover, and a phone does
-   * not hover. Every one of them was dead there, and since `row` keeps the
-   * explanation out of the description slot on purpose, the detail was not
-   * reachable at all: a column of terse labels each wearing a glyph that did
-   * nothing. This is the half of it a test can hold, which is that the detail
-   * is in the panel and revealed by pressing the mark rather than by hovering.
-   */
-  it("is a button that shows its detail, not a hover tooltip", async () => {
-    await fresh();
-    const { plugin } = await load();
-    choosePairing(plugin, "invite");
-
-    const key = built.find((s) => s.name === "Invite or recovery key")!;
-    const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
-    expect(mark, "no ? on the row").toBeDefined();
-    expect(mark.attributes.get("role"), "the ? is not pressable").toBe("button");
-
-    // Hidden to start with, or the panel is a wall of prose again.
-    expect(key.descEl.allText()).toBe("");
-
-    mark.fire("click");
-    expect(key.descEl.allText(), "pressing the ? said nothing").toMatch(
-      /An invite is made on a device that already has the vault/,
-    );
-
-    // And it closes again, so a row asked about does not stay expanded for ever.
-    mark.fire("click");
-    expect(key.descEl.allText()).toBe("");
-  }, 300_000);
-
-  it("keeps the hover tooltip for the desktop, where it worked", async () => {
+describe("pairing instructions", () => {
+  it("shows the required guidance without a hover or extra click", async () => {
     await fresh();
     const { plugin } = await load();
     choosePairing(plugin, "invite");
     const key = built.find((s) => s.name === "Invite or recovery key")!;
-    const mark = key.nameEl.children.find((c) => c.cls === "basalt-help")!;
-    expect(mark.attributes.get("aria-label")).toMatch(/An invite is made on a device/);
+    expect(key.desc).toMatch(/invite from a paired device/);
+    expect(key.desc).toMatch(/saved recovery key/);
+    expect(key.nameEl.children).toEqual([]);
   }, 300_000);
 });
 
@@ -865,9 +830,9 @@ describe("recovering a deleted note from the app", () => {
 
     await plugin.runCommand("recover-deleted");
     await until("the list to load", () =>
-      modals.at(-1)!.contentEl.allText().includes("Nothing has been"),
+      modals.at(-1)!.contentEl.allText().includes("No deleted notes to restore"),
     );
-    expect(modals.at(-1)!.contentEl.allText()).toMatch(/Nothing has been deleted/);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/No deleted notes to restore/);
   }, 300_000);
 
   /**
@@ -888,7 +853,7 @@ describe("recovering a deleted note from the app", () => {
     );
     const shown = modals.at(-1)!.contentEl.allText();
     expect(shown).toMatch(/Cannot ask the server/);
-    expect(shown).not.toMatch(/Nothing has been deleted/);
+    expect(shown).not.toMatch(/No deleted notes to restore/);
   }, 300_000);
 });
 
@@ -947,6 +912,42 @@ describe("renames, which only Obsidian can report", () => {
 });
 
 describe("unlinking", () => {
+  it("coalesces overlapping unlink requests before another pairing can begin", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let clears = 0;
+    const save = plugin.saveData.bind(plugin);
+    plugin.saveData = async (value: unknown) => {
+      if (value === null) {
+        clears++;
+        await gate;
+      }
+      await save(value);
+    };
+    const first = plugin.unlink();
+    const second = plugin.unlink();
+    try {
+      await until("unlink to reach the settings file", () => clears > 0);
+      await sleep(25);
+      expect(clears, "two unlink operations can erase settings after the first one returns").toBe(
+        1,
+      );
+    } finally {
+      release();
+      await Promise.all([first, second]);
+    }
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
   it("forgets the pairing and keeps every note", async () => {
     await fresh();
     const { plugin, app } = await load();
@@ -1059,8 +1060,8 @@ describe("the panel, which is a modal and a settings tab", () => {
     plugin.ribbonIcons[0]!.callback();
 
     const asked = built.map((s) => s.name);
-    expect(asked).toContain("It is joining a vault I already have");
-    expect(asked).toContain("It is the first device on a new vault");
+    expect(asked).toContain("Join an existing vault");
+    expect(asked).toContain("Set up a new vault");
     // And no fields yet, because a field belongs to one of the two answers.
     expect(asked).not.toContain("Invite or recovery key");
     expect(asked).not.toContain("Setup string");
@@ -1071,15 +1072,10 @@ describe("the panel, which is a modal and a settings tab", () => {
     // rather than out of `allText`, because the fake keeps a description as a
     // property where Obsidian renders it into the row.
     const desc = (name: string) => built.find((s) => s.name === name)?.desc ?? "";
-    expect(desc("It is joining a vault I already have")).toMatch(
-      /Make an invite on a device that already has it/,
-    );
-    expect(desc("It is the first device on a new vault")).toMatch(/setup line the server printed/);
+    expect(desc("Join an existing vault")).toMatch(/Use an invite from another device/);
+    expect(desc("Set up a new vault")).toMatch(/setup string from your server/);
     // And nothing that decides the choice is hidden behind a mark.
-    for (const name of [
-      "It is joining a vault I already have",
-      "It is the first device on a new vault",
-    ]) {
+    for (const name of ["Join an existing vault", "Set up a new vault"]) {
       const mark = built.find((s) => s.name === name)!.nameEl.children;
       expect(
         mark.filter((c) => c.cls === "basalt-help"),
@@ -1135,7 +1131,7 @@ describe("the panel, which is a modal and a settings tab", () => {
    * subject: an invite is how a row appears in the list, and a row in the list
    * is what can be cut off.
    */
-  it("offers an invite and a device list, and says the key is not needed", async () => {
+  it("offers an invite and device access management", async () => {
     await fresh();
     const { plugin } = await load();
     await startVault(plugin, "laptop");
@@ -1146,20 +1142,17 @@ describe("the panel, which is a modal and a settings tab", () => {
     const adding = built.find((s) => s.name === "Add another device")!;
     expect(adding, "the panel offers no way to add a device").toBeDefined();
     expect(adding.buttons.map((b) => b.label)).toContain("Create invite");
-    // The sentence that keeps the recovery key written down and offline. If
-    // the panel is silent about it, adding a device becomes fetching the key.
-    // On the row's `?` with everything else it has to say, because a row is a
-    // label and a control now and the prose is one hover away.
-    expect(tooltips()).toMatch(/recovery key is not needed/i);
-    expect(tooltips()).toMatch(/no root secret/);
-
+    expect(adding.desc).toMatch(/one-time invite/);
+    expect(adding.desc).toMatch(/Expires in 10 minutes/);
     const row = built.find((s) => s.name === "Devices")!;
     expect(row, "the panel has no device list").toBeDefined();
-    expect(tooltips()).toMatch(/Add one with an invite/);
+    expect(row.desc).toMatch(/manage their access/);
 
     built.length = 0;
     await row.buttons[0]!.click();
-    await until("the list to arrive", () => built.some((s) => s.desc.includes("added ")));
+    await until("the list to arrive", () =>
+      built.some((s) => /Last seen|Never connected/.test(s.desc)),
+    );
     const listed = built.find((s) => s.name.startsWith("laptop"))!;
     expect(listed.name).toMatch(/\(this device\)/);
     // No button on it, because it is the vault's only device and emptying the
@@ -1168,6 +1161,37 @@ describe("the panel, which is a modal and a settings tab", () => {
     // there too.
     expect(listed.buttons).toEqual([]);
   }, 300_000);
+
+  it("does not rebuild a closed panel when a settings request finishes", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin);
+    await synced(plugin);
+    const watching = vi.spyOn(plugin, "watchState");
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const panel = modals.at(-1)!;
+    const row = built.find((setting) => setting.name === "This device's name")!;
+    row.texts[0]!.type("new name");
+    let finish!: (name: string) => void;
+    const request = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    vi.spyOn(plugin, "renameDevice").mockReturnValueOnce(request);
+    const renaming = row.buttons[0]!.click();
+    panel.close();
+    watching.mockClear();
+    finish("new name");
+    await renaming;
+    expect(
+      panel.contentEl.children,
+      "a completed request rebuilt a detached settings panel",
+    ).toEqual([]);
+    expect(
+      watching,
+      "the closed panel subscribed again without another teardown",
+    ).not.toHaveBeenCalled();
+  });
 
   it("shows what is happening once it is paired", async () => {
     await fresh();
@@ -1178,7 +1202,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const names = built.map((s) => s.name);
-    expect(names).toContain("Sync now");
+    expect(names).toContain("Sync status");
     expect(names).toContain("Devices");
     expect(names).toContain("Recovery key");
     expect(names).toContain("Unlink this vault");
@@ -1194,13 +1218,8 @@ describe("the panel, which is a modal and a settings tab", () => {
    * because it needs no code and holds no state, which is the whole reason the
    * panel can be the whole interface.
    *
-   * There are two of them now, and the second is a different kind of thing.
-   * *Manage this vault* holds actions that are rare or cannot be undone;
-   * *Server* holds the two cursors and what answered them, which are numbers
-   * nobody needs while it is working and the first thing wanted when it is not.
-   * This used to assert that the panel had exactly one disclosure, by taking
-   * the first `<details>` it found, and that is why it is spelled by name here:
-   * a test that means "the Manage one" should say so.
+   * Pairing, server details and management each have a named disclosure.
+   * Only sync and recovery actions are visible by default.
    */
   it("puts the rare rows behind one disclosure and leaves the everyday ones out", async () => {
     await fresh();
@@ -1211,15 +1230,29 @@ describe("the panel, which is a modal and a settings tab", () => {
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const disclosures = modals.at(-1)!.contentEl.children.filter((el) => el.tag === "details");
+    const adding = disclosures.find((el) => el.children[0]?.text === "Add another device");
+    expect(adding, "adding a device needs its own collapsed section").toBeDefined();
+    expect(adding!.attributes.has("open")).toBe(false);
+    expect(
+      containsElement(adding!, built.find((s) => s.name === "Add another device")!.settingEl),
+    ).toBe(true);
+    const primaryRows = built.filter(
+      (s) => !disclosures.some((d) => containsElement(d, s.settingEl)),
+    );
+    expect(primaryRows.flatMap((s) => s.buttons.map((b) => b.label))).toEqual([
+      "Sync now",
+      "Browse deleted",
+    ]);
     const manage = disclosures.find((el) => el.children[0]?.text === "Manage this vault")!;
     expect(manage, "the panel has no Manage disclosure").toBeDefined();
     expect(manage.children[0]!.tag).toBe("summary");
     // And the numbers are behind the other one, not loose at the top.
     const server = disclosures.find((el) => el.children[0]?.text?.startsWith("Server"));
     expect(server, "the server numbers are not behind a disclosure").toBeDefined();
+    expect(disclosures.indexOf(adding!)).toBeLessThan(disclosures.indexOf(server!));
 
     const inside = (name: string): boolean =>
-      manage.children.includes(built.find((s) => s.name === name)!.settingEl);
+      containsElement(manage, built.find((s) => s.name === name)!.settingEl);
     for (const row of [
       "Devices",
       "Recovery key",
@@ -1227,7 +1260,7 @@ describe("the panel, which is a modal and a settings tab", () => {
       "Unlink this vault",
     ])
       expect(inside(row), `"${row}" is on the everyday panel`).toBe(true);
-    for (const row of ["Sync now", "Add another device", "Recover a deleted note"])
+    for (const row of ["Sync status", "Add another device", "Recover a deleted note"])
       expect(inside(row), `"${row}" is behind the disclosure`).toBe(false);
 
     // And the way out of the panel for anybody who wants the rest of it, which
@@ -1545,6 +1578,28 @@ describe("unlinking during the handshake", () => {
  * adapter failure left the vault unpaired on disk and paired in memory.
  */
 describe("unlink, in order and all the way", () => {
+  it("refuses to report unlink complete when the pairing file was not actually cleared", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    const paired = structuredClone(plugin.savedData);
+    const save = plugin.saveData.bind(plugin);
+    plugin.saveData = async (value: unknown) => {
+      if (value !== null) await save(value);
+    };
+    await expect(plugin.unlink()).rejects.toThrow(/pairing.*(removed|cleared|read back)/);
+    expect(plugin.savedData).toEqual(paired);
+    expect(plugin.paired).toBe(true);
+    expect(plugin.currentState.kind).toBe("stopped");
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+    plugin.saveData = save;
+    await plugin.unlink();
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.paired).toBe(false);
+  });
+
   const INDEX = ".obsidian/plugins/basalt/index.json";
   const STAGED = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
 
@@ -1810,8 +1865,8 @@ describe("a vault that was started and never joined", () => {
     );
     expect(failed?.message, "starting the vault succeeded").toMatch(/could not register itself/);
     // The row the registration may already have committed, named. A phone
-    // told only to pair again registers a second row and spends another of
-    // the vault's eight slots, and nothing ever says the first one is there.
+    // told only to pair again registers a second row without learning
+    // that the first one is there.
     expect(failed?.message).toMatch(/device row was registered/);
     expect(failed?.message).toMatch(/never connected/);
     expect(failed?.message).toMatch(/Write the recovery key shown in the Basalt panel down/);
@@ -1845,8 +1900,7 @@ describe("a vault that was started and never joined", () => {
    *
    * A row exists on the vault that nothing holds the key to, and the advice
    * has to name it. Pairing again registers a second one, so a phone that is
-   * only told to try again spends one of the vault's eight slots per attempt
-   * and nothing ever says so. The words come from `adviseAfterRegistering`,
+   * only told to try again leaves another unused row per attempt. The words come from `adviseAfterRegistering`,
    * which the CLI's `init` and `pair` also take theirs from.
    */
   it("names the row the panel's pairing left when the credential could not be saved", async () => {
@@ -1869,7 +1923,7 @@ describe("a vault that was started and never joined", () => {
     expect(failed?.message, "the pairing succeeded").toMatch(/EIO/);
     expect(failed?.message).toMatch(/device row was registered/);
     expect(failed?.message).toMatch(/never connected/);
-    expect(failed?.message).toMatch(/device slots/);
+    expect(failed?.message).toMatch(/nothing can connect as that device/);
     // Nothing here claims to be paired, because nothing here can connect.
     expect(second.plugin.savedData).toBe(null);
 
@@ -1942,6 +1996,10 @@ describe("a config that cannot be read", () => {
 
     await expect(startVault(plugin, "laptop")).rejects.toThrow(/could not be read/);
     await expect(plugin.pair("basalt3_whatever", "laptop")).rejects.toThrow(/could not be read/);
+    const before = modals.length;
+    plugin.protocolHandlers.get(INVITE_ACTION)!({ invite: "basalt3i_invalid" });
+    expect(modals).toHaveLength(before);
+    expect(notices.at(-1)!.message).toMatch(/could not be read/);
     expect(plugin.savedData).toEqual(unreadable);
   }, 300_000);
 });
@@ -2883,6 +2941,7 @@ describe("what the status bar shows", () => {
       ).not.toThrow();
       const icon = statusIcon(plugin);
       expect(icon, `${state.kind} chose no glyph`).not.toBe("");
+      expect(plugin.statusBarItems[0]!.children[0]!.text).toBe("Basalt");
       expect(status(plugin), `${state.kind} has no tooltip`).toMatch(/^Basalt Sync: \S/);
       seen.add(icon);
     }
@@ -2961,7 +3020,7 @@ it("tints only the state that is actually wrong", async () => {
  * and the panel says so where it used to be shown.
  */
 describe("adding a device from the panel", () => {
-  it("adds one with an invite, and neither device ends up with a root", async () => {
+  it("opens a scanned invite for confirmation and syncs after Pair", async () => {
     await fresh();
     const first = await load();
     first.app.vault.adapter.seed("note.md", "# From the first device\n");
@@ -2976,13 +3035,48 @@ describe("adding a device from the panel", () => {
     await adding.buttons.find((b) => b.label === "Create invite")!.click();
     const shown = notices.map((n) => n.message).join(" ");
     expect(shown, "the invite was not offered for copying").toMatch(/Copied|clipboard/);
-    const invite = (await first.plugin.createInvite()).invite;
+    const pairingCode = built.find((s) => s.name === "Pairing code");
+    expect(pairingCode, "the invite needs a labelled field beside its Copy button").toBeDefined();
+    expect(pairingCode!.desc).toMatch(/Paste this.*other device/);
+    const field = pairingCode!.texts[0]!;
+    expect(field.inputEl.attributes.has("readonly")).toBe(true);
+    const invite = field.getValue();
     expect(invite).toMatch(/^basalt3i_/);
+    const copied: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: async (text: string) => {
+          copied.push(text);
+        },
+      },
+    });
+    try {
+      await pairingCode!.buttons.find((b) => b.label === "Copy")!.click();
+      expect(copied, "Copy must include the entire pairing code").toEqual([invite]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const images: FakeEl[] = [];
+    const visit = (el: FakeEl): void => {
+      if (el.tag === "img") images.push(el);
+      for (const child of el.children) visit(child);
+    };
+    visit(modals.at(-1)!.contentEl);
+    expect(images).toHaveLength(1);
+    expect(images[0]!.hidden).toBe(false);
+    expect(images[0]!.attributes.get("src")).toBe(inviteQrImage(invite));
 
     const second = await load();
-    choosePairing(second.plugin, "invite");
+    built.length = 0;
+    const link = new URL(inviteLink(invite));
+    second.plugin.protocolHandlers.get(INVITE_ACTION)!(Object.fromEntries(link.searchParams));
+    expect(second.plugin.paired).toBe(false);
+    expect(second.plugin.savedData).toBe(null);
+    expect((await first.plugin.devices()).devices).toHaveLength(1);
+    expect(built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.getValue()).toBe(
+      invite,
+    );
     built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
-    built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(invite);
     await built
       .find((s) => s.buttons.some((b) => b.label === "Pair"))!
       .buttons.find((b) => b.label === "Pair")!
@@ -3007,6 +3101,32 @@ describe("adding a device from the panel", () => {
     const listed = await first.plugin.devices();
     expect(listed.devices.map((d) => d.name).sort()).toEqual(["laptop", "phone"]);
   }, 300_000);
+
+  it("rejects invalid invite links without opening a form or writing settings", async () => {
+    const { plugin } = await load();
+    const before = modals.length;
+    for (const params of [{}, { invite: "basalt3i_invalid" }, { invite: "https://example.com" }]) {
+      plugin.protocolHandlers.get(INVITE_ACTION)!(params);
+    }
+    expect(modals).toHaveLength(before);
+    expect(plugin.savedData).toBe(null);
+    expect(notices.at(-1)!.message).toMatch(/invite link is invalid/);
+  });
+
+  it("refuses an invite link in an already paired vault", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    const invite = (await plugin.createInvite()).invite;
+    const saved = plugin.savedData;
+    const before = modals.length;
+    plugin.protocolHandlers.get(INVITE_ACTION)!({ invite });
+    expect(modals).toHaveLength(before);
+    expect(plugin.savedData).toEqual(saved);
+    expect(notices.at(-1)!.message).toMatch(/already paired/);
+    expect((await plugin.devices()).devices).toHaveLength(1);
+  });
 
   it("spends an invite once, and leaves nothing behind on the second try", async () => {
     await fresh();
@@ -3134,21 +3254,22 @@ describe("adding a device from the panel", () => {
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
       .buttons.find((b) => b.label === "Start a new vault")!
       .click();
-    await until("the recovery key to be shown", () =>
-      modals.at(-1)!.contentEl.allText().includes("Write this down"),
-    );
+    await until("the recovery key to be shown", () => panelText().includes("Write this down"));
 
-    const shown = modals.at(-1)!.contentEl.allText();
+    const shown = panelText();
     expect(shown).toMatch(/Write this down/);
-    // What it is for, on the `?` beside the key: the screen itself says the
-    // two things somebody has to act on now, which is write it down and keep
-    // it offline.
-    expect(shown).toMatch(/keep it offline/);
-    expect(tooltips()).toMatch(/only way back/);
+    expect(shown).toMatch(/somewhere safe and separate/);
+    expect(shown).toMatch(/only way back/);
+    expect(shown).toMatch(/Anyone with it can access your vault/);
     // The key itself, taken off the screen, because this is the one moment it
     // exists anywhere: no device keeps it and nothing reprints it.
     const key = shown.split(/\s+/).find((w) => w.startsWith("basalt3_"))!;
     expect(key, "no recovery key was shown").toBeDefined();
+    const beforeScan = modals.length;
+    plugin.protocolHandlers.get(INVITE_ACTION)!({ invite: "basalt3i_invalid" });
+    expect(modals).toHaveLength(beforeScan);
+    expect(notices.at(-1)!.message).toMatch(/pairing is already in progress/);
+    expect(plugin.pendingFirstPairing()).toBe(key);
 
     // And a way to get it off the device, which is the whole point of showing
     // it. "Write it down" is hardest to follow exactly where this plugin is
@@ -3293,13 +3414,9 @@ describe("adding a device from the panel", () => {
     const key = keyOf(plugin);
     expect(modals.at(-1)!.contentEl.allText(), "the key was on screen unasked").not.toContain(key);
     const setting = built.find((s) => s.name === "Recovery key")!;
-    // Said, not shown, because there is nothing to show: the key was
-    // displayed once and this device kept its own credential instead. The row
-    // says where the key is; the `?` beside the section says why it is there
-    // and not here.
-    expect(tooltips()).toMatch(/not kept here/);
-    expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
-    expect(tooltips()).toMatch(/register itself again after being revoked/);
+    // After the handoff, the panel explains that this device has no saved key.
+    expect(panelText()).toMatch(/Not stored on this device/);
+    expect(panelText()).toMatch(/Keep your saved copy safe/);
     expect(setting.buttons, "the panel offers to show a key it does not have").toEqual([]);
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
   }, 300_000);
@@ -3422,11 +3539,9 @@ describe("what the panel knows and used to keep to itself", () => {
     );
     expect(shown).toContain(`Protocol ${PROTO}, basaltd ${to.server!.version}.`);
     expect(shown).not.toContain("Not connected");
-    // A test server has nothing in front of it. What that costs is on the
-    // line's `?` rather than in the line, because it is the same two clauses
-    // on every open and the sentence is read on every open.
-    expect(tooltips()).toMatch(/No TLS in front of this hop/);
-    expect(tooltips()).toMatch(/credential and the note sizes are not/);
+    // An unencrypted connection shows its warning in the server details.
+    expect(panelText()).toMatch(/No TLS in front of this hop/);
+    expect(panelText()).toMatch(/credential and the note sizes are not/);
   }, 300_000);
 
   it("says the protocol and the build are unknown rather than leaving a gap", () => {
@@ -3455,19 +3570,155 @@ describe("what the panel knows and used to keep to itself", () => {
  * The device list in the panel, which is the only device management a plugin
  * device has.
  */
+describe("changing the server address", () => {
+  it("waits for a pending rename save before unlinking and refuses an overlapping address edit", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let saving = false;
+    let forgotten = false;
+    const save = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data: unknown) => {
+      if (data !== null) {
+        saving = true;
+        await gate;
+      } else forgotten = true;
+      await save(data);
+    };
+    const renaming = plugin.renameDevice("renamed laptop").catch((err: Error) => err);
+    await until("the rename save to begin", () => saving);
+    await expect(plugin.changeServerAddress(server.wsUrl)).rejects.toThrow(/in progress/);
+    const unlinking = plugin.unlink();
+    try {
+      await sleep(0);
+      expect(forgotten, "unlink forgot the pairing before its pending save finished").toBe(false);
+    } finally {
+      release();
+      await unlinking;
+      await renaming;
+    }
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
+  it("moves to the same server on a new port without resetting credentials, notes, or history", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    const saved = structuredClone(plugin.savedData) as Record<string, unknown>;
+    const cursor = plugin.cursors()!.local;
+    expect(cursor).toBeGreaterThan(0);
+    const index = await app.vault.adapter.read(".obsidian/plugins/basalt/index.json");
+    await server.stop();
+    await server.start();
+    expect(server.wsUrl).not.toBe(saved["url"]);
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const setting = built.find((s) => s.name === "Server address")!;
+    setting.texts[0]!.type(`  ${server.wsUrl.replace("ws://", "http://")}/  `);
+    await setting.buttons[0]!.click();
+    await synced(plugin);
+    expect(plugin.connection()!.url).toBe(server.wsUrl);
+    expect(plugin.savedData).toEqual({ ...saved, url: server.wsUrl });
+    expect(plugin.cursors()!.local).toBe(cursor);
+    expect(await app.vault.adapter.read(".obsidian/plugins/basalt/index.json")).toBe(index);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+    const peer = await load(plugin.savedData);
+    await synced(peer.plugin);
+    expect(await peer.app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
+  it("refuses another server without changing the current pairing or notes", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    const saved = structuredClone(plugin.savedData);
+    const other = new TestServer();
+    await other.start();
+    try {
+      await expect(plugin.changeServerAddress(other.wsUrl)).rejects.toThrow();
+      expect(plugin.savedData).toEqual(saved);
+      expect(plugin.connection()!.url).toBe(server.wsUrl);
+      expect(plugin.currentState.kind).toBe("synced");
+      expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+    } finally {
+      await other.cleanup();
+    }
+  });
+
+  it("cannot restore a pairing when unlinked during the address save", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    await server.stop();
+    await server.start();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let saving = false;
+    const save = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data: unknown) => {
+      if (data !== null) {
+        saving = true;
+        await gate;
+      }
+      await save(data);
+    };
+    const changing = plugin.changeServerAddress(server.wsUrl).catch((err: Error) => err);
+    await until("the new address save to begin", () => saving);
+    const unlinking = plugin.unlink();
+    release();
+    await unlinking;
+    expect(await changing).toBeInstanceOf(Error);
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+});
+
 describe("the device list in the panel", () => {
-  /**
-   * Emptying the vault is the recovery key's, and no device holds one, so the
-   * panel does not offer a button that could only ever be refused.
-   *
-   * The last row is always this device: reading the list at all means this
-   * device connected. What it offers instead is the two things that do work,
-   * the command that would do it and the local unlink that leaves the row
-   * alone, because a refusal a person cannot act on sends them looking for a
-   * worse route, and the worse route here is replacing the vault's secret and
-   * pairing everything again.
-   */
-  it("offers no way to empty the vault, and says whose job that is", async () => {
+  it("keeps the current device list visible during refresh and after a failed refresh", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const button = built.find((s) => s.name === "Devices")!.buttons[0]!;
+    await button.click();
+    const oldRow = built.find((s) => s.name.startsWith("laptop"))!.settingEl;
+    const panel = modals.at(-1)!.contentEl;
+    let reject!: (error: Error) => void;
+    const request = new Promise<Awaited<ReturnType<Testable["devices"]>>>((_, fail) => {
+      reject = fail;
+    });
+    vi.spyOn(plugin, "devices").mockReturnValueOnce(request);
+    const refreshing = button.click();
+    expect(containsElement(panel, oldRow), "refresh removed the visible list").toBe(true);
+    expect(button.disabled).toBe(true);
+    reject(new Error("connection interrupted"));
+    await refreshing;
+    expect(containsElement(panel, oldRow)).toBe(true);
+    expect(button.disabled).toBe(false);
+    expect(panelText()).toContain("connection interrupted");
+  });
+  it("keeps the last device registered and the list concise", async () => {
     await fresh();
     const { plugin } = await load();
     await startVault(plugin, "laptop");
@@ -3484,10 +3735,11 @@ describe("the device list in the panel", () => {
       "the last row offered a button that cannot work",
     ).toEqual([]);
 
-    const said = modals.at(-1)!.contentEl.allText();
-    expect(said).toMatch(/last device/);
-    expect(said).toMatch(/--allow-last --recovery-key/);
-    expect(said).toMatch(/Unlink this vault/);
+    expect(built.find((s) => s.name === "Devices")!.desc).toBe("1 device");
+    expect(row.desc).toMatch(/^Last seen /);
+    expect(row.desc).not.toContain((await plugin.devices()).thisDevice);
+    expect(panelText()).not.toMatch(/--allow-last|Revoking stops|at most/);
+    expect(built.find((s) => s.name === "Unlink this vault")!.buttons[0]!.label).toBe("Unlink");
     // And the row is still there, because nothing was pressed and nothing was
     // sent: a panel that said this while the vault emptied itself would be
     // worse than one that said nothing.
@@ -3529,7 +3781,7 @@ describe("the device list in the panel", () => {
       .contentEl.children.filter((el) => el.tag === "details")
       .find((el) => el.children[0]?.text === "Manage this vault");
     expect(manage, "the panel has no disclosure to manage the vault from").toBeDefined();
-    const kids = manage!.children;
+    const kids = manage!.children.find((el) => el.cls === "setting-group")!.children[0]!.children;
     const row = built.find((b) => b.name.includes("laptop"))!;
     const at = kids.indexOf(heading.settingEl);
     const listAt = kids.findIndex((el) => el.children.includes(row.settingEl));
@@ -3551,14 +3803,12 @@ describe("the device list in the panel", () => {
     await until("the list to arrive", () => built.some((s) => s.name === "Outstanding invite"));
 
     const row = built.find((s) => s.name === "Outstanding invite")!;
-    expect(row.desc).toMatch(/adds one device/);
-    expect(row.desc).toMatch(/expires/);
+    expect(row.desc).toMatch(/^Expires /);
     // Never the string, which is the only thing that could redeem it.
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(issued.invite);
-    expect(modals.at(-1)!.contentEl.allText()).toMatch(/1 outstanding invite/);
 
     await row.buttons.find((b) => b.label === "Cancel")!.click();
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/no longer adds a device/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/can no longer add a device/);
     expect((await first.plugin.devices()).invites).toHaveLength(0);
 
     // And the string it cancelled no longer pairs anything.
@@ -3590,18 +3840,17 @@ describe("the device list in the panel", () => {
     built.length = 0;
     first.plugin.ribbonIcons[0]!.callback();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
-    await until("the list to arrive", () => built.some((s) => s.desc.includes("added ")));
+    await until("the list to arrive", () =>
+      built.some((s) => /Last seen|Never connected/.test(s.desc)),
+    );
 
     const stranded = built.find((s) => s.name === "the-one-that-crashed")!;
     expect(stranded, "the panel did not list the stranded row").toBeDefined();
-    expect(stranded.desc).toMatch(/never connected/);
+    expect(stranded.desc).toBe("Never connected");
     // And this device, which has connected, is not flagged: a marker on every
     // row says nothing.
-    expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toMatch(/last seen/);
-
-    const said = modals.at(-1)!.contentEl.allText();
-    expect(said).toMatch(/1 has never connected/);
-    expect(said).toMatch(/holds a slot/);
+    expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toMatch(/Last seen/);
+    expect(built.find((s) => s.name === "Devices")!.desc).toBe("2 devices");
   }, 300_000);
 
   /**
@@ -3630,16 +3879,38 @@ describe("the device list in the panel", () => {
     await button.click();
     expect(button.label).toBe("Yes, revoke");
     expect((await first.plugin.devices()).devices).toHaveLength(2);
-    expect(modals.at(-1)!.contentEl.allText()).toMatch(/will stop syncing at once/);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/will stop syncing/);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/keeps its decryption key/);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/can still read copies of your notes/);
 
     // The second does it, and the revoked device finds out by being stopped.
     await button.click();
     expect((await first.plugin.devices()).devices.map((d) => d.name)).toEqual(["laptop"]);
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/keeps the vault's key/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(
+      /Existing notes on that device are kept/,
+    );
     await until(
       "the revoked device to be stopped",
       () => second.plugin.currentState.kind === "stopped",
     );
+  }, 300_000);
+
+  it("keeps devices with the same name distinguishable before revocation", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin, "phone");
+    await synced(first.plugin);
+    const second = await load();
+    await second.plugin.pair((await first.plugin.createInvite()).invite, "phone");
+    await synced(second.plugin);
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
+    const listed = await first.plugin.devices();
+    for (const device of listed.devices) {
+      const name = device.id === listed.thisDevice ? "phone (this device)" : "phone";
+      expect(built.find((s) => s.name === name)!.desc).toContain(`ID ${device.id}`);
+    }
   }, 300_000);
 });
 
@@ -3659,6 +3930,140 @@ describe("the device list in the panel", () => {
  * the note the backup did hold is still there too.
  */
 describe("rejoining a server that lost history (I10, plugin)", () => {
+  it("does not rejoin a pairing unlinked while its cursor probe was pending", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    let answer!: (value: { local: number; server: number }) => void;
+    const probing = new Promise<{ local: number; server: number }>((resolve) => {
+      answer = resolve;
+    });
+    vi.spyOn(plugin, "rejoinCursors").mockReturnValueOnce(probing);
+    const rejoining = plugin.rebase().catch((err: Error) => err);
+    await plugin.unlink();
+    answer({ local: 2, server: 1 });
+    expect(await rejoining).toBeInstanceOf(Error);
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
+  it("waits for the rejoin index reset before finishing unlink", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    vi.spyOn(plugin, "rejoinCursors").mockResolvedValueOnce({ local: 2, server: 1 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let resetting = false;
+    const remove = ObsidianIndexStore.prototype.remove;
+    vi.spyOn(ObsidianIndexStore.prototype, "remove").mockImplementationOnce(async function (
+      this: ObsidianIndexStore,
+    ) {
+      resetting = true;
+      await gate;
+      await remove.call(this);
+    });
+    const rejoining = plugin.rebase().catch((err: Error) => err);
+    await until("the rejoin index reset", () => resetting);
+    let unlinked = false;
+    const unlinking = plugin.unlink().then(() => {
+      unlinked = true;
+    });
+    try {
+      await sleep(25);
+      expect(
+        unlinked,
+        "unlink returned while rejoin could still remove its next pairing's index",
+      ).toBe(false);
+    } finally {
+      release();
+      await unlinking;
+      await rejoining;
+    }
+    expect(await rejoining).toBeInstanceOf(Error);
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
+  it("finishes unlink after an in-flight rejoin reset fails", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    vi.spyOn(plugin, "rejoinCursors").mockResolvedValueOnce({ local: 2, server: 1 });
+    let fail!: (error: Error) => void;
+    const gate = new Promise<void>((_, reject) => {
+      fail = reject;
+    });
+    let resetting = false;
+    vi.spyOn(ObsidianIndexStore.prototype, "remove").mockImplementationOnce(async () => {
+      resetting = true;
+      await gate;
+    });
+    const rejoining = plugin.rebase().catch((err: Error) => err);
+    await until("the rejoin index reset", () => resetting);
+    const unlinking = plugin.unlink();
+    // Quiet has begun waiting for the reset when its write reports failure.
+    await sleep(25);
+    fail(new Error("temporary reset error"));
+    await unlinking;
+    expect(await rejoining).toBeInstanceOf(Error);
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
+  it("closes a rejoin connection when unlink interrupts its handshake", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("kept.md", "my original note\n");
+    await startVault(plugin);
+    await synced(plugin);
+    vi.spyOn(plugin, "rejoinCursors").mockResolvedValueOnce({ local: 2, server: 1 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let connecting: Client | undefined;
+    const connect = Client.prototype.connect;
+    vi.spyOn(Client.prototype, "connect").mockImplementationOnce(async function (
+      this: Client,
+      opts,
+    ) {
+      const limits = await connect.call(this, opts);
+      connecting = this;
+      await gate;
+      return limits;
+    });
+    const rejoining = plugin.rebase().catch((err: Error) => err);
+    await until("the rejoin connection", () => connecting !== undefined);
+    const closing = vi.spyOn(connecting!, "close");
+    try {
+      await plugin.unlink();
+      expect(closing, "unlink did not close the rejoin connection").toHaveBeenCalled();
+    } finally {
+      release();
+      await rejoining;
+    }
+    expect(await rejoining).toBeInstanceOf(Error);
+    expect(plugin.savedData).toBe(null);
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+    expect(await app.vault.adapter.read("kept.md")).toBe("my original note\n");
+  });
+
   /** A copy of the server's data directory, taken with the server stopped. */
   async function backupServer(): Promise<string> {
     const { cp } = await import("node:fs/promises");
@@ -3720,13 +4125,17 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     first.plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Rejoin this server")!;
     expect(row, "the panel offered no way back").toBeDefined();
-    expect(tooltips()).toMatch(/Nothing is deleted/);
+    expect(panelText()).toMatch(/local notes are kept/);
     // On the panel itself, never behind the disclosure: a device the server
     // has refused has to say so, and offer the way out, on open.
-    expect(
-      modals.at(-1)!.contentEl.children,
-      "the way back off a refused device is behind a disclosure",
-    ).toContain(row.settingEl);
+    const panel = modals.at(-1)!.contentEl;
+    expect(containsElement(panel, row.settingEl)).toBe(true);
+    for (const disclosure of panel.children.filter((el) => el.tag === "details")) {
+      expect(
+        containsElement(disclosure, row.settingEl),
+        "the way back off a refused device is behind a disclosure",
+      ).toBe(false);
+    }
     const button = row.buttons[0]!;
     expect(button.warning, "a destructive action with no warning on it").toBe(true);
     await button.click();

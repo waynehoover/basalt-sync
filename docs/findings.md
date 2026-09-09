@@ -123,3 +123,66 @@ The explanatory comments remain. This cleanup was recorded at `9f99b6a`.
 
 `C0` and `C1` in server name validation refer to Unicode control-character
 classes, not review findings.
+
+## 0.6.2 pre-release review
+
+Parallel reviews of the CLI, shared client, Obsidian plugin, server, and docs
+found the defects below. All were fixed; each code regression was demonstrated
+failing before its fix and passing after it.
+
+| Defect | Result after the fix | Regression coverage |
+|---|---|---|
+| The documented `pair -` form rejected standard input as an unknown option. | A lone dash reaches the secret reader; pairing from a private pipe works. | [state.test.ts](../client/src/cli/state.test.ts): standard-input pairing, saved mirror mode, and note readback. |
+| `unlock --json` returned success for competing holders. | Contested recovery returns `ok: false` and exit 1, matching text output. | [unlock.test.ts](../client/src/cli/unlock.test.ts): contested recovery preserves the current holder. |
+| Recovery-key administration could act on another server with the same vault name. | A paired directory's saved endpoint determines the target; keys with an old address remain usable. | [cli.test.ts](../client/src/cli/cli.test.ts): two-server refusal and moved-address administration. |
+| A sync failure hid a completed local restore. | Both output formats retain the restored path and distinguish local restoration from sync failure. | [recover.test.ts](../client/src/cli/recover.test.ts): the restored bytes and current edit both survive; sync can be retried. |
+| An unrelated upload marked a restored note as sent. | Delivery is checked for that exact path, and an unsent copy is reported accurately. | [recover.test.ts](../client/src/cli/recover.test.ts): another file uploads while the restored file remains absent from server history. |
+| Watch mode omitted its live recovery inventory. | Watch reports include retained paths and incomplete recovery, using the current connection. | [state.test.ts](../client/src/cli/state.test.ts): a separate watcher process reports a torn ledger and retains the displaced bytes. |
+| CLI advice implied that rotation protected future content after device theft. | The device list and revocation output explain the retained data key and when recovery-key rotation helps. | [cli.test.ts](../client/src/cli/cli.test.ts): listing and revocation guidance. |
+
+Documentation corrections remove the old device caps from the server reference,
+name the current pairing and deleted-note controls, distinguish plugin releases
+from the server release channel, and keep custom-vault CLI setup out of the
+plugin's local directory. The CLI reference now explains restore delivery and
+the server targeted by recovery-key administration. Local links were checked;
+comparison claims were checked against the official Obsidian and LiveSync docs.
+
+The retained SVG diagrams were reviewed too. Both security themes now describe
+shared-key authentication, replay risk, recovery-key administration, and stored
+credential hashes accurately. Both transfer diagrams label their figures as a
+historical example and remove the incorrect claim that metadata is most of the
+illustrated transfer. These diagrams are not currently embedded in the guides;
+the referenced logo is unchanged.
+
+### Shared client and plugin
+
+| Defect | Result after the fix | Regression coverage |
+|---|---|---|
+| Rejoin could continue after unlink or unload. | Recovery retains ownership of its pairing; shutdown waits for index resets and closes recovery connections. | [main.test.ts](../client/src/plugin/main.test.ts): delayed cursor probe, reset success/failure, and interrupted handshake. |
+| Concurrent unlink requests started independent clears. | Repeated requests share the same unlink operation. | [main.test.ts](../client/src/plugin/main.test.ts): overlapping unlink requests. |
+| Unlink trusted a successful settings write without checking it. | Saved settings are read back before unlink reports completion. | [main.test.ts](../client/src/plugin/main.test.ts): a silently dropped clear is reported. |
+| Restore could write after client shutdown finished. | Fetching and publishing the recovered note share the shutdown queue; closed clients refuse new restores. | [restore.test.ts](../client/src/core/restore.test.ts): close waits for recovered bytes, and a closed client cannot restore a folder. |
+| A delayed action could rebuild a closed panel and recreate subscriptions. | A torn-down panel stays closed when an action completes. | [main.test.ts](../client/src/plugin/main.test.ts): delayed completion after panel teardown. |
+
+### Server
+
+| Defect | Result after the fix | Regression coverage |
+|---|---|---|
+| A root credential retired during authentication could keep a registrar session. | Publication is followed by a credential recheck, closing the gap around rotation. | [release_review_test.go](../server/internal/server/release_review_test.go): rotation before registrar publication. |
+| Rotation and asynchronous logging read unfinished session identity. | Both read identity only after authentication publishes it under the session mutex. | [release_review_test.go](../server/internal/server/release_review_test.go): unpublished handshake and connection-failure races. |
+| Large invite TTLs overflowed before the expiry cap applied. | Milliseconds are clamped before duration conversion. | [release_review_test.go](../server/internal/server/release_review_test.go): overflowing positive TTL. |
+| SQLite interpreted a `?` in the data path as URI syntax. | Filesystem paths are encoded before connection options are added. | [path_test.go](../server/internal/store/path_test.go): special characters remain in the real database path. |
+| Read-only inspection recreated missing chunk directories. | Inspection refuses missing storage without creating it. | [open_test.go](../server/internal/store/open_test.go): missing chunk storage remains absent. |
+| Repair applied the plaintext file limit to encrypted chunk bodies. | Repair uses the ciphertext chunk limit, allowing valid repairs under a small file ceiling. | [resend_test.go](../server/internal/server/resend_test.go): exact repaired bytes and unchanged history. |
+
+### Verification scope
+
+The review's broader runs passed 403 CLI tests, 335 client/plugin tests, and the
+full Go race-enabled suite. The complete local gate then passed: 1,523 client
+tests, 24 stress tests, server race tests, the restore rehearsal, package/build
+checks, and Docker checks. Exact-commit CI is still required before publication.
+
+The screenshot script captured 12 views in both themes in desktop Obsidian
+1.13.7, using sample data. Its interrupted-run cleanup was exercised too.
+Android and iOS acceptance were not performed during this review; existing
+platform and threat-model limits remain as documented in [the design](design.md).

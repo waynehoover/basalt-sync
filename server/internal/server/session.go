@@ -230,11 +230,23 @@ func (s *Session) writeLoop() {
 func (s *Session) kill(cause error) {
 	s.closeOnce.Do(func() {
 		if cause != nil {
-			s.srv.log.Info("closing session", "remote", s.remote, "vault", s.vaultID, "cause", cause)
+			s.srv.log.Info("closing session", "remote", s.remote, "vault", s.publishedVaultID(), "cause", cause)
 		}
 		close(s.dead)
 		_ = s.conn.CloseNow()
 	})
+}
+
+// publishedVaultID is safe for the writer, timeout and keepalive goroutines.
+// During hello the session may still be initializing vaultID; authenticated
+// publishes it by releasing the pre-auth count under this mutex.
+func (s *Session) publishedVaultID() string {
+	s.srv.sessMu.Lock()
+	defer s.srv.sessMu.Unlock()
+	if s.counted {
+		return ""
+	}
+	return s.vaultID
 }
 
 // drain waits, bounded, for every queued frame to finish being written, so a
@@ -413,7 +425,7 @@ func (s *Session) takeID(m wire.In) error {
 //
 // A client that answers pings and sends nothing else holds a session open. That
 // is a slow-loris in a system built for one person's own devices behind a
-// tunnel, and MaxPeers already bounds how many of them there can be.
+// tunnel. Per-session queues and frame sizes are bounded.
 func (s *Session) readMsg() (websocket.MessageType, []byte, error) {
 	// A pong is processed only inside this Read, so keepalive may ping only
 	// while it is running. The flag is cleared on the way out because the
@@ -473,7 +485,7 @@ func (s *Session) keepalive() {
 			// which ends the session. Logged at debug: a device going away is
 			// ordinary.
 			s.srv.log.Debug("connection stopped answering",
-				"remote", s.remote, "vault", s.vaultID, "err", err)
+				"remote", s.remote, "vault", s.publishedVaultID(), "err", err)
 			s.kill(nil)
 			return
 		}
@@ -688,10 +700,8 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		// Emptying the vault is the one revocation nothing on a device can
 		// undo, so it belongs to the credential that can undo it, and a
 		// refusal naming a credential that could not act would be worse than
-		// no gate at all. And a vault whose eight rows are all pairings that
-		// crashed refuses every registration with `full`, so if the recovery
-		// key could not prune the list there would be no way back into such a
-		// vault short of editing SQLite by hand. Both are in docs/design.md,
+		// no gate at all. The recovery key also lets someone remove abandoned
+		// registrations when no paired device remains. See docs/design.md,
 		// "What a device can do to another device", with what it costs: a
 		// leaked root can now stop devices connecting, where before it could
 		// only read and add. Rotation is still what answers that: `revoke` is
@@ -1009,11 +1019,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	if s.srv.beforeJoin != nil {
 		s.srv.beforeJoin()
 	}
-	peers, admitted := s.srv.hub.joinIfRoom(m.Vault, s, s.srv.maxPeers)
-	if !admitted {
-		return s.fatalWith(wire.CodeBusy, fmt.Errorf(
-			"vault has %d devices connected, limit is %d", peers, s.srv.maxPeers), DeviceLimitRetryAfter)
-	}
+	s.srv.hub.join(m.Vault, s)
 	s.joined = true
 
 	// Still registered, and stamped as seen, in one statement.
@@ -1041,7 +1047,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 		return err
 	}
 	s.srv.log.Info("session ready", "remote", s.remote, "vault", m.Vault,
-		"device", m.Device, "deviceId", m.DeviceID, "cursor", m.Cursor, "latest", latest, "peers", peers)
+		"device", m.Device, "deviceId", m.DeviceID, "cursor", m.Cursor, "latest", latest, "peers", s.srv.hub.peerCount(m.Vault))
 
 	cursor, sent, err := s.replay(m.Vault, m.Cursor)
 	if err != nil {
@@ -1089,8 +1095,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 // Refusals. An invite that is unknown, expired, already used or malformed is
 // `auth` and says none of the four, exactly as a wrong token does. A device id
 // or an auth key the server will not write is the request's own fault and is
-// named: `badname` and `badentry`. A vault already at its device cap is
-// `full`, not `busy`, because waiting never makes it true. Every one of them
+// named: `badname` and `badentry`. Every refusal
 // leaves the invite unspent, because the store rolls the spend back with the
 // registration; see store.RedeemInviteFor.
 func (s *Session) helloAsInvite(m wire.In) error {
@@ -1127,7 +1132,7 @@ func (s *Session) helloAsInvite(m wire.In) error {
 
 	sum := sha256.Sum256([]byte(m.Auth))
 	sealed, err := s.srv.st.RedeemInviteFor(m.Vault, m.Invite, m.DeviceID, name,
-		hex.EncodeToString(sum[:]), store.MaxDevices, s.srv.now().UnixMilli())
+		hex.EncodeToString(sum[:]), s.srv.now().UnixMilli())
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrNoInvite), errors.Is(err, store.ErrUnknownVault):
@@ -1137,8 +1142,6 @@ func (s *Session) helloAsInvite(m wire.In) error {
 		s.srv.log.Warn("invite refused", "remote", s.remote, "vault", m.Vault,
 			"deviceId", m.DeviceID, "err", err)
 		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
-	case errors.Is(err, store.ErrDeviceLimit):
-		return s.fatal(wire.CodeFull, err)
 	case errors.Is(err, store.ErrDeviceExists):
 		return s.fatal(wire.CodeBadEntry, fmt.Errorf(
 			"this vault already has a device registered under id %q, so this invite was not spent; "+
@@ -1165,7 +1168,7 @@ func (s *Session) helloAsInvite(m wire.In) error {
 // What comes back is a session that may register a device, rotate the vault's
 // secret and administer the device list, and nothing else: no note is read or
 // written on one. It joins no vault's fan-out, so it is sent no entry and
-// occupies no device slot, and it is given no `ready`, because `ready` promises
+// is given no `ready`, because `ready` promises
 // the ceilings for a put and a backlog behind it and this session will never
 // get either.
 func (s *Session) helloAsRegistrar(m wire.In) error {
@@ -1206,6 +1209,9 @@ func (s *Session) helloAsRegistrar(m wire.In) error {
 				"cannot serve: start a fresh data directory and pair the first device again", m.Vault, s.srv.version))
 	}
 
+	if s.srv.beforeRegistrarPublish != nil {
+		s.srv.beforeRegistrarPublish()
+	}
 	s.bootstrap = grant.Bootstrap
 	s.authHash = grant.AuthHash
 	s.wrapped = wrapped
@@ -1219,20 +1225,30 @@ func (s *Session) helloAsRegistrar(m wire.In) error {
 	// whoever later rotates this vault; see Server.registrarsOn.
 	s.srv.authenticated(s)
 	s.conn.SetReadLimit(ReadLimit)
+	// Publish before rechecking the credential, just as a device joins before
+	// checking its row. A rotation before publication must be caught here;
+	// one after publication will see this session and evict it. Checking only
+	// before publication left a retired root able to list and cancel invites.
+	currentHash, err := s.srv.st.AuthHash(m.Vault)
+	if err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	}
+	if grant.AuthHash != "" && currentHash != grant.AuthHash {
+		return s.fatal(wire.CodeAuth, errors.New(
+			"the vault's secret was rotated while this session was authenticating; pair again with the new string"))
+	}
 
 	if err := s.srv.st.EnsureVault(m.Vault, s.srv.now().UnixMilli()); err != nil {
 		return s.fatal(wire.CodeInternal, err)
 	}
 	// No join, no cursor check and no catch-up: there is nothing this session
-	// may be sent. It is not counted against the vault's connected-device
-	// limit either, because it is not a device and holding a slot open would
-	// mean adding a device could cost you one.
+	// may be sent.
 	s.srv.log.Info("registrar ready", "remote", s.remote, "vault", m.Vault,
 		"device", m.Device, "bootstrap", grant.Bootstrap)
 	return s.writeJSON(wire.Registrar{
 		Res: "registrar", ID: s.reqID,
 		Proto: wire.Proto, MinProto: wire.MinProto,
-		ServerVersion: s.srv.version, MaxDevices: store.MaxDevices,
+		ServerVersion: s.srv.version, MaxDevices: 0,
 	})
 }
 
@@ -2041,10 +2057,10 @@ func (s *Session) handleResend(m wire.In) error {
 	if err := s.writeJSON(wire.Want{Res: "want", ID: s.reqID, Chunks: missing}); err != nil {
 		return err
 	}
-	// The same body reader a put uses, so the size ceiling, the framing rules
-	// and the hash check are one implementation rather than two. The allowance
-	// is what these bodies are permitted to occupy, computed the way a put's is.
-	if err := s.readBodies(missing, s.srv.perFileMax*int64(len(missing))); err != nil {
+	// These are existing ciphertext chunks, which include encryption overhead
+	// and may belong to older versions larger than today's file ceiling. Bound
+	// them by the chunk ceiling; the per-file limit measures plaintext uploads.
+	if err := s.readBodies(missing, s.srv.st.Chunks().Max()*int64(len(missing))); err != nil {
 		return err
 	}
 
@@ -2386,7 +2402,7 @@ func (s *Session) handleRegister(m wire.In) error {
 		s.srv.beforeRegister()
 	}
 	err := s.srv.st.RegisterDevice(s.vaultID, m.DeviceID, name, deviceHash,
-		s.authHash, store.MaxDevices, s.srv.now().UnixMilli())
+		s.authHash, s.srv.now().UnixMilli())
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrDeviceExists):
@@ -2399,8 +2415,6 @@ func (s *Session) handleRegister(m wire.In) error {
 				"this vault already has a different device registered under id %q", m.DeviceID))
 		}
 		s.srv.log.Info("device already registered", "vault", s.vaultID, "deviceId", m.DeviceID)
-	case errors.Is(err, store.ErrDeviceLimit):
-		return s.reject(wire.CodeFull, err)
 	case errors.Is(err, store.ErrRotated):
 		// The vault was rotated between this session's hello and this
 		// registration. Fatal, for the same reason a losing rotate is: the
@@ -2426,7 +2440,7 @@ func (s *Session) handleRegister(m wire.In) error {
 //
 // Either credential may ask. It is the access list rather than the vault's
 // content, it carries no key material, and the recovery key needs it to be
-// able to act: `revoke` takes an id, and a vault whose eight rows are all
+// able to act: `revoke` takes an id, and a vault whose rows are all
 // crashed pairings has no device left to read the list from. See dispatch.
 func (s *Session) handleDevices(m wire.In) error {
 	ds, err := s.srv.st.Devices(s.vaultID)
@@ -2446,7 +2460,7 @@ func (s *Session) handleDevices(m wire.In) error {
 		return s.reject(wire.CodeInternal, errors.New("the invite list could not be read: "+err.Error()))
 	}
 	return s.writeJSON(wire.DeviceList{
-		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: store.MaxDevices, Invites: invites,
+		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: 0, Invites: invites,
 	})
 }
 
@@ -2665,13 +2679,16 @@ func (s *Session) handleInvite(m wire.In) error {
 	if m.TTLMs < 0 {
 		return s.reject(wire.CodeBadEntry, fmt.Errorf("ttlMs is %d, and an invite cannot expire before it is issued", m.TTLMs))
 	}
-	ttl := time.Duration(m.TTLMs) * time.Millisecond
-	if ttl == 0 {
-		ttl = DefaultInviteTTL
+	// Clamp milliseconds before converting to nanoseconds: a large positive
+	// wire value can overflow time.Duration and become a past expiry.
+	ttlMs := m.TTLMs
+	if ttlMs == 0 {
+		ttlMs = DefaultInviteTTL.Milliseconds()
 	}
-	if ttl > MaxInviteTTL {
-		ttl = MaxInviteTTL
+	if ttlMs > MaxInviteTTL.Milliseconds() {
+		ttlMs = MaxInviteTTL.Milliseconds()
 	}
+	ttl := time.Duration(ttlMs) * time.Millisecond
 	now := s.srv.now()
 	expiresAt := now.Add(ttl).UnixMilli()
 	if err := s.srv.st.AddInvite(s.vaultID, m.Invite, m.Sealed, expiresAt, now.UnixMilli()); err != nil {

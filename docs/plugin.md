@@ -12,8 +12,9 @@ services for that vault. Each device should have its own local copy.
 
 ## Install
 
-1. Download `main.js`, `manifest.json`, and `styles.css` from the
-   [latest plugin release](https://github.com/waynehoover/basalt-sync/releases/latest).
+1. Download `main.js`, `manifest.json`, and `styles.css` from the newest stable
+   [plugin release](https://github.com/waynehoover/basalt-sync/releases).
+   Plugin releases use a plain version such as `0.6.2`; skip `server/v…` and `cli/v…`.
 2. Create `<vault>/.obsidian/plugins/basalt-sync/` and put the three files there.
    If you use a custom Obsidian configuration folder, use that folder instead
    of `.obsidian`.
@@ -26,6 +27,16 @@ To upgrade, replace the same three files and reload Obsidian. When a release
 changes the protocol, upgrade the server before its clients.
 
 ## Pairing
+
+<details>
+<summary>See the setup screen</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/pairing-dark.png">
+  <img src="assets/screenshots/pairing.png" alt="Choose to join an existing vault or set up a new one." width="640">
+</picture>
+
+</details>
 
 ### Start your first device
 
@@ -49,14 +60,27 @@ join it with an invite.
 ### Add another device
 
 1. On a paired device, open **Add another device → Create invite**.
-2. On the new device, install Basalt, open its panel, and choose **Paste an invite**.
-3. Choose a device name, paste the invite into **Invite or recovery key**, and
-   press **Pair**.
+2. On your phone, install and enable Basalt, then scan the QR code. Or copy the
+   pairing code and press **Paste an invite** under **Join an existing vault**
+   on the new device.
+3. Choose a device name and press **Pair**. If you copied the invite, paste it
+   into **Invite or recovery key** first.
 4. Keep Obsidian open while the first sync finishes.
 
 An invite works once and expires after ten minutes. If it expires, create a new
 one. If no paired device remains, paste the recovery key into the same field.
-You can have up to eight registered devices.
+There is no fixed device limit. Older servers may still enforce their previous
+limit; update the server to remove it.
+
+<details>
+<summary>See the QR code and pairing code</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/invite-dark.png">
+  <img src="assets/screenshots/invite.png" alt="A QR code and a compact pairing code field with a Copy button." width="640">
+</picture>
+
+</details>
 
 ## What it does
 
@@ -101,8 +125,18 @@ History remains available until the server operator
 
 ## Deleted notes
 
-Open **Recover a deleted note**, select the note, and restore it. A note whose
+Press **Browse deleted**, select the note, and restore it. A note whose
 content has been purged is listed without a restore button.
+
+<details>
+<summary>See deleted notes</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/deleted-dark.png">
+  <img src="assets/screenshots/deleted.png" alt="Deleted notes with individual Restore buttons." width="640">
+</picture>
+
+</details>
 
 A deletion received from another device goes to the system trash, or the
 vault's `.trash` if necessary. If you edit a note while another device deletes
@@ -148,6 +182,23 @@ iOS has not been tested. If a first connection is rejected because of its
 browser origin, the panel shows an origin hint for the server operator; see
 [server connection troubleshooting](server.md#connection-troubleshooting).
 
+## Change the server address
+
+Open **Server → Server address**, enter the new address, and press **Save**.
+Basalt checks the connection using this device's existing pairing before saving.
+Use this when the same server moves to a new hostname or port. Notes and sync
+history are kept. Update the address on each device.
+
+<details>
+<summary>See server settings</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/server-dark.png">
+  <img src="assets/screenshots/server.png" alt="Server connection details above the editable server address." width="640">
+</picture>
+
+</details>
+
 ## Devices, and revoking one
 
 Under **Manage this vault**:
@@ -157,9 +208,18 @@ Under **Manage this vault**:
 - **Devices → Show devices** lists registered devices and outstanding invites.
 - **Revoke** stops a device connecting; **Cancel** invalidates an unused invite.
 
-Review the device ID as well as its name, since names need not be unique.
-Rows marked **never connected** may be left by an interrupted pairing and still
-count toward the eight-device limit.
+When names match, the list shows device IDs to help you tell them apart.
+Rows marked **Never connected** may be left by an interrupted pairing.
+
+<details>
+<summary>See the device list</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/devices-dark.png">
+  <img src="assets/screenshots/devices.png" alt="Two registered devices with last-seen times and access controls." width="640">
+</picture>
+
+</details>
 
 Revocation cannot erase notes or decryption keys already on a device. See
 [what to do after losing a device](security.md#if-a-device-is-lost-or-stolen).

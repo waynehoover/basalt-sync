@@ -90,33 +90,6 @@ const EXPECTED = [
   "status-bar-stopped",
 ];
 
-/**
- * Every row description in a capture, unwrapped.
- *
- * The outline puts a field on one line and continues it under the label's own
- * width, so a description is `desc` plus every line indented exactly eight
- * further columns. Read by that indent rather than by a regex over the whole
- * dump, because the dump's other lines are indented too and a greedy match
- * would swallow the next element and call the description long.
- */
-function descriptions(body: string): string[] {
-  const lines = body.split("\n");
-  const out: string[] = [];
-  for (const [i, line] of lines.entries()) {
-    const head = /^( *)desc {4}(.*)$/.exec(line);
-    if (!head) continue;
-    const indent = " ".repeat(head[1]!.length + 8);
-    let text = head[2]!;
-    for (let j = i + 1; j < lines.length; j++) {
-      const next = lines[j]!;
-      if (!next.startsWith(indent) || next[indent.length] === " ") break;
-      text += ` ${next.slice(indent.length)}`;
-    }
-    out.push(text.replace(/\s+/g, " ").trim());
-  }
-  return out;
-}
-
 describe("the panel walk", () => {
   const of = (name: string): string => {
     const shot = shots.find((s) => s.name === name);
@@ -150,8 +123,8 @@ describe("the panel walk", () => {
     // The question, not a form. Both paths are named and neither field is
     // drawn until one of them is chosen, because a screen holding both said
     // nothing about which half was yours.
-    expect(of("unpaired")).toContain("It is joining a vault I already have");
-    expect(of("unpaired")).toContain("It is the first device on a new vault");
+    expect(of("unpaired")).toContain("Join an existing vault");
+    expect(of("unpaired")).toContain("Set up a new vault");
     expect(of("unpaired")).toContain("Paste an invite");
     expect(of("unpaired")).toContain("Use a setup line");
     // And no fields yet: a field belongs to one of the two answers.
@@ -170,12 +143,11 @@ describe("the panel walk", () => {
     const body = of("paired");
     const rows = [
       // What a panel is opened for, always on screen.
-      "Sync now",
-      "Add another device",
+      "Sync status",
       "Recover a deleted note",
-      // And what is rare, inside the one disclosure, in the order the
-      // paragraphs above the code describe: the list, then the two things
-      // that touch the vault's secret, then leaving.
+      // Pairing, connection settings, then vault management in disclosures.
+      "Add another device",
+      "Server address",
       "Devices",
       "Recovery key",
       "Replace the vault's secret",
@@ -192,9 +164,8 @@ describe("the panel walk", () => {
    * The altitude split, pinned against the same text a reviewer reads.
    *
    * design.md: a thing that matters only when something specific happens
-   * appears in that moment. Four of the seven rows are rare and three of those
-   * four are destructive, so they are inside one `<details>` and the everyday
-   * three are not. This is a layout claim, which is exactly the kind this
+   * appears in that moment. Pairing and management have their own disclosures;
+   * sync and recovery remain visible. This is a layout claim, which is the kind this
    * artifact can hold on its own.
    */
   it("keeps the everyday rows out of the disclosure and the rare ones in", () => {
@@ -203,11 +174,15 @@ describe("the panel walk", () => {
     expect(disclosure, "the panel has no disclosure at all").toBeGreaterThan(-1);
     expect(body).toContain("Manage this vault");
 
-    for (const row of ["Sync now", "Add another device", "Recover a deleted note"]) {
+    const adding = body.indexOf("<details.basalt-add-device>");
+    expect(adding).toBeGreaterThan(-1);
+    expect(adding).toBeLessThan(body.indexOf("<details.basalt-server>"));
+    expect(body.indexOf("name    Add another device")).toBeGreaterThan(adding);
+    for (const row of ["Sync status", "Recover a deleted note"]) {
       expect(
         body.indexOf(`name    ${row}`),
         `"${row}" is behind the disclosure, and it is an everyday row`,
-      ).toBeLessThan(disclosure);
+      ).toBeLessThan(adding);
     }
     for (const row of [
       "Devices",
@@ -222,45 +197,15 @@ describe("the panel walk", () => {
     }
   });
 
-  /**
-   * The cut, measured rather than asserted about.
-   *
-   * Sixteen descriptions carrying five hundred words is what this panel was.
-   * Trimming each to fifteen words made it shorter and no easier to scan,
-   * because the shape was still label-prose-label-prose all the way down. A
-   * row is a label, a `?` and a control now, and no description at all.
-   *
-   * The first exception: a description that *is* the row's content rather than
-   * an explanation of it. A device row is `id · added X · last seen Y` and a
-   * deleted note is `Deleted X, last written on Y`; strip those and the list
-   * says nothing. They are recognised by shape rather than by an allowlist of
-   * rows, so a new list row is covered and a new sentence is not.
-   *
-   * The second is a screen rather than a row: the question an unpaired device
-   * is asked. What made sixteen descriptions unreadable was
-   * label-prose-label-prose down a panel of rows that each do something; the
-   * unpaired panel has two rows and its whole job is to be chosen between, so
-   * the line under each is what somebody reads to choose rather than an
-   * explanation of a control. It cannot be behind a `?` for the same reason
-   * the `?` had to stop being a hover: on a phone a person choosing has no way
-   * to reveal it. Excepted by screen, not by row, so a third row on that
-   * screen is covered and a new sentence anywhere else is not.
-   */
-  it("gives rows a label and a control, and prose only where it is the content", () => {
-    const isContent = (d: string): boolean =>
-      d.includes(" · ") || /^Deleted .*(last written on|nothing to restore)/.test(d);
-    const chooses = (shotName: string): boolean => shotName === "unpaired";
-    const prosey: string[] = [];
-    for (const shot of shots) {
-      if (chooses(shot.name)) continue;
-      for (const desc of descriptions(shot.body)) {
-        if (!isContent(desc)) prosey.push(`${shot.name}: ${desc}`);
-      }
-    }
-    expect(
-      prosey,
-      `these rows still carry a description; put it on the row's ?:\n${prosey.join("\n")}`,
-    ).toEqual([]);
+  it("uses native setting groups without question-mark controls", () => {
+    expect(of("paired")).toContain("setting-group");
+    expect(prose("paired").indexOf("Local cursor")).toBeLessThan(
+      prose("paired").indexOf("name Server address"),
+    );
+    expect(prose("paired").indexOf("Connected to")).toBeLessThan(
+      prose("paired").indexOf("name Server address"),
+    );
+    for (const shot of shots) expect(shot.body).not.toContain("basalt-help");
   });
 
   /**
@@ -294,20 +239,6 @@ describe("the panel walk", () => {
   });
 
   /**
-   * And the prose did not simply vanish: it is on the badges.
-   *
-   * A cut that deleted the sentences instead of moving them would pass the
-   * test above and leave a panel that explains nothing, which is the failure
-   * this pairs with.
-   */
-  it("keeps the explanations, on the badges", () => {
-    const labels = of("paired")
-      .split("\n")
-      .filter((l) => l.includes("@aria-label"));
-    expect(labels.length, "the paired panel has no tooltips at all").toBeGreaterThan(4);
-  });
-
-  /**
    * The four things the cut was not allowed to take, each still on screen.
    *
    * Every one of them was a paragraph somebody argued for, and each is now a
@@ -315,19 +246,19 @@ describe("the panel walk", () => {
    */
   it("still says the four things that were paid for in incidents", () => {
     // Revoking, beside the buttons that do it.
-    expect(prose("devices-listed")).toMatch(/still read any copy of the notes/);
+    expect(prose("devices-revoke-confirming")).toMatch(/can still read copies of your notes/);
     // What revoking does not do, which is the half that used to be overstated:
     // the copy said to replace the vault's secret "too", implying that made a
     // stolen device harmless. It does not. The data key is the same key for
     // the life of the vault and rotation replaces the wrapping around it
     // (I24).
-    expect(prose("devices-listed")).toMatch(/keeps the vault's key either way/);
+    expect(prose("devices-revoke-confirming")).toMatch(/keeps its decryption key/);
     // An invite: one device, once, and it expires.
-    expect(prose("paired")).toMatch(/An invite adds one device, works once, and expires/);
-    expect(prose("devices-listed")).toMatch(/adds one device · expires/);
+    expect(prose("paired")).toMatch(/Create a one-time invite. Expires in 10 minutes/);
+    expect(prose("devices-listed")).toMatch(/Expires /);
     // The recovery key is written down, and is not how a device is added.
-    expect(prose("paired")).toMatch(/Written down, not kept here/);
-    expect(prose("paired")).toMatch(/An invite adds a device/);
+    expect(prose("paired")).toMatch(/Not stored on this device/);
+    expect(prose("fresh-recovery-key")).toMatch(/only way back if every device is lost/);
     // And what a hop with nothing in front of it costs.
     expect(prose("paired")).toMatch(/No TLS in front of this hop/);
     expect(prose("paired")).toMatch(/credential and the note sizes are not/);
@@ -345,7 +276,7 @@ describe("the panel walk", () => {
   it("puts the device rows below the row that offers them", () => {
     const body = of("devices-listed");
     const offer = body.indexOf("name    Devices");
-    const first = body.indexOf("· added ");
+    const first = body.indexOf("Last seen ");
     expect(offer, "there is no Devices row at all").toBeGreaterThan(-1);
     expect(first, "no device rows were drawn").toBeGreaterThan(-1);
     expect(first, `the rows came out above the row that offers them:\n${body}`).toBeGreaterThan(
@@ -354,20 +285,16 @@ describe("the panel walk", () => {
     // The outstanding invite is under the rows for the same reason: a row is
     // a device that was added and an invite is one about to be.
     expect(body.indexOf("Outstanding invite")).toBeGreaterThan(first);
-    // And the summary under all of it says the thing the feature would be
-    // worse than useless without: revoking stops a device connecting and
-    // does not un-read what it already read.
-    expect(prose("devices-listed"), "the list does not say what revoking does not do").toMatch(
-      /still read any copy of the notes/,
-    );
+    expect(prose("devices-listed")).not.toContain("decryption key");
   });
 
-  it("keeps the one-device vault's row buttonless, and says whose job that is", () => {
+  it("keeps the one-device vault's row buttonless without command-line instructions", () => {
     const body = of("devices-listed-last-device");
-    expect(body).toContain("· added ");
+    expect(body).toContain("Last seen ");
     // No revoke here: the last row is the one revocation no device can undo.
     expect(body).not.toContain("button  [Revoke]");
-    expect(prose("devices-listed-last-device")).toContain("--allow-last --recovery-key");
+    expect(prose("devices-listed-last-device")).toContain("1 device");
+    expect(body).not.toContain("--allow-last");
   });
 
   it("says out loud, mid-revocation, that revoking does not un-read anything", () => {
@@ -375,15 +302,15 @@ describe("the panel walk", () => {
     // The first press only relabels and explains. Nothing has happened yet,
     // which is what makes a destructive button in a panel safe to draw.
     expect(body).toContain("button  [Yes, revoke]");
-    expect(prose("devices-revoke-confirming")).toMatch(
-      /cannot connect again until it is added with an invite/,
-    );
+    expect(prose("devices-revoke-confirming")).toMatch(/can still read copies of your notes/);
   });
 
   it("puts the invite and the recovery key on screen where they can be read", () => {
     // Both are strings somebody has to copy off a screen that may have no
     // clipboard behind it, so both have to be rendered and not only offered.
     expect(of("invite-created")).toContain("basalt3i_");
+    expect(of("invite-created")).toContain("Pairing code");
+    expect(of("invite-created")).toContain("button  [Copy]");
     expect(of("fresh-recovery-key")).toContain("basalt3_");
     expect(of("fresh-recovery-key")).toContain("I have written it down");
   });

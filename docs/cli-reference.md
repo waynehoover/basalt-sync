@@ -78,6 +78,9 @@ The recovery key can also list devices and cancel invites when no working
 paired device remains. It does not erase a device's local notes or data key.
 See [Security and privacy](security.md).
 
+In a paired directory, these commands target its saved server address. In an
+unpaired directory, they use the address embedded in the recovery key.
+
 Read-only mode governs ordinary synchronization. It is not an access restriction
 on the server, and an explicit `repair` can upload missing content.
 
@@ -103,7 +106,9 @@ For sync and restore, the overall `outcome.kind` is one of:
 
 Only `synced` and `conflicted` give exit 0. Other command schemas differ; do not
 assume every command returns a sync report. Restore's `restored` flag describes
-local restoration separately from overall `ok`. Sync counters include uploads,
+local restoration separately from overall `ok`; `sent` says whether that copy
+was acknowledged by the server. After `restored: true`, retry `sync` if needed
+instead of restoring again. Sync counters include uploads,
 downloads, merges, conflicts, ignored paths, and changes held back on this device.
 
 ## Files and locking

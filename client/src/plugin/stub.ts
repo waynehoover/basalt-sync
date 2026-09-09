@@ -313,6 +313,7 @@ export class Plugin extends Component {
   >();
   readonly registeredEvents: unknown[] = [];
   readonly settingTabs: PluginSettingTab[] = [];
+  readonly protocolHandlers = new Map<string, (params: Record<string, string>) => void>();
 
   constructor(
     public app: App,
@@ -365,6 +366,13 @@ export class Plugin extends Component {
 
   registerEvent(ref: unknown): void {
     this.registeredEvents.push(ref);
+  }
+
+  registerObsidianProtocolHandler(
+    action: string,
+    handler: (params: Record<string, string>) => void,
+  ): void {
+    this.protocolHandlers.set(action, handler);
   }
 
   registerInterval(id: number): number {
@@ -472,6 +480,8 @@ export class TextComponent {
 }
 
 export class ButtonComponent {
+  readonly buttonEl = new FakeEl("button");
+  disabled = false;
   label = "";
   cta = false;
   warning = false;
@@ -492,7 +502,8 @@ export class ButtonComponent {
     return this;
   }
 
-  setDisabled(): this {
+  setDisabled(disabled: boolean): this {
+    this.disabled = disabled;
     return this;
   }
 
@@ -503,6 +514,7 @@ export class ButtonComponent {
 
   /** Presses the button, and waits for whatever it started. */
   async click(): Promise<void> {
+    if (this.disabled) return;
     await this.onClickHandler?.();
   }
 }
@@ -559,6 +571,7 @@ export class Setting {
   }
 
   setHeading(): this {
+    this.settingEl.addClass("setting-item-heading");
     return this;
   }
 
@@ -574,6 +587,15 @@ export class Setting {
     this.buttons.push(component);
     cb(component);
     return this;
+  }
+}
+
+/** Native row grouping introduced in Obsidian 1.11. */
+export class SettingGroup {
+  readonly listEl: FakeEl;
+
+  constructor(containerEl: FakeEl) {
+    this.listEl = containerEl.createDiv("setting-group").createDiv("setting-items");
   }
 }
 

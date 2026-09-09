@@ -48,7 +48,7 @@ func (h *harness) RegisterDevice(vaultID, deviceID, name, deviceHash string, now
 		// answer be about the vault.
 		vaultHash = strings.Repeat("0", 64)
 	}
-	return h.Store.RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash, 1000, now)
+	return h.Store.RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash, now)
 }
 
 // claimedStore is a vault that has been claimed, which is the only kind a
@@ -605,7 +605,7 @@ func TestConcurrentRegistrationsOfOneIDUnderTwoKeysCannotFlipTheRow(t *testing.T
 				defer wg.Done()
 				<-start
 				errs[i] = h.Store.RegisterDevice(
-					"v1", "contested", names[i], hashes[i], hash1, 1000, int64(1000+i))
+					"v1", "contested", names[i], hashes[i], hash1, int64(1000+i))
 			}(i, h)
 		}
 		close(start)
@@ -845,115 +845,23 @@ func TestRotatingAVaultLeavesEveryDeviceRow(t *testing.T) {
  * The cap, and the credential a registration is authorised by
  * ---------------------------------------------------------------- */
 
-// The eighth device registers and the ninth does not, and the refusal says
-// what a person has to do about it. A cap the caller discovers by being told
-// `internal`, or by watching a device fail to connect, is the connection-count
-// cliff this replaced.
-func TestTheNinthRegistrationIsRefused(t *testing.T) {
+// Adding devices preserves every existing credential and last-seen value.
+func TestRegisteringMoreDevicesPreservesExistingDevices(t *testing.T) {
 	h := claimedStore(t)
-	for i := 0; i < MaxDevices; i++ {
-		id := fmt.Sprintf("device-%d", i)
-		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, MaxDevices, int64(1000+i)); err != nil {
-			t.Fatalf("device %d of %d: %v", i+1, MaxDevices, err)
-		}
-	}
-	err := h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2000)
-	if !errors.Is(err, ErrDeviceLimit) {
-		t.Fatalf("the ninth registration returned %v, want ErrDeviceLimit", err)
-	}
-	if !strings.Contains(err.Error(), "revoke") {
-		t.Fatalf("the refusal does not say what to do about it: %v", err)
-	}
-	if got := ids(t, h, "v1"); len(got) != MaxDevices {
-		t.Fatalf("%d devices after the refusal, want %d", len(got), MaxDevices)
-	}
-	if _, _, ok, _ := h.DeviceByID("v1", "one-too-many"); ok {
-		t.Fatal("the refused registration wrote a row anyway")
-	}
-
-	// Revoking one makes room, which is the whole of what "a managed list"
-	// means: the cap is cleared by a decision, not by waiting.
-	if err := h.RevokeDevice("v1", "device-0", "", false); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if err := h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2001); err != nil {
-		t.Fatalf("registering into the freed slot: %v", err)
-	}
-}
-
-// A full vault says how many of its rows nothing has ever connected under,
-// because those are the ones somebody can reclaim without losing a device.
-//
-// This is the cost of the ordering redemption deliberately has: the row is
-// written before the device redeeming it saves anything, so a pairing that
-// reaches the server and then crashes strands a row rather than a device that
-// believes it is paired. Eight of those, or eight an attacker minted invites
-// for, fill the cap. Nothing here deletes one, for the reason in MaxDevices,
-// so the refusal has to be the thing that points at them: "the vault is full"
-// on its own leaves a person choosing which of their working devices to cut
-// off.
-func TestTheCapRefusalNamesTheRowsThatNeverConnected(t *testing.T) {
-	h := claimedStore(t)
-	for i := 0; i < MaxDevices; i++ {
-		id := fmt.Sprintf("device-%d", i)
-		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, MaxDevices, int64(1000+i)); err != nil {
-			t.Fatalf("device %d: %v", i, err)
-		}
-	}
-	// Five of the eight have connected; three are what a crashed pairing
-	// leaves.
-	for i := 0; i < 5; i++ {
-		if err := h.SawDevice("v1", fmt.Sprintf("device-%d", i), 5000); err != nil {
-			t.Fatalf("last seen on device %d: %v", i, err)
-		}
-	}
-	err := h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2000)
-	if !errors.Is(err, ErrDeviceLimit) {
-		t.Fatalf("the ninth registration returned %v, want ErrDeviceLimit", err)
-	}
-	if !strings.Contains(err.Error(), "3 of them have never connected") {
-		t.Fatalf("the refusal does not count the rows worth reclaiming: %v", err)
-	}
-	if !strings.Contains(err.Error(), "revoke") {
-		t.Fatalf("the refusal does not say what to do about them: %v", err)
-	}
-
-	// And a full vault whose every row is in use does not invent them: a
-	// sentence about crashed pairings on a vault that has had none would send
-	// somebody looking for a row that is not there.
-	for i := 5; i < MaxDevices; i++ {
-		if err := h.SawDevice("v1", fmt.Sprintf("device-%d", i), 6000); err != nil {
-			t.Fatalf("last seen on device %d: %v", i, err)
-		}
-	}
-	err = h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2001)
-	if !errors.Is(err, ErrDeviceLimit) || strings.Contains(err.Error(), "never connected") {
-		t.Fatalf("a vault with no stranded rows was told it had some: %v", err)
-	}
-}
-
-// A vault that somehow already holds more devices than the cap keeps every one
-// of them, and every one goes on being a device. Nothing here deletes a row to
-// get back under: the only way to enforce a cap retroactively is to pick one of
-// somebody's devices and stop it working, and a device that cannot connect
-// looks from the outside exactly like a vault that has lost notes.
-func TestAVaultOverTheCapKeepsEveryDeviceAndGainsNoMore(t *testing.T) {
-	h := claimedStore(t)
-	// Written with a higher cap, which is how a directory from a build with a
-	// different number, or a hand-edited database, arrives.
-	const over = MaxDevices + 3
+	// Seed existing registrations before adding another.
+	const over = 24
 	for i := 0; i < over; i++ {
 		id := fmt.Sprintf("device-%d", i)
-		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, over, int64(1000+i)); err != nil {
+		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, int64(1000+i)); err != nil {
 			t.Fatalf("seeding device %d: %v", i, err)
 		}
 	}
-	if err := h.Store.RegisterDevice("v1", "another", "phone", hashB, hash1, MaxDevices, 2000); !errors.Is(err, ErrDeviceLimit) {
-		t.Fatalf("an over-full vault answered %v, want ErrDeviceLimit", err)
+	if err := h.Store.RegisterDevice("v1", "another", "phone", hashB, hash1, 2000); err != nil {
+		t.Fatalf("adding another device: %v", err)
 	}
 	got := ids(t, h, "v1")
-	if len(got) != over {
-		t.Fatalf("%d devices after the refusal, want the %d that were there", len(got), over)
+	if len(got) != over+1 {
+		t.Fatalf("%d devices after the refusal, want %d", len(got), over+1)
 	}
 	for i := 0; i < over; i++ {
 		id := fmt.Sprintf("device-%d", i)
@@ -963,92 +871,6 @@ func TestAVaultOverTheCapKeepsEveryDeviceAndGainsNoMore(t *testing.T) {
 		if err := h.SawDevice("v1", id, 5000); err != nil {
 			t.Fatalf("%s could not connect: %v", id, err)
 		}
-	}
-}
-
-// Counting and inserting are one statement, so two callers racing for the last
-// slot produce one row and one refusal. A count read before the insert is a
-// count that was true a moment ago, and both callers see room.
-//
-// Through two Store handles on one directory, because that is the shape the
-// guarantee has to survive, and the same reason TestConcurrentRevokesCannotEmptyTheVault
-// gives: writeMu makes a read-then-write atomic within one process, so a
-// single-handle version of this passes against the broken implementation. It
-// was written single-handle first and it did pass, which is the whole of why
-// this comment is here. The store is opened by more than one process, since
-// `basaltd backup` and `basaltd purge` run against a live server's directory,
-// so the atomicity has to be in the SQL and the test has to be able to see it.
-//
-// Against the read-then-write version this fails as SQLITE_BUSY rather than as
-// an over-filled vault: a transaction that reads before it writes has to
-// upgrade its lock, and the second writer cannot. That is the same defect
-// arriving as a refusal instead of as a wrong answer, which is the safe
-// direction and still a failure. What the passing version pins is the exact
-// outcome: one registered, one refused with ErrDeviceLimit, every time.
-func TestConcurrentRegistrationsCannotExceedTheCap(t *testing.T) {
-	const cap = 4
-	overfilled := 0
-	for attempt := 0; attempt < 25; attempt++ {
-		dir := t.TempDir()
-		one := openAt(t, dir)
-		if err := one.EnsureVault("v1", 1000); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := one.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
-			t.Fatal(err)
-		}
-		for i := 0; i < cap-1; i++ {
-			id := fmt.Sprintf("seated-%d", i)
-			if err := one.Store.RegisterDevice("v1", id, id, hashA, hash1, cap, int64(1000+i)); err != nil {
-				t.Fatalf("seeding: %v", err)
-			}
-		}
-		two := openAt(t, dir)
-
-		errs := make([]error, 2)
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		for i, h := range []*harness{one, two} {
-			wg.Add(1)
-			go func(i int, h *harness) {
-				defer wg.Done()
-				<-start
-				errs[i] = h.Store.RegisterDevice("v1", fmt.Sprintf("racer-%d", i),
-					"contested", hashB, hash1, cap, int64(2000+i))
-			}(i, h)
-		}
-		close(start)
-		wg.Wait()
-
-		seated := ids(t, one, "v1")
-		if len(seated) != cap {
-			overfilled++
-			t.Errorf("attempt %d: %d devices after two racing registrations, want the cap of %d: %v "+
-				"(errors: %v, %v)", attempt, len(seated), cap, seated, errs[0], errs[1])
-		}
-		won, refused := 0, 0
-		for _, err := range errs {
-			switch {
-			case err == nil:
-				won++
-			case errors.Is(err, ErrDeviceLimit):
-				refused++
-			default:
-				t.Fatalf("attempt %d: %v, want nil or ErrDeviceLimit", attempt, err)
-			}
-		}
-		if won != 1 || refused != 1 {
-			t.Errorf("attempt %d: %d registered and %d refused, want one of each", attempt, won, refused)
-		}
-		if err := one.Close(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
-		if err := two.Close(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
-	}
-	if overfilled > 0 {
-		t.Fatalf("%d attempts left the vault over its cap", overfilled)
 	}
 }
 
@@ -1063,13 +885,13 @@ func TestConcurrentRegistrationsCannotExceedTheCap(t *testing.T) {
 // touch, because rotating deliberately leaves every device row alone.
 func TestRegisteringUnderARetiredVaultCredentialIsRefused(t *testing.T) {
 	h := claimedStore(t)
-	if err := h.Store.RegisterDevice("v1", "before", "laptop", hashA, hash1, MaxDevices, 1000); err != nil {
+	if err := h.Store.RegisterDevice("v1", "before", "laptop", hashA, hash1, 1000); err != nil {
 		t.Fatalf("the registration before the rotation: %v", err)
 	}
 	if err := h.Rotate("v1", hash1, hash2, wrapped2); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	err := h.Store.RegisterDevice("v1", "after", "the leak", hashB, hash1, MaxDevices, 2000)
+	err := h.Store.RegisterDevice("v1", "after", "the leak", hashB, hash1, 2000)
 	if !errors.Is(err, ErrRotated) {
 		t.Fatalf("a registration under the retired credential returned %v, want ErrRotated", err)
 	}
@@ -1082,7 +904,7 @@ func TestRegisteringUnderARetiredVaultCredentialIsRefused(t *testing.T) {
 		t.Fatal("the rotation removed a device row")
 	}
 	// The new credential registers.
-	if err := h.Store.RegisterDevice("v1", "after", "phone", hashB, hash2, MaxDevices, 3000); err != nil {
+	if err := h.Store.RegisterDevice("v1", "after", "phone", hashB, hash2, 3000); err != nil {
 		t.Fatalf("registering under the new credential: %v", err)
 	}
 }
@@ -1134,7 +956,7 @@ func TestRevokingUnderARetiredVaultCredentialIsRefused(t *testing.T) {
 func TestRegisteringNamesTheCredentialItIsAuthorisedBy(t *testing.T) {
 	h := claimedStore(t)
 	for _, bad := range []string{"", "not-hex", strings.Repeat("a", 63)} {
-		err := h.Store.RegisterDevice("v1", "device-one", "laptop", hashA, bad, MaxDevices, 1000)
+		err := h.Store.RegisterDevice("v1", "device-one", "laptop", hashA, bad, 1000)
 		if !errors.Is(err, ErrBadEntry) {
 			t.Fatalf("vault hash %q returned %v, want ErrBadEntry", bad, err)
 		}

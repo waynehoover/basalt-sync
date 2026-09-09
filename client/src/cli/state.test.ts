@@ -13,6 +13,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { cleanupBinary, removeTree, serverBinary, TestServer, until } from "../core/test-server.ts";
@@ -69,6 +70,28 @@ async function cli(...argv: string[]): Promise<Run> {
   r.code = await run(argv, io);
   return r;
 }
+
+it("pairs using the documented standard-input form without exposing the invite in arguments", async () => {
+  const a = await paired();
+  const issued = await cli("invite", "--dir", a, "--json");
+  expect(issued.code, issued.all).toBe(0);
+  const b = await vaultDir("stdin");
+  const input = Readable.from([Buffer.from(String(issued.json()["invite"]) + "\n")]);
+  const stdin = vi.spyOn(process, "stdin", "get").mockReturnValue(input as typeof process.stdin);
+  try {
+    const paired = await cli("pair", "-", "--dir", b, "--read-only", "--json");
+    expect(paired.code, paired.all).toBe(0);
+    expect((await loadConfig(b))?.readOnly).toBe(true);
+    await writeFile(join(a, "From stdin.md"), "The invite arrived through a private pipe.\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+    expect(await readFile(join(b, "From stdin.md"), "utf8")).toBe(
+      "The invite arrived through a private pipe.\n",
+    );
+  } finally {
+    stdin.mockRestore();
+  }
+}, 60_000);
 
 beforeAll(async () => {
   await serverBinary();
@@ -562,6 +585,33 @@ describe("the vault lock", () => {
  * not a clean vault and `sync` did not (RR5).
  */
 describe("the two ways of asking how a vault is", () => {
+  it("includes the live recovery inventory in watcher reports", async () => {
+    const dir = await paired("watch-recovery");
+    await writeFile(join(dir, "note.md"), "the ordinary note\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    const at = join(STATE_DIR, "tmp", "preserved.aaaa1111");
+    await mkdir(join(dir, STATE_DIR, "tmp"), { recursive: true });
+    await writeFile(join(dir, at), "the retained edit\n");
+    await writeFile(join(dir, STATE_DIR, "displaced.log"), '{"at":"unfinished');
+    const watcher = basalt("sync", "--watch", "--dir", dir, "--json");
+    let output = "";
+    watcher.stdout!.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+    });
+    await until("the watcher's first report", () => output.includes("\n"), 30_000);
+    const first = JSON.parse(output.split("\n")[0]!) as {
+      ok: boolean;
+      outcome: { kind: string };
+      stranded: string[];
+      recoveryUnknown: string | null;
+    };
+    expect(first.ok, output).toBe(false);
+    expect(first.outcome.kind).toBe("recoveryUnknown");
+    expect(first.stranded).toContain(at);
+    expect(first.recoveryUnknown).toMatch(/cannot be read/);
+    expect(await readFile(join(dir, at), "utf8")).toBe("the retained edit\n");
+  }, 60_000);
+
   it("agree when the record of what is waiting cannot be read", async () => {
     const dir = await paired("agree");
     await writeFile(join(dir, "note.md"), "a note\n");
@@ -1061,7 +1111,7 @@ describe("a vault that was started and never joined", () => {
    * the starting one. A registration commits and its credential does not reach
    * the disk, so the vault has a row nothing holds the key to. That is the
    * orphan the invite path already leaves when a reply is lost, and the
-   * refusal has to name it: an unnamed row is one of eight slots nobody can
+   * refusal has to name it: an unnamed registration is one nobody can
    * account for later.
    */
   it("names the row it left behind when a pairing could not save its credential", async () => {
@@ -1092,8 +1142,8 @@ describe("a vault that was started and never joined", () => {
    * credential. When that save fails it printed the recovery key, which is
    * right, and said "unlink here, and pair with that key", which is right and
    * incomplete: the row is already on the server and nothing holds its key, so
-   * pairing again registers a *second* row and each retry silently spends one
-   * of the vault's eight slots. `pair` said so and `init` did not, which is
+   * pairing again registers a *second* row without explaining the first.
+   * `pair` said so and `init` did not, which is
    * what one shared counsellor is for; see `adviseAfterRegistering`.
    *
    * Walked to the end rather than asserted as a sentence (rule 11): the row is

@@ -26,15 +26,7 @@ import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import {
-  App,
-  type FakeEl,
-  Plugin as StubPlugin,
-  built,
-  modals,
-  notices,
-  resetStub,
-} from "./stub.ts";
+import { App, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
 import BasaltPlugin from "./main.ts";
 
 /**
@@ -146,25 +138,6 @@ async function started(): Promise<{ plugin: Testable; app: App; key: string }> {
 }
 
 /**
- * Every `?` tooltip in the panel that is open, joined.
- *
- * The panel's descriptions are one line each, and the detail they used to
- * carry is on an `aria-label` beside the section it belongs to, which is what
- * Obsidian draws as a hover tooltip.
- */
-const tooltips = (): string => {
-  const found: string[] = [];
-  const walk = (el: FakeEl): void => {
-    const label = el.attributes.get("aria-label");
-    if (label !== undefined) found.push(label);
-    for (const child of el.children) walk(child);
-  };
-  const modal = modals.at(-1);
-  if (modal) walk(modal.contentEl as unknown as FakeEl);
-  return found.join("\n");
-};
-
-/**
  * Waits for a promise that is supposed to settle, and says so when it does not.
  *
  * The failure being guarded is a wait left pending, so the symptom is a test
@@ -203,16 +176,9 @@ describe("replacing the vault's secret from the panel", () => {
     plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Replace the vault's secret")!;
     expect(row, "the panel offers no way to retire a leaked secret").toBeDefined();
-    // The copy has to say the two things a person would otherwise get wrong:
-    // that this needs the key they wrote down, and that every device keeps
-    // syncing, which is the opposite of what people expect a key change to do.
-    // The first is short enough for the row's one line. The other two followed the cut on
-    // to the `?` beside the disclosure this row sits in, which is where the
-    // panel keeps the detail a line cannot carry.
-    expect(tooltips()).toMatch(/Paste the vault's current recovery key/);
-    expect(tooltips()).toMatch(/keeps every device syncing/i);
-    expect(tooltips()).toMatch(/cannot un-read/i);
-    // The field, and the button that reads it, are separate rows.
+    expect(row.desc).toMatch(/Existing devices keep syncing/);
+    expect(row.texts[0]!.placeholder).toBe("Current recovery key");
+    // The field and its action share a native settings row.
     const field = row.texts[0]!;
     const button = built.find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!
       .buttons[0]!;
@@ -221,6 +187,9 @@ describe("replacing the vault's secret from the panel", () => {
     // Nothing happens without the key, and nothing is said that sounds like
     // it did.
     await button.click();
+    expect(modals.at(-1)!.contentEl.allText()).toContain(
+      "Paste the vault's current recovery key first.",
+    );
     expect(notices.map((n) => n.message).join("\n")).not.toMatch(/new secret/);
 
     field.setValue(oldKey);
@@ -230,9 +199,7 @@ describe("replacing the vault's secret from the panel", () => {
     // nobody can get back into. So the acknowledgement comes first and the
     // await comes after it, as the pairing's does.
     const rotating = button.click();
-    await until("the new key to be shown", () =>
-      modals.at(-1)!.contentEl.allText().includes("Write this down"),
-    );
+    await until("the new key to be shown", () => built.some((s) => s.name === "Write this down"));
     const shown = modals
       .at(-1)!
       .contentEl.allText()
@@ -291,9 +258,7 @@ describe("replacing the vault's secret from the panel", () => {
     const clicking = built
       .find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!
       .buttons[0]!.click();
-    await until("the new key to be shown", () =>
-      modals.at(-1)!.contentEl.allText().includes("Write this down"),
-    );
+    await until("the new key to be shown", () => built.some((s) => s.name === "Write this down"));
 
     modals.at(-1)!.close();
     // Settles rather than hanging on a wait nothing will ever answer. Bounded,

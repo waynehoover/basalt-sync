@@ -699,40 +699,41 @@ export class Client {
    * no recovery tool.
    */
   async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
-    if (version.deleted) {
-      throw new Error(
-        `version ${version.uid} of ${version.path} is the deletion itself, not a version to restore`,
-      );
-    }
-    if (version.folder) {
-      const at = to ?? version.path;
-      await this.opts.vault.mkdir(at);
-      return { path: at, bytes: 0 };
-    }
+    // Keep both the fetch and the local publication in the queue. Closing a
+    // client must wait for its last filesystem write before the caller can
+    // unlink, release the CLI lock, or start another writer on this vault.
+    return this.serial(async () => {
+      if (this.closing) throw new Error("this client is closed");
+      if (version.deleted) {
+        throw new Error(
+          `version ${version.uid} of ${version.path} is the deletion itself, not a version to restore`,
+        );
+      }
+      if (version.folder) {
+        const at = to ?? version.path;
+        await this.opts.vault.mkdir(at);
+        return { path: at, bytes: 0 };
+      }
 
-    // Queued like a pass, because reassembling a version is several
-    // requests and a sync starting in the middle of them would collide. The
-    // chunk list the signed history entry named is what `get` must answer
-    // with; anything else is not this version.
-    const content = await this.serial(() =>
-      this.engine.contentOf(version.uid, version.contentId, version.size),
-    );
-    const wanted = to ?? version.path;
-    const vault = this.opts.vault;
-    const exists = (p: string) => vault.exists(p);
-    const times = { mtime: version.mtime, ctime: version.ctime };
-    // Never over what is there, and never in the gap between looking and
-    // writing either. The copy's name is numbered past whatever exists:
-    // restoring the same version twice is ordinary, and the second copy
-    // landing on the first replaced the one thing a restore gives back.
-    const at = await placeBeside(
-      async () =>
-        (await exists(wanted)) ? firstFreeName(restoredCopyPath(wanted, version), exists) : wanted,
-      content,
-      times,
-      vault,
-    );
-    return { path: at, bytes: content.length };
+      // The signed history entry's chunk list is what `get` must answer with.
+      const content = await this.engine.contentOf(version.uid, version.contentId, version.size);
+      const wanted = to ?? version.path;
+      const vault = this.opts.vault;
+      const exists = (p: string) => vault.exists(p);
+      const times = { mtime: version.mtime, ctime: version.ctime };
+      // Never over what is there, and never in the gap between looking and
+      // writing either. Repeated restores get distinct copy names.
+      const at = await placeBeside(
+        async () =>
+          (await exists(wanted))
+            ? firstFreeName(restoredCopyPath(wanted, version), exists)
+            : wanted,
+        content,
+        times,
+        vault,
+      );
+      return { path: at, bytes: content.length };
+    });
   }
 
   /**
@@ -1647,8 +1648,8 @@ export async function whatTheDiskHolds(
  * be missing a sentence. `init`'s copy was: it printed the recovery key and
  * said "unlink here, and pair with that key", which is right and incomplete.
  * A registration may already have committed, so pairing again registers a
- * *second* row, and each retry silently spends one of the vault's eight device
- * slots. `pair`'s copy said so; `init`'s did not.
+ * *second* row, leaving an unused registration behind. `pair`'s copy said so;
+ * `init`'s did not.
  *
  * What each state is owed:
  *
@@ -1711,8 +1712,7 @@ export function adviseAfterRegistering(what: {
             : "Unlink this vault and pair again with the recovery key on the panel";
       return (
         `A device row ${registered ? "was" : "may have been"} registered with the vault and its ` +
-        `credential is not here, so it is a row nothing can connect as, and it holds one of the ` +
-        `vault's device slots until somebody takes it off. ${wayBack}, then ` +
+        `credential is not here, so nothing can connect as that device. ${wayBack}, then ` +
         (cli
           ? `basalt devices lists that row as never connected and basalt revoke ID removes it.`
           : `the device list shows that row as never connected, with Revoke beside it.`)
@@ -1728,13 +1728,13 @@ export function adviseAfterRegistering(what: {
  * sit through its whole backlog twice, once here and once when the command it
  * was actually running connects.
  */
-async function proveDeviceConnects(
+export async function proveDeviceConnects(
   config: DeviceConfig,
   opts: {
     timeoutMs?: number | undefined;
     socketFactory?: ((url: string) => SocketLike) | undefined;
     log?: ((message: string, ...rest: unknown[]) => void) | undefined;
-  },
+  } = {},
 ): Promise<void> {
   const { deviceId, deviceSecret } = deviceCredential(config);
   const transport = new Transport(config.url, {

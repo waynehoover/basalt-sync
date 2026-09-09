@@ -93,7 +93,7 @@ const (
 	CodeProtoState = "protostate"
 	// CodeInternal is a server-side fault. The put is not committed.
 	CodeInternal = "internal"
-	// CodeBusy is the vault's device limit, or a server that is shutting down.
+	// CodeBusy is pre-authentication admission pressure or server shutdown.
 	// Honest refusal beats degrading. It is the one refusal a client should
 	// simply wait out, which is what `retryable` and `retryAfterMs` say.
 	CodeBusy = "busy"
@@ -105,16 +105,8 @@ const (
 	// with both sides reporting success. It is refused instead, because a
 	// refusal is reversible and silent divergence is not.
 	CodeCursor = "cursor"
-	// CodeFull is a registration refused because the vault already holds as
-	// many devices as it may.
-	//
-	// Not `busy`, although both are limits. `busy` means come back later and
-	// carries a hint saying how much later, and this never becomes true by
-	// waiting: somebody has to revoke a device. A client that treated it as
-	// `busy` would retry a registration that can only ever be refused, which
-	// is the hot loop `retryable` exists to prevent. The session continues,
-	// because nothing was written and a registrar with a second device to
-	// register may still register it.
+	// CodeFull is retained for older servers that capped device registrations.
+	// Current servers do not emit it. It remains non-retryable.
 	CodeFull = "full"
 	// CodeRotated is a rotate that lost the race: the vault's credential is no
 	// longer the one this session authenticated under, because another device
@@ -414,9 +406,8 @@ type Ready struct {
 // a backlog behind it, and a reply that promised a catch-up nobody would send
 // is how a client comes to wait for a frame that is not coming.
 //
-// MaxDevices is here for the same reason every ceiling is in `ready`: a client
-// that knows the cap before it registers can say "revoke one first" instead of
-// discovering the cap by being refused.
+// MaxDevices is retained for protocol-5 clients. Zero means no device cap;
+// older servers may advertise a positive limit.
 type Registrar struct {
 	Res           string `json:"res"` // "registrar"
 	ID            int64  `json:"id,omitempty"`
@@ -738,8 +729,8 @@ func Error(code, msg string) Err {
 // request cannot. It is the "retryable" column of the error table in
 // docs/protocol.md, and the two are kept in step by hand.
 //
-// Only three codes are transient. `busy` is a device limit or a shutdown, both
-// of which pass. `nospace` is a full disk, which an operator clears. `internal`
+// Only three codes are transient. `busy` is admission pressure or a shutdown.
+// `nospace` is a full disk, which an operator clears. `internal`
 // is a server fault the put did not survive, and the server is the thing that
 // can be fixed. Everything else names a fact about the request or the
 // credentials that a retry does not change, and a watching client that

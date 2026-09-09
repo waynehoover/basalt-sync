@@ -228,3 +228,22 @@ func TestInspectionChangesNothingOnDisk(t *testing.T) {
 			len(before), len(after))
 	}
 }
+
+func TestInspectionDoesNotRecreateMissingChunkStorage(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	// A missing mount or incomplete restore is a fault to inspect, not an
+	// instruction for a diagnostic command to create replacement storage.
+	if err := os.Remove(chunkDir); err != nil {
+		t.Fatal(err)
+	}
+	st, err := OpenForInspection(dbPath, chunkDir)
+	if st != nil {
+		_ = st.Close()
+	}
+	if _, statErr := os.Stat(chunkDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("inspection recreated the missing chunk directory: %v", statErr)
+	}
+	if err == nil {
+		t.Fatal("inspection accepted missing chunk storage")
+	}
+}

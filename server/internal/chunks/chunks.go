@@ -141,11 +141,34 @@ type Store struct {
 // than being checked by callers so that there is exactly one place a body's
 // size is bounded, and no path into Put that forgets to bound it.
 func New(dir string, max int64) (*Store, error) {
+	return open(dir, max, true)
+}
+
+// OpenExisting opens an existing chunk directory without creating storage.
+// Diagnostic commands use it so a missing mount stays missing and visible.
+func OpenExisting(dir string, max int64) (*Store, error) {
+	return open(dir, max, false)
+}
+
+func open(dir string, max int64, create bool) (*Store, error) {
 	if max <= 0 {
 		return nil, fmt.Errorf("chunks: max must be positive, got %d", max)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
+	if create {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	} else {
+		info, err := os.Stat(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("chunk storage is missing at %s: %w", dir, err)
+			}
+			return nil, err
+		}
+		if !info.IsDir() {
+			return nil, fmt.Errorf("chunks: %s is not a directory", dir)
+		}
 	}
 	return &Store{dir: dir, max: max, sync: fsync.Dir, write: writeAll}, nil
 }

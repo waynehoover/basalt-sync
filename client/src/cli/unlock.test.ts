@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { STATE_DIR } from "./config.ts";
+import { run } from "./cli.ts";
 import { alive, lockPath, lockVault, midBreak, unlockVault, type Unlocked } from "./lock.ts";
 
 const dirs: string[] = [];
@@ -54,6 +55,41 @@ const stale = () => ({
 });
 
 describe("unlock", () => {
+  it("returns a failure in JSON when an unlock finds competing holders", async () => {
+    const dir = await vault();
+    await put(dir, stale());
+    midBreak.beforeTaking = async () => {
+      await put(dir, {
+        pid: process.pid,
+        host: hostname(),
+        command: "the holder that returned",
+        since: Date.now(),
+        token: "returned",
+      });
+    };
+    let release: (() => Promise<void>) | undefined;
+    midBreak.taken = async () => {
+      release = await lockVault(dir, "the competing holder");
+    };
+    const out: string[] = [];
+    try {
+      const code = await run(["unlock", "--dir", dir, "--json"], {
+        out: (line) => out.push(line),
+        err: (line) => out.push(line),
+      });
+      const result = JSON.parse(out.join("\n")) as { ok: boolean; did: string; why: string };
+      expect(result.did).toBe("contested");
+      expect(result.why).toContain("stop both");
+      expect(result.ok).toBe(false);
+      expect(code).toBe(1);
+      expect(JSON.parse(await readFile(lockPath(dir), "utf8")).command).toBe(
+        "the competing holder",
+      );
+    } finally {
+      await release?.();
+    }
+  });
+
   it("says so when there is nothing to clear", async () => {
     const out = await unlockVault(await vault());
     expect(out.did).toBe("nothing");

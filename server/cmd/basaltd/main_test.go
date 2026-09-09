@@ -231,7 +231,7 @@ func registryOn(t *testing.T, dir string) {
 		t.Fatalf("claim: %v", err)
 	}
 	if err := st.RegisterDevice("default", "alfa", "laptop", strings.Repeat("b", 64),
-		vaultHash, 8, 1000); err != nil {
+		vaultHash, 1000); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := st.AddInvite("default", "AAAAAAAAAAAAAAAAAAAAAA", testWrapped,
@@ -1454,8 +1454,11 @@ func TestPurgeRefusesABackupWithNoChunkBodies(t *testing.T) {
 	if err == nil {
 		t.Fatalf("purge accepted a backup holding no bodies:\n%s", out)
 	}
-	if !strings.Contains(err.Error(), "not its contents") {
+	if !strings.Contains(err.Error(), "chunk storage is missing") {
 		t.Fatalf("the refusal does not say what is wrong: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(backup, "chunks")); !os.IsNotExist(statErr) {
+		t.Fatalf("checking the backup recreated its missing chunk directory: %v", statErr)
 	}
 }
 

@@ -93,31 +93,6 @@ const (
 	// refusing the second registration, not the length.
 	MaxDeviceIDLen = 64
 
-	// MaxDevices caps how many devices one vault may have registered at once.
-	//
-	// The same eight as server.DefaultMaxPeers, deliberately, and a test pins
-	// the two together: a vault that may register eight devices must be able
-	// to have all eight connected, or the eighth would be refused with `busy`
-	// for ever and nothing would say why. They are separate constants because
-	// they bound different things, a stored list and a live fan-out, and the
-	// connection limit is an operator's to lower.
-	//
-	// The ninth registration is refused with ErrDeviceLimit. That is the whole
-	// of what "a managed list rather than a connection-count cliff" means: the
-	// refusal names a person's decision, revoke a device you no longer use,
-	// instead of arriving as a connection that mysteriously will not open.
-	//
-	// A vault that somehow already holds more than this keeps every row and
-	// every one of those devices goes on connecting and syncing. Nothing here
-	// deletes a row to get back under the cap. The cap bounds growth; it is
-	// not an invariant the store enforces retroactively, because the only way
-	// to enforce it retroactively is for the server to choose which of
-	// somebody's devices stops working, silently, and a device that cannot
-	// connect looks from the outside exactly like a vault that has lost notes.
-	// Refusing the next registration is visible and reversible; a delete is
-	// neither (rule 3, and the first rule).
-	MaxDevices = 8
-
 	// MaxVaultLen bounds a vault id, for the same reason as MaxDeviceLen and
 	// one more: it lands in log lines on every refusal, and it was unbounded
 	// (S24). It is hashed before it touches the filesystem, so the bound is
@@ -217,13 +192,6 @@ var (
 	// distinct so that a session can tell "you were revoked while connected"
 	// from "the database is broken", and stop rather than retry.
 	ErrUnknownDevice = errors.New("no such device on this vault")
-
-	// ErrDeviceLimit is a registration refused because the vault already holds
-	// MaxDevices devices. Distinct from ErrDeviceExists because the answer is
-	// different: that one means "you already did this", this one means "revoke
-	// something first". Never retryable, and never resolved by waiting, which
-	// is why it does not become `busy` on the wire.
-	ErrDeviceLimit = errors.New("this vault already has as many devices as it may have")
 
 	// ErrLastDevice is a revocation that would leave a vault with no devices
 	// at all. Reachable only by the recovery key after that, which is a real
@@ -2487,9 +2455,8 @@ var betweenSpendAndRegister func() error
 // **Neither half survives the other failing.** An invite spent with no row
 // behind it is an invite somebody has to notice is gone and reissue; a row
 // under an invite that is still live is a device registered twice over. Both
-// writes are in one transaction, so a failure anywhere between them, the cap,
-// a duplicate id, or the process dying, rolls the spend back with it and the
-// string in somebody's hand still works. TestARedeemThatCannotRegisterLeaves
+// writes are in one transaction. A failure, duplicate id, or process death
+// rolls the spend back too, so the string in somebody's hand still works. TestARedeemThatCannotRegisterLeaves
 // TheInviteUnspent and TestACrashBetweenSpendingAnInviteAndRegisteringSpends
 // Neither.
 //
@@ -2505,16 +2472,13 @@ var betweenSpendAndRegister func() error
 // vault in its own transaction, so an invite issued before a rotation cannot
 // be redeemed after one. The guard is the same guard, one table over.
 // TestARedeemRacingARotationCannotWin.
-func (s *Store) RedeemInviteFor(vaultID, invite, deviceID, name, deviceHash string, max int, now int64) (string, error) {
+func (s *Store) RedeemInviteFor(vaultID, invite, deviceID, name, deviceHash string, now int64) (string, error) {
 	if err := checkDeviceFields(deviceID, name, deviceHash); err != nil {
 		return "", err
 	}
 	if !ValidInvite(invite) {
 		// The same error an unknown one gets: see ErrNoInvite.
 		return "", fmt.Errorf("%w: vault %q", ErrNoInvite, vaultID)
-	}
-	if max <= 0 {
-		max = MaxDevices
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -2530,7 +2494,7 @@ func (s *Store) RedeemInviteFor(vaultID, invite, deviceID, name, deviceHash stri
 				return err
 			}
 		}
-		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, "", max, now)
+		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, "", now)
 	})
 	if err != nil {
 		return "", err
@@ -2954,9 +2918,6 @@ type Device struct {
 // the ErrRotated incident again, in the one place where the prize is a
 // credential that survives the rotation.
 //
-// max is what the vault may hold, MaxDevices when it is not positive. Over it
-// is ErrDeviceLimit; see MaxDevices for what happens to a vault already over.
-//
 // A device id this vault already holds is ErrDeviceExists, not a constraint
 // error. AddInvite's story is the precedent: a bare insert surfaced as
 // `internal`, which is retryable, so a device that retried after a lost reply
@@ -2965,7 +2926,7 @@ type Device struct {
 // The insert itself is insertDeviceTx, shared with the other way a device
 // comes to exist: RedeemInviteFor, where the authority is an invite rather
 // than the vault's credential.
-func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash string, max int, now int64) error {
+func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash string, now int64) error {
 	if err := checkDeviceFields(deviceID, name, deviceHash); err != nil {
 		return err
 	}
@@ -2975,15 +2936,12 @@ func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash st
 		return fmt.Errorf("%w: registering a device names the vault credential it is authorised by, "+
 			"which is a 64 character hex digest", ErrBadEntry)
 	}
-	if max <= 0 {
-		max = MaxDevices
-	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	return s.inTx(func(tx *sql.Tx) error {
-		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, vaultHash, max, now)
+		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, vaultHash, now)
 	})
 }
 
@@ -3016,28 +2974,23 @@ func checkDeviceFields(deviceID, name, deviceHash string) error {
 // claimed: a vault with no root behind it has no data key for a device to be
 // handed, and an invite cannot exist on one because AddInvite refuses it.
 //
-// Every condition is in the one statement rather than read first and acted on
-// second, because the store is opened by more than one process and a count
-// read outside the insert is a count that was true a moment ago: eight
-// goroutines each seeing seven rows would each insert an eighth.
-// TestConcurrentRegistrationsCannotExceedTheCap is the one that fails against
-// a read-then-write version.
+// The credential check and insert share one statement, so a concurrent root
+// rotation cannot authorise a registration with a retired credential.
 //
 // Rule 4: the row count is checked rather than the absence of an error,
 // because an insert whose WHERE is false is a successful statement that wrote
 // nothing. Which of the refusals it was is then read inside the same
 // transaction, so the answer describes the rows the insert was actually
 // refused against, the way RevokeDevice's does.
-func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash string, max int, now int64) error {
+func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash string, now int64) error {
 	res, err := tx.Exec(
 		`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
 		 SELECT ?, ?, ?, ?, ?, 0
 		  WHERE EXISTS (SELECT 1 FROM vaults
 		                 WHERE vault_id = ? AND auth_hash != '' AND (? = '' OR auth_hash = ?))
-		    AND (SELECT COUNT(*) FROM devices WHERE vault_id = ?) < ?
 		 ON CONFLICT(vault_id, device_id) DO NOTHING`,
 		vaultID, deviceID, name, deviceHash, now,
-		vaultID, vaultHash, vaultHash, vaultID, max)
+		vaultID, vaultHash, vaultHash)
 	if err != nil {
 		return err
 	}
@@ -3072,31 +3025,7 @@ func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash s
 	case !errors.Is(err, sql.ErrNoRows):
 		return err
 	}
-	// The cap, and with it the count of rows nothing has ever connected under,
-	// because those are the ones a person can reclaim without losing anything.
-	//
-	// A redemption registers the row before the device redeeming it saves
-	// anything, deliberately: the alternative strands a device that believes
-	// it is paired. What that ordering costs is a row left behind whenever a
-	// pairing reaches the server and then crashes, and eight of those, or
-	// eight an attacker minted invites for, fill the cap and refuse every
-	// registration after them. Nothing here deletes one, for the reason in
-	// MaxDevices; what the refusal can do is name the rows worth looking at,
-	// rather than say the vault is full and leave somebody guessing which of
-	// their devices to cut off. TestTheCapRefusalNamesTheRowsThatNeverConnected.
-	var count, never int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*), COALESCE(SUM(last_seen = 0), 0) FROM devices WHERE vault_id = ?`,
-		vaultID).Scan(&count, &never); err != nil {
-		return err
-	}
-	if never > 0 {
-		return fmt.Errorf("%w: vault %q has %d of at most %d devices, and %d of them have never "+
-			"connected, which is what a pairing that crashed leaves behind; revoke one of those, "+
-			"or one you no longer use", ErrDeviceLimit, vaultID, count, max, never)
-	}
-	return fmt.Errorf("%w: vault %q has %d of at most %d devices; revoke one you no longer use",
-		ErrDeviceLimit, vaultID, count, max)
+	return fmt.Errorf("registration did not insert or find device %q", deviceID)
 }
 
 // Devices is every device registered to a vault, oldest first, for the list op

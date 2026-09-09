@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -81,12 +82,23 @@ func OpenMode(dbPath, chunkDir string, mode Mode, sync SyncMode) (*Store, error)
 		}
 	}
 
-	cs, err := chunks.New(chunkDir, ChunkMax)
+	openChunks := chunks.New
+	if mode == ReadOnly {
+		openChunks = chunks.OpenExisting
+	}
+	cs, err := openChunks(chunkDir, ChunkMax)
 	if err != nil {
 		return nil, err
 	}
 
-	dsn := dbPath + "?_pragma=busy_timeout(5000)" +
+	// SQLite and its driver parse URI parameters. Escape the filesystem path
+	// first so a literal '?' cannot truncate it or inject connection options.
+	absPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	dbURL := &url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}
+	dsn := dbURL.String() + "?_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(" + string(sync) + ")" +
 		"&_pragma=foreign_keys(1)"
 	if mode == ReadOnly {

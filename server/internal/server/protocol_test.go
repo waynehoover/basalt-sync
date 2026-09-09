@@ -230,20 +230,16 @@ func TestI1AFetchWithARottedBodyIsRefusedBeforeTheHeader(t *testing.T) {
 // Every error says whether reconnecting later can help, per the
 // table in docs/protocol.md, and `busy` says how long to wait.
 func TestI2ErrorsCarryRetryablePerTheTable(t *testing.T) {
-	t.Run("busy at the device limit is retryable with a hint", func(t *testing.T) {
-		r := newRigWithPeers(t, 1)
-		r.dial("a").hello(0)
+	t.Run("busy before authentication is retryable with a hint", func(t *testing.T) {
+		r := newRig(t)
+		r.srv.maxPreAuth = 0
 		late := r.dial("b")
-		late.sendJSON(late.deviceHello(0))
 		f := rawFields(t, late.recvRaw())
 		if f["code"] != wire.CodeBusy || f["retryable"] != true {
-			t.Fatalf("device limit refusal: %v", f)
+			t.Fatalf("pre-authentication refusal: %v", f)
 		}
 		if ms, _ := f["retryAfterMs"].(float64); ms <= 0 {
 			t.Fatalf("busy carries no retryAfterMs: %v", f)
-		}
-		if f["id"] == nil {
-			t.Fatalf("the hello's refusal carries no id: %v", f)
 		}
 	})
 	t.Run("auth, cursor and proto are not", func(t *testing.T) {
@@ -658,8 +654,7 @@ func TestRotationLeavesEveryDeviceRowAndEverySessionAlone(t *testing.T) {
 // Each eviction gives its peer up to a second to read the notice before the
 // connection is closed, and they ran in series, before the rotating device was
 // told anything. Seven other devices meant about seven seconds of silence on a
-// request that had already committed. The device limit is eight, so that is a
-// real vault, not a contrived one.
+// request that had already committed.
 func TestI5RotateEvictsEveryPeerAtOnce(t *testing.T) {
 	r := newRigDerived(t)
 	claimed(t, r, "a").conn.CloseNow()
@@ -791,14 +786,14 @@ func TestS24VaultAndDeviceAreBoundedAndFreeOfControlCharacters(t *testing.T) {
 	longVault := strings.Repeat("v", store.MaxVaultLen)
 	longName := strings.Repeat("d", store.MaxDeviceLen)
 	longID := strings.Repeat("i", store.MaxDeviceIDLen)
-	r := newRigWith(t, DefaultMaxPeers, func(*store.Store) Authenticator {
+	r := newRigWith(t, func(*store.Store) Authenticator {
 		return StaticTokens(map[string]string{longVault: testToken})
 	})
 	if ok, err := r.st.ClaimVault(longVault, hashOf(testToken), testWrapped, 1); err != nil || !ok {
 		t.Fatalf("claiming the long-named vault: ok=%v err=%v", ok, err)
 	}
 	if err := r.st.RegisterDevice(longVault, longID, longName, hashOf(longKey),
-		hashOf(testToken), store.MaxDevices, 1); err != nil {
+		hashOf(testToken), 1); err != nil {
 		t.Fatalf("registering a device with names at the bound: %v", err)
 	}
 	cl := r.dial("a")
@@ -1071,7 +1066,7 @@ func TestADeviceOfAnUnservedVaultIsRefused(t *testing.T) {
 	const deviceID = "AAAAAAAAAAAAAAAAAAAAAA"
 	key := strings.Repeat("k", 43)
 	sum := sha256.Sum256([]byte(key))
-	if err := r.st.RegisterDevice(other, deviceID, "theirs", hex.EncodeToString(sum[:]), otherHash, 8,
+	if err := r.st.RegisterDevice(other, deviceID, "theirs", hex.EncodeToString(sum[:]), otherHash,
 		r.srv.now().UnixMilli()); err != nil {
 		t.Fatalf("register a device on the other vault: %v", err)
 	}

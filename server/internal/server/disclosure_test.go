@@ -399,19 +399,11 @@ func TestNoPreAuthRefusalDependsOnWhetherTheVaultExists(t *testing.T) {
 	}
 }
 
-// `full` needs a live invite to reach, which is what keeps the device limit
-// from being something a stranger can measure.
-//
-// The invite is spent inside the transaction that registers the row, and the
-// spend comes first, so a redeem carrying an invite nobody issued is refused
-// as `auth` before the count is looked at. A vault at its limit therefore
-// answers a bogus invite exactly as an empty vault does. Reversing those two
-// steps would turn the device limit into a probe: send junk, and the code tells
-// you how many devices this vault has.
-func TestAFullVaultDoesNotAnnounceItselfToAnInviteNobodyIssued(t *testing.T) {
-	full := newRig(t)
-	for i := 0; i < store.MaxDevices; i++ {
-		full.device(fmt.Sprintf("device-%d", i))
+// An invalid invite reveals nothing about the registered devices.
+func TestInvalidInviteDoesNotDiscloseDeviceCount(t *testing.T) {
+	populated := newRig(t)
+	for i := 0; i < 24; i++ {
+		populated.device(fmt.Sprintf("device-%d", i))
 	}
 	empty := newRig(t)
 
@@ -422,19 +414,19 @@ func TestAFullVaultDoesNotAnnounceItselfToAnInviteNobodyIssued(t *testing.T) {
 		Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"),
 		Auth: strings.Repeat("k", MinClaimLength)}
 
-	cl := full.dial("prober")
+	cl := populated.dial("prober")
 	cl.sendJSON(probe)
-	atLimit := cl.recvFrame()
+	withDevices := cl.recvFrame()
 
 	cl = empty.dial("prober")
 	cl.sendJSON(probe)
-	withRoom := cl.recvFrame()
+	withoutDevices := cl.recvFrame()
 
-	if string(atLimit) != string(withRoom) {
-		t.Fatalf("a full vault answers a bogus invite differently:\n  full:  %s\n  empty: %s",
-			atLimit, withRoom)
+	if string(withDevices) != string(withoutDevices) {
+		t.Fatalf("a populated vault answers a bogus invite differently:\n  populated:  %s\n  empty: %s",
+			withDevices, withoutDevices)
 	}
-	if !strings.Contains(string(atLimit), `"code":"auth"`) {
-		t.Fatalf("a bogus invite is not refused as auth: %s", atLimit)
+	if !strings.Contains(string(withDevices), `"code":"auth"`) {
+		t.Fatalf("a bogus invite is not refused as auth: %s", withDevices)
 	}
 }

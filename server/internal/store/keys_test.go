@@ -121,14 +121,14 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 		t.Fatalf("err = %v, want ErrBadEntry", err)
 	}
 	// Redeem once, which registers the device that redeemed it.
-	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 1500)
 	if err != nil || sealed != sealed1 {
 		t.Fatalf("redeem: %q %v", sealed, err)
 	}
 	if ds, err := h.Devices("v1"); err != nil || len(ds) != 1 || ds[0].ID != "dev-one" {
 		t.Fatalf("the redemption registered %v, %v", ds, err)
 	}
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-two", "two", devHash2, 0, 1500); !errors.Is(err, ErrNoInvite) {
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-two", "two", devHash2, 1500); !errors.Is(err, ErrNoInvite) {
 		t.Fatalf("an invite was redeemed twice: %v", err)
 	}
 	// Expired: refused, and unknown and malformed look the same.
@@ -143,7 +143,7 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 		{"unknown", "DDDDDDDDDDDDDDDDDDDDDD", 1500},
 		{"malformed", "not base64!", 1500},
 	} {
-		if _, err := h.RedeemInviteFor("v1", c.invite, "dev-two", "two", devHash2, 0, c.now); !errors.Is(err, ErrNoInvite) {
+		if _, err := h.RedeemInviteFor("v1", c.invite, "dev-two", "two", devHash2, c.now); !errors.Is(err, ErrNoInvite) {
 			t.Fatalf("an %s invite was answered %v, want ErrNoInvite", c.what, err)
 		}
 	}
@@ -154,7 +154,7 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 	if err := h.AddInvite("v2", "EEEEEEEEEEEEEEEEEEEEEE", sealed1, 5000, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.RedeemInviteFor("v1", "EEEEEEEEEEEEEEEEEEEEEE", "dev-two", "two", devHash2, 0, 1500); !errors.Is(err, ErrNoInvite) {
+	if _, err := h.RedeemInviteFor("v1", "EEEEEEEEEEEEEEEEEEEEEE", "dev-two", "two", devHash2, 1500); !errors.Is(err, ErrNoInvite) {
 		t.Fatalf("an invite was redeemed against the wrong vault: %v", err)
 	}
 	// Not one of the refusals wrote a row, and none of them spent the invite
@@ -211,7 +211,7 @@ func TestInvitesListsWhatCanStillBeRedeemed(t *testing.T) {
 
 	// Spent and expired are not outstanding: a list that showed either would
 	// be showing strings that no longer work.
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500); err != nil {
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 1500); err != nil {
 		t.Fatalf("redeem: %v", err)
 	}
 	got, _ = h.Invites("v1", 6500)
@@ -256,7 +256,7 @@ func TestCancellingAnInviteRetiresTheString(t *testing.T) {
 		t.Fatalf("%d invite rows after a cancel, want the row gone", n)
 	}
 	// And it no longer redeems, which is the whole point.
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500); !errors.Is(err, ErrNoInvite) {
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 1500); !errors.Is(err, ErrNoInvite) {
 		t.Fatalf("a cancelled invite redeemed: %v", err)
 	}
 	if ds, _ := h.Devices("v1"); len(ds) != 0 {
@@ -270,7 +270,7 @@ func TestCancellingAnInviteRetiresTheString(t *testing.T) {
 	if err := h.AddInvite("v1", "CCCCCCCCCCCCCCCCCCCCCC", sealed1, 9000, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.RedeemInviteFor("v1", "CCCCCCCCCCCCCCCCCCCCCC", "dev-two", "two", devHash2, 0, 1500); err != nil {
+	if _, err := h.RedeemInviteFor("v1", "CCCCCCCCCCCCCCCCCCCCCC", "dev-two", "two", devHash2, 1500); err != nil {
 		t.Fatalf("redeem: %v", err)
 	}
 	for _, c := range []struct {
@@ -345,7 +345,7 @@ func TestI23InvitesTravelInTheBackup(t *testing.T) {
 		t.Fatalf("backup: %v", err)
 	}
 	restored := openAt(t, dest)
-	sealed, err := restored.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 2000)
+	sealed, err := restored.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 2000)
 	if err != nil || sealed != sealed1 {
 		t.Fatalf("redeem from the restored store: %q %v", sealed, err)
 	}
@@ -516,7 +516,7 @@ func TestACrashBetweenSpendingAnInviteAndRegisteringSpendsNeither(t *testing.T) 
 
 	boom := errors.New("the power went off here")
 	betweenSpendAndRegister = func() error { return boom }
-	_, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	_, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 1500)
 	betweenSpendAndRegister = nil
 	if !errors.Is(err, boom) {
 		t.Fatalf("the redemption returned %v, want the injected failure", err)
@@ -532,7 +532,7 @@ func TestACrashBetweenSpendingAnInviteAndRegisteringSpendsNeither(t *testing.T) 
 	}
 	// And the same string still works, which is what makes the crash cost
 	// nothing but a retry.
-	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 1500)
 	if err != nil || sealed != sealed1 {
 		t.Fatalf("the invite did not survive the crash: %q %v", sealed, err)
 	}
@@ -576,7 +576,7 @@ func TestARedeemRacingARevokeLeavesTheVaultConsistent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 2000)
+			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 2000)
 		}()
 		go func() {
 			defer wg.Done()
@@ -639,7 +639,7 @@ func TestARedeemRacingARotationCannotWin(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 2000)
+			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 2000)
 		}()
 		go func() {
 			defer wg.Done()
@@ -668,45 +668,9 @@ func TestARedeemRacingARotationCannotWin(t *testing.T) {
 			t.Fatalf("attempt %d: the redemption was refused with %v, want ErrNoInvite", attempt, redeemErr)
 		}
 		// And after the rotation the string is dead for good.
-		if _, err := one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "charlie", "tablet", hashC, 0, 2001); !errors.Is(err, ErrNoInvite) {
+		if _, err := one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "charlie", "tablet", hashC, 2001); !errors.Is(err, ErrNoInvite) {
 			t.Fatalf("attempt %d: an invite issued before the rotation still redeems: %v", attempt, err)
 		}
-	}
-}
-
-// An invite is not a way past the device cap.
-//
-// The cap is what stops a vault's list of devices becoming a list nobody
-// reads, and a second way to register that did not check it would be the cap
-// applying to whichever path somebody happened to use.
-func TestAnInviteCannotExceedTheDeviceCap(t *testing.T) {
-	h := newTestStore(t)
-	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
-		t.Fatal(err)
-	}
-	const cap = 3
-	for i := 0; i < cap; i++ {
-		id := fmt.Sprintf("seated-%d", i)
-		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, cap, int64(1000+i)); err != nil {
-			t.Fatalf("seeding: %v", err)
-		}
-	}
-	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, cap, 2000); !errors.Is(err, ErrDeviceLimit) {
-		t.Fatalf("a redemption onto a full vault returned %v, want ErrDeviceLimit", err)
-	}
-	if n := len(ids(t, h, "v1")); n != cap {
-		t.Fatalf("%d devices, want the cap %d", n, cap)
-	}
-	// Refused, and so not spent: revoking something makes room and the same
-	// string works.
-	if err := h.RevokeDevice("v1", "seated-0", "", false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, cap, 2001); err != nil {
-		t.Fatalf("the invite did not survive being refused for the cap: %v", err)
 	}
 }
 
@@ -714,7 +678,7 @@ func TestAnInviteCannotExceedTheDeviceCap(t *testing.T) {
 // refusal an unknown invite gets.
 func TestAnUnclaimedVaultHasNothingToRedeem(t *testing.T) {
 	h := newTestStore(t)
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 1000); !errors.Is(err, ErrNoInvite) {
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 1000); !errors.Is(err, ErrNoInvite) {
 		t.Fatalf("redeeming against an unclaimed vault returned %v, want ErrNoInvite", err)
 	}
 }
@@ -739,7 +703,7 @@ func TestARedemptionOntoAnExistingIdChangesNothing(t *testing.T) {
 	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "alfa", "impostor", hashB, 0, 2000); !errors.Is(err, ErrDeviceExists) {
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "alfa", "impostor", hashB, 2000); !errors.Is(err, ErrDeviceExists) {
 		t.Fatalf("a redemption onto an existing id returned %v, want ErrDeviceExists", err)
 	}
 	_, hash, ok, err := h.DeviceByID("v1", "alfa")
@@ -803,7 +767,7 @@ func TestConcurrentRedemptionsOfOneInviteRegisterExactlyOneDevice(t *testing.T) 
 				id := fmt.Sprintf("racer-%d", i)
 				<-start
 				sealed[i], errs[i] = hands[i].RedeemInviteFor(
-					"v1", "AAAAAAAAAAAAAAAAAAAAAA", id, id, fmt.Sprintf("%064x", i), 0, 2000)
+					"v1", "AAAAAAAAAAAAAAAAAAAAAA", id, id, fmt.Sprintf("%064x", i), 2000)
 			}(i)
 		}
 		close(start)
@@ -842,7 +806,7 @@ func TestConcurrentRedemptionsOfOneInviteRegisterExactlyOneDevice(t *testing.T) 
 			t.Fatalf("attempt %d: %d invites still outstanding (%v)", attempt, n, err)
 		}
 		if _, err := one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "latecomer", "late",
-			devHash1, 0, 2001); !errors.Is(err, ErrNoInvite) {
+			devHash1, 2001); !errors.Is(err, ErrNoInvite) {
 			t.Fatalf("attempt %d: the invite redeemed again afterwards: %v", attempt, err)
 		}
 
