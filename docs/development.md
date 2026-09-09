@@ -124,6 +124,8 @@ published gallery. A failed layout check leaves a `.failed.png` for inspection.
 |---|---|---|
 | Status panel | [View](assets/screenshots/panel.png) | [View](assets/screenshots/panel-dark.png) |
 | Loading sync history | [View](assets/screenshots/loading.png) | [View](assets/screenshots/loading-dark.png) |
+| Uploading changes | [View](assets/screenshots/uploading.png) | [View](assets/screenshots/uploading-dark.png) |
+| Downloading changes | [View](assets/screenshots/downloading.png) | [View](assets/screenshots/downloading-dark.png) |
 | Plugin settings | [View](assets/screenshots/settings.png) | [View](assets/screenshots/settings-dark.png) |
 | Status indicator | [View](assets/screenshots/status.png) | [View](assets/screenshots/status-dark.png) |
 | Setup choices | [View](assets/screenshots/pairing.png) | [View](assets/screenshots/pairing-dark.png) |
@@ -143,6 +145,8 @@ Phone layout previews (desktop rendering with mobile styles):
 |---|---|---|
 | Status panel | [View](assets/screenshots/panel-phone.png) | [View](assets/screenshots/panel-phone-dark.png) |
 | Loading sync history | [View](assets/screenshots/loading-phone.png) | [View](assets/screenshots/loading-phone-dark.png) |
+| Uploading changes | [View](assets/screenshots/uploading-phone.png) | [View](assets/screenshots/uploading-phone-dark.png) |
+| Downloading changes | [View](assets/screenshots/downloading-phone.png) | [View](assets/screenshots/downloading-phone-dark.png) |
 | Setup choices | [View](assets/screenshots/pairing-phone.png) | [View](assets/screenshots/pairing-phone-dark.png) |
 | First device | [View](assets/screenshots/setup-phone.png) | [View](assets/screenshots/setup-phone-dark.png) |
 | Join a vault | [View](assets/screenshots/join-phone.png) | [View](assets/screenshots/join-phone-dark.png) |
