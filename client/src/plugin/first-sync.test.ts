@@ -10,18 +10,18 @@ describe("first-sync file check", () => {
     adapter.seed(".obsidian/workspace.json", "{}");
     adapter.seed(".git/config", "git settings");
     await adapter.mkdir("Attachments");
-    await expect(checkFirstSync(adapter, "Settings", "download")).resolves.toBeUndefined();
+    await expect(checkFirstSync(adapter, "Settings")).resolves.toBeUndefined();
     expect(adapter.text("Settings/plugins/basalt/data.json")).toBe("credentials");
   });
 
   it.each(["Notes/deep/note.md", "Attachments/report.pdf", "README"])(
-    "refuses the existing file %s without modifying it",
+    "requires confirmation for the existing file %s without modifying it",
     async (path) => {
       const adapter = new FakeAdapter();
       adapter.seed(path, "existing contents");
-      await expect(checkFirstSync(adapter, ".obsidian", "download")).rejects.toThrow(/empty vault/);
+      await expect(checkFirstSync(adapter, ".obsidian")).rejects.toThrow(/Confirm merging/);
       expect(adapter.text(path)).toBe("existing contents");
-      await expect(checkFirstSync(adapter, ".obsidian", "combine")).resolves.toBeUndefined();
+      await expect(checkFirstSync(adapter, ".obsidian", true)).resolves.toBeUndefined();
       expect(adapter.text(path)).toBe("existing contents");
     },
   );

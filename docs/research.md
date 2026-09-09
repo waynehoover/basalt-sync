@@ -24,6 +24,23 @@ byte-for-byte correctness alongside timings. Check that the proxy applies
 back-pressure in both directions. The benchmark fixtures and their output are
 the starting point; a past table is not a substitute for a new run.
 
+## Pairing a populated vault
+
+Inspected Obsidian 1.13.7's bundled Sync implementation on September 8, 2026.
+Connecting a vault that contains files opens a merge confirmation with Continue
+and Cancel. There is no first-sync strategy selector. After connecting, Sync
+offers folder exclusions and a separate Start syncing action. Its
+[onboarding for another device](https://obsidian.md/help/sync/setup) also offers
+creating a new local vault from the remote vault.
+
+Basalt uses the populated-vault confirmation and lets empty vaults proceed
+directly. Its filesystem check runs before consuming an invite, including when
+Obsidian's loaded-file cache is incomplete. Basalt still preserves divergent
+versions according to its existing conflict rules; this UI change does not adopt
+Sync's initial same-path resolution by modification time. An automatic
+backup-and-replace workflow was deferred because it would need a separate,
+resumable recovery design.
+
 ## Transfers and history
 
 Historical transfer after inserting one line, including entry metadata in both

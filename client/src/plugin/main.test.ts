@@ -3069,7 +3069,7 @@ it("tints only the state that is actually wrong", async () => {
  */
 describe("adding a device from the panel", () => {
   it.each(["invite", "recovery key"])(
-    "refuses a populated vault before spending a %s when downloading",
+    "requires confirmation before spending a %s in a populated vault",
     async (kind) => {
       await fresh();
       const first = await load();
@@ -3085,9 +3085,7 @@ describe("adding a device from the panel", () => {
         new Uint8Array([37, 80, 68, 70, 0, 255]).buffer,
       );
 
-      await expect(second.plugin.pair(key, "phone")).rejects.toThrow(
-        /empty vault.*Combine local files/s,
-      );
+      await expect(second.plugin.pair(key, "phone")).rejects.toThrow(/Confirm merging/);
       expect(second.plugin.savedData).toBe(null);
       expect(second.plugin.paired).toBe(false);
       expect(second.app.vault.adapter.text("Inbox/note.md")).toBe("Keep this note\n");
@@ -3116,47 +3114,77 @@ describe("adding a device from the panel", () => {
     300_000,
   );
 
-  it("lets QR pairing combine local files only after choosing it", async () => {
-    await fresh();
-    const first = await load();
-    first.app.vault.adapter.seed("Organized/note.md", "Keep this note\n");
-    await startVault(first.plugin, "laptop");
-    await synced(first.plugin);
-    const invite = (await first.plugin.createInvite()).invite;
-    const second = await load();
-    second.app.vault.adapter.seed("Inbox/note.md", "Keep this note\n");
-    const pdf = new Uint8Array([37, 80, 68, 70, 0, 255]);
-    await second.app.vault.adapter.writeBinary("local.pdf", pdf.buffer);
-    built.length = 0;
-    second.plugin.protocolHandlers.get(INVITE_ACTION)!({ invite });
-    const choice = built.find((s) => s.name === "First sync")!;
-    expect(choice.dropdowns[0]!.getValue()).toBe("download");
-    expect([...choice.dropdowns[0]!.options.values()]).toEqual([
-      "Download server vault",
-      "Combine local files",
-    ]);
-    const keyField = built.find((s) => s.name === "Invite or recovery key")!.texts[0]!;
-    built.find((s) => s.name === "Device name")!.texts[0]!.type("Phone");
-    const pair = built.flatMap((s) => s.buttons).find((b) => b.label === "Pair")!;
-    await pair.click();
-    expect(notices.at(-1)!.message).toMatch(/empty vault/);
-    expect(second.plugin.paired).toBe(false);
-    choice.dropdowns[0]!.choose("combine");
-    expect(choice.desc).toMatch(/Old copies can bring back files/);
-    expect(keyField.getValue()).toBe(invite);
-    await pair.click();
-    await synced(second.plugin);
-    await until(
-      "both sets of notes to reach both devices",
-      () =>
-        first.app.vault.adapter.text("Inbox/note.md") === "Keep this note\n" &&
-        second.app.vault.adapter.text("Organized/note.md") === "Keep this note\n",
-    );
-    expect(new Uint8Array(await first.app.vault.adapter.readBinary("local.pdf"))).toEqual(pdf);
-    expect(second.app.vault.adapter.text("Inbox/note.md")).toBe("Keep this note\n");
-    expect(first.app.vault.adapter.text("Organized/note.md")).toBe("Keep this note\n");
-    expect(second.plugin.deviceName).toBe("Phone");
-  }, 300_000);
+  it.each(["QR", "pasted invite", "recovery key"])(
+    "confirms combining a populated vault during %s pairing",
+    async (source) => {
+      await fresh();
+      const first = await load();
+      first.app.vault.adapter.seed("Organized/note.md", "Keep this note\n");
+      await startVault(first.plugin, "laptop");
+      await synced(first.plugin);
+      const invite = (await first.plugin.createInvite()).invite;
+      const pairingValue = source === "recovery key" ? keyOf(first.plugin) : invite;
+      const second = await load();
+      second.app.vault.adapter.seed("Inbox/note.md", "Keep this note\n");
+      const pdf = new Uint8Array([37, 80, 68, 70, 0, 255]);
+      await second.app.vault.adapter.writeBinary("local.pdf", pdf.buffer);
+      built.length = 0;
+      if (source === "QR") second.plugin.protocolHandlers.get(INVITE_ACTION)!({ invite });
+      else choosePairing(second.plugin, "invite");
+      expect(built.find((s) => s.name === "First sync")).toBeUndefined();
+      const keyField = built.find((s) => s.name === "Invite or recovery key")!.texts[0]!;
+      if (source !== "QR") keyField.type(pairingValue);
+      built.find((s) => s.name === "Device name")!.texts[0]!.type("Phone");
+      const pair = built.flatMap((s) => s.buttons).find((b) => b.label === "Pair")!;
+      built.length = 0;
+      await pair.click();
+      expect(built.find((s) => s.name === "Confirm merge")).toBeDefined();
+      expect(modals.at(-1)!.contentEl.allText()).toMatch(/moved or deleted/);
+      expect(second.plugin.paired).toBe(false);
+      expect(second.plugin.savedData).toBe(null);
+      expect((await first.plugin.devices()).devices).toHaveLength(1);
+      const cancel = built.flatMap((s) => s.buttons).find((b) => b.label === "Cancel")!;
+      built.length = 0;
+      await cancel.click();
+      expect(built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.getValue()).toBe(
+        pairingValue,
+      );
+      expect(built.find((s) => s.name === "Device name")!.texts[0]!.getValue()).toBe("Phone");
+      const retry = built.flatMap((s) => s.buttons).find((b) => b.label === "Pair")!;
+      built.length = 0;
+      await retry.click();
+      const proceed = built.flatMap((s) => s.buttons).find((b) => b.label === "Continue")!;
+      const cancelPending = built.flatMap((s) => s.buttons).find((b) => b.label === "Cancel")!;
+      const doPair = second.plugin.pair.bind(second.plugin);
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.spyOn(second.plugin, "pair").mockImplementationOnce(async (...args) => {
+        await pending;
+        await doPair(...args);
+      });
+      const connecting = proceed.click();
+      const cancelDisabled = cancelPending.disabled;
+      release();
+      await connecting;
+      expect(cancelDisabled, "Cancel must not imply an in-flight registration can be undone").toBe(
+        true,
+      );
+      await synced(second.plugin);
+      await until(
+        "both sets of notes to reach both devices",
+        () =>
+          first.app.vault.adapter.text("Inbox/note.md") === "Keep this note\n" &&
+          second.app.vault.adapter.text("Organized/note.md") === "Keep this note\n",
+      );
+      expect(new Uint8Array(await first.app.vault.adapter.readBinary("local.pdf"))).toEqual(pdf);
+      expect(second.app.vault.adapter.text("Inbox/note.md")).toBe("Keep this note\n");
+      expect(first.app.vault.adapter.text("Organized/note.md")).toBe("Keep this note\n");
+      expect(second.plugin.deviceName).toBe("Phone");
+    },
+    300_000,
+  );
 
   it("checks files that Obsidian has not indexed yet and refuses a failed scan", async () => {
     await fresh();
@@ -3170,7 +3198,7 @@ describe("adding a device from the panel", () => {
       new Uint8Array([37, 80, 68, 70]).buffer,
     );
     vi.spyOn(second.app.vault, "getAllLoadedFiles").mockReturnValue([]);
-    await expect(second.plugin.pair(invite, "phone")).rejects.toThrow(/empty vault/);
+    await expect(second.plugin.pair(invite, "phone")).rejects.toThrow(/Confirm merging/);
     second.app.vault.adapter.fault = (op) =>
       op === "list" ? new Error("directory unreadable") : undefined;
     await expect(second.plugin.pair(invite, "phone")).rejects.toThrow(/directory unreadable/);

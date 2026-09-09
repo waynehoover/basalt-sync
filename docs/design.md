@@ -97,11 +97,11 @@ CLI options still form a configuration surface and need explicit documentation
 and combination testing. Avoid adding a second implementation where the same
 behavior can be shared.
 
-Joining an existing vault defaults to downloading into an empty local vault.
-The plugin checks the filesystem before registration or invite redemption;
-unreadable folders refuse pairing. Combining existing local files requires an
-explicit choice. This is a setup precondition, not a lasting merge preference:
-files created after the check participate in normal two-way sync.
+Joining an existing vault checks the filesystem before registration or invite
+redemption; unreadable folders refuse pairing. Empty vaults proceed directly.
+Populated vaults require confirmation before their files are combined with the
+synced vault. Cancelling does not consume the invite. This is a setup step, not
+a lasting merge preference: paired devices use normal two-way sync.
 
 ## Refusals
 

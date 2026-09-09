@@ -3,6 +3,7 @@ import { Plugin, PluginSettingTab } from "obsidian";
 import { BasaltPanel, BasaltModal, RecoverModal, paintStatus } from "../../client/src/plugin/main";
 import { HistoryModal } from "../../client/src/plugin/history";
 import { formatInvite } from "../../client/src/core/pairing";
+import { MergeConfirmationRequired } from "../../client/src/plugin/first-sync";
 
 const electron = require("electron");
 const fs = require("fs");
@@ -168,7 +169,11 @@ export default class Screenshots extends Plugin {
           : this.platformClasses.get(cls),
       );
     }
-    this.model = this.makeModel(!["pairing", "join", "join-combine", "setup"].includes(name));
+    this.model = this.makeModel(!["pairing", "join", "join-confirm", "setup"].includes(name));
+    if (name === "join-confirm")
+      this.model.pair = async () => {
+        throw new MergeConfirmationRequired();
+      };
     paintStatus(this.status, this.makeModel().currentState);
     this.backdrop.style.display = name === "status" ? "none" : "";
     this.window.setMinimumSize(320, 480);
@@ -223,17 +228,16 @@ export default class Screenshots extends Plugin {
       button.click();
       return button;
     };
-    if (name === "join" || name === "join-combine") press("Paste an invite");
-    if (name === "join-combine") {
-      const select = content.querySelector("select");
-      select.value = "combine";
-      select.dispatchEvent(new select.ownerDocument.defaultView.Event("change", { bubbles: true }));
-    }
+    if (name === "join" || name === "join-confirm") press("Paste an invite");
     if (name === "setup") press("Use a setup line");
-    if (name === "join" || name === "join-combine" || name === "setup") {
+    if (name === "join" || name === "join-confirm" || name === "setup") {
       const field = content.querySelector("input");
       field.value = name.startsWith("join") ? "Phone" : "MacBook";
       field.dispatchEvent(new field.ownerDocument.defaultView.Event("input", { bubbles: true }));
+    }
+    if (name === "join-confirm") {
+      press("Pair");
+      await settle();
     }
     if (name === "invite") {
       content.querySelector(".basalt-add-device").open = true;

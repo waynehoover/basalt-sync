@@ -392,11 +392,7 @@ export async function walkPanelStates(
     .flatMap((s) => s.buttons)
     .find((b) => b.label === "Paste an invite")!
     .click();
-  shots.push(shotOfOpenPanel("join-download", "Joining defaults to an empty local vault."));
-  built.find((s) => s.name === "First sync")!.dropdowns[0]!.choose("combine");
-  shots.push(
-    shotOfOpenPanel("join-combine", "Combining existing local files is an explicit setup choice."),
-  );
+  shots.push(shotOfOpenPanel("join", "Joining uses the same pairing form for every vault."));
   closePanel();
 
   // A config that cannot be read. Deliberately shows no pairing form: pairing
@@ -417,6 +413,22 @@ export async function walkPanelStates(
   loaded.push(laptop);
   const recoveryKey = await laptop.pairFirst(server.setup, "laptop");
   await until("the first sync", () => laptop.currentState.kind === "synced");
+
+  nobody.app.vault.adapter.seed("local.md", "An existing local note\n");
+  openPanel(nobody);
+  await built
+    .flatMap((s) => s.buttons)
+    .find((b) => b.label === "Paste an invite")!
+    .click();
+  built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(recoveryKey);
+  await built
+    .flatMap((s) => s.buttons)
+    .find((b) => b.label === "Pair")!
+    .click();
+  shots.push(
+    shotOfOpenPanel("join-confirm", "A populated vault requires confirmation before pairing."),
+  );
+  closePanel();
 
   openPanel(laptop);
   shots.push(shotOfOpenPanel("paired", "Paired and up to date: the panel as it usually looks."));

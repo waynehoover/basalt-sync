@@ -199,12 +199,12 @@ chosen private location. Press **I have written it down** only after the user
 has saved it, or after verifying a save to a destination they designated for
 this purpose. Wait for pairing and sync to finish.
 
-**Additional device:** choose **First sync → Download server vault** for a
-fresh copy. This is the default and requires no existing notes or attachments.
-Create a new empty Obsidian vault and preserve the old vault separately; do not
-clear it automatically. Choose **Combine local files** only when the user
-wants this device's existing files uploaded too. An older copy can reintroduce
-moved or deleted files. Both choices use normal two-way sync after setup.
+**Additional device:** an empty local vault downloads the synced files directly.
+If files already exist, **Confirm merge** asks before combining them with the
+synced vault. Continue only when the user wants those files included; an older
+copy can reintroduce moved or deleted files. Cancelling leaves the invite unused.
+For a fresh copy, create a new empty Obsidian vault and preserve the old vault
+separately; do not clear it automatically. Sync runs both ways after pairing.
 
 On a paired device, choose **Add another device → Create
 invite**. On the new device, choose **Paste an invite**, supply a device name and

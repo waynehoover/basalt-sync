@@ -63,15 +63,12 @@ join it with an invite.
 2. On your phone, install and enable Basalt, then scan the QR code. Or copy the
    pairing code and press **Paste an invite** under **Join an existing vault**
    on the new device.
-3. Choose a device name and **First sync** option:
-   - **Download server vault** (default): start with an empty vault to download
-     your synced notes. Existing notes and attachments block pairing and stay untouched.
-   - **Combine local files**: upload this device's existing files too. An older
-     copy can bring back files moved or deleted elsewhere.
-4. Press **Pair**. If you copied the invite, paste it into **Invite or recovery
-   key** first.
-5. Keep Obsidian open while the first sync finishes. After setup, changes sync
-   both ways with either choice.
+3. Choose a device name and press **Pair**. If you copied the invite, paste it
+   into **Invite or recovery key** first.
+4. If this vault already contains files, Basalt asks you to confirm combining
+   them with your synced vault. An older copy can bring back files moved or
+   deleted elsewhere. **Cancel** leaves your files and invite untouched.
+5. Keep Obsidian open while the first sync finishes. Changes sync both ways.
 
 To download a fresh copy, create a new empty Obsidian vault and keep the old
 vault as a backup. Basalt does not clear or move existing files during pairing.

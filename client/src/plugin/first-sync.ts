@@ -1,16 +1,20 @@
 import { normalizePath, type DataAdapter } from "obsidian";
 import { configFolderName, isNeverSynced } from "../core/paths.ts";
 
-export type FirstSync = "download" | "combine";
+/** A populated vault needs consent before its files join the synced vault. */
+export class MergeConfirmationRequired extends Error {
+  constructor() {
+    super("Confirm merging this vault's existing files before pairing.");
+  }
+}
 
 /** Check the actual files before registering a device or spending its invite. */
 export async function checkFirstSync(
   adapter: Pick<DataAdapter, "list">,
   configDir: string,
-  choice: FirstSync,
+  mergeConfirmed = false,
 ): Promise<void> {
-  if (choice === "combine") return;
-  if (choice !== "download") throw new Error("Choose how to start the first sync.");
+  if (mergeConfirmed === true) return;
   const excluded = new Set([configFolderName(configDir)]);
   const included = (path: string) => !isNeverSynced(normalizePath(path), excluded);
   const folders = [""];
@@ -19,10 +23,7 @@ export async function checkFirstSync(
     // A failed directory read must also refuse pairing, never mean "empty".
     const listed = await adapter.list(folders.pop()!);
     if (listed.files.some(included)) {
-      throw new Error(
-        "Download server vault needs an empty vault. Create a new Obsidian vault, " +
-          "or choose Combine local files to upload the files already on this device. Nothing has been changed.",
-      );
+      throw new MergeConfirmationRequired();
     }
     folders.push(...listed.folders.filter(included));
   }

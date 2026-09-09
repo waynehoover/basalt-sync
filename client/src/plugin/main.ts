@@ -62,7 +62,7 @@ import { ProtocolError } from "../core/transport.ts";
 import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
-import { checkFirstSync, type FirstSync } from "./first-sync.ts";
+import { checkFirstSync, MergeConfirmationRequired } from "./first-sync.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
 export type State =
@@ -1028,17 +1028,13 @@ export default class BasaltPlugin extends Plugin {
    * paired, and the first sign of it was a status bar saying stopped, later
    * (I13). See `registerAsDevice`.
    */
-  async pair(
-    pairingString: string,
-    device: string,
-    firstSync: FirstSync = "download",
-  ): Promise<void> {
+  async pair(pairingString: string, device: string, mergeConfirmed = false): Promise<void> {
     await this.onePairing(async () => {
       const name = deviceName(device);
       const mine = this.generation;
       const invite = isInvite(pairingString) ? parseInvite(pairingString) : undefined;
       const pairing = invite === undefined ? parsePairing(pairingString) : undefined;
-      await checkFirstSync(this.app.vault.adapter, this.app.vault.configDir, firstSync);
+      await checkFirstSync(this.app.vault.adapter, this.app.vault.configDir, mergeConfirmed);
       if (mine !== this.generation)
         throw new Error("Pairing was cancelled while checking local files.");
       if (invite !== undefined) return await this.pairWithInvite(invite, name);
@@ -2289,6 +2285,8 @@ class BasaltPanel {
 
   teardown(): void {
     this.closed = true;
+    this.joinDraft = undefined;
+    this.confirmMerge = false;
     this.unwatch?.();
     // The wait for "I have written it down" needs an answer on every way out
     // of it, and closing the panel is one of them (R40).
@@ -2967,6 +2965,44 @@ class BasaltPanel {
    * who left is somebody who was not sure.
    */
   private renderPairing(host: HTMLElement): void {
+    if (this.confirmMerge && this.joinDraft) {
+      const draft = this.joinDraft;
+      new Setting(host).setName("Confirm merge").setHeading();
+      host.createEl("p", {
+        text: "This vault already contains files. They will be combined with your synced vault.",
+      });
+      host.createEl("p", {
+        cls: "basalt-advice",
+        text:
+          "Files moved or deleted on another device may reappear. " +
+          "Conflicting edits may create copies.",
+      });
+      let cancel!: ButtonComponent;
+      new Setting(host)
+        .addButton((b) => {
+          cancel = b;
+          b.setButtonText("Cancel").onClick(() => {
+            this.confirmMerge = false;
+            this.render();
+          });
+        })
+        .addButton((b) =>
+          b
+            .setButtonText("Continue")
+            .setCta()
+            .onClick(async () => {
+              b.setDisabled(true);
+              cancel.setDisabled(true);
+              try {
+                await this.pairFromPanel(draft.key, draft.device, true);
+              } finally {
+                b.setDisabled(false);
+                cancel.setDisabled(false);
+              }
+            }),
+        );
+      return;
+    }
     new Setting(host).setName("Set up sync").setHeading();
     const contentEl = settingGroup(host);
     if (this.joining === undefined) {
@@ -3023,32 +3059,16 @@ class BasaltPanel {
     row(contentEl, "Device name", "Shown in the device list and future sync activity.").addText(
       (t) => {
         t.setPlaceholder("laptop");
-        t.setValue(suggestedDeviceName());
+        t.setValue(
+          this.joining === "invite"
+            ? (this.joinDraft?.device ?? suggestedDeviceName())
+            : suggestedDeviceName(),
+        );
         deviceField = t;
       },
     );
 
     if (this.joining === "invite") {
-      let firstSync: FirstSync = "download";
-      const firstSyncRow = row(
-        contentEl,
-        "First sync",
-        "Download your notes into an empty vault. After setup, changes sync both ways.",
-      );
-      firstSyncRow.addDropdown((d) =>
-        d
-          .addOption("download", "Download server vault")
-          .addOption("combine", "Combine local files")
-          .setValue(firstSync)
-          .onChange((value) => {
-            firstSync = value === "combine" ? "combine" : "download";
-            firstSyncRow.setDesc(
-              firstSync === "download"
-                ? "Download your notes into an empty vault. After setup, changes sync both ways."
-                : "Upload existing local files too. Old copies can bring back files moved or deleted elsewhere.",
-            );
-          }),
-      );
       let pairingField: TextComponent | undefined;
       row(
         contentEl,
@@ -3056,7 +3076,8 @@ class BasaltPanel {
         "Paste an invite from a paired device, or use your saved recovery key.",
       ).addText((t) => {
         t.setPlaceholder("basalt3i_...");
-        if (this.incomingInvite !== undefined) t.setValue(this.incomingInvite);
+        const key = this.joinDraft?.key ?? this.incomingInvite;
+        if (key !== undefined) t.setValue(key);
         pairingField = t;
       });
 
@@ -3067,15 +3088,11 @@ class BasaltPanel {
             .setButtonText("Pair")
             .setCta()
             .onClick(async () => {
+              b.setDisabled(true);
               try {
-                await this.plugin.pair(pairingField?.getValue() ?? "", device(), firstSync);
-                // Reached the server, so this is true. It is syncing only
-                // once the loop says so, and the panel follows the loop.
-                new Notice("Paired. Basalt is connecting.");
-                this.joining = undefined;
-                this.render();
-              } catch (err) {
-                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+                await this.pairFromPanel(pairingField?.getValue() ?? "", device());
+              } finally {
+                b.setDisabled(false);
               }
             }),
         );
@@ -3132,6 +3149,31 @@ class BasaltPanel {
   /** Which pairing path the panel is showing, or the question if neither. */
   private joining: "invite" | "first" | undefined;
 
+  private joinDraft: { key: string; device: string } | undefined;
+  private confirmMerge = false;
+
+  /** Confirmation is a panel step; it never leaves a pairing request waiting. */
+  private async pairFromPanel(key: string, device: string, mergeConfirmed = false): Promise<void> {
+    if (this.closed) return;
+    this.joinDraft = { key, device };
+    try {
+      await this.plugin.pair(key, device, mergeConfirmed);
+      this.joinDraft = undefined;
+      this.confirmMerge = false;
+      this.joining = undefined;
+      new Notice("Paired. Basalt is connecting.");
+      this.render();
+    } catch (err) {
+      if (this.closed) return;
+      if (err instanceof MergeConfirmationRequired) {
+        this.confirmMerge = true;
+        this.render();
+      } else {
+        new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+      }
+    }
+  }
+
   /**
    * Back to the question, because a choice that cannot be unmade is one
    * somebody has to be sure about before they know anything.
@@ -3142,6 +3184,8 @@ class BasaltPanel {
    */
   private chooseAgain(): void {
     this.joining = undefined;
+    this.joinDraft = undefined;
+    this.confirmMerge = false;
     this.render();
   }
 
