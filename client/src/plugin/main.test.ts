@@ -3173,10 +3173,11 @@ describe("adding a device from the panel", () => {
       );
       await synced(second.plugin);
       await until(
-        "both sets of notes to reach both devices",
+        "both sets of notes and the attachment to reach both devices",
         () =>
           first.app.vault.adapter.text("Inbox/note.md") === "Keep this note\n" &&
-          second.app.vault.adapter.text("Organized/note.md") === "Keep this note\n",
+          second.app.vault.adapter.text("Organized/note.md") === "Keep this note\n" &&
+          first.app.vault.adapter.text("local.pdf") !== undefined,
       );
       expect(new Uint8Array(await first.app.vault.adapter.readBinary("local.pdf"))).toEqual(pdf);
       expect(second.app.vault.adapter.text("Inbox/note.md")).toBe("Keep this note\n");
