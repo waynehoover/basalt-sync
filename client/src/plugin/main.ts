@@ -44,6 +44,7 @@ import {
   type Version,
 } from "../core/client.ts";
 import { watchResume } from "./resume.ts";
+import { pollWhileVisible } from "./visible-poll.ts";
 import type { TransferActivity } from "../core/transfer.ts";
 import { describeTransfer } from "./transfer.ts";
 import { describeDelivery, deliverySummary } from "../core/delivery.ts";
@@ -2140,6 +2141,15 @@ async function copyToClipboard(text: string, said: string): Promise<void> {
   }
 }
 
+/** Keep mobile keyboards from capitalizing or correcting addresses and keys. */
+function literalInput(field: TextComponent, address = false): void {
+  field.inputEl.setAttribute("autocapitalize", "none");
+  field.inputEl.setAttribute("autocorrect", "off");
+  field.inputEl.setAttribute("autocomplete", "off");
+  field.inputEl.spellcheck = false;
+  if (address) field.inputEl.inputMode = "url";
+}
+
 function offersRejoin(state: State): boolean {
   return state.kind === "stopped" && state.recovery === "rejoin";
 }
@@ -2366,7 +2376,7 @@ function docsLink(el: HTMLElement, text: string): void {
 class BasaltPanel {
   private closed = false;
   private unwatch: (() => void) | undefined;
-  private deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopDelivery: (() => void) | undefined;
   private renderGeneration = 0;
   private unwatchUnload: () => void;
 
@@ -2391,7 +2401,7 @@ class BasaltPanel {
     this.unwatchUnload();
     this.closed = true;
     this.renderGeneration++;
-    clearTimeout(this.deliveryTimer);
+    this.stopDelivery?.();
     this.joinDraft = undefined;
     this.confirmMerge = false;
     this.unwatch?.();
@@ -2412,7 +2422,7 @@ class BasaltPanel {
     // A pending settings request may finish after its modal or tab was closed.
     if (this.closed) return;
     this.renderGeneration++;
-    clearTimeout(this.deliveryTimer);
+    this.stopDelivery?.();
     this.unwatch?.();
     this.host.empty();
 
@@ -2674,6 +2684,7 @@ class BasaltPanel {
       .addText((text) => {
         address = text;
         text.setPlaceholder("wss://sync.example.com").setValue(this.plugin.connection()?.url ?? "");
+        literalInput(text, true);
         text.inputEl.setAttribute("aria-label", "Server address");
       })
       .addButton((button) =>
@@ -2849,11 +2860,9 @@ class BasaltPanel {
         if (line.textContent !== message) say(line, message);
       } catch {
         if (current()) say(line, "Device delivery unavailable.");
-      } finally {
-        if (current()) this.deliveryTimer = setTimeout(() => void refresh(), 1000);
       }
     };
-    void refresh();
+    this.stopDelivery = pollWhileVisible(refresh, 1000);
   }
 
   /** Show the QR and a selectable pairing code, with Copy beside the code. */
@@ -3047,6 +3056,7 @@ class BasaltPanel {
     )
       .addText((t) => {
         t.setPlaceholder("Current recovery key");
+        literalInput(t);
         keyField = t;
       })
       .addButton((b) =>
@@ -3240,6 +3250,7 @@ class BasaltPanel {
         "Paste an invite from a paired device, or use your saved recovery key.",
       ).addText((t) => {
         t.setPlaceholder("basalt3i_...");
+        literalInput(t);
         const key = this.joinDraft?.key ?? this.incomingInvite;
         if (key !== undefined) t.setValue(key);
         pairingField = t;
@@ -3268,6 +3279,7 @@ class BasaltPanel {
         "Paste your server's setup string, including its secure address.",
       ).addText((t) => {
         t.setPlaceholder("homelab:3003#K7M2PQR4-...");
+        literalInput(t, true);
         setupField = t;
       });
       new Setting(contentEl)

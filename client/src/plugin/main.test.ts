@@ -933,21 +933,16 @@ describe("when things go wrong", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("fine.md", "this one is ok");
-    app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "this one is not");
+    app.vault.adapter.seed(`${"x".repeat(4800)}.md`, "this one is not");
 
     await startVault(plugin, "laptop");
-    // A minute, not the default fifteen seconds. Sealing a 4800-character path
-    // and having the server refuse it is the most work any test in this file
-    // asks for in one pass: about seven seconds here, and past fifteen on the
-    // mounted-filesystem job, which failed on exactly this line three times in
-    // twelve runs while every other job passed it.
-    await synced(plugin, 120_000);
+    // One overlong path exercises the real server refusal without creating
+    // and syncing 1,200 parent folders first.
+    await synced(plugin);
     // Said once, when the refusal first appears, so it is looked for
     // rather than provoked again.
-    await until(
-      "the refusal to be announced",
-      () => notices.some((n) => /cannot sync/.test(n.message)),
-      120_000,
+    await until("the refusal to be announced", () =>
+      notices.some((n) => /cannot sync/.test(n.message)),
     );
     await plugin.syncNow();
     // And the refusal did not stop the file that was fine, and the status
@@ -955,8 +950,7 @@ describe("when things go wrong", () => {
     // "ignored" and "in the way" were three words a person had to learn before
     // the status could be read, and what differs between them is the reason,
     // which the notice above carries.
-    expect(status(plugin)).toMatch(/need attention/);
-    expect(status(plugin)).toMatch(/files? need attention\./);
+    expect(status(plugin)).toMatch(/1 file needs attention\./);
   }, 300_000);
 });
 
@@ -2364,19 +2358,11 @@ describe("what is announced, and how often", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("fine.md", "ok");
-    app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "nope");
+    app.vault.adapter.seed(`${"x".repeat(4800)}.md`, "nope");
     await startVault(plugin, "laptop");
-    // A budget, for the same reason the sibling test above has one: sealing a
-    // 4800-character path is the most work any test in this file asks for in
-    // one pass, and `until`'s default fifteen seconds is a fact about the
-    // machine that wrote it. That sibling was given a minute and this one was
-    // left, which is the one-of-two-call-sites shape; CI found it on the
-    // case-folding runner, timed out at `connecting`.
-    await synced(plugin, 120_000);
-    await until(
-      "the refusal to be announced",
-      () => notices.some((n) => /cannot sync/.test(n.message)),
-      120_000,
+    await synced(plugin);
+    await until("the refusal to be announced", () =>
+      notices.some((n) => /cannot sync/.test(n.message)),
     );
     notices.length = 0;
     for (let i = 0; i < 4; i++) await plugin.syncNow();
@@ -2389,7 +2375,6 @@ describe("what is announced, and how often", () => {
     await until(
       "the edit to upload and its pass to finish",
       () => plugin.cursors()!.local > beforeSave && plugin.currentState.kind === "synced",
-      120_000,
     );
     expect(notices.filter((n) => /cannot sync/.test(n.message))).toHaveLength(0);
     // The status still says so, because a status describes the vault.
@@ -2699,6 +2684,52 @@ describe("pairing honestly", () => {
  * and was called unguarded.
  */
 describe("on a phone", () => {
+  it("stops delivery timers while hidden and refreshes on return", async () => {
+    const { plugin } = await load();
+    vi.spyOn(plugin, "paired", "get").mockReturnValue(true);
+    vi.spyOn(plugin, "deliveryReady", "get").mockReturnValue(true);
+    vi.spyOn(plugin, "currentState", "get").mockReturnValue({
+      kind: "synced",
+      summary: "Up to date",
+      at: 0,
+      refused: 0,
+      waiting: 0,
+    });
+    vi.spyOn(plugin, "cursors").mockReturnValue({ local: 0, server: 0 });
+    const requests = vi.spyOn(plugin, "devices").mockResolvedValue({
+      devices: [],
+      maxDevices: 0,
+      invites: [],
+      thisDevice: "phone",
+    });
+    const doc = Object.assign(new EventTarget(), { visibilityState: "hidden" });
+    vi.stubGlobal("document", doc);
+    vi.useFakeTimers();
+    try {
+      plugin.ribbonIcons[0]!.callback();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(requests).not.toHaveBeenCalled();
+      doc.visibilityState = "visible";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requests).toHaveBeenCalledTimes(1);
+      doc.visibilityState = "hidden";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(vi.getTimerCount()).toBe(0);
+      modals.at(-1)!.close();
+      doc.visibilityState = "visible";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(requests).toHaveBeenCalledTimes(1);
+    } finally {
+      modals.at(-1)?.close();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("adds no status bar item and still says everything on the ribbon", async () => {
     await fresh();
     Platform.isMobileApp = true;

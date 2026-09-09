@@ -88,6 +88,11 @@ export interface HistorySource {
 export const PAGE = 20;
 
 export class HistoryModal extends Modal {
+  private closed = false;
+  private reading = false;
+  private restoring = false;
+  /** Keep only the selected version, including an in-flight download. */
+  private preview: { uid: number; text: Promise<string> } | undefined;
   private versions: Version[] = [];
   private chosen: Version | undefined;
   private text = "";
@@ -119,6 +124,7 @@ export class HistoryModal extends Modal {
   }
 
   override onOpen(): void {
+    this.closed = false;
     this.setTitle(`History of ${this.path}`);
     this.modalEl.addClass("mod-basalt-history", "mod-sidebar-layout");
     const sidebar = this.contentEl.createDiv("modal-sidebar mod-history");
@@ -131,14 +137,27 @@ export class HistoryModal extends Modal {
     void this.load();
   }
 
+  override onClose(): void {
+    this.closed = true;
+    this.loading++;
+    this.preview = undefined;
+    this.text = "";
+    this.chosen = undefined;
+    this.versions = [];
+    this.contentEl.empty();
+  }
+
   /** Fetches a page and redraws. `before` continues from the oldest held. */
   private load(): Promise<void> {
+    if (this.closed) return Promise.resolve();
     // One page at a time. Two presses of Load more used to send two requests
     // for the same `before`, and the second page arrived twice.
     if (this.paging) return this.paging;
     this.paging = this.loadPage().finally(() => {
       this.paging = undefined;
+      if (!this.closed) this.renderList();
     });
+    this.renderList();
     return this.paging;
   }
 
@@ -149,11 +168,13 @@ export class HistoryModal extends Modal {
         limit: PAGE,
         ...(before !== undefined ? { before } : {}),
       });
+      if (this.closed) return;
       // Short of a full page means the server has no more. Asking again
       // would be a round trip that can only return nothing.
       if (page.length < PAGE) this.exhausted = true;
       this.versions.push(...page);
     } catch (err) {
+      if (this.closed) return;
       // Not exhausted: the server was not asked, it was unreachable. Setting
       // it here took the Load more button away, so an offline moment while
       // the modal opened left a window whose only recovery was closing it
@@ -187,6 +208,10 @@ export class HistoryModal extends Modal {
 
   private renderList(): void {
     this.listEl.empty();
+    if (this.paging && this.versions.length === 0) {
+      this.listEl.createEl("p", { cls: "basalt-history-empty", text: "Loading history…" });
+      return;
+    }
     if (this.versions.length === 0 && this.failed !== undefined) {
       // "The server holds no history for this note" over an ask that never
       // reached the server is rule 7's mistake in miniature: it describes the
@@ -222,8 +247,9 @@ export class HistoryModal extends Modal {
     if (!this.exhausted) {
       const more = this.listEl.createEl("button", {
         cls: "basalt-history-button",
-        text: this.failed === undefined ? "Load more" : "Try again",
+        text: this.paging ? "Loading…" : this.failed === undefined ? "Load more" : "Try again",
       });
+      more.disabled = this.paging !== undefined;
       more.addEventListener("click", () => void this.load());
     }
   }
@@ -252,8 +278,13 @@ export class HistoryModal extends Modal {
       this.showDiff = !this.showDiff;
       void this.choose(version);
     });
+    toggle.disabled = this.restoring;
 
-    const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore" });
+    const restore = actions.createEl("button", {
+      cls: "mod-cta",
+      text: this.restoring ? "Restoring…" : "Restore",
+    });
+    restore.disabled = this.reading || this.restoring;
     restore.addEventListener("click", () => void this.restore(version));
 
     const pre = this.paneEl.createEl("pre", {
@@ -280,15 +311,26 @@ export class HistoryModal extends Modal {
   }
 
   private async choose(version: Version): Promise<void> {
+    if (this.closed || this.restoring) return;
     const mine = ++this.loading;
     this.chosen = version;
+    this.reading = true;
     this.text = "Loading…";
     this.render();
     let text: string;
     try {
-      const older = await this.source.contentAt(version);
+      if (this.preview?.uid !== version.uid) {
+        const preview = { uid: version.uid, text: this.source.contentAt(version) };
+        this.preview = preview;
+        void preview.text.catch(() => {
+          if (this.preview === preview) this.preview = undefined;
+        });
+      }
+      const older = await this.preview.text;
+      if (mine !== this.loading) return;
       if (this.showDiff) {
         const now = (await this.source.currentText(this.path)) ?? "";
+        if (mine !== this.loading) return;
         text = diffLines(older, now);
       } else {
         text = older;
@@ -300,6 +342,7 @@ export class HistoryModal extends Modal {
     // belongs to a version the list no longer says is chosen, and drawing it
     // would label one version's text with another's name.
     if (mine !== this.loading) return;
+    this.reading = false;
     this.text = text;
     // Only the pane, so a slow read does not rebuild the list under the
     // pointer of somebody about to click the next version.
@@ -307,6 +350,9 @@ export class HistoryModal extends Modal {
   }
 
   private async restore(version: Version): Promise<void> {
+    if (this.closed || this.restoring || this.reading) return;
+    this.restoring = true;
+    this.renderPane();
     try {
       const done = await this.source.restoreVersion(version);
       // Longer on screen when the note is here but not yet on the other
@@ -316,6 +362,9 @@ export class HistoryModal extends Modal {
       this.close();
     } catch (err) {
       new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+    } finally {
+      this.restoring = false;
+      if (!this.closed) this.renderPane();
     }
   }
 }

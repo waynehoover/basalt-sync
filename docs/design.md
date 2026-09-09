@@ -115,7 +115,14 @@ A completed local checkpoint is reported only after a clean pass flushes files
 and saves the index. The device list exposes this separately from metadata
 receipt. An open panel refreshes delivery status once per second; hidden or
 closed panels do not poll. Receipts expire with the connection and are not
-stored in SQLite, avoiding a database write per edit.
+stored in SQLite, avoiding a database write per edit. Hidden panels cancel their
+poll timer and refresh immediately when the app becomes visible again.
+
+Version history keeps only the selected preview in memory, sharing an in-flight
+download and reusing it when switching between text and changes. Comparisons
+always reread the local note. Closing the window discards the preview and stops
+late page responses from starting further downloads. Repeated Restore taps
+cannot start another restore while the first is running.
 
 Manual sync interrupts reconnect backoff when offline. Repeated requests share
 the same work, and the panel shows a disabled busy action while connecting,

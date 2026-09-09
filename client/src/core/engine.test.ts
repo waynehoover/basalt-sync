@@ -2974,7 +2974,7 @@ describe("what status says about a folder this device ignores (N4)", () => {
     // through the reconcile loop, hiding that the first pass left it owing.
     await a.vault.edit("Drafts/plan.md", "not for the other one\n");
     await a.settle();
-    await until("b to stage the ignored path", () => b.engine.status().pending > 0);
+    await receiveCommitted(b.transport);
 
     await b.engine.sync();
 

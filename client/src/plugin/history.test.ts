@@ -8,6 +8,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { deferred, nextTurn } from "../core/test-async.ts";
 
 import { Client } from "../core/client.ts";
 import { testWrapped } from "../core/test-keys.ts";
@@ -258,6 +259,131 @@ function buttons(modal: HistoryModal): { text: string; click(): void }[] {
   return found;
 }
 
+describe("history on a slow connection", () => {
+  const version: Version = {
+    uid: 1,
+    path: "note.md",
+    contentId: "v1",
+    size: 4,
+    ctime: 0,
+    mtime: 1,
+    folder: false,
+    deleted: false,
+    device: "phone",
+    chunks: 1,
+  };
+  function fixture() {
+    const source = {
+      history: vi.fn(async () => [version]),
+      contentAt: vi.fn(async () => "old\n"),
+      currentText: vi.fn(async () => "new\n"),
+      restoreVersion: vi.fn(async () => ({ path: "restored.md", sent: true })),
+    };
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    const work = modal as unknown as {
+      choose(v: Version): Promise<void>;
+      load(): Promise<void>;
+      restore(v: Version): Promise<void>;
+    };
+    return { modal, source, work };
+  }
+
+  it("reuses the selected download but compares with the latest local edit", async () => {
+    const { modal, source } = fixture();
+    modal.open();
+    await nextTurn();
+    buttons(modal)
+      .find((b) => b.text === "Show changes")!
+      .click();
+    await nextTurn();
+    expect(rendered(modal)).toContain("+ new");
+    buttons(modal)
+      .find((b) => b.text === "Show text")!
+      .click();
+    await nextTurn();
+    source.currentText.mockResolvedValue("edited again\n");
+    buttons(modal)
+      .find((b) => b.text === "Show changes")!
+      .click();
+    await nextTurn();
+    expect(rendered(modal)).toContain("+ edited again");
+    expect(source.contentAt).toHaveBeenCalledTimes(1);
+    expect(source.currentText).toHaveBeenCalledTimes(2);
+    modal.close();
+  });
+
+  it("shares a download when the same version is selected twice", async () => {
+    const { modal, source, work } = fixture();
+    const content = deferred<string>();
+    source.contentAt.mockReturnValue(content.promise);
+    modal.open();
+    await nextTurn();
+    const again = work.choose(version);
+    content.resolve("exact downloaded text\n");
+    await again;
+    expect(rendered(modal)).toContain("exact downloaded text\n");
+    expect(source.contentAt).toHaveBeenCalledTimes(1);
+    modal.close();
+  });
+
+  it("does not fetch a preview after the history window has closed", async () => {
+    const { modal, source, work } = fixture();
+    const page = deferred<Version[]>();
+    source.history.mockReturnValue(page.promise);
+    modal.open();
+    expect(rendered(modal)).toContain("Loading history…");
+    const loading = work.load();
+    modal.close();
+    page.resolve([version]);
+    await loading;
+    expect(source.contentAt).not.toHaveBeenCalled();
+    expect(rendered(modal)).toBe("");
+  });
+
+  it("discards a preview that finishes after closing", async () => {
+    const { modal, source, work } = fixture();
+    const content = deferred<string>();
+    source.contentAt.mockReturnValue(content.promise);
+    modal.open();
+    await nextTurn();
+    const reading = work.choose(version);
+    modal.close();
+    content.resolve("private version contents\n");
+    await reading;
+    expect(rendered(modal)).toBe("");
+  });
+
+  it("restores once when Restore is tapped repeatedly", async () => {
+    const { modal, source, work } = fixture();
+    modal.open();
+    await nextTurn();
+    const done = deferred<{ path: string; sent: boolean }>();
+    source.restoreVersion.mockReturnValue(done.promise);
+    const first = work.restore(version);
+    const second = work.restore(version);
+    expect(rendered(modal)).toContain("Restoring…");
+    done.resolve({ path: "restored.md", sent: true });
+    await Promise.all([first, second]);
+    expect(source.restoreVersion).toHaveBeenCalledTimes(1);
+    expect(notices.filter((n) => n.message.startsWith("Restored"))).toHaveLength(1);
+  });
+
+  it("allows a failed restore and a failed preview to be retried", async () => {
+    const { modal, source, work } = fixture();
+    source.contentAt.mockRejectedValueOnce(new Error("offline"));
+    modal.open();
+    await nextTurn();
+    expect(rendered(modal)).toContain("Could not read this version");
+    await work.choose(version);
+    expect(rendered(modal)).toContain("old\n");
+    source.restoreVersion.mockRejectedValueOnce(new Error("offline"));
+    await work.restore(version);
+    expect(buttons(modal).some((b) => b.text === "Restore")).toBe(true);
+    await work.restore(version);
+    expect(source.restoreVersion).toHaveBeenCalledTimes(2);
+  });
+});
+
 /**
  * The modal has to say which note it belongs to. It calls setTitle, but
  * mod-sidebar-layout collapses the modal header to nothing, so for a while the
@@ -388,8 +514,9 @@ describe("selections that finish out of order", () => {
 
     const more = () => buttons(modal).find((b) => b.text.includes("Load more"));
     expect(more(), "no Load more button for a full first page").toBeDefined();
-    more()!.click();
-    more()!.click();
+    const loadMore = more()!;
+    loadMore.click();
+    loadMore.click();
     await until("the second history page", () => rows(modal).length === PAGE + 1);
     expect(calls(), "two presses became two requests for the same page").toBe(2);
     expect(rows(modal).length).toBe(PAGE + 1);
