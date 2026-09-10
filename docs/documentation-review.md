@@ -94,3 +94,23 @@ example syntax, subtitle consistency, and the server image pin. Compared command
 examples and behavior claims with source, CLI help, Obsidian CLI capabilities,
 and release metadata. Actual installation, two-device acceptance, benchmarks,
 and the full application test suite were not rerun for this prose-only pass.
+
+## September 10 follow-up
+
+Reviewed the README, documentation hub, comparison, plugin guide, and agent
+installer against the current plugin and server contracts. The September 8
+review above remains a record of that version, including its protocol references.
+
+- Replaced the README's vague privacy benefit with encryption before upload.
+- Clarified when pairing shows a first-sync preview and how device delivery
+  status differs from this device finishing sync.
+- Documented retry and older-page navigation in deleted-note recovery.
+- Moved the agent installer's Compose inspection before startup and put the
+  released pairing preview in the main installation flow.
+- Rechecked comparison claims against official Obsidian and LiveSync sources.
+
+The accompanying plugin review exercised deleted-note recovery with two clients
+and a real test server, and checked the recovery dialogs in light and dark
+desktop and phone layouts. Phone images use desktop Obsidian's mobile CSS;
+they do not establish Android runtime behavior. No installation or deployment
+to a personal vault was part of this review.

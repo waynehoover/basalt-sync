@@ -23,15 +23,11 @@
  * afford to because it deduplicates on the plaintext hash instead. Basalt
  * deduplicates on the wire, so the determinism has to be in the cipher.
  *
- * The nonce is therefore synthetic: HMAC of the plaintext under a separate key.
- * This is the construction AES-GCM-SIV packages up, spelled out from the two
- * primitives WebCrypto actually provides, because WebCrypto's AES modes are
- * fixed by specification at CBC, CTR, GCM and KW and the client runs in a
- * webview on mobile.
- *
- * The nonce-reuse hazard does not arise: a nonce repeats only for identical
- * plaintext under the same key, which is exactly the equality being asked for,
- * and distinct plaintexts get distinct nonces from the HMAC.
+ * The nonce is HMAC of the plaintext under a separate key, truncated to 96
+ * bits. This is deterministic AES-GCM, not AES-GCM-SIV. Identical plaintext
+ * intentionally repeats its nonce and ciphertext; distinct inputs can collide
+ * in the truncated nonce, so nonce reuse remains a probabilistic risk. The
+ * construction and its limits are documented in docs/design.md, "The keys".
  *
  * What this concedes, and it belongs stated rather than buried: the server can
  * see that two chunks are byte-identical. That is not a leak being tolerated,

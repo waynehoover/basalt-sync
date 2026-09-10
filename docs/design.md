@@ -34,6 +34,11 @@ These rule numbers are stable because code comments cite them. The
 11. **A recovery path tested only in docs is a rumour.** Exercise restore with
     the built server and read the restored versions and content back.
 
+Writable server startup flushes the chunk directories and their ancestors
+before reporting existing bodies as durable. This requires readable directory
+ancestors and working directory `fsync`; a failed flush refuses startup or the
+affected write. Inspection commands do not perform these flushes.
+
 ## Conflicts: keep both
 
 Three-way merging uses the last reconciled content as its ancestor. The engine

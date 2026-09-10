@@ -125,7 +125,8 @@ For sync, `outcome` explains the result and the counters describe the work.
 
 A conflict exits 0 because both versions were preserved. Ignored files and
 changes held back by read-only mode also do not make a sync fail. Inspect those
-fields if your job needs a stricter condition. Incomplete recovery is a failure.
+fields if your job needs a stricter condition. Hidden versions awaiting recovery
+and an unreadable recovery inventory make sync fail until addressed.
 
 Restore separates `restored` (the local file was written), `sent` (that copy was
 acknowledged by the server), and `ok` (the overall operation succeeded). If the

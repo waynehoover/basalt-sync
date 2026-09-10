@@ -2073,21 +2073,21 @@ export class Engine {
               base: remote?.uid ?? 0,
             },
             bodyOf: noBodies,
-            basedOn: remote?.uid,
-            commit: (uid) => {
+            commit: (uid, remoteIsNewer) => {
               // Recorded before the entry is forgotten. This
               // device's own writes come back with no payload, so
               // nothing else will ever tell it the deletion
               // happened, and a stale entry here reads on the next
               // pass as a file to download back.
-              this.remote.set(path, {
-                uid,
-                folder: false,
-                deleted: true,
-                mtime: this.now(),
-                size: 0,
-                hash: "",
-              });
+              if (!remoteIsNewer)
+                this.remote.set(path, {
+                  uid,
+                  folder: false,
+                  deleted: true,
+                  mtime: this.now(),
+                  size: 0,
+                  hash: "",
+                });
               this.entries.delete(path);
               report.deletedRemotely++;
               this.log("deleted on the server", path, action.why);
@@ -2179,17 +2179,17 @@ export class Engine {
           // A folder has no content and so no lineage.
           entry: { ...facts, ...(await this.authFor(facts, "")), base },
           bodyOf: noBodies,
-          basedOn,
-          commit: (uid) => {
+          commit: (uid, remoteIsNewer) => {
             synced(entry, "", [], uid, this.now());
-            this.remote.set(path, {
-              uid,
-              folder: true,
-              deleted: false,
-              mtime: 0,
-              size: 0,
-              hash: "",
-            });
+            if (!remoteIsNewer)
+              this.remote.set(path, {
+                uid,
+                folder: true,
+                deleted: false,
+                mtime: 0,
+                size: 0,
+                hash: "",
+              });
             if (count) report.uploaded++;
           },
         },
@@ -2227,29 +2227,48 @@ export class Engine {
         // a receiver tell a new version from a replayed old one.
         entry: { ...facts, ...(await this.authFor(facts, entry.synchash)), base, prevBase },
         bodyOf: plan.bodyOf,
-        basedOn,
-        commit: (uid) => {
+        commit: (uid, remoteIsNewer) => {
           synced(entry, hash, chunks, uid, this.now());
           // Record what the server now holds, so the next pass sees
           // agreement rather than deciding to upload again.
-          this.remote.set(path, {
-            uid,
-            folder: false,
-            deleted: false,
-            mtime,
-            size,
-            hash,
-            ...spellingHeads(this.remote.get(path), path, path, uid),
-          });
+          if (!remoteIsNewer)
+            this.remote.set(path, {
+              uid,
+              folder: false,
+              deleted: false,
+              mtime,
+              size,
+              hash,
+              ...spellingHeads(this.remote.get(path), path, path, uid),
+            });
           if (previous) {
+            // A peer can advance the destination before this ack is handled.
+            // Its source retirement still committed; own broadcasts carry
+            // no entry that could record that fact for us later.
             const old = canonicalSpelling(previous);
-            if (old !== path && (this.remote.get(old)?.uid ?? 0) <= uid) {
-              this.remote.set(old, { uid, folder: false, deleted: true, mtime, size: 0, hash: "" });
+            if (old !== path) {
+              // The old incarnation was retired even if a peer has already
+              // reused its name with identical bytes. Keeping that ancestor
+              // would misread the absent old file as a new deletion.
               this.entries.delete(old);
-              this.pending.delete(old);
+              if ((this.remote.get(old)?.uid ?? 0) <= uid) {
+                this.remote.set(old, {
+                  uid,
+                  folder: false,
+                  deleted: true,
+                  mtime,
+                  size: 0,
+                  hash: "",
+                  ...spellingHeads(this.remote.get(old), old, previous, uid),
+                });
+                this.pending.delete(old);
+              }
             } else if (old === path) {
               const state = this.remote.get(path)!;
-              this.remote.set(path, { ...state, heads: { ...state.heads, [previous]: uid } });
+              this.remote.set(path, {
+                ...state,
+                heads: { ...state.heads, [previous]: Math.max(state.heads?.[previous] ?? 0, uid) },
+              });
             }
           }
           if (count) report.uploaded++;
@@ -2420,30 +2439,19 @@ export class Engine {
         this.recordFailure(q.path, result.error, report);
         continue;
       }
-      if (this.remote.get(q.path)?.uid !== q.basedOn) {
-        // Another device committed a version of this path between the
-        // decision and now. Batches arrive on the transport's own chain, so
-        // `remote` moves under a running pass, and the server has just
-        // taken this write on top of a version it never saw. Recording it
-        // as synced would make the index say both sides agree, and the
-        // other device would then download this version cleanly over its
-        // own edit, with nothing conflicted and nothing merged: a lost
-        // update with a clean report.
-        //
-        // So nothing is recorded. The index still holds the old ancestor
-        // and the remote index the version that arrived, which is exactly
-        // the divergence the next pass merges or keeps both halves of. It
-        // runs straight away, because a client that syncs once and exits
-        // must not exit here.
+      const remoteIsNewer = (this.remote.get(q.path)?.uid ?? 0) > result.uid;
+      // A successful conditional write is an accepted ancestor even if a
+      // peer edits it before the ack arrives. Record that local checkpoint
+      // and any source retirement, while preserving the newer remote head.
+      q.commit(result.uid, remoteIsNewer);
+      if (remoteIsNewer) {
         report.waiting++;
         this.again = true;
-        this.log("another device wrote first, reconciling next pass", q.path, {
-          decidedAgainst: q.basedOn ?? "nothing",
+        this.log("another device wrote after this upload, reconciling next pass", q.path, {
+          uploaded: result.uid,
           now: this.remote.get(q.path)?.uid,
         });
-        continue;
       }
-      q.commit(result.uid);
     }
   }
 
@@ -2691,6 +2699,7 @@ export class Engine {
     }
 
     const held = new Map<string, Uint8Array>();
+    let fetchIndividually = false;
     if (wanted.length > 0) {
       try {
         const bodies = await this.fetchAll(
@@ -2700,10 +2709,19 @@ export class Engine {
         );
         for (let i = 0; i < wanted.length; i++) held.set(wanted[i]!, bodies[i]!);
       } catch (err) {
-        // The fetch failed, so no file in it arrived. Each is retried,
-        // exactly as it would have been on its own.
-        for (const d of batch) this.recordFailure(d.path, err, report);
-        return;
+        // A missing or quarantined body must not hold every healthy note in
+        // this batch back forever. The server refuses before sending bodies,
+        // so the connection is still usable for individual file requests.
+        if (
+          err instanceof ProtocolError &&
+          err.code === "nochunk" &&
+          !this.opts.transport.isClosed
+        ) {
+          fetchIndividually = true;
+        } else {
+          for (const d of batch) this.recordFailure(d.path, err, report);
+          return;
+        }
       }
     }
 
@@ -2725,9 +2743,9 @@ export class Engine {
         // would only displace them again.
         if (reused === "kept") continue;
         const wrote =
-          from !== undefined
-            ? // The local copy did not prove out, so ask for it after all.
-              // Rare, and it costs one extra round trip rather than a file.
+          from !== undefined || fetchIndividually
+            ? // Isolate missing bodies, or fetch after local reuse could not
+              // be verified. Ordinary healthy batches keep the shared fetch.
               await this.land(d, await this.fetchFor(d), report)
             : await this.land(d, held, report);
         // Counted only when it happened. A conflict copy is not a download,
@@ -3932,10 +3950,18 @@ export class Engine {
     const entry = this.entries.get(from);
     if (!entry) return;
 
-    // The new path inherits the sync state, so the content is recognised as
-    // already on the server and the move costs no chunks, and `prev` tells the
-    // server which name this used to be.
-    const moved: IndexEntry = { ...entry, chunks: [...entry.chunks] };
+    // Content follows the file; reconciliation history belongs to the path.
+    // If B was moved to C before A moves to B, A's old ancestor does not
+    // describe B. Inheriting it would mistake the old remote B for an edit
+    // to A and download it over the moved note. The source entry below keeps
+    // the UID needed to conditionally retire A when this rename commits.
+    const target = this.entries.get(to);
+    const moved: IndexEntry = {
+      ...entry,
+      chunks: [...entry.chunks],
+      synchash: target?.synchash ?? "",
+      syncuid: target?.syncuid ?? 0,
+    };
     renamed(moved, from, to);
     this.entries.set(to, moved);
 
@@ -4316,14 +4342,8 @@ interface Queued {
   readonly size: number;
   readonly entry: BatchEntry;
   readonly bodyOf: (name: string) => Promise<Uint8Array>;
-  /**
-   * The server's newest version of this path when the write was decided, or
-   * undefined when it had none. Compared against the remote index again at
-   * commit time; see `flush` for what a difference means.
-   */
-  readonly basedOn: number | undefined;
-  /** Run only once the server has committed it, with the uid it was given. */
-  readonly commit: (uid: number) => void;
+  /** Record the accepted write, preserving a remote head newer than its UID. */
+  readonly commit: (uid: number, remoteIsNewer: boolean) => void;
 }
 
 /**

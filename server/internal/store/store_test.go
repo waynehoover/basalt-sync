@@ -1318,6 +1318,13 @@ func TestPurgeCompletesWithAQuarantinedBody(t *testing.T) {
 	newest := h.file(t, "note.md", "head", "new tail")
 
 	// Set aside the newest version's own chunk, as a failed fetch would.
+	p, err := h.Chunks().Path("v1", newest.Chunks[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("bad tail"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.Chunks().Quarantine("v1", newest.Chunks[1]); err != nil {
 		t.Fatalf("quarantine: %v", err)
 	}
@@ -1586,6 +1593,13 @@ func TestAQuarantineCannotOvertakeACommit(t *testing.T) {
 	done := make(chan struct{})
 	st.betweenCheckAndCommit = func() {
 		st.betweenCheckAndCommit = nil
+		p, err := st.Chunks().Path("v", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("bit rot"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		go func() {
 			defer close(done)
 			if err := st.Quarantine("v", name); err != nil {

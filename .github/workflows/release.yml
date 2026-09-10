@@ -168,10 +168,10 @@ jobs:
             docker image rm -f "$REF" >/dev/null 2>&1 || true
             got=$(docker run --rm --platform "linux/$arch" "$REF" version)
             echo "linux/$arch: $got"
-            case "$got" in
-              *"$WANT"*) ;;
-              *) echo "linux/$arch does not say it is $WANT" >&2; exit 1 ;;
-            esac
+            if [ "$(printf '%s\n' "$got" | awk 'NR == 1 { print $2 }')" != "$WANT" ]; then
+              echo "linux/$arch does not say it is $WANT" >&2
+              exit 1
+            fi
           done
           docker image rm -f "$REF" >/dev/null 2>&1 || true
 

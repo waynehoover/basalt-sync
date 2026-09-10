@@ -88,7 +88,7 @@ export interface JournalFiles {
 
 /** When a log has earned a fresh snapshot. */
 export interface SnapshotPolicy {
-  /** Of the snapshot's own size. Measured; see docs/compared.md. */
+  /** Of the snapshot's own size. Measured; see docs/research.md. */
   readonly fractionOfSnapshot: number;
   readonly maxRecords: number;
   /**
@@ -108,7 +108,7 @@ export interface SnapshotPolicy {
  *
  * The spec proposed a quarter of the snapshot, 1000 records and a 64 KiB floor
  * and said all three were guesses. `bun run src/stress/journal.ts` measures
- * them; the figures are in docs/compared.md with the corpus. All three stay,
+ * them; the figures are in docs/research.md with the corpus. All three stay,
  * and the useful thing the measurement produced is knowing which one governs
  * where, because they turned out to bind at three different vault sizes:
  *

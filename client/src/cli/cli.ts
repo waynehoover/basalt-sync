@@ -1411,7 +1411,7 @@ async function writeKeyOut(path: string, recoveryKey: string): Promise<void> {
 export function exitCodeFor(
   report: SyncReport,
   /** The vault, for what it could establish about versions waiting (RR5). */
-  vault?: { recovery?: Inventory },
+  vault?: { recovery?: Inventory; stranded?: readonly string[] },
 ): number {
   // Through the shared vocabulary, so the exit code, the panel's glyph and
   // the JSON all draw the same conclusion from one pass (I04). This counted
@@ -1423,7 +1423,7 @@ export function exitCodeFor(
   // did, and the engine is told only that a path was kept. `status` worked it
   // out for itself and `sync` did not, so the two exited differently on one
   // vault (RR5).
-  return exitCodeOf(outcomeOf(report, undefined, vault?.recovery));
+  return exitCodeOf(outcomeOf(report, undefined, vault?.recovery, vault?.stranded));
 }
 
 /**
@@ -1826,7 +1826,9 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
  */
 async function cmdRepair(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
-  const client = await open(config, args, io);
+  // Repair only resends bodies. A peer arriving during the request must not
+  // start an ordinary sync: this command does not hold the vault's writer lock.
+  const client = await open(config, args, io, { inspect: true });
   try {
     const out = await client.repair();
     const wrong = out.failed.length > 0 || out.stillMissing > 0;
@@ -1872,7 +1874,7 @@ async function cmdRepair(args: Args, io: Console): Promise<number> {
     );
     return wrong ? 1 : 0;
   } finally {
-    client.close();
+    await client.close();
   }
 }
 
@@ -2090,7 +2092,7 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
       // and saying so is not the same as saying the run had nothing else
       // wrong with it; folding the two together is what made the old `true`
       // look reasonable.
-      const outcome = outcomeOf(report, undefined, client.vault.recovery);
+      const outcome = outcomeOf(report, undefined, client.vault.recovery, client.vault.stranded);
       const code = exitCodeOf(outcome);
       io.out(
         JSON.stringify({
@@ -2270,7 +2272,7 @@ async function open(
   opts: ConnectHow & { inspect?: boolean } = {},
 ): Promise<Client> {
   const client = new Client({
-    ...(await clientOptions(config, args, io)),
+    ...(await clientOptions(config, args, io, opts.inspect)),
     ...(opts.inspect === true ? { inspect: true } : {}),
   });
   try {
@@ -2282,8 +2284,20 @@ async function open(
   return client;
 }
 
-async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
-  const vault = new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore });
+async function clientOptions(
+  config: Config,
+  args: Args,
+  io?: Console,
+  observeOnly = false,
+): Promise<ClientOptions> {
+  const vault = new NodeVault(args.dir, {
+    configDir: args.configDir,
+    alsoIgnore: args.ignore,
+    // Inspection suppresses automatic sync and the scan's own mutations.
+    // Preview lists files, so transport-only inspection would still compact
+    // the recovery ledger and normalize names beside a running writer.
+    observeOnly,
+  });
   // Once, here, before anything canonicalises a path. Until the probe has run
   // `canonical` folds case, which is the safe default and the wrong answer on
   // Linux: two files that differ only in case are one file as far as the alias
@@ -2351,7 +2365,12 @@ export function renderReport(
     undefined,
     // From the same string the text renderer prints below, so the JSON's `ok`
     // and the sentence a person reads cannot say different things.
-    recoveryUnknown === undefined ? undefined : { complete: false, why: recoveryUnknown },
+    {
+      complete: recoveryUnknown === undefined,
+      ...(recoveryUnknown !== undefined ? { why: recoveryUnknown } : {}),
+      waiting: displaced,
+    },
+    stranded,
   );
   if (args.json) {
     // `ok` and `outcome` come from the same conclusion, so a script keying on
@@ -2406,7 +2425,11 @@ export function renderReport(
   say(r.ignored, "ignored here, and synced by another device");
 
   if (lines.length === 0) {
-    io.out("Nothing to do. Everything here matches the server.");
+    io.out(
+      outcome.kind === "synced"
+        ? "Nothing to do. Everything here matches the server."
+        : describeOutcome(outcome),
+    );
   } else {
     for (const line of lines) io.out(line);
     // The conclusion, once, in the same words the panel and the JSON use

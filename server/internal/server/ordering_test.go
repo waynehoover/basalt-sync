@@ -333,18 +333,20 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 		t.Fatalf("ensure vault: %v", err)
 	}
 
-	newSession := func() *Session {
+	newSession := func(name string) *Session {
+		id, key := r.device(name)
 		s := &Session{
 			srv: r.srv, vaultID: testVault,
+			deviceID: id, deviceHash: hashOf(key),
 			out: make(chan outFrame, 32), dead: make(chan struct{}),
 		}
 		s.flushPending(0) // past catch-up, so deliveries go straight to the queue
 		return s
 	}
 
-	observer := newSession()
+	observer := newSession("observer")
 	r.srv.hub.join(testVault, observer)
-	a, b := newSession(), newSession()
+	a, b := newSession("a"), newSession("b")
 
 	secondAssigned := make(chan struct{})
 	var once sync.Once

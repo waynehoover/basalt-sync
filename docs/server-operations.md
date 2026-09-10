@@ -18,8 +18,12 @@ basaltd verify -deep -data /srv/basalt-backup
 
 `backup` copies the database and required encrypted content, including history,
 and verifies the result. Reusing a destination copies content incrementally and
-replaces its database snapshot only after a successful copy. An interrupted
-backup leaves the previous completed snapshot available.
+replaces its database snapshot only after a successful copy. If copying fails,
+the previous completed snapshot stays in place.
+
+If a destination has unfinished SQLite recovery from an earlier server run,
+backup refuses to replace it. Keep that directory intact and choose a fresh
+backup directory; do not remove its journal files to bypass the refusal.
 
 For Compose:
 
@@ -155,11 +159,10 @@ not the first recovery step.
 
 ## Purge
 
-**Purge permanently removes older versions from the live server.** It keeps only
-the newest entry for each path, retains records needed to keep moved-away names
-retired, and removes unreferenced content. If the newest
-entry is a deletion, that note's older content is no longer recoverable there.
-Nothing purges automatically.
+**Purge permanently removes older versions from the live server.** It keeps
+current files and enough history to track moves and deletions, then removes
+unused content. Some deleted notes remain recoverable when that history is
+needed. Nothing purges automatically.
 
 First inspect how much space it could reclaim:
 

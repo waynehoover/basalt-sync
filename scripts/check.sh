@@ -140,6 +140,8 @@ run "the attestation can be started" "" \
   bash "$root/scripts/attest-trigger.test.sh"
 run "the runbook prints what it means to" "" \
   bash "$root/scripts/release-runbook.test.sh"
+run "the release verifier refuses incomplete assets" "" \
+  bash "$root/scripts/verify-release.test.sh"
 run "the pin check excuses one commit and no others" "" \
   bash "$root/scripts/pin-check.test.sh"
 run "every doc comment names what it sits on" "" \

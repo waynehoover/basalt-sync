@@ -539,6 +539,9 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	if err := s.refuseOverlap(destDir); err != nil {
 		return rep, err
 	}
+	if err := refuseDestinationRecovery(destDir); err != nil {
+		return rep, err
+	}
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return rep, err
 	}
@@ -745,6 +748,30 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	}
 	rep.Meta = meta
 	return rep, nil
+}
+
+// A destination once served by a process that crashed may still need its WAL
+// or rollback journal. Publishing a new database beside those files lets
+// SQLite replay old pages over a snapshot we just verified. Keep the recovery
+// copy intact; the caller holds its exclusive data lock throughout this check
+// and publication, so another Basalt process cannot create a journal here.
+func refuseDestinationRecovery(destDir string) error {
+	dbPath, _ := DataDir(destDir)
+	for _, suffix := range []string{"-wal", "-journal"} {
+		p := dbPath + suffix
+		info, err := os.Stat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("checking destination SQLite recovery state: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Size() > 0 {
+			return fmt.Errorf("backup destination has SQLite recovery state at %s; "+
+				"keep this directory intact and choose a fresh backup directory", p)
+		}
+	}
+	return nil
 }
 
 // distinctChunkCount is how many distinct bodies this store's entries

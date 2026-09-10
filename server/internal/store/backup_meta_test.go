@@ -65,6 +65,11 @@ func TestBackupLeavesNoCoverageRatherThanStaleCoverage(t *testing.T) {
 	if st.Versions != 1 {
 		t.Fatalf("the published database holds %d versions, want 1", st.Versions)
 	}
+	// Release the restored database before reusing its directory as a backup
+	// destination, as the command's exclusive destination lock requires.
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// And there is no coverage claiming the three the previous run had.
 	if _, err := os.Stat(filepath.Join(dir, BackupMetaFile)); !os.IsNotExist(err) {

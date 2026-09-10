@@ -527,6 +527,9 @@ func TestSweepReportsQuarantinedBodiesInsteadOfAborting(t *testing.T) {
 	if err := s.Put("v1", name, good); err != nil {
 		t.Fatalf("put: %v", err)
 	}
+	if err := os.WriteFile(s.path("v1", name), []byte("a corrupt body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Quarantine("v1", name); err != nil {
 		t.Fatalf("quarantine: %v", err)
 	}
@@ -557,6 +560,25 @@ func TestSweepReportsQuarantinedBodiesInsteadOfAborting(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("CountBodies = %d, want 0: a quarantined body is not a body", n)
+	}
+}
+
+func TestQuarantineDoesNotRemoveAPathItCannotRead(t *testing.T) {
+	s := newTestStore(t)
+	name := Name([]byte("unreadable body"))
+	p := s.path("v1", name)
+	// A directory reliably makes ReadFile fail, even when tests run as root.
+	if err := os.MkdirAll(p, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Quarantine("v1", name); err == nil || errors.Is(err, ErrCorrupt) {
+		t.Fatalf("non-corruption read failure was not propagated: %v", err)
+	}
+	if info, err := os.Stat(p); err != nil || !info.IsDir() {
+		t.Fatalf("unreadable path was removed: %v", err)
+	}
+	if _, err := os.Stat(p + corruptSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected quarantine evidence: %v", err)
 	}
 }
 
@@ -716,6 +738,9 @@ func TestSweepCountsTheSpaceItWalkedPastAndCannotReclaim(t *testing.T) {
 	name := Name(body)
 	if err := s.Put("v1", name, body); err != nil {
 		t.Fatalf("put: %v", err)
+	}
+	if err := os.WriteFile(s.path("v1", name), []byte(strings.Repeat("!", len(body))), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	if err := s.Quarantine("v1", name); err != nil {
 		t.Fatalf("quarantine: %v", err)

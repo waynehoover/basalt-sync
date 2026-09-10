@@ -64,10 +64,10 @@ bin=$work/elsewhere/node_modules/.bin/basalt
 echo "==> running it under node $(node --version)"
 got=$("$bin" --version)
 echo "    version: $got"
-case "$got" in
-  *"$want"*) ;;
-  *) echo "the packed CLI says \"$got\", and the package says $want" >&2; exit 1 ;;
-esac
+if [ "$got" != "$want" ]; then
+  echo "the packed CLI says \"$got\", and the package says $want" >&2
+  exit 1
+fi
 
 # `--help` is what somebody types first, and a bundle that throws on startup
 # throws here too.

@@ -380,16 +380,17 @@ describe("what a scan costs", () => {
     const listed = await v.list();
     expect(listed.length).toBe(210); // 200 notes and the 10 folders
 
-    // Two `exists`: the case-folding probe, which happens only on the first
-    // listing, and the displaced-version log, which is looked at on every one.
-    // Nothing per file, which is the property this is here for -- the cost has
-    // to stay flat as the vault grows, and a constant two is flat.
+    // One case-folding probe on the first listing and one recovery-log stat
+    // on every listing. Neither costs a call per note as the vault grows.
     expect(
       { stat: counting.stats, list: counting.lists, exists: counting.exists_ },
       `a 200 file vault cost ${counting.stats} stat, ${counting.lists} list and ${counting.exists_} exists calls`,
-    ).toEqual({ stat: 0, list: 0, exists: 2 });
+    ).toEqual({ stat: 1, list: 0, exists: 1 });
     await v.list();
-    expect(counting.exists_, "the second scan cost more than the log").toBe(3);
+    expect(
+      { stat: counting.stats, list: counting.lists, exists: counting.exists_ },
+      "the second scan cost more than the log",
+    ).toEqual({ stat: 2, list: 0, exists: 1 });
 
     // And the same vault at ten times the size costs the same, which is the
     // claim. Pinning the number alone would pass on a scan that had become
@@ -403,9 +404,9 @@ describe("what a scan costs", () => {
     );
     await bigVault.list();
     expect(
-      bigCount.exists_,
-      `ten times the notes cost ${bigCount.exists_} exists calls, so the scan is per file`,
-    ).toBe(2);
+      { stat: bigCount.stats, list: bigCount.lists, exists: bigCount.exists_ },
+      "ten times the notes must not increase scan calls",
+    ).toEqual({ stat: 1, list: 0, exists: 1 });
   });
 
   it("still reports what the walk did", async () => {

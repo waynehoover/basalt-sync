@@ -666,6 +666,46 @@ func TestARevokeRacingAConnectAlwaysWins(t *testing.T) {
 		func() bool { return r.srv.Peers(testVault) == 1 })
 }
 
+func TestReusingARevokedDeviceIDDoesNotCompleteItsOldHandshake(t *testing.T) {
+	r := newRig(t)
+	keeper := r.dial("keeper")
+	keeper.hello(0)
+	r.device("racer")
+	freshKey := deviceKey("replacement")
+	var once sync.Once
+	r.srv.beforeJoin = func() {
+		once.Do(func() {
+			if err := r.st.RevokeDevice(testVault, deviceID("racer"), "", false); err != nil {
+				t.Errorf("revoke before join: %v", err)
+			}
+			rootHash, err := r.st.AuthHash(testVault)
+			if err != nil {
+				t.Errorf("read root hash: %v", err)
+			}
+			if err := r.st.RegisterDevice(testVault, deviceID("racer"), "replacement", hashOf(freshKey), rootHash, 1); err != nil {
+				t.Errorf("reuse revoked id: %v", err)
+			}
+		})
+	}
+	racer := r.dial("racer")
+	racer.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: deviceKey("racer"), DeviceID: deviceID("racer"), Device: "racer"})
+	racer.expectErr(wire.CodeAuth)
+	if !racer.closed() {
+		t.Fatal("the retired credential completed its handshake under a replacement device's id")
+	}
+	waitFor(t, "the retired session to leave the fan-out", func() bool { return r.srv.Peers(testVault) == 1 })
+	d, _, exists, err := r.st.DeviceByID(testVault, deviceID("racer"))
+	if err != nil || !exists || d.LastSeen != 0 {
+		t.Fatalf("the refused hello marked the replacement as connected: %+v %v %v", d, exists, err)
+	}
+	// The replacement credential remains usable after the old one is refused.
+	replacement := r.dial("replacement")
+	replacement.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: freshKey, DeviceID: deviceID("racer"), Device: "replacement"})
+	replacement.recvInto("ready", &wire.Ready{})
+}
+
 /* ---------------------------------------------------------------- *
  * last_seen
  * ---------------------------------------------------------------- */

@@ -995,11 +995,11 @@ export class NodeVault implements Vault {
    * A crash mid-write leaves its temporary behind, and the staging folder is
    * never listed, so left alone it would sit there for ever, unseen. Anything
    * older than the grace period and not open in this process cannot be an
-   * in-flight write, so it is removed and counted. Read errors here are
-   * ignored: the folder may not exist yet, and a reaper that stops a sync is
-   * worse than a temporary that waits.
+   * in-flight write, so it is removed and counted. A missing folder is empty;
+   * other scan errors make the recovery inventory incomplete while unrelated
+   * notes can continue syncing.
    */
-  private async reapStaleTemps(): Promise<void> {
+  private async reapStaleTemps(): Promise<string | undefined> {
     // Cleared here, at the top of the scan that fills it, because the walk
     // below adds to it too (R46).
     this.stranded.length = 0;
@@ -1017,16 +1017,17 @@ export class NodeVault implements Vault {
     // file and it was the only writer with no guard.
     try {
       await this.checkStaging();
-    } catch {
+    } catch (err) {
       // Not a directory this vault owns. Nothing here is ours to remove, and
       // the write paths refuse it too.
-      return;
+      return `recovery staging could not be checked: ${(err as Error).message}`;
     }
     let names: string[];
     try {
       names = await readdir(this.staging);
-    } catch {
-      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      return `recovery staging could not be read: ${(err as Error).message}`;
     }
     // What is in here that this will not remove, before deciding to remove
     // anything (R35). Recorded on every scan and not only on a reaping one,
@@ -1092,7 +1093,7 @@ export class NodeVault implements Vault {
     // The pass over staging still runs, because counting what it will not
     // remove is a read and is the only thing that tells anybody a preserved
     // version is sitting there (R35); the removal half is what it skips.
-    await this.reapStaleTemps();
+    const stagingUnknown = await this.reapStaleTemps();
     this.diskName.clear();
     this.spellingsKnown.clear();
     this.ambiguousPaths = [];
@@ -1291,7 +1292,14 @@ export class NodeVault implements Vault {
     // The walk is a second, independent source, so what the ledger could not
     // establish is not necessarily missing from `stranded`. It is still not
     // established, and saying so is the point.
-    this.recovery = inventory;
+    this.recovery =
+      stagingUnknown === undefined
+        ? inventory
+        : {
+            ...inventory,
+            complete: false,
+            why: inventory.why ? `${stagingUnknown}; ${inventory.why}` : stagingUnknown,
+          };
     const already = new Set(this.stranded);
     for (const d of this.displaced) {
       if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {
@@ -2909,6 +2917,14 @@ class NodeDisplacedFiles implements DisplacedFiles {
   }
 
   async stillThere(at: string): Promise<boolean> {
-    return (await lstat(join(this.root, at)).catch(() => undefined)) !== undefined;
+    try {
+      await lstat(join(this.root, at));
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      // An unreadable retained version is not a resolved one. The ledger
+      // keeps its record when this throws instead of compacting it away.
+      throw err;
+    }
   }
 }

@@ -22,6 +22,8 @@ const scenes = [
   "devices",
   "deleted",
   "deleted-empty",
+  "deleted-error",
+  "deleted-older-empty",
   "changes",
   "activity",
   "conflicts",

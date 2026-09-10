@@ -64,6 +64,9 @@ type Session struct {
 	// afterwards by whoever is revoking that device, so the hub's lock is what
 	// publishes it; see Hub.sessionsOf.
 	deviceID string
+	// Captured at hello, so reusing a revoked ID with a new key cannot grant
+	// its old session permission to mutate the vault.
+	deviceHash string
 	// Zero is unknown; otherwise the last applied cursor plus one.
 	applied atomic.Int64
 
@@ -985,6 +988,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	s.vaultID = m.Vault
 	s.device = m.Device
 	s.deviceID = m.DeviceID
+	s.deviceHash = hex.EncodeToString(offered[:])
 	s.wrapped = wrapped
 	// Authenticated: out of the pre-auth count, and allowed the full read
 	// limit from here on. Taking sessMu here is also what publishes the fields
@@ -1026,18 +1030,15 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	s.srv.hub.join(m.Vault, s)
 	s.joined = true
 
-	// Still registered, and stamped as seen, in one statement.
-	//
-	// After the join and not before, which is what makes a revoke racing a
-	// connect come out right whichever order they land in. A revoke deletes
-	// the row and only then collects the sessions to close. If the delete
-	// lands before this update, SawDevice moves no rows, because it is an
-	// UPDATE and never an upsert, and this session is refused. If it lands
-	// after, this session was already in the hub when the revoke looked, so
-	// the revoke closes it. There is no interleaving that leaves a revoked
-	// device connected. TestARevokeRacingAConnectAlwaysWins.
-	if err := s.srv.st.SawDevice(m.Vault, m.DeviceID, s.srv.now().UnixMilli()); err != nil {
-		if errors.Is(err, store.ErrUnknownDevice) {
+	// Recheck the credential and stamp it as seen after joining, under the
+	// same lock as revocation. A prior revoke is refused even if its device ID
+	// has since been reused with another key. A later revoke finds this joined
+	// session when it collects sockets to close.
+	seenAt := s.srv.now().UnixMilli()
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.SawDevice(m.Vault, m.DeviceID, seenAt)
+	}); err != nil {
+		if errors.Is(err, store.ErrUnknownDevice) || errors.Is(err, errSessionRevoked) {
 			s.srv.log.Warn("device revoked mid-handshake", "remote", s.remote,
 				"vault", m.Vault, "deviceId", m.DeviceID)
 			return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
@@ -1851,6 +1852,14 @@ func (s *Session) commit(e store.Entry, base, prevBase int64) (int64, *wire.Err)
 
 	s.srv.commitMu.Lock()
 	defer s.srv.commitMu.Unlock()
+	if err := s.currentCredential(); err != nil {
+		code := wire.CodeInternal
+		if errors.Is(err, errSessionRevoked) {
+			code = wire.CodeAuth
+		}
+		refusal := wire.Error(code, err.Error())
+		return 0, &refusal
+	}
 
 	var uid int64
 	var err error
@@ -2316,7 +2325,9 @@ func (s *Session) handleRotate(m wire.In) error {
 	if s.srv.beforeRotate != nil {
 		s.srv.beforeRotate()
 	}
-	if err := s.srv.st.Rotate(s.vaultID, s.authHash, next, m.Wrapped); err != nil {
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.Rotate(s.vaultID, s.authHash, next, m.Wrapped)
+	}); err != nil {
 		if errors.Is(err, store.ErrRotated) {
 			s.srv.log.Warn("rotate lost the race", "vault", s.vaultID, "device", s.device)
 			return s.fatal(wire.CodeRotated, errors.New(
@@ -2420,8 +2431,10 @@ func (s *Session) handleRegister(m wire.In) error {
 	if s.srv.beforeRegister != nil {
 		s.srv.beforeRegister()
 	}
-	err := s.srv.st.RegisterDevice(s.vaultID, m.DeviceID, name, deviceHash,
-		s.authHash, s.srv.now().UnixMilli())
+	now := s.srv.now().UnixMilli()
+	err := s.authorizedMutation(func() error {
+		return s.srv.st.RegisterDevice(s.vaultID, m.DeviceID, name, deviceHash, s.authHash, now)
+	})
 	switch {
 	case err == nil:
 	case errors.Is(err, store.ErrDeviceExists):
@@ -2514,7 +2527,12 @@ func (s *Session) handleRename(m wire.In) error {
 			"a device name cannot be empty: it is what the device list, history and conflict "+
 				"copies are read by"))
 	}
-	if err := s.srv.st.RenameDevice(s.vaultID, s.deviceID, m.Name); err != nil {
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.RenameDevice(s.vaultID, s.deviceID, m.Name)
+	}); err != nil {
+		if errors.Is(err, errSessionRevoked) {
+			return s.fatal(wire.CodeAuth, err)
+		}
 		if errors.Is(err, store.ErrUnknownDevice) {
 			// This session authenticated against a row that has since gone,
 			// which is a revocation landing between the hello and this. Fatal
@@ -2553,12 +2571,10 @@ func (s *Session) handleRename(m wire.In) error {
 // only one wants a rotation as well, and a rotation already needs the recovery
 // key, so the person doing this correctly is holding it either way.
 //
-// Deleting the row alone would be a revocation the revoked device does not
-// notice until it happens to reconnect: it holds an authenticated connection,
-// and nothing on it is re-checked, so it would go on reading every note pushed
-// to the vault for as long as it stayed up. "Revoked" has to mean "and it
-// stopped", or the panel is telling somebody their stolen laptop is off the
-// vault while it is still receiving.
+// Deleting the row blocks subsequent persistent mutations, but the open
+// connection must also be closed to stop reads and live deliveries. The reply
+// follows that eviction so it never reports a device removed while its socket
+// is still receiving notes.
 //
 // The order is the guarantee, not luck. The delete lands first, so a connect
 // racing this either does its SawDevice after the delete and is refused, or was
@@ -2598,8 +2614,12 @@ func (s *Session) handleRevoke(m wire.In) error {
 		}
 		vaultHash = s.authHash
 	}
-	if err := s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, vaultHash, m.AllowLast); err != nil {
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, vaultHash, m.AllowLast)
+	}); err != nil {
 		switch {
+		case errors.Is(err, errSessionRevoked):
+			return s.fatal(wire.CodeAuth, err)
 		case errors.Is(err, store.ErrUnknownDevice):
 			return s.reject(wire.CodeNoDevice, err)
 		case errors.Is(err, store.ErrRotated):
@@ -2710,7 +2730,12 @@ func (s *Session) handleInvite(m wire.In) error {
 	ttl := time.Duration(ttlMs) * time.Millisecond
 	now := s.srv.now()
 	expiresAt := now.Add(ttl).UnixMilli()
-	if err := s.srv.st.AddInvite(s.vaultID, m.Invite, m.Sealed, expiresAt, now.UnixMilli()); err != nil {
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.AddInvite(s.vaultID, m.Invite, m.Sealed, expiresAt, now.UnixMilli())
+	}); err != nil {
+		if errors.Is(err, errSessionRevoked) {
+			return s.fatal(wire.CodeAuth, err)
+		}
 		if errors.Is(err, store.ErrBadEntry) || errors.Is(err, store.ErrUnknownVault) {
 			return s.reject(wire.CodeBadEntry, err)
 		}
@@ -2747,7 +2772,16 @@ func (s *Session) handleUninvite(m wire.In) error {
 		return s.reject(wire.CodeBadEntry, fmt.Errorf(
 			"the invite identifier is %d bytes and must be base64url of at most %d", len(m.Invite), store.MaxInviteLen))
 	}
-	if err := s.srv.st.CancelInvite(s.vaultID, m.Invite, s.srv.now().UnixMilli()); err != nil {
+	now := s.srv.now().UnixMilli()
+	if err := s.authorizedMutation(func() error {
+		return s.srv.st.CancelInvite(s.vaultID, m.Invite, now)
+	}); err != nil {
+		if errors.Is(err, errSessionRevoked) {
+			return s.fatal(wire.CodeAuth, err)
+		}
+		if errors.Is(err, store.ErrRotated) {
+			return s.fatal(wire.CodeRotated, errors.New("the vault's secret was rotated; reconnect with the new recovery key"))
+		}
 		if errors.Is(err, store.ErrNoInvite) {
 			return s.reject(wire.CodeBadEntry, errors.New(
 				"this vault has no outstanding invite under that identifier: it may have expired, "+

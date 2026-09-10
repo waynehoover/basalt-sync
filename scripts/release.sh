@@ -368,7 +368,7 @@ To publish the server, on its own tag because it moves on its own clock:
 The headless client builds nothing here, because npm is where it goes. Bump
 client/package.json on its own clock, then:
 
-  git tag -a cli/v1.2.3 -m "basalt CLI 1.2.3" && git push origin cli/v1.2.3
+  git tag -a cli/v@CLI@ -m "basalt CLI @CLI@" && git push origin cli/v@CLI@
 
 That tag publishes it over OIDC, with no token and no 2FA code.
 

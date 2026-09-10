@@ -89,9 +89,6 @@ Clone the official repository into a new dedicated deployment directory:
 git clone https://github.com/waynehoover/basalt-sync.git
 cd basalt-sync
 docker compose config
-docker compose up -d
-docker compose exec basalt /basaltd version
-docker compose exec basalt /basaltd health
 ```
 
 Review the included [compose.yaml](compose.yaml) before starting. It pins an
@@ -100,6 +97,14 @@ image tag and digest, uses a persistent named volume, and publishes
 chosen plugin; do not assume an arbitrary source tag carries the newest pin.
 Record the actual image digest and Compose directory. Reuse that directory and
 project name for later commands so maintenance targets the same volume.
+
+Once the configuration and compatible image pin are verified, start it:
+
+```bash
+docker compose up -d
+docker compose exec basalt /basaltd version
+docker compose exec basalt /basaltd health
+```
 
 If the directory or container name already exists, inspect it and reuse the
 correct installation instead of overwriting it. Keep the published port on
@@ -218,6 +223,10 @@ the invite, then press **Pair**. Invites expire after ten minutes by default and
 work once. Create one per device. A recovery key is the fallback when no paired
 device remains, not the routine handoff.
 
+If **Review your first sync** appears, review the upload, download, and
+preserved-copy counts before choosing **Continue sync**. **Pause sync** keeps
+the first sync paused; resume from the Basalt menu when ready.
+
 If pairing is interrupted, inspect the panel and saved state before retrying.
 Keep any recovery key already generated. Do not initialize a second vault or
 unlink simply because a previous attempt timed out.
@@ -284,6 +293,4 @@ This source tree, the Compose image, and released 0.8.x clients use protocol 7.
 Version 0.7.x uses protocol 6 and cannot connect. For source builds, build the
 server and clients from the same checkout.
 Keep existing data and credentials, and verify the reported protocol after
-connecting. Pairing a populated vault now pauses for a preview: review its
-counts with the user before choosing Continue sync. `basalt preview --json`
-provides a read-only plan for CLI vaults.
+connecting. `basalt preview --json` provides a read-only plan for CLI vaults.

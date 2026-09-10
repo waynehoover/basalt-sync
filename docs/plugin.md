@@ -14,7 +14,7 @@ services for that vault. Each device should have its own local copy.
 
 1. Download `main.js`, `manifest.json`, and `styles.css` from the newest stable
    [plugin release](https://github.com/waynehoover/basalt-sync/releases).
-   Plugin releases use a plain version such as `0.6.3`; skip `server/v…` and `cli/v…`.
+   Plugin releases use a plain `X.Y.Z` version; skip `server/v…` and `cli/v…`.
 2. Create `<vault>/.obsidian/plugins/basalt-sync/` and put the three files there.
    If you use a custom Obsidian configuration folder, use that folder instead
    of `.obsidian`.
@@ -68,8 +68,9 @@ join it with an invite.
 4. If this vault already contains files, Basalt asks you to confirm combining
    them with your synced vault. An older copy can bring back files moved or
    deleted elsewhere. **Cancel** leaves your files and invite untouched.
-5. Review the first-sync counts, then choose **Continue sync**. An empty vault
-   starts downloading immediately. Keep Obsidian open until it finishes.
+5. If **Review your first sync** appears, review the counts and choose
+   **Continue sync**. An empty vault starts downloading immediately.
+   Keep Obsidian open until it finishes.
 
 To download a fresh copy, create a new empty Obsidian vault and keep the old
 vault as a backup. Basalt does not clear or move existing files during pairing.
@@ -102,6 +103,10 @@ details or click it for quick actions and settings.
 During longer transfers, the panel shows which file is uploading or downloading
 and how much data has moved. Keep Obsidian open until sync finishes.
 
+The delivery line reports which other devices have received the latest changes.
+If it is waiting for your phone, open Obsidian there. A disconnected device
+cannot confirm new changes until it reconnects.
+
 | Status | What to do |
 |---|---|
 | Unpaired | Pair this vault. |
@@ -127,8 +132,8 @@ The activity log keeps the latest 300 events on this device across restarts.
 Search by filename or filter errors and conflicts. **Copy diagnostics** omits
 filenames; note contents and credentials are never recorded in this log.
 
-A populated vault's first sync shows upload, download, and preserved-copy
-counts before it starts. Deleting an entire folder containing several synced
+Before combining populated vaults, Basalt shows upload, download, and preserved-copy
+counts. Deleting an entire folder containing several synced
 files also opens a review. Choose **Pause sync** if the changes are unexpected.
 **Preview sync** lets you inspect planned changes at other times without writing
 notes. A preview is an estimate: files are checked again when sync runs.
@@ -176,6 +181,8 @@ History remains available until the server operator
 
 Press **Browse deleted**, select the note, and restore it. A note whose
 content has been purged is listed without a restore button.
+Use **Show older** to browse further back and **Newest** to return. If the
+connection fails, choose **Try again** after reconnecting.
 
 <details>
 <summary>See deleted notes</summary>

@@ -124,6 +124,9 @@ jobs:
       - name: the runbook prints what it means to
         run: scripts/release-runbook.test.sh
 
+      - name: the release verifier refuses incomplete assets
+        run: bash scripts/verify-release.test.sh
+
       - name: the pin check excuses one commit and no others
         run: scripts/pin-check.test.sh
 

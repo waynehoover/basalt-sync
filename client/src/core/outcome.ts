@@ -45,6 +45,8 @@ export type Outcome =
    * vocabulary exists to stop.
    */
   | { readonly kind: "recoveryUnknown"; readonly why: string }
+  /** Preserved versions remain at hidden paths until somebody recovers them. */
+  | { readonly kind: "recoveryNeeded"; readonly paths: readonly string[] }
   /** Both versions of something are on this disk, waiting to be looked at. */
   | { readonly kind: "conflicted"; readonly count: number }
   /** Everything this device knows about is where it should be. */
@@ -67,7 +69,13 @@ export function outcomeOf(
    * Optional, because an adapter that cannot strand a version has no opinion,
    * and absent is not the same as incomplete.
    */
-  recovery?: { readonly complete: boolean; readonly why?: string },
+  recovery?: {
+    readonly complete: boolean;
+    readonly why?: string;
+    readonly waiting?: readonly { readonly at: string }[];
+  },
+  /** An adapter can discover retained versions that predate its ledger. */
+  stranded: readonly string[] = [],
 ): Outcome {
   if (failure !== undefined) {
     return failure.offline === true
@@ -99,6 +107,8 @@ export function outcomeOf(
       why: recovery.why ?? "what is waiting to be recovered could not be established",
     };
   }
+  const hidden = [...new Set([...stranded, ...(recovery?.waiting ?? []).map((entry) => entry.at)])];
+  if (hidden.length > 0) return { kind: "recoveryNeeded", paths: hidden };
   if (report.conflicted > 0) return { kind: "conflicted", count: report.conflicted };
   return { kind: "synced" };
 }
@@ -123,6 +133,7 @@ export function exitCodeOf(outcome: Outcome): number {
     case "retrying":
     case "refused":
     case "recoveryUnknown":
+    case "recoveryNeeded":
       return 1;
     case "conflicted":
     case "synced":
@@ -147,6 +158,10 @@ export function describeOutcome(outcome: Outcome): string {
         : `${outcome.paths.length} need a person: ${outcome.paths.join(", ")}`;
     case "recoveryUnknown":
       return `everything sent and received, but ${outcome.why}, so a version may be waiting where nothing lists it`;
+    case "recoveryNeeded":
+      return outcome.paths.length === 1
+        ? "1 preserved version needs recovery"
+        : `${outcome.paths.length} preserved versions need recovery`;
     case "conflicted":
       return `${outcome.count} kept both versions, which are both on this device`;
     case "synced":

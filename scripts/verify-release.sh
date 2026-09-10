@@ -55,6 +55,11 @@ need() { command -v "$1" >/dev/null || { missing+=("$1"); return 1; }; }
 check_release() { # check_release <tag> <what>
   local tag=$1 what=$2
   local dir="$work/$what"
+  local required=() asset
+  case "$what" in
+    plugin) required=(main.js manifest.json styles.css) ;;
+    server) required=(basaltd-linux-amd64 basaltd-linux-arm64 basaltd-darwin-amd64 basaltd-darwin-arm64) ;;
+  esac
   printf '\n== %s, from the %s release\n' "$what" "$tag"
   mkdir -p "$dir"
   if ! gh release download "$tag" --repo "$repo" --dir "$dir" --clobber 2>"$dir/err"; then
@@ -63,6 +68,11 @@ check_release() { # check_release <tag> <what>
   fi
   ls "$dir" | grep -v '^err$' | sed 's/^/  /'
 
+  # Valid checksums for a partial download do not make an installable release.
+  for asset in "${required[@]}"; do
+    [ -s "$dir/$asset" ] || wrong "the $tag release is missing a nonempty $asset"
+  done
+
   if [ ! -f "$dir/SHA256SUMS" ]; then
     wrong "the $tag release has no SHA256SUMS, so nothing anybody downloads can be checked"
   elif ( cd "$dir" && shasum -a 256 -c --status SHA256SUMS ); then
@@ -70,6 +80,17 @@ check_release() { # check_release <tag> <what>
   else
     wrong "SHA256SUMS does not check out:"
     ( cd "$dir" && shasum -a 256 -c SHA256SUMS 2>&1 | grep -v ': OK$' | sed 's/^/    /' >&2 )
+  fi
+
+  if [ -f "$dir/SHA256SUMS" ]; then
+    for asset in "${required[@]}"; do
+      if ! awk -v name="$asset" '
+        $2 == name || $2 == "*" name { found = 1 }
+        END { exit !found }
+      ' "$dir/SHA256SUMS"; then
+        wrong "SHA256SUMS does not cover $asset"
+      fi
+    done
   fi
 
   # Provenance, on the bytes that are there now. The attest workflow rebuilds
@@ -182,13 +203,16 @@ if [ -n "$server" ]; then
         # and fixing it there and not here is how one of two call sites keeps
         # the defect.
         docker image rm -f "$image@$digest" >/dev/null 2>&1 || true
-        if got=$(docker run --rm --platform "linux/$arch" "$image@$digest" version 2>&1); then
-          case "$got" in
-            *"$server"*) note "linux/$arch: $got" ;;
-            *) wrong "linux/$arch says \"$got\", not $server" ;;
-          esac
+        # Docker reports pulls on stderr; only stdout is the binary's version.
+        image_err=$work/image-$arch.stderr
+        if got=$(docker run --rm --platform "linux/$arch" "$image@$digest" version 2>"$image_err"); then
+          if [ "$(printf '%s\n' "$got" | awk 'NR == 1 { print $2 }')" = "$server" ]; then
+            note "linux/$arch: $got"
+          else
+            wrong "linux/$arch says \"$got\", not $server"
+          fi
         else
-          wrong "linux/$arch will not run: $got"
+          wrong "linux/$arch will not run: $got $(cat "$image_err")"
         fi
       done
     fi
@@ -223,10 +247,11 @@ if [ -n "$cli" ]; then
              --prefix "$dir/elsewhere" "$dir/$tgz" >/dev/null 2>&1 ); then
         bin=$dir/elsewhere/node_modules/.bin/basalt
         if got=$("$bin" --version 2>&1); then
-          case "$got" in
-            *"$cli"*) note "installs and runs under node $(node --version): $got" ;;
-            *) wrong "the published CLI says \"$got\", not $cli" ;;
-          esac
+          if [ "$got" = "$cli" ]; then
+            note "installs and runs under node $(node --version): $got"
+          else
+            wrong "the published CLI says \"$got\", not $cli"
+          fi
         else
           wrong "the published CLI will not start: $got"
         fi

@@ -49,7 +49,7 @@ for the installed version's usage.
 | `--uid N` | Exact version for `restore`. |
 | `--to PATH` | Destination for `restore`. |
 | `--limit N` | `history`: default 20; `deleted`: default all. |
-| `--before UID` | Earlier page for `deleted`. |
+| `--before UID` | Earlier page for `history` or `deleted`. |
 | `--key-file PATH` | Read a setup string, invite, or recovery key from a private file. |
 | `--key-out PATH` | Also save a generated recovery key in a new file with mode `0600`. |
 | `--recovery-key KEY` | Use the recovery key for `devices`, `revoke`, or `uninvite`. |
@@ -85,6 +85,8 @@ unpaired directory, they use the address embedded in the recovery key.
 
 Read-only mode governs ordinary synchronization. It is not an access restriction
 on the server, and an explicit `repair` can upload missing content.
+Repair leaves local notes and the sync index unchanged; it does not run an
+ordinary sync when other devices send changes.
 
 ## Exit status and JSON
 
@@ -103,6 +105,7 @@ For sync and restore, the overall `outcome.kind` is one of:
 | `retrying` | Paths need another attempt. |
 | `refused` | Paths need intervention. |
 | `recoveryUnknown` | The recovery inventory is incomplete or unreadable. |
+| `recoveryNeeded` | Preserved versions remain at hidden paths and need recovery. |
 | `passFailed` | The sync pass did not finish. |
 | `offline` | No usable server connection. |
 
@@ -125,6 +128,8 @@ basalt sync --dir ~/vault --verify
 ```
 
 Command-specific flags used on another command are refused with exit 2.
+Preview leaves notes, staging files, and the recovery ledger unchanged, so it
+can run while a watcher holds the vault. Sync checks the plan again before writing.
 
 ## Files and locking
 

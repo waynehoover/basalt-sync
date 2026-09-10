@@ -22,7 +22,7 @@ Obsidian's [Sync overview](https://obsidian.md/sync),
 [encryption guide](https://obsidian.md/help/sync/security), and
 [settings guide](https://obsidian.md/help/sync/settings), and the
 [LiveSync documentation](https://github.com/vrtmrz/obsidian-livesync) describe
-those options. Comparison checked September 8, 2026; see their documentation
+those options. Comparison checked September 10, 2026; see their documentation
 for current plans and features.
 
 ## What you get with Basalt

@@ -91,6 +91,13 @@ type Store struct {
 	// writer can see is a directory whose own name is already durable. See
 	// mkdirAll for the race it closes.
 	mkdirMu sync.Mutex
+	// A directory is cached only after its parent flush succeeds. Failed
+	// publications remain unknown and are flushed again on the next write.
+	publishedDirs map[string]struct{}
+	// Publishers share this lock only while renaming a verified temp file.
+	// Quarantine holds it exclusively across revalidation and removal, so a
+	// stale corruption observation cannot set aside a newly repaired body.
+	publicationMu sync.RWMutex
 
 	// unproven is the chunk names this process has placed and cannot yet
 	// prove durable: renamed into the directory, and that directory not
@@ -110,8 +117,8 @@ type Store struct {
 	// A name stays here after a failed flush, deliberately. This process cannot
 	// prove that name durable and will not pretend otherwise: the chunk reads
 	// as absent, the next put writes and flushes it again, and success is what
-	// takes it out. On restart the map is empty and presence is the stat again,
-	// which is the truth a crash leaves behind.
+	// takes it out. Writable startup flushes every existing directory before
+	// an empty map can let presence depend on the stat again.
 	//
 	// It replaced a per-name publication claim that made the second writer of a
 	// chunk wait for the first. That closed the same window and introduced a
@@ -151,8 +158,17 @@ func OpenExisting(dir string, max int64) (*Store, error) {
 }
 
 func open(dir string, max int64, create bool) (*Store, error) {
+	return openWithSync(dir, max, create, fsync.Dir)
+}
+
+func openWithSync(dir string, max int64, create bool, syncDir func(string) error) (*Store, error) {
 	if max <= 0 {
 		return nil, fmt.Errorf("chunks: max must be positive, got %d", max)
+	}
+	var err error
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, err
 	}
 	if create {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -170,7 +186,58 @@ func open(dir string, max int64, create bool) (*Store, error) {
 			return nil, fmt.Errorf("chunks: %s is not a directory", dir)
 		}
 	}
-	return &Store{dir: dir, max: max, sync: fsync.Dir, write: writeAll}, nil
+	s := &Store{dir: dir, max: max, sync: syncDir, write: writeAll, publishedDirs: map[string]struct{}{}}
+	if create {
+		if err := s.establishDirectories(); err != nil {
+			return nil, fmt.Errorf("flushing chunk directories: %w", err)
+		}
+	}
+	return s, nil
+}
+
+// A process restart does not imply a power cycle: visible names may still be
+// awaiting the old process's failed fsync. Flush the root and its ancestors,
+// then the existing vault/fan-out directories before admitting stored bodies.
+// This visits directories only, never enumerating or rereading chunk files.
+// Inspection opens deliberately skip it.
+func (s *Store) establishDirectories() error {
+	for dir := s.dir; ; dir = filepath.Dir(dir) {
+		if err := s.sync(dir); err != nil {
+			return err
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
+	}
+	vaults, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	for _, vault := range vaults {
+		if !vault.IsDir() {
+			continue
+		}
+		vaultDir := filepath.Join(s.dir, vault.Name())
+		if err := s.sync(vaultDir); err != nil {
+			return err
+		}
+		s.publishedDirs[vaultDir] = struct{}{}
+		leaves, err := os.ReadDir(vaultDir)
+		if err != nil {
+			return err
+		}
+		for _, leaf := range leaves {
+			if !leaf.IsDir() {
+				continue
+			}
+			leafDir := filepath.Join(vaultDir, leaf.Name())
+			if err := s.sync(leafDir); err != nil {
+				return err
+			}
+			s.publishedDirs[leafDir] = struct{}{}
+		}
+	}
+	return nil
 }
 
 // writeAll writes the whole body or reports why it could not.
@@ -500,7 +567,10 @@ func (s *Store) place(vaultID, name string, body []byte) ([]string, error) {
 	if err := tmp.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(tmp.Name(), p); err != nil {
+	s.publicationMu.RLock()
+	err = os.Rename(tmp.Name(), p)
+	s.publicationMu.RUnlock()
+	if err != nil {
 		return nil, err
 	}
 	// Only the leaf: every directory above it was flushed by mkdirAll before
@@ -542,16 +612,18 @@ func (s *Store) mkdirAll(dir string) error {
 		err := os.Mkdir(next, 0o700)
 		switch {
 		case err == nil:
-			// A new entry in cur, which is durable only once cur is flushed,
-			// and that happens here rather than being left to the caller.
+			delete(s.publishedDirs, next)
+		case errors.Is(err, os.ErrExist):
+			// Existence alone is insufficient: a previous parent fsync may
+			// have failed after creating this directory.
+		default:
+			return err
+		}
+		if _, proven := s.publishedDirs[next]; !proven {
 			if err := s.sync(cur); err != nil {
 				return err
 			}
-		case errors.Is(err, os.ErrExist):
-			// Already there, and whoever created it flushed its parent before
-			// releasing this lock, so there is nothing to do for it.
-		default:
-			return err
+			s.publishedDirs[next] = struct{}{}
 		}
 		cur = next
 	}
@@ -743,6 +815,18 @@ func (w *Writer) Close() error {
 func (s *Store) Quarantine(vaultID, name string) error {
 	if !ValidName(name) {
 		return fmt.Errorf("%w: %q", ErrBadName, name)
+	}
+	// The caller's failed Get may precede another reader's quarantine and a
+	// successful repair. Inspect the current body, excluding all publishers
+	// until its fate is decided. A correct or already absent body needs no work.
+	s.publicationMu.Lock()
+	defer s.publicationMu.Unlock()
+	_, err := s.Get(vaultID, name)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		return err
 	}
 	p := s.path(vaultID, name)
 	aside := p + corruptSuffix

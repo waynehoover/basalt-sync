@@ -342,6 +342,9 @@ type Server struct {
 	// one layer down, where the store holds a single write mutex for the same
 	// ordering reason, so this adds a fan-out of a few non-blocking channel
 	// sends to a section that was serial anyway.
+	// Credential retirement and registry mutations use this same lock, so a
+	// session's credential check remains valid until its mutation commits.
+	// Socket replies and eviction are kept outside this section.
 	commitMu sync.Mutex
 
 	// sessions is every connection Handle is running, joined to a vault or not,

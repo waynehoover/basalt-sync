@@ -17,14 +17,13 @@ you reconnect, and recover earlier versions from inside Obsidian.
   <img src="docs/assets/screenshots/panel.png" alt="Basalt's simple sync panel." width="700">
 </picture>
 
-
 ## Made for your personal vault
 
 - **Host it where you want.** Run a Docker container or a standalone server
   binary on your homelab. Basalt is free, open-source software; you provide the
   hosting and backups.
-- **Keep your notes private.** Contents and filenames are encrypted before
-  upload. The server stores the encrypted copies.
+- **Encrypt before upload.** Contents and filenames are encrypted on your
+  devices. The server stores the encrypted copies.
 - **Send less when you edit.** Basalt uploads changed pieces of a file and
   reuses the rest, reducing transfers and storage across versions.
 - **Recover your work.** Browse history, compare changes, and restore deleted

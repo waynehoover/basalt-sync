@@ -15,19 +15,33 @@ const notRetiredByRename = `NOT EXISTS (
   SELECT 1 FROM entries moved
    WHERE moved.vault_id = e.vault_id AND moved.prev_path = e.path AND moved.uid > e.uid)`
 
-// The latest record for each path is required for catch-up. A rename can also
-// be the current deletion of its source after its destination has been edited
-// again. Keep that retirement until a later record occupies its source path.
+// Keep current paths and rename retirements. Deleted also needs the latest
+// rename and, for a reused name, its predecessor after that rename: removing
+// this evidence makes a genuine deletion look like a legacy rename's tail.
+// A retained predecessor with content remains recoverable, including its bodies.
 // Purge and its preview use exactly the same survivor set.
 const purgeSurvivorUIDs = `
-SELECT MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path
+WITH heads AS (
+ SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path
+), renames AS (
+ SELECT prev_path AS path, MAX(uid) AS uid FROM entries
+  WHERE vault_id = ? AND prev_path <> '' GROUP BY prev_path
+), deletions AS (
+ SELECT e.path, e.uid, r.uid AS rename_uid FROM entries e
+  JOIN heads h ON h.path = e.path AND h.uid = e.uid
+  JOIN renames r ON r.path = e.path
+  WHERE e.vault_id = ? AND e.deleted = 1
+)
+SELECT uid FROM heads
 UNION
-SELECT MAX(moved.uid) AS uid FROM entries moved
- WHERE moved.vault_id = ? AND moved.prev_path <> ''
-   AND NOT EXISTS (
-     SELECT 1 FROM entries newer
-      WHERE newer.vault_id = moved.vault_id AND newer.path = moved.prev_path AND newer.uid > moved.uid)
- GROUP BY moved.prev_path`
+SELECT r.uid FROM renames r LEFT JOIN heads h ON h.path = r.path
+ WHERE h.uid IS NULL OR h.uid < r.uid
+UNION
+SELECT rename_uid FROM deletions
+UNION
+SELECT MAX(p.uid) FROM entries p JOIN deletions d ON d.path = p.path
+ WHERE p.vault_id = ? AND p.uid < d.uid AND p.uid > d.rename_uid
+ GROUP BY p.path`
 
 // A rename is also a tombstone for its previous path at the same UID.
 func pathHead(q headReader, vault, path string) (uid int64, deleted bool, err error) {

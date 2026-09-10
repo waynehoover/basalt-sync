@@ -147,9 +147,9 @@ func cmdService(args []string, out io.Writer) error {
 	// directory that is not the one meant.
 	qExe, qData := shellQuote(exe), shellQuote(data)
 	fmt.Fprintf(out, `
-# To install, as root:
+# Save this output as basalt.service and review it. Then install it as root:
 #
-#   basaltd service > /etc/systemd/system/basalt.service
+#   install -m 0644 basalt.service /etc/systemd/system/basalt.service
 #   systemctl daemon-reload
 #   systemctl enable --now basalt
 #   systemctl status basalt

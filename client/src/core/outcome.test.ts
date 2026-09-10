@@ -77,6 +77,19 @@ describe("what a pass came to", () => {
     expect(exitCodeOf(outcomeOf(undefined, { why: "gone" }))).toBe(1);
   });
 
+  it("keeps a known hidden version distinct from visible conflict copies", () => {
+    const at = ".basalt/tmp/preserved.edit";
+    const recovery = { complete: true, waiting: [{ at }] };
+    const outcome = outcomeOf(report({ conflicted: 1 }), undefined, recovery);
+    expect(outcome).toEqual({ kind: "recoveryNeeded", paths: [at] });
+    expect(exitCodeOf(outcome)).toBe(1);
+    expect(describeOutcome(outcome)).toContain("needs recovery");
+    expect(outcomeOf(report(), undefined, undefined, [at])).toEqual(outcome);
+    expect(
+      exitCodeOf(outcomeOf(report({ conflicted: 1 }), undefined, { complete: true, waiting: [] })),
+    ).toBe(0);
+  });
+
   it("says which paths, because a count is not something anybody can act on", () => {
     expect(describeOutcome(outcomeOf(report({ retrying: 1, retryingPaths: ["c.md"] })))).toContain(
       "c.md",

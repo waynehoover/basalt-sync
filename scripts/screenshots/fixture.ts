@@ -245,10 +245,17 @@ export default class Screenshots extends Plugin {
         currentText: async () => undefined,
         restoreVersion: async () => { throw new Error("Screenshot sample only"); },
       }, "Attachments/Coastal walk.pdf");
-    } else if (name === "deleted" || name === "deleted-empty") {
-      if (name === "deleted-empty")
+    } else if (
+      ["deleted", "deleted-empty", "deleted-error", "deleted-older-empty"].includes(name)
+    ) {
+      if (name === "deleted-empty" || name === "deleted-older-empty")
         this.model.deletedNotes = async () => ({ notes: [], more: false });
+      if (name === "deleted-error")
+        this.model.deletedNotes = async () => {
+          throw new Error("Connection lost. Check your connection and try again.");
+        };
       this.modal = new RecoverModal(this.model);
+      if (name === "deleted-older-empty") this.modal.before = 38;
     } else {
       if (name === "uploading" || name === "downloading") {
         this.model.deliveryReady = false;

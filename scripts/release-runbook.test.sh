@@ -89,6 +89,16 @@ while read -r tag; do
 done < <(printf '%s\n%s\n' "$with" "$without" | grep -o 'git tag -a [^ ]*' | sed 's/git tag -a //' | sort -u)
 [ $badtag -eq 0 ] && ok "every tag name printed is one of the three shapes"
 
+# The command must publish this package, not the old example version.
+cliversion=$(node -p "require('$here/../client/package.json').version")
+for out in "$with" "$without"; do
+  case $out in
+    *"git tag -a cli/v$cliversion -m \"basalt CLI $cliversion\""*)
+      ok "the CLI command uses the package version $cliversion" ;;
+    *) bad "the CLI tag command does not use the package version $cliversion" ;;
+  esac
+done
+
 # ---- and the server half is only there when it was asked for --------------
 case $with in
   *'git tag -a server/v0.5.1'*) ok "the server commands appear when a version is given" ;;

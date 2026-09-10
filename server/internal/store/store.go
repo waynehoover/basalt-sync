@@ -820,6 +820,8 @@ func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64
 // hold, and the pushing client -- told the server already had C -- would never
 // resend it. Half a second earlier and `AppendEntry` would have answered
 // `ErrChunkMissing` and got the good bytes back.
+// The chunk store also revalidates under its publication lock: another fetch
+// may already have quarantined the bad bytes and a client repaired them.
 func (s *Store) Quarantine(vaultID, name string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -970,11 +972,9 @@ const DeletedMax = 1000
 
 // Deletion is a deleted path, and whether anything survives to restore it from.
 //
-// The two are separate facts and used to be conflated. Purge keeps the
-// newest version per path, which for a deleted note is the deletion record, so
-// after a purge the note is still listed and its content is gone. A client
-// saying "all still recoverable" over that list, which one did, is telling
-// somebody their note is safe when it is not.
+// The two are separate facts. Purge may remove every content version behind a
+// deletion, or retain one as evidence that a moved-away name was reused. The
+// list alone therefore says nothing about whether its notes remain recoverable.
 type Deletion struct {
 	Entry
 	// RestorableUID is the newest version of this path with content in it, or
@@ -1541,7 +1541,7 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 		// Capture the required UIDs before deleting. Counting distinct paths
 		// afterward cannot detect a lost retirement record, or a whole path
 		// removed by a faulty delete predicate.
-		rows, err := tx.Query(purgeSurvivorUIDs, vaultID, vaultID)
+		rows, err := tx.Query(purgeSurvivorUIDs, vaultID, vaultID, vaultID, vaultID)
 		if err != nil {
 			return err
 		}
@@ -1563,7 +1563,7 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 			`DELETE FROM entries
 			  WHERE vault_id = ?
 			    AND uid NOT IN (`+purgeSurvivorUIDs+`)`,
-			vaultID, vaultID, vaultID)
+			vaultID, vaultID, vaultID, vaultID, vaultID)
 		if err != nil {
 			return err
 		}
@@ -1719,7 +1719,7 @@ func (s *Store) Reclaimable(vaultID string, grace time.Duration) (Reclaimable, e
 	var r Reclaimable
 	if err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM entries WHERE vault_id = ? AND uid NOT IN (`+purgeSurvivorUIDs+`)`,
-		vaultID, vaultID, vaultID).Scan(&r.Versions); err != nil {
+		vaultID, vaultID, vaultID, vaultID, vaultID).Scan(&r.Versions); err != nil {
 		return r, err
 	}
 
@@ -1727,7 +1727,7 @@ func (s *Store) Reclaimable(vaultID string, grace time.Duration) (Reclaimable, e
 		`SELECT DISTINCT name FROM entry_chunks
 		  WHERE vault_id = ?
 		    AND uid IN (`+purgeSurvivorUIDs+`)`,
-		vaultID, vaultID, vaultID)
+		vaultID, vaultID, vaultID, vaultID, vaultID)
 	if err != nil {
 		return r, err
 	}

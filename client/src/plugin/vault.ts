@@ -1747,11 +1747,9 @@ class ObsidianDisplacedFiles implements DisplacedFiles {
   ) {}
 
   async read(): Promise<string | undefined> {
-    // `exists` first, because `read` on a missing file throws and absent is
-    // not the same answer as unreadable (rule 2): the caller treats a throw as
-    // "the log could not be read", which is worth saying, and a log that was
-    // never written is not.
-    if (!(await this.adapter.exists(this.path))) return undefined;
+    // Desktop `exists` turns access failures into false. Only a missing file
+    // is an empty ledger; stat propagates other errors to the recovery report.
+    if ((await this.adapter.stat(this.path)) === null) return undefined;
     return await this.adapter.read(this.path);
   }
 
@@ -1774,7 +1772,7 @@ class ObsidianDisplacedFiles implements DisplacedFiles {
   // `core/displaced.ts`.
 
   async stillThere(at: string): Promise<boolean> {
-    return await this.adapter.exists(at);
+    return (await this.adapter.stat(at)) !== null;
   }
 
   private async mkdirForIt(): Promise<void> {

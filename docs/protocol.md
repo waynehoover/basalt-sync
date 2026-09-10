@@ -307,6 +307,11 @@ and historical device labels and existing conflict filenames are unchanged.
 
 Revoke removes the row and closes its live sessions. Connecting and revoking
 are ordered so a revoked device cannot remain attached between those steps.
+Persistent note and access changes recheck the session's credential under the
+same lock as revocation and rotation. An in-flight request cannot commit new
+history or grant access after its credential is retired. Immutable encrypted
+body uploads already underway may finish; those bytes grant no access and do
+not create a note version.
 Revoking the last device needs a registrar and `allowLast`; a device presenting
 that field is refused with `auth`. A nonexistent device is `nodevice`.
 
@@ -375,9 +380,11 @@ It opens a registrar session to recover access when no paired device remains.
 
 ## Which clients may connect
 
-No Origin header is allowed for non-browser clients. Browser clients must match
+Non-browser clients may omit Origin. Cross-host browser origins must match
 `app://obsidian.md`, `capacitor://localhost`, `http://localhost`, or an explicitly
-configured `-allow-origin`. Rejected origins are logged with an operator hint.
+configured `-allow-origin`. The WebSocket library also accepts an Origin whose
+host matches the request's Host. Every connection still needs valid credentials
+in hello. Rejected origins are logged with an operator hint.
 
 ## Crypto
 

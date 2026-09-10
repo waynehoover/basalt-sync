@@ -750,11 +750,15 @@ export default class BasaltPlugin extends Plugin {
       // whether to keep going before the sleep and after it and did nothing
       // in between.
       onWaiting: (wake) => {
-        this.wakeLoop = wake;
+        if (current()) this.wakeLoop = wake;
       },
     });
-    this.wakeLoop = undefined;
-    if (current()) this.live = undefined;
+    // An old backoff can finish after a settings change starts another run.
+    // Its cleanup must leave the replacement run's reconnect handle intact.
+    if (current()) {
+      this.wakeLoop = undefined;
+      this.live = undefined;
+    }
     return fatal;
   }
 
@@ -1303,7 +1307,10 @@ export default class BasaltPlugin extends Plugin {
 
   private async readConfig(): Promise<DeviceConfig | undefined> {
     const raw: unknown = await this.loadData();
-    if (raw === null || raw === undefined) return undefined;
+    // Obsidian returns null for a missing data.json, but undefined after a
+    // failed read or JSON parse. The latter must not permit a new pairing.
+    if (raw === undefined) throw new Error(`Obsidian could not read ${this.dataPath}`);
+    if (raw === null) return undefined;
     return decodeConfig(raw, "the Basalt plugin's saved settings");
   }
 
@@ -1663,10 +1670,18 @@ export default class BasaltPlugin extends Plugin {
    * version before it, so that is looked up here rather than assumed.
    */
   async recover(deletion: Version): Promise<Restored> {
-    if (!this.client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
-    const version = await this.client.newestContentVersion(deletion.path);
+    const client = this.client;
+    if (!client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
+    // The list may stay open while a peer recreates this name. Recover the
+    // selected deletion, not content uploaded after it.
+    const version = await client.findVersion(
+      deletion.path,
+      (version) => version.uid < deletion.uid && !version.deleted && !version.folder,
+    );
     if (!version) {
-      throw new Error(`the server holds no version of ${deletion.path} with any content in it`);
+      throw new Error(
+        `the server no longer holds content from before this deletion of ${deletion.path}`,
+      );
     }
     return this.restoreAndSend(version);
   }
@@ -2130,6 +2145,8 @@ export default class BasaltPlugin extends Plugin {
     this.generation++;
     this.running = false;
     this.clearTimers();
+    this.wakeLoop?.();
+    this.wakeLoop = undefined;
     const { live, client } = this.retireClients();
     await live?.close();
     await client?.close();
@@ -3858,6 +3875,10 @@ class RecoverModal extends Modal {
         cls: "basalt-advice",
         text: `Cannot ask the server: ${(err as Error).message}`,
       });
+      new Setting(contentEl).addButton((button) =>
+        button.setButtonText("Try again").onClick(() => this.render()),
+      );
+      this.renderNewest();
       return;
     }
 
@@ -3865,21 +3886,19 @@ class RecoverModal extends Modal {
     contentEl.empty();
 
     if (deleted.notes.length === 0) {
-      contentEl.createEl("p", { cls: "basalt-advice", text: "No deleted notes to restore." });
+      contentEl.createEl("p", {
+        cls: "basalt-advice",
+        text:
+          this.before === undefined
+            ? "No deleted notes to restore."
+            : "No older deleted notes to restore.",
+      });
+      this.renderNewest();
       return;
     }
 
     contentEl.createEl("p", { cls: "basalt-advice", text: describeDeleted(deleted) });
-    if (this.before !== undefined) {
-      // Somewhere to go back to. Paging forward without a way back is a list
-      // somebody can walk off the end of.
-      row(contentEl, "Back to the newest", "This is a page further back.").addButton((b) =>
-        b.setButtonText("Newest").onClick(async () => {
-          this.before = undefined;
-          await this.render();
-        }),
-      );
-    }
+    this.renderNewest();
     if (deleted.more && deleted.oldest !== undefined) {
       // A page, not a bigger ask (F21). This doubled the limit it requested,
       // which stops working at the server's cap: at a thousand deletions the
@@ -3899,10 +3918,9 @@ class RecoverModal extends Modal {
     for (const version of deleted.notes) {
       const deletedAt = when(version.mtime);
       if (version.restorable === 0) {
-        // Listed, and honestly. A purge keeps only the newest version
-        // per path, which for a deleted note is the deletion itself, so
-        // this one is a record of something with nothing left behind
-        // it. Offering a button that could only fail would be worse.
+        // Purge can retain a deletion after its recoverable content is gone.
+        // Follow the server's restorable count, since some history survives
+        // purge as evidence of moves or deletions.
         new Setting(contentEl)
           .setName(version.path)
           .setDesc(
@@ -3912,7 +3930,7 @@ class RecoverModal extends Modal {
       }
       new Setting(contentEl)
         .setName(version.path)
-        .setDesc(`Deleted ${deletedAt}, last written on ${version.device}`)
+        .setDesc(`Deleted ${deletedAt} on ${version.device}`)
         .addButton((b) =>
           b
             .setButtonText("Restore")
@@ -3934,6 +3952,16 @@ class RecoverModal extends Modal {
             }),
         );
     }
+  }
+
+  private renderNewest(): void {
+    if (this.before === undefined) return;
+    row(this.contentEl, "Back to the newest", "This is a page further back.").addButton((button) =>
+      button.setButtonText("Newest").onClick(async () => {
+        this.before = undefined;
+        await this.render();
+      }),
+    );
   }
 }
 

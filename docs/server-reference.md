@@ -37,6 +37,8 @@ for installed usage.
 Batch and fetch budgets cannot be smaller than one maximum-sized chunk.
 Built-in browser origins are `app://obsidian.md`, `capacitor://localhost`, and
 `http://localhost`; non-browser clients without an Origin header are allowed.
+Origins matching the request's Host are also accepted. These handshake checks
+do not replace device authentication.
 
 Flags specifying bytes accept integers, not `MiB` suffixes. For a 128 MiB file
 limit in Compose:
@@ -73,7 +75,7 @@ Useful `stats -json` fields:
 |---|---|
 | `files`, `folders`, `bytes` | Current live content. |
 | `deleted`, `recoverable`, `purged` | Deleted paths and recovery availability. |
-| `versions`, `history` | All versions and the older versions purge would remove. |
+| `versions`, `history` | All versions and the older versions eligible for purge; required move/deletion history is retained. |
 | `latestUid` | Newest version still present. |
 | `allocatedTo` | Highest version number ever allocated; does not go backward after purge. |
 | `purges` | Purge generation. |
