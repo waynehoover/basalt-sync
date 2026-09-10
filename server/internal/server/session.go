@@ -1315,18 +1315,14 @@ func (s *Session) replay(vaultID string, cursor int64) (int64, int, error) {
  * Live delivery
  * ---------------------------------------------------------------- */
 
-// deliver is the non-blocking path used by the hub.
+// deliverFrame is the non-blocking path used by the hub. Its encoded frame is
+// immutable and may also be queued by other sessions.
 //
 // While this session is still replaying its backlog the change is buffered
 // rather than written. Writing it immediately would let a newer uid overtake an
 // older catch-up frame in the same queue, and a client that advances its cursor
 // to a batch's To would then step past files it has not received.
-func (s *Session) deliver(e store.Entry, elide bool) {
-	b, err := json.Marshal(liveBatch(e, elide))
-	if err != nil {
-		return
-	}
-
+func (s *Session) deliverFrame(uid int64, b []byte) {
 	s.mu.Lock()
 	if !s.catchupDone {
 		// Bounded in bytes as well as entries (S8). The entry bound alone let
@@ -1337,7 +1333,7 @@ func (s *Session) deliver(e store.Entry, elide bool) {
 			s.kill(errors.New("catch-up buffer overflow, peer too slow"))
 			return
 		}
-		s.pending = append(s.pending, pendingChange{uid: e.UID, frame: b})
+		s.pending = append(s.pending, pendingChange{uid: uid, frame: b})
 		s.pendingBytes += int64(len(b))
 		s.mu.Unlock()
 		return

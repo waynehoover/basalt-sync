@@ -93,7 +93,8 @@ There is no fixed device limit.
 
 Basalt syncs shortly after edits and checks periodically while Obsidian is open.
 It reconnects after a dropped connection. Press **Sync now** to sync immediately,
-or **Reconnect** to retry an offline connection without waiting.
+including retrying files after fixing a problem. Use **Reconnect** when offline
+or **Resume sync** when paused.
 
 Open the panel for the result and any files needing attention. It includes the
 server address and version, useful when diagnosing a connection problem.

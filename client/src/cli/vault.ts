@@ -463,6 +463,17 @@ export class NodeVault implements Vault {
   private readonly normal: (name: string) => string;
   /** Whether this vault may write while listing. See NodeVaultOptions. */
   private readonly observeOnly: boolean;
+  private readonly listingWatchers = new Set<FSWatcher>();
+  private cachedListing: Map<string, FileStat> | undefined;
+  private readonly listingChanges = new Set<string>();
+  private listingGeneration = 0;
+  private fullScanDue = 0;
+
+  private invalidateListing(): void {
+    this.cachedListing = undefined;
+    this.listingChanges.clear();
+    this.listingGeneration++;
+  }
   /**
    * What this client has taken off a name and could not put back.
    *
@@ -510,6 +521,7 @@ export class NodeVault implements Vault {
    * (R46). Never throws: see `DisplacedLedger.record`.
    */
   private async noteDisplaced(at: string, from: string, why: string): Promise<void> {
+    this.invalidateListing();
     await this.ledger.record({
       at: relative(this.root, at),
       from: this.normalPath(relative(this.root, from)),
@@ -572,6 +584,7 @@ export class NodeVault implements Vault {
    * a mount all changed names on disk that nothing then synced.
    */
   private dirty(full: string, deepestExisting: string): void {
+    this.invalidateListing();
     let at = dirname(full);
     this.unflushed.add(at);
     while (at !== deepestExisting && at.startsWith(this.root) && at !== this.root) {
@@ -1087,13 +1100,86 @@ export class NodeVault implements Vault {
    * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
    * 2.6x worse than the default 4.
    */
-  async list(): Promise<FileStat[]> {
+  async list(options: { forceFull?: boolean } = {}): Promise<FileStat[]> {
     // Neither of the two writes a scan normally makes happens in observe-only
     // mode (R12): reaping a crashed run's temporaries, and re-spelling names.
     // The pass over staging still runs, because counting what it will not
     // remove is a read and is the only thing that tells anybody a preserved
     // version is sitting there (R35); the removal half is what it skips.
     const stagingUnknown = await this.reapStaleTemps();
+    const listed = await this.listFiles(options.forceFull === true);
+
+    // Recovery remains an authoritative inventory on every pass, including
+    // passes whose visible files came from the watcher-backed listing.
+    const inventory = await this.ledger.inventory(!this.observeOnly);
+    this.displaced = inventory.waiting;
+    this.recovery =
+      stagingUnknown === undefined
+        ? inventory
+        : {
+            ...inventory,
+            complete: false,
+            why: inventory.why ? `${stagingUnknown}; ${inventory.why}` : stagingUnknown,
+          };
+    const already = new Set(this.stranded);
+    for (const d of this.displaced) {
+      if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {
+        this.stranded.push(d.at);
+        already.add(d.at);
+      }
+    }
+    return listed;
+  }
+
+  private async listFiles(forceFull: boolean): Promise<FileStat[]> {
+    if (
+      !forceFull &&
+      !this.observeOnly &&
+      this.listingWatchers.size > 0 &&
+      Date.now() < this.fullScanDue
+    ) {
+      const cached = this.cachedListing;
+      if (cached) {
+        // Drain before awaiting: an event arriving during a stat belongs to
+        // the next pass, even if it names the same file.
+        const changes = [...this.listingChanges];
+        this.listingChanges.clear();
+        const gate = limiter(SCAN_CONCURRENCY);
+        try {
+          await Promise.all(
+            changes.map((path) =>
+              gate(async () => {
+                const s = await lstat(await this.absolute(path)).catch(
+                  (err: NodeJS.ErrnoException) => {
+                    if (err.code === "ENOENT" || err.code === "ENOTDIR") return undefined;
+                    throw err;
+                  },
+                );
+                if (!s?.isFile()) {
+                  this.invalidateListing();
+                  return;
+                }
+                cached.set(path, {
+                  path,
+                  folder: false,
+                  mtime: s.mtimeMs,
+                  ctime: s.birthtimeMs || s.ctimeMs,
+                  size: s.size,
+                  changeId: `${s.dev}:${s.ino}:${s.ctimeMs}`,
+                });
+              }),
+            ),
+          );
+        } catch (err) {
+          this.invalidateListing();
+          throw err; // Unreadable is never an authoritative deletion.
+        }
+        if (this.cachedListing === cached) return [...cached.values()];
+      }
+    }
+
+    this.invalidateListing();
+    const generation = this.listingGeneration;
     this.diskName.clear();
     this.spellingsKnown.clear();
     this.ambiguousPaths = [];
@@ -1276,36 +1362,17 @@ export class NodeVault implements Vault {
       return out;
     };
     const listed = await walk(this.root, "");
-
-    // The ledger last, and merged rather than replacing what the walk found.
-    //
-    // Two sources for one list, on purpose. The ledger knows which note a
-    // parked file came off and why, which no walk can work out; the walk finds
-    // parked files nothing wrote a record for, which is what an older build
-    // left and what another process is holding. Reporting only the ledger
-    // would lose the second kind, and only the walk would lose every reason.
-    // Not tidied when this scan is a question (R12). `status` runs beside a
-    // watcher and takes no lock, and rewriting the log would be the one write
-    // an observing scan still made.
-    const inventory = await this.ledger.inventory(!this.observeOnly);
-    this.displaced = inventory.waiting;
-    // The walk is a second, independent source, so what the ledger could not
-    // establish is not necessarily missing from `stranded`. It is still not
-    // established, and saying so is the point.
-    this.recovery =
-      stagingUnknown === undefined
-        ? inventory
-        : {
-            ...inventory,
-            complete: false,
-            why: inventory.why ? `${stagingUnknown}; ${inventory.why}` : stagingUnknown,
-          };
-    const already = new Set(this.stranded);
-    for (const d of this.displaced) {
-      if (!already.has(d.at) && !liveTemps.has(join(this.root, d.at))) {
-        this.stranded.push(d.at);
-        already.add(d.at);
-      }
+    if (
+      !this.observeOnly &&
+      this.listingWatchers.size > 0 &&
+      generation === this.listingGeneration &&
+      this.stranded.length === 0 &&
+      this.ambiguousPaths.length === 0
+    ) {
+      // Parked originals outside staging require the full walk to keep their
+      // recovery inventory current. Ambiguous spellings do as well.
+      this.cachedListing = new Map(listed.map((entry) => [entry.path, entry]));
+      this.fullScanDue = Date.now() + 30_000;
     }
     return listed;
   }
@@ -1392,6 +1459,7 @@ export class NodeVault implements Vault {
    * it just received, forever.
    */
   async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(full);
@@ -1505,6 +1573,7 @@ export class NodeVault implements Vault {
     times: Times,
     keepAt: string,
   ): Promise<Replaced> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(full);
@@ -1721,6 +1790,7 @@ export class NodeVault implements Vault {
     expect: ExpectedContent | undefined,
     keepAt: string,
   ): Promise<Replaced> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     if ((await lstat(full).catch(() => undefined)) === undefined) {
@@ -1826,6 +1896,7 @@ export class NodeVault implements Vault {
     digestOf(await this.absolute(path)).catch(() => undefined);
 
   async remove(path: string): Promise<void> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     try {
@@ -1899,6 +1970,7 @@ export class NodeVault implements Vault {
   }
 
   async mkdir(path: string): Promise<void> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(join(full, "x"));
@@ -1911,7 +1983,8 @@ export class NodeVault implements Vault {
       await access(await this.absolute(path), constants.F_OK);
       return true;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
       // Not "no": a disk that would not answer. The callers here go on to
       // write beside or over the answer, so an honest error beats a guess.
       throw err;
@@ -1987,6 +2060,7 @@ export class NodeVault implements Vault {
    * instead, which is exclusive but can leave a partial file after a crash.
    */
   async create(path: string, bytes: Uint8Array, times: Times): Promise<boolean> {
+    this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
     // The staging directory too (R11). `write` checks it and this did not, so
@@ -2074,11 +2148,10 @@ export class NodeVault implements Vault {
   /**
    * Reports changes under the vault, coalesced.
    *
-   * What this is and is not: it decides *when to look*, never *what changed*.
-   * The scan is what decides, and it re-reads the vault from scratch, so a
-   * missed event costs latency and never correctness. That is the reason this
-   * can be built on recursive `fs.watch` at all, which is documented as
-   * best-effort and is not available on every platform.
+   * Known content events refresh that file's stat. Structural or incomplete
+   * events invalidate the listing. A full scan on the client's periodic tick,
+   * and a cache deadline here, recover missed notifications. Without a healthy
+   * watcher every listing is a full scan.
    *
    * Events delivered together share the next event-loop turn. More events
    * cannot keep postponing the scan while a folder is being copied.
@@ -2087,36 +2160,54 @@ export class NodeVault implements Vault {
     let timer: NodeJS.Timeout | undefined;
     const changed = new Set<string>();
     let watcher: FSWatcher | undefined;
+    const enqueue = (path: string) => {
+      changed.add(path);
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        const paths = [...changed];
+        changed.clear();
+        for (const path of paths) onChange(path);
+      }, 0);
+    };
+    const failed = () => {
+      if (watcher) this.listingWatchers.delete(watcher);
+      this.invalidateListing();
+    };
 
     try {
-      watcher = fsWatch(this.root, { recursive: true, persistent: true }, (_event, filename) => {
-        if (!filename) return;
+      this.invalidateListing(); // No cached scan can bridge a gap in watching.
+      watcher = fsWatch(this.root, { recursive: true, persistent: true }, (event, filename) => {
+        if (!filename) {
+          this.invalidateListing();
+          enqueue("");
+          return;
+        }
         const path = filename.toString().split(sep).join("/");
+        if (isParkedOriginal(basename(path))) this.invalidateListing();
         // The state folder changes on every single pass, because that is
         // where the index is written. Watching it would mean each pass
         // scheduled the next one, forever.
         if (this.neverSynced(path)) return;
         if (isTemporary(basename(path), join(this.root, path))) return;
-        changed.add(path);
-        if (timer) return;
-        timer = setTimeout(() => {
-          timer = undefined;
-          const paths = [...changed];
-          changed.clear();
-          for (const path of paths) onChange(path);
-        }, 0);
+        const normal = this.normalPath(path);
+        const known = this.cachedListing?.get(normal);
+        if (event === "change" && known && !known.folder) this.listingChanges.add(normal);
+        else this.invalidateListing();
+        enqueue(path);
       });
-      watcher.on("error", () => {
-        // A watch that fails is a vault that gets scanned on a timer
-        // instead. Slower to notice, and no less correct.
-      });
+      this.listingWatchers.add(watcher);
+      watcher.on("error", failed);
+      watcher.on("close", failed);
     } catch {
+      failed();
       // Recursive watching is not available everywhere. The caller polls.
       return () => {};
     }
 
     return () => {
       if (timer) clearTimeout(timer);
+      failed();
       watcher?.close();
     };
   }

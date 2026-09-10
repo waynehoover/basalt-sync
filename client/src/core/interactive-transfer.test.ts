@@ -100,7 +100,8 @@ it.each(["oversized", "unreadable"] as const)(
         const report = await client.engine.sync({ coalesceWrites: false });
         expect(vault.text("background.md")).toBe("another device's note");
         expect(vault.text("active.md")).toBe(local);
-        expect(report.nextUploadAt).toBeUndefined();
+        if (failure === "oversized") expect(report.nextUploadAt).toBeUndefined();
+        else expect(report.nextUploadAt).toBeGreaterThan(Date.now());
         expect(report.appliedCursor).toBeUndefined();
         expect(failure === "oversized" ? report.skipped : report.retrying).toBe(1);
       }

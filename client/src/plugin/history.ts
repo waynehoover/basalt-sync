@@ -99,6 +99,8 @@ export class HistoryModal extends Modal {
   private paging: Promise<void> | undefined;
   private listEl!: HTMLElement;
   private paneEl!: HTMLElement;
+  private versionsEl!: HTMLElement;
+  private moreEl!: HTMLButtonElement;
 
   constructor(
     app: App,
@@ -118,6 +120,10 @@ export class HistoryModal extends Modal {
     // never says which note you are looking at the history of.
     sidebar.createDiv({ cls: "basalt-history-heading", text: this.path });
     this.listEl = sidebar.createDiv("modal-sidebar-inner");
+    this.versionsEl = this.listEl.createDiv("modal-sidebar-list");
+    this.moreEl = this.listEl.createEl("button", { cls: "basalt-history-button" });
+    this.moreEl.setAttribute("type", "button");
+    this.moreEl.addEventListener("click", () => void this.load());
     this.paneEl = this.contentEl.createDiv("basalt-history-content-container");
     void this.load();
   }
@@ -157,7 +163,14 @@ export class HistoryModal extends Modal {
       // Short of a full page means the server has no more. Asking again
       // would be a round trip that can only return nothing.
       if (page.length < PAGE) this.exhausted = true;
+      const moveFocus = this.moreEl.ownerDocument.activeElement === this.moreEl;
       this.versions.push(...page);
+      this.renderList();
+      if (moveFocus) {
+        const target = page[0] ?? this.versions.at(-1);
+        if (target)
+          this.listEl.querySelector<HTMLElement>(`[data-version="${target.uid}"]`)?.focus();
+      }
     } catch (err) {
       if (this.closed) return;
       // Not exhausted: the server was not asked, it was unreachable. Setting
@@ -193,9 +206,15 @@ export class HistoryModal extends Modal {
 
   private renderList(): void {
     const focused = this.listEl.ownerDocument?.activeElement?.getAttribute("data-version");
-    this.listEl.empty();
+    this.versionsEl.empty();
+    this.moreEl.setText(
+      this.paging ? "Loading…" : this.failed === undefined ? "Load more" : "Try again",
+    );
+    // Keep keyboard focus during a request. load() already joins repeated presses.
+    this.moreEl.setAttribute("aria-disabled", String(this.paging !== undefined));
+    this.moreEl.toggle(!this.exhausted && (this.versions.length > 0 || this.failed !== undefined));
     if (this.paging && this.versions.length === 0) {
-      this.listEl.createEl("p", { cls: "basalt-history-empty", text: "Loading history…" });
+      this.versionsEl.createEl("p", { cls: "basalt-history-empty", text: "Loading history…" });
       return;
     }
     if (this.versions.length === 0 && this.failed !== undefined) {
@@ -203,19 +222,19 @@ export class HistoryModal extends Modal {
       // reached the server is rule 7's mistake in miniature: it describes the
       // question rather than the vault. This says what happened, and the
       // button under it asks again.
-      this.listEl.createEl("p", {
+      this.versionsEl.createEl("p", {
         cls: "basalt-history-empty",
         text: `The history could not be read: ${this.failed}`,
       });
     } else if (this.versions.length === 0) {
-      this.listEl.createEl("p", {
+      this.versionsEl.createEl("p", {
         cls: "basalt-history-empty",
         text: "The server holds no history for this note.",
       });
       return;
     }
 
-    const list = this.listEl.createDiv("modal-sidebar-list");
+    const list = this.versionsEl;
     this.versions.forEach((version, i) => {
       const item = list.createEl("button", {
         cls:
@@ -250,15 +269,6 @@ export class HistoryModal extends Modal {
         this.listEl.querySelector<HTMLElement>(`[data-version="${target.uid}"]`)?.focus();
       });
     });
-
-    if (!this.exhausted) {
-      const more = this.listEl.createEl("button", {
-        cls: "basalt-history-button",
-        text: this.paging ? "Loading…" : this.failed === undefined ? "Load more" : "Try again",
-      });
-      more.disabled = this.paging !== undefined;
-      more.addEventListener("click", () => void this.load());
-    }
   }
 
   private renderPane(): void {

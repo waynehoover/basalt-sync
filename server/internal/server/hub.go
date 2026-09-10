@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/waynehoover/basalt-sync/server/internal/store"
@@ -61,18 +62,33 @@ func (h *Hub) broadcast(vaultID string, e store.Entry, origin *Session) {
 	}
 	h.mu.RUnlock()
 
+	// Encoded frames are immutable. Each peer accounts for its own queue even
+	// when the backing bytes are shared with other live or catching-up peers.
+	// Encode lazily: an origin-only update does not need the full entry at all.
+	var full, own []byte
 	for _, s := range peers {
-		s.deliver(e, s == origin)
+		frame := &full
+		if s == origin {
+			frame = &own
+		}
+		if *frame == nil {
+			var err error
+			*frame, err = json.Marshal(liveBatch(e, s == origin))
+			if err != nil {
+				return
+			}
+		}
+		s.deliverFrame(e.UID, *frame)
 	}
 }
 
 // sessionsOf returns every session on the vault belonging to one device,
 // except origin, for a revoke to close.
 //
-// Deleting the row is not enough on its own. A revoked device holding an open
-// connection has already authenticated, and nothing on a live session is
-// re-checked, so it would go on receiving every note pushed to the vault for
-// as long as it stayed up: a revocation the revoked device never notices.
+// Deleting the row is not enough on its own. A live stream does not check the
+// credential again for each notification, so it would go on receiving every
+// note pushed to the vault for as long as it stayed up: a revocation the revoked
+// device never notices.
 //
 // A device may have more than one session, so this is a list rather than a
 // lookup, and origin is left out because the caller is about to answer it.

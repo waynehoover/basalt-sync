@@ -169,6 +169,7 @@ export const SYNC_EVENT_DELAY_MS = 0;
 export class Client {
   readonly engine: Engine;
   readonly transport: Transport;
+  private uploadTransport: Transport | undefined;
   private limits: ServerLimits | undefined;
   private soonTimer: ReturnType<typeof setTimeout> | undefined;
   private uploadTimer: ReturnType<typeof setTimeout> | undefined;
@@ -223,6 +224,7 @@ export class Client {
         this.backlogChanged();
       },
       onClosed: (cause) => {
+        this.uploadTransport?.close();
         this.endedWith = cause;
         this.backlogChanged();
         this.notifyEnded?.(cause);
@@ -236,6 +238,8 @@ export class Client {
       store: opts.store,
       dataKey: opts.dataKey,
       transport: this.transport,
+      withUploadTransport: (work) => this.withUploadTransport(work),
+      releaseUploadTransport: () => this.releaseUploadTransport(),
       device: opts.device,
       vaultId: opts.vaultId,
       deviceId: opts.deviceId,
@@ -252,6 +256,76 @@ export class Client {
       ...(opts.activePath !== undefined ? { activePath: opts.activePath } : {}),
     });
     this.engine = engine;
+  }
+
+  /** One temporary wire per engine sync, with no independent index or file writer. */
+  private async withUploadTransport<T>(work: (transport: Transport) => Promise<T>): Promise<T> {
+    if (this.closing || this.transport.isClosed)
+      throw new ConnectionError("this client has closed");
+    if (this.uploadTransport && !this.uploadTransport.isClosed) {
+      try {
+        return await this.completeUpload(work, this.uploadTransport);
+      } catch (err) {
+        this.releaseUploadTransport();
+        throw err;
+      }
+    }
+    const transport = new Transport(this.opts.url, {
+      // The main connection alone authenticates/applies metadata to the engine.
+      // The auxiliary stream is checked for framing/continuity and discarded.
+      onBatch: () => {},
+      ...(this.opts.timeoutMs !== undefined ? { timeoutMs: this.opts.timeoutMs } : {}),
+      ...(this.opts.socketFactory ? { socketFactory: this.opts.socketFactory } : {}),
+    });
+    this.uploadTransport = transport;
+    try {
+      await transport.connect();
+      const cursor = this.engine.status().cursor;
+      const limits = await transport.hello({
+        vault: this.opts.vaultId,
+        deviceId: this.opts.deviceId,
+        token: this.opts.token,
+        device: this.opts.device,
+        cursor,
+      });
+      if (limits.cursor < cursor)
+        throw new ProtocolError("cursor", "upload server is behind this device");
+      for (const key of [
+        "perFileMax",
+        "chunkMax",
+        "maxChunks",
+        "maxBatchBytes",
+        "maxFetchBytes",
+      ] as const) {
+        if (limits[key] !== this.limits?.[key])
+          throw new Error("upload server limits changed; reconnect sync");
+      }
+      if (this.closing || this.transport.isClosed)
+        throw new ConnectionError("this client has closed");
+      return await this.completeUpload(work, transport);
+    } catch (err) {
+      this.releaseUploadTransport();
+      throw err;
+    }
+  }
+
+  private releaseUploadTransport(): void {
+    this.uploadTransport?.close();
+    this.uploadTransport = undefined;
+  }
+
+  private async completeUpload<T>(
+    work: (transport: Transport) => Promise<T>,
+    transport: Transport,
+  ): Promise<T> {
+    const result = await work(transport);
+    // Broadcasts precede the auxiliary ACK. A later pong on the main wire
+    // covers them too, including authenticated metadata still being decoded.
+    // Without this barrier an older main frame could arrive after q.commit
+    // and replace its newly acknowledged head with an older revision.
+    await this.transport.ping();
+    await this.transport.drainReceived();
+    return result;
   }
 
   /**
@@ -453,9 +527,9 @@ export class Client {
    * Keeps syncing until the connection ends, and resolves with the reason.
    *
    * The watcher says when to look and the timer is the backstop for a platform
-   * where watching does not work. Neither decides anything: the scan does, and
-   * it re-reads the vault every time, so a missed event costs latency and
-   * never correctness.
+   * where watching does not work. A healthy filesystem watcher may refresh a
+   * cached listing for ordinary edits. The periodic pass and explicit content
+   * verification force a full scan; recovery inventory is always read afresh.
    */
   async runUntilClosed(tickMs = 30_000): Promise<Error> {
     if (this.endedWith) return this.endedWith;
@@ -475,7 +549,7 @@ export class Client {
     // One frame every half minute is cheaper than that, and it is also how a
     // device finds out promptly that a connection has died under it.
     const ticker = setInterval(() => {
-      void this.sync().then(() => this.keepalive());
+      void this.sync({ forceFullScan: true }).then(() => this.keepalive());
     }, tickMs);
     let cause: Error;
     try {
@@ -1109,6 +1183,7 @@ export class Client {
       this.soonTimer = undefined;
     }
     this.transport.close();
+    this.uploadTransport?.close();
     await this.drain();
   }
 }

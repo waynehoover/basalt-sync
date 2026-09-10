@@ -6,9 +6,64 @@ This page records dated measurements and design evaluations. Results describe
 specific fixtures, not a speed ranking against another product. The original
 transfer tables remain in `git show 573617c:docs/compared.md`.
 
-## Current measurements — September 10, 2026
+## Post-0.8.2 performance work — September 10, 2026
 
-Unreleased protocol 7 changes on top of `920324c`; Node 22.23.2, Go 1.27.1,
+Local changes based on `aba03b4`; Node 22.23.2, Apple M4 Pro, macOS.
+The CLI measurements use real filesystem adapters and the released 0.8.2 server.
+Five samples per mode after warm-up, with exact local and server contents checked
+after every sample:
+
+| 10,000-note CLI pass | Full listing | Healthy watcher |
+|---|---:|---:|
+| No changes | 102.18 ms | 33.03 ms |
+| One edited note | 119.10 ms | 50.61 ms |
+| File listing during edited pass | 66.97 ms | 0.39 ms |
+
+These compare modes on the final implementation. An earlier run measured
+127.56 / 54.62 ms for the edited pass; filesystem timing varies. A healthy watcher avoids
+relisting unchanged files; namespace changes, uncertain events and periodic
+verification still require full scans. This does not measure cold startup or
+mobile performance. Engine reconciliation still visits the full index.
+
+For 10,000 local and 10,000 remote records, detached journal comparisons took
+**7.36 ms**, down from **13.78 ms** (25 samples). Retained comparison state grew
+from about **5.0 MB to 8.8 MB**. The durable journal format and flushing are
+unchanged. Whole CLI edited-pass journal saves fell from the earlier **24.38 ms**
+to **16.66 ms** in the final unwatched fixture.
+
+Server microbenchmarks, median of three runs:
+
+| Work | Before | After |
+|---|---:|---:|
+| Deep verification: 500 references to one 64 KiB body | 25.83 ms | 1.87 ms |
+| Encode and queue a 512-chunk update for 32 connections | 727 µs | 25.7 µs |
+
+Verification checks each distinct body once per invocation and still reports
+every affected reference. Broadcast shares immutable encoded frames while
+charging each connection its full queue budget. Two-connection fan-out is
+unchanged within measurement noise. These are maintenance and encoding costs,
+not end-to-end sync latency.
+
+The existing end-to-end cadence benchmark stayed broadly unchanged: two-client
+repeat-edit medians were **21 / 33 / 99 ms** with **0 / 2,000 / 10,000** baseline
+notes (previously **20 / 34 / 99 ms**). These use memory adapters, 10 / 10 / 5
+samples and a 10 ms observation interval. Eight-client results were mixed, so
+they do not establish a general latency improvement. All runs checked exact
+contents on every receiver.
+
+Large uploads now use a temporary connection. A real-server regression holds an
+attachment after its first body and verifies three successive saved note edits
+reach another client before that attachment completes. Additional checks cover
+interrupted uploads, close, concurrent note edits and delayed main-stream
+metadata. The fast path serves existing independent text files up to 512 KiB;
+conflicts and namespace changes retain normal reconciliation. Downloads and
+attachment preparation are not preempted. Run
+`bun run test src/core/responsive-upload.test.ts src/core/upload-ordering.test.ts`
+from `client/` to exercise this ordering without a latency threshold.
+
+## Protocol 7 measurements — September 10, 2026
+
+Protocol 7 changes originally measured on top of `920324c`; Node 22.23.2, Go 1.27.1,
 Apple M4 Pro, macOS arm64. [Raw results](reviews/0.7.1-metrics.json) include
 sample arrays and environment details. Benchmarks ran sequentially, outside
 the test gate.
@@ -188,13 +243,15 @@ deliveries took **623–644 ms**. Processing text first and flushing its transfe
 queue before preparing attachments reduced that to **123–129 ms**. Every note
 and attachment was verified. Ordinary repeat edits measured **122–126 ms**.
 These use the same loopback setup as above, not a measured phone-storage delay.
-An attachment already transferring still occupies the serial transport until
-it completes; this change prioritizes work waiting to start.
+At that stage, an attachment already transferring occupied the serial transport
+until completion. The post-0.8.2 implementation above removes that wait for
+independent saved note edits.
 
 Device delivery confirmation is separate from these transfer timings. A device
 reports a completed checkpoint only after its files and index have been saved.
-The server holds that receipt in memory, and an open visible panel refreshes
-it once per second. Tests withhold confirmation during a blocked replacement,
+The server holds that receipt in memory; the panel originally refreshed once per
+second and now uses the adaptive schedule in [Design](design.md#sync-scheduling).
+Tests withhold confirmation during a blocked replacement,
 a failed replacement, and a failed index save. A disconnected device is shown
 as unconfirmed; receipt metadata is not a backup guarantee.
 
@@ -241,8 +298,8 @@ loopback measurements with memory vaults, not mobile network results.
 Run `BASALT_BENCH_NOTES=2000 bun run bench:cadence` to repeat the larger-vault
 workload; its output includes pass counts and content verification. The serial
 queue still bounds active work and combines requests waiting to start. A second
-transport, partial-vault scans, and interrupting an attachment already in flight
-remain deferred; they need separate preservation tests and real-device profiles.
+transport and partial-vault scans were deferred in this experiment; see the
+post-0.8.2 results above for the subsequent implementation and its limits.
 
 The accompanying UI changes make the offline sync action reconnect immediately,
 combine repeated manual requests, and show sustained activity even when each

@@ -1,18 +1,35 @@
-/** Run at most one request at a time, only while this webview is visible. */
-export function pollWhileVisible(refresh: () => Promise<void>, intervalMs: number): () => void {
+export type VisiblePoll = (() => void) & { refresh(): void };
+
+/** One request at a time, with immediate invalidation and no hidden-webview timer. */
+export function pollWhileVisible(
+  refresh: () => Promise<void>,
+  intervalMs: number | (() => number | undefined),
+  isVisible?: () => boolean,
+): VisiblePoll {
   const doc = globalThis.document;
   let stopped = false;
   let running = false;
+  let again = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const visible = () => !stopped && doc?.visibilityState !== "hidden";
+  const visible = () => !stopped && (isVisible ? isVisible() : doc?.visibilityState !== "hidden");
   const schedule = () => {
     running = false;
-    if (visible()) timer = setTimeout(run, intervalMs);
+    if (!visible()) return;
+    if (again) {
+      again = false;
+      run();
+      return;
+    }
+    const interval = typeof intervalMs === "function" ? intervalMs() : intervalMs;
+    if (interval !== undefined) timer = setTimeout(run, interval);
   };
   const run = () => {
-    if (!visible() || running) return;
+    if (!visible()) return;
+    if (running) {
+      again = true;
+      return;
+    }
     running = true;
-    // The caller presents failures. Either outcome may retry on the next tick.
     void Promise.resolve()
       .then(() => {
         if (visible()) return refresh();
@@ -23,11 +40,14 @@ export function pollWhileVisible(refresh: () => Promise<void>, intervalMs: numbe
     clearTimeout(timer);
     if (visible()) run();
   };
-  doc?.addEventListener("visibilitychange", changed);
+  if (!isVisible) doc?.addEventListener("visibilitychange", changed);
   run();
-  return () => {
-    stopped = true;
-    clearTimeout(timer);
-    doc?.removeEventListener("visibilitychange", changed);
-  };
+  return Object.assign(
+    () => {
+      stopped = true;
+      clearTimeout(timer);
+      if (!isVisible) doc?.removeEventListener("visibilitychange", changed);
+    },
+    { refresh: changed },
+  );
 }

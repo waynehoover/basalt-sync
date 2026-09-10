@@ -59,6 +59,11 @@ base.
 3. Choose a fresh snapshot when required by recovery or snapshot policy.
 4. Otherwise append the delta and verify the resulting log size.
 
+Comparison uses detached, JSON-normalized snapshots of individual records.
+Unchanged records compare structurally without serialization; changed records
+are copied. Mutable engine entries and chunk arrays never serve as the saved
+baseline. This changes memory and CPU costs, not the durable format or write order.
+
 If either file's stamp changed unexpectedly, report it and write a complete
 snapshot rather than append a delta over an unknown base. This is detection and
 recovery, not a substitute for single-writer exclusion.

@@ -1442,6 +1442,8 @@ export class Transport {
      */
     auth: { mac: string; parent: string; base?: number; prevBase?: number },
     onBytes?: (bytes: number) => void,
+    /** Work on a separate connection while this upload yields between bodies. */
+    interleave?: () => Promise<void>,
   ): Promise<{ uid: number; uploaded: number; bytes: number }> {
     notifyTransfer(onBytes, 0);
     const reply = await this.request(
@@ -1475,7 +1477,7 @@ export class Transport {
     // the bodies found the answer already there.
     const id = idOf(reply);
     const ack = this.expectMore(id, "acknowledgement");
-    const bytes = await this.sendBodies(wanted, offered, bodyOf, "put", onBytes);
+    const bytes = await this.sendBodies(wanted, offered, bodyOf, "put", onBytes, interleave);
     const acked = await this.awaitPhase(ack, id);
     if (acked["res"] !== "ack") {
       throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(acked)}`);
@@ -1618,6 +1620,7 @@ export class Transport {
     bodyOf: (name: string) => Promise<Uint8Array>,
     what: string,
     onBytes?: (bytes: number) => void,
+    interleave?: () => Promise<void>,
   ): Promise<number> {
     let bytes = 0;
     let reported = 0;
@@ -1634,6 +1637,7 @@ export class Transport {
             }
           };
     for (const name of wanted) {
+      await interleave?.();
       if (!offered.has(name)) {
         // Already checked when the reply was read; kept because this is
         // the line that sends bytes, and it should not trust a list.
@@ -1643,14 +1647,15 @@ export class Transport {
         );
       }
       const body = await bodyOf(name);
+      await interleave?.();
       this.send(body);
       bytes += body.length;
-      await this.drained(UPLOAD_HIGH_WATER, progress);
+      await this.drained(interleave ? 256 * 1024 : UPLOAD_HIGH_WATER, progress, interleave);
     }
     // Every body is with the socket before the clock on the ack starts. The
     // ack follows the last body, so a timer armed while bodies were still
     // queued measured the upload rather than the server.
-    await this.drained(0, progress);
+    await this.drained(0, progress, interleave);
     return bytes;
   }
 
@@ -1668,7 +1673,11 @@ export class Transport {
    * A stall, meaning the buffer has not shrunk in a whole timeout, is the
    * connection being dead, and is treated as one.
    */
-  private async drained(below: number, progress?: () => void): Promise<void> {
+  private async drained(
+    below: number,
+    progress?: () => void,
+    interleave?: () => Promise<void>,
+  ): Promise<void> {
     progress?.();
     const socket = this.socket;
     if (!socket || socket.bufferedAmount === undefined) return;
@@ -1679,6 +1688,11 @@ export class Transport {
       // Browser WebSocket has no drain event. Poll only while bytes remain;
       // removing this wait would spin or remove the upload's memory bound.
       await sleep(DRAIN_POLL_MS);
+      if (interleave) {
+        const before = Date.now();
+        await interleave();
+        movedAt += Date.now() - before;
+      }
       const now = socket.bufferedAmount;
       progress?.();
       if (now < last) {

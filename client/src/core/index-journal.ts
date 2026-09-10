@@ -267,21 +267,22 @@ export function applyDelta(state: StoredState, delta: JournalDelta): StoredState
 /**
  * What was last written, in the form the next comparison needs.
  *
- * Not the state itself, and the difference is the whole cost of a settled
- * pass. Keeping a copy of the state to compare against means a deep clone of
- * the index on every save, and comparing two states means serialising every
- * entry of both: at ten thousand notes that is two 5.6 MiB round trips through
- * JSON to record that nothing happened, which is more than the whole-file
- * write this design exists to replace. One string per entry costs about what
- * `LastIndexWrite` already kept, and turns a pass into one serialisation of
- * the new state and a map lookup per path.
+ * A detached value per record. Unchanged records reuse these snapshots after
+ * a structural comparison; only changed records are copied. This avoids
+ * serialising the entire index on every settled pass without trusting the
+ * identity of engine entries or their mutable chunk arrays.
  */
 export interface SavedShape {
   readonly cursor: number;
-  /** Path to the JSON of the entry as it was written. */
-  readonly entries: ReadonlyMap<string, string>;
-  readonly remote: ReadonlyMap<string, string>;
+  /** Path to a detached JSON value as it was written. */
+  readonly entries: ReadonlyMap<string, SavedValue>;
+  readonly remote: ReadonlyMap<string, SavedValue>;
   readonly pending: readonly string[];
+}
+
+interface SavedValue {
+  /** Detached from the mutable engine state, including nested chunk arrays. */
+  readonly value: unknown;
 }
 
 /** The shape of a state that is already on disk. */
@@ -302,9 +303,9 @@ export function shapeOf(state: StoredState): SavedShape {
  * nothing at all. Today's `LastIndexWrite` exists for the same reason and
  * found the same thing twice.
  *
- * Compared by the serialisation rather than by identity, because the engine
- * mutates entries in place (see index-state.ts `observe`), so identity says
- * nothing.
+ * Unchanged records reuse their saved value after comparison with a detached
+ * value. The engine mutates entries and nested arrays in place, so retaining
+ * its objects as the comparison baseline would silently lose those updates.
  */
 export function deltaFrom(
   saved: SavedShape,
@@ -312,8 +313,8 @@ export function deltaFrom(
 ): { delta: JournalDelta | undefined; shape: SavedShape } {
   const shape: SavedShape = {
     cursor: next.cursor,
-    entries: serialised(next.entries),
-    remote: serialised(next.remote),
+    entries: serialised(next.entries, saved.entries),
+    remote: serialised(next.remote, saved.remote),
     pending: listOf(next.pending),
   };
 
@@ -349,34 +350,88 @@ export function deltaBetween(prev: StoredState, next: StoredState): JournalDelta
   return deltaFrom(shapeOf(prev), next).delta;
 }
 
-/** Paths whose serialisation moved, and paths that are no longer there. */
+/** Changed snapshots, and paths that are no longer there. */
 function changed(
-  before: ReadonlyMap<string, string>,
-  after: ReadonlyMap<string, string>,
+  before: ReadonlyMap<string, SavedValue>,
+  after: ReadonlyMap<string, SavedValue>,
   values: Record<string, unknown>,
 ): { set: Record<string, unknown>; del: string[] } {
   // Null-prototype for the same reason `copyOf` uses one: this is where a
   // path becomes a key, and `__proto__` is not a key on an ordinary object.
   const set: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
   const del: string[] = [];
-  for (const [path, json] of after) if (before.get(path) !== json) set[path] = values[path];
+  for (const [path, saved] of after) {
+    // These identities belong to detached snapshots, never engine objects.
+    if (before.get(path) !== saved) set[path] = values[path];
+  }
   for (const path of before.keys()) if (!after.has(path)) del.push(path);
   return { set, del };
 }
 
 /**
- * One JSON string per key.
+ * One detached JSON value per key.
  *
  * Tolerant of a shape that is not an object, because a snapshot this client
  * did not write is refused by `validateStoredState` and not here, and throwing
  * on the way to that refusal would replace a message naming the bad field with
  * a stack trace.
  */
-function serialised(from: unknown): Map<string, string> {
-  const out = new Map<string, string>();
+function serialised(
+  from: unknown,
+  previous?: ReadonlyMap<string, SavedValue>,
+): Map<string, SavedValue> {
+  const out = new Map<string, SavedValue>();
   if (typeof from !== "object" || from === null || Array.isArray(from)) return out;
-  for (const [key, value] of Object.entries(from)) out.set(key, JSON.stringify(value));
+  for (const key of Object.keys(from)) {
+    const value = (from as Record<string, unknown>)[key];
+    const saved = previous?.get(key);
+    if (saved && sameJSONValue(saved.value, value)) out.set(key, saved);
+    else {
+      const json = JSON.stringify(value);
+      const snapshot: unknown = json === undefined ? undefined : JSON.parse(json);
+      // JSON can normalize an unfamiliar value (Date, undefined, NaN) into
+      // the value already saved. Preserve that existing comparison contract.
+      out.set(key, saved && sameJSONValue(saved.value, snapshot) ? saved : { value: snapshot });
+    }
+  }
   return out;
+}
+
+/** Compare ordinary JSON data; unfamiliar shapes keep the JSON fallback. */
+function sameJSONValue(before: unknown, after: unknown): boolean {
+  if (before === after) return true;
+  if (
+    before === null ||
+    after === null ||
+    typeof before !== "object" ||
+    typeof after !== "object"
+  ) {
+    return false;
+  }
+  if (typeof (after as { toJSON?: unknown }).toJSON === "function") return false;
+  if (Array.isArray(before)) {
+    return (
+      Array.isArray(after) &&
+      before.length === after.length &&
+      before.every((value, i) => sameJSONValue(value, after[i]))
+    );
+  }
+  if (Array.isArray(after)) return false;
+  const prototype = Object.getPrototypeOf(after);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Object.keys(before);
+  const nextKeys = Object.keys(after);
+  return (
+    keys.length === nextKeys.length &&
+    keys.every(
+      (key, i) =>
+        key === nextKeys[i] &&
+        sameJSONValue(
+          (before as Record<string, unknown>)[key],
+          (after as Record<string, unknown>)[key],
+        ),
+    )
+  );
 }
 
 function listOf(from: unknown): string[] {

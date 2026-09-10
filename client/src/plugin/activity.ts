@@ -17,6 +17,14 @@ const ACTIONS: Record<ActivityAction, string> = {
 export class ActivityLog {
   events: Activity[] = [];
   problem: string | undefined;
+  private readonly listeners = new Set<() => void>();
+  watch(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  private changed(): void {
+    for (const listener of this.listeners) listener();
+  }
   private dirty = false;
   private writing: Promise<void> = Promise.resolve();
   constructor(
@@ -69,6 +77,7 @@ export class ActivityLog {
     this.events.push(event);
     this.events = this.events.slice(-LIMIT);
     this.dirty = true;
+    this.changed();
   }
 
   flush(): Promise<void> {
@@ -80,6 +89,7 @@ export class ActivityLog {
       } catch {
         this.dirty = true;
         this.problem = "Recent activity could not be saved. Clear the log to retry.";
+        this.changed();
       }
     });
     return this.writing;
@@ -90,6 +100,7 @@ export class ActivityLog {
     this.events = [];
     this.problem = undefined;
     this.dirty = true;
+    this.changed();
     await this.flush();
   }
 
@@ -104,17 +115,19 @@ export class ActivityLog {
 }
 
 export class ActivityModal extends Modal {
+  private stop: (() => void) | undefined;
   constructor(
     app: App,
     private readonly log: ActivityLog,
     private readonly openPath: (path: string) => void,
+    private readonly watchUnload?: (close: () => void) => () => void,
   ) {
     super(app);
   }
   override onOpen(): void {
     this.setTitle("Sync activity");
     this.modalEl.addClass("mod-basalt-activity");
-    if (this.log.problem) this.contentEl.createEl("p", { text: this.log.problem });
+    const problem = this.contentEl.createEl("p");
     let query = "";
     let filter = "all";
     const controls = new Setting(this.contentEl).setName("Recent activity");
@@ -136,8 +149,11 @@ export class ActivityModal extends Modal {
         });
     });
     const list = this.contentEl.createDiv("basalt-activity-list");
+    const rows = new Map<Activity, Setting>();
+    const empty = list.createEl("p", { text: "No matching activity." });
     const draw = () => {
-      list.empty();
+      problem.setText(this.log.problem ?? "");
+      problem.toggle(this.log.problem !== undefined);
       const events = this.log.events
         .filter(
           (event) =>
@@ -146,24 +162,74 @@ export class ActivityModal extends Modal {
         )
         .slice()
         .reverse();
-      if (!events.length) list.createEl("p", { text: "No matching activity." });
+      empty.toggle(events.length === 0);
+      const visible = new Set(events);
+      for (const [event, row] of rows) {
+        if (!visible.has(event)) {
+          row.settingEl.remove();
+          rows.delete(event);
+        }
+      }
+      let previous: HTMLElement = empty;
       for (const event of events) {
-        const row = new Setting(list)
-          .setName(event.path ?? "Sync")
-          .setDesc(`${when(event.at)} · ${ACTIONS[event.action]}`);
-        if (event.path)
-          row.addExtraButton((button) =>
-            button
-              .setIcon("file-text")
-              .setTooltip("Open file")
-              .onClick(() => {
-                this.close();
-                this.openPath(event.path!);
-              }),
-          );
+        let row = rows.get(event);
+        if (!row) {
+          row = new Setting(list)
+            .setName(event.path ?? "Sync")
+            .setDesc(`${when(event.at)} · ${ACTIONS[event.action]}`);
+          if (event.path)
+            row.addExtraButton((button) =>
+              button
+                .setIcon("file-text")
+                .setTooltip("Open file")
+                .onClick(() => {
+                  this.close();
+                  this.openPath(event.path!);
+                }),
+            );
+          rows.set(event, row);
+        }
+        if (previous.nextElementSibling !== row.settingEl)
+          list.insertBefore(row.settingEl, previous.nextElementSibling);
+        previous = row.settingEl;
       }
     };
     draw();
+    let closed = false;
+    let queued = false;
+    let frame: number | undefined;
+    let dirty = false;
+    const doc =
+      typeof this.contentEl.ownerDocument?.addEventListener === "function"
+        ? this.contentEl.ownerDocument
+        : globalThis.document;
+    const view = doc?.defaultView ?? globalThis;
+    const schedule = () => {
+      dirty = true;
+      if (closed || queued || doc?.visibilityState === "hidden") return;
+      queued = true;
+      const paint = () => {
+        queued = false;
+        frame = undefined;
+        if (closed || doc?.visibilityState === "hidden" || !dirty) return;
+        dirty = false;
+        draw();
+      };
+      if (typeof view.requestAnimationFrame === "function")
+        frame = view.requestAnimationFrame(paint);
+      else queueMicrotask(paint);
+    };
+    const unwatch = this.log.watch(schedule);
+    doc?.addEventListener("visibilitychange", schedule);
+    const unwatchUnload = this.watchUnload?.(() => this.close());
+    this.stop = () => {
+      closed = true;
+      unwatch();
+      unwatchUnload?.();
+      doc?.removeEventListener("visibilitychange", schedule);
+      if (frame !== undefined) view.cancelAnimationFrame(frame);
+      rows.clear();
+    };
     new Setting(this.contentEl)
       .setName("Troubleshooting")
       .setDesc("The last 300 events stay on this device. Copied diagnostics omit filenames.")
@@ -180,12 +246,12 @@ export class ActivityModal extends Modal {
       .addButton((button) =>
         button.setButtonText("Clear log").onClick(async () => {
           await this.log.clear();
-          this.contentEl.empty();
-          this.onOpen();
         }),
       );
   }
   override onClose(): void {
+    this.stop?.();
+    this.stop = undefined;
     this.contentEl.empty();
   }
 }

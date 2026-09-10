@@ -51,10 +51,10 @@ import {
   type Version,
 } from "../core/client.ts";
 import { watchResume } from "./resume.ts";
-import { pollWhileVisible } from "./visible-poll.ts";
+import { watchDelivery } from "./delivery.ts";
 import type { TransferActivity } from "../core/transfer.ts";
 import { describeTransfer } from "./transfer.ts";
-import { describeDelivery, deliverySummary } from "../core/delivery.ts";
+import { describeDelivery } from "../core/delivery.ts";
 import { generateSecret } from "../core/crypto.ts";
 import { REJOIN_ADVICE, type RepairReport, type SyncReport } from "../core/engine.ts";
 import {
@@ -178,6 +178,8 @@ export default class BasaltPlugin extends Plugin {
   private workingTransfer: TransferActivity | undefined;
   private workingSince: number | undefined;
   private manualSync: Promise<void> | undefined;
+  private previewing: Promise<void> | undefined;
+  private previewModal: SyncPreviewModal | undefined;
 
   /**
    * Why the saved settings could not be read, while that is the case.
@@ -424,6 +426,8 @@ export default class BasaltPlugin extends Plugin {
    * an index behind its notes is safe, an index cut off mid-write is not.
    */
   override onunload(): void {
+    this.previewModal?.close();
+    this.previewModal = undefined;
     for (const close of this.panelClosers) close();
     this.panelClosers.clear();
     this.stopResume?.();
@@ -452,16 +456,41 @@ export default class BasaltPlugin extends Plugin {
    * Running
    * ------------------------------------------------------------ */
 
-  private async openPreview(): Promise<void> {
-    if (!this.client) {
+  private openPreview(): Promise<void> {
+    if (this.previewing) {
+      if (this.previewModal?.isClosed) this.previewModal.open();
+      return this.previewing;
+    }
+    const client = this.client;
+    if (!client) {
       new Notice(this.whyNoClient());
-      return;
+      return Promise.resolve();
     }
-    try {
-      new SyncPreviewModal(this.app, await this.client.preview()).open();
-    } catch (error) {
-      new Notice(`Could not preview sync: ${(error as Error).message}`);
-    }
+    this.previewModal?.close();
+    const modal = new SyncPreviewModal(this.app);
+    this.previewModal = modal;
+    modal.open();
+    const generation = this.generation;
+    const detach = this.watchUnload(() => modal.close());
+    const prepare = async () => {
+      try {
+        const preview = await client.preview();
+        if (this.client === client && this.generation === generation) modal.showPreview(preview);
+        else modal.close();
+      } catch (error) {
+        if (this.client === client && this.generation === generation)
+          modal.showError(`Could not preview sync: ${(error as Error).message}`);
+        else modal.close();
+      } finally {
+        detach();
+      }
+    };
+    const work = prepare();
+    this.previewing = work;
+    void work.then(() => {
+      if (this.previewing === work) this.previewing = undefined;
+    });
+    return work;
   }
 
   private async confirmSync(
@@ -486,7 +515,12 @@ export default class BasaltPlugin extends Plugin {
 
   private openActivity(): void {
     if (this.activityLog)
-      new ActivityModal(this.app, this.activityLog, (path) => this.openExisting(path)).open();
+      new ActivityModal(
+        this.app,
+        this.activityLog,
+        (path) => this.openExisting(path),
+        (close) => this.watchUnload(close),
+      ).open();
   }
 
   private openExisting(path: string): void {
@@ -573,7 +607,7 @@ export default class BasaltPlugin extends Plugin {
       item
         .setTitle(this.paused ? "Resume sync" : "Pause sync")
         .setIcon(this.paused ? "play" : "pause")
-        .setDisabled(!this.config || !!this.pausing)
+        .setDisabled(!this.config || (!this.paused && !!this.pausing))
         .onClick(() => void this.togglePause()),
     );
     menu.addItem((item) =>
@@ -590,27 +624,33 @@ export default class BasaltPlugin extends Plugin {
   }
 
   private async togglePause(): Promise<void> {
-    if (!this.config || this.pausing) return;
+    const config = this.config;
+    if (!config) return;
     if (this.paused) {
+      const mine = this.generation;
+      await this.pausing;
+      if (mine !== this.generation || this.config !== config || !this.paused) return;
       this.paused = false;
       this.start();
       return;
     }
+    if (this.pausing) return;
     this.paused = true;
     this.running = false;
     this.generation++;
     this.clearTimers();
     this.wakeLoop?.();
     const { live, client } = this.retireClients();
-    const closing = Promise.all([live?.close(), client?.close()]).then(() => undefined);
+    // Resume must wait for the entire pause, including the activity write.
+    // Clear the flag before resolving so start() can accept the queued resume.
+    const closing = Promise.all([live?.close(), client?.close()])
+      .then(() => this.activityLog?.flush())
+      .finally(() => {
+        if (this.pausing === closing) this.pausing = undefined;
+      });
     this.pausing = closing;
     this.setState({ kind: "paused" });
-    try {
-      await closing;
-      await this.activityLog?.flush();
-    } finally {
-      this.pausing = undefined;
-    }
+    await closing;
   }
 
   private start(): void {
@@ -1135,6 +1175,10 @@ export default class BasaltPlugin extends Plugin {
       new BasaltModal(this).open();
       return;
     }
+    if (this.paused) {
+      await this.togglePause();
+      return;
+    }
     const client = this.client;
     if (!client) {
       if (this.running && this.state.kind === "offline" && this.wakeLoop) {
@@ -1167,7 +1211,7 @@ export default class BasaltPlugin extends Plugin {
         if (typeof view.save === "function") await view.save();
       }
       if (mine !== this.generation || this.client !== client) return;
-      report = await client.settle({ coalesceWrites: false, verifyContents });
+      report = await client.settle({ coalesceWrites: false, verifyContents, retryFailures: true });
     } catch (err) {
       if (mine !== this.generation) return;
       // Both callers discarded this promise, so a pass that threw was a
@@ -2323,6 +2367,9 @@ export default class BasaltPlugin extends Plugin {
 
   /** Takes the clients off the plugin, so nothing reaches for them again. */
   private retireClients(): { live: Client | undefined; client: Client | undefined } {
+    this.previewModal?.close();
+    this.previewModal = undefined;
+    this.previewing = undefined;
     for (const close of this.syncPrompts) close();
     this.syncPrompts.clear();
     const taken = { live: this.live, client: this.client };
@@ -2348,7 +2395,11 @@ export default class BasaltPlugin extends Plugin {
     // Where a phone can see it. `aria-label` is what Obsidian renders as a
     // ribbon tooltip, and it is also what a screen reader reads out.
     if (this.ribbonEl) {
-      setIcon(this.ribbonEl, iconFor(state));
+      const glyph = iconFor(state);
+      if (this.ribbonEl.getAttribute("data-basalt-icon") !== glyph) {
+        setIcon(this.ribbonEl, glyph);
+        this.ribbonEl.setAttribute("data-basalt-icon", glyph);
+      }
       this.ribbonEl.removeClass("basalt-attention", "basalt-working");
       const tone = toneFor(state);
       if (tone) this.ribbonEl.addClass(tone);
@@ -2530,17 +2581,25 @@ export function describeDeleted(list: DeletedList): string {
 
 /** One compact status glyph, with the plugin name and details in its tooltip. */
 function paintStatus(el: HTMLElement, state: State): void {
-  el.empty();
-  el.removeClass("basalt-attention", "basalt-working");
-  const icon = el.createSpan({ cls: "basalt-status-icon" });
+  const icon =
+    el.querySelector<HTMLElement>(".basalt-status-icon") ??
+    el.createSpan({ cls: "basalt-status-icon" });
   icon.setAttribute("aria-hidden", "true");
-  setIcon(icon, iconFor(state));
+  const glyph = iconFor(state);
+  if (icon.getAttribute("data-basalt-icon") !== glyph) {
+    setIcon(icon, glyph);
+    icon.setAttribute("data-basalt-icon", glyph);
+  }
   // Only when there is one. The settled state has no tone, and addClass with
   // an empty string throws: "The token provided must not be empty", which
   // arrives as a sync error about a DOMTokenList and says nothing about the
   // status bar it came from.
   const tone = toneFor(state);
-  if (tone !== "") el.addClass(tone);
+  if (el.getAttribute("data-basalt-tone") !== tone) {
+    el.removeClass("basalt-attention", "basalt-working");
+    if (tone !== "") el.addClass(tone);
+    el.setAttribute("data-basalt-tone", tone);
+  }
   // Both, because Obsidian styles aria-label as its own tooltip and a plain
   // title is what shows if it ever stops.
   el.setAttribute("aria-label", `Basalt Sync: ${longStatus(state)}`);
@@ -2712,6 +2771,7 @@ class BasaltPanel {
     const problem = this.plugin.configProblem;
     if (problem !== undefined) {
       this.renderUnreadable(contentEl, problem);
+      this.watchShape();
       return;
     }
     if (!this.plugin.paired) {
@@ -2743,11 +2803,13 @@ class BasaltPanel {
       // that caught it.
       if (this.freshRecoveryKey !== undefined) {
         this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
+        this.watchShape();
         return;
       }
       const pending = this.plugin.pendingFirstPairing();
       if (pending !== undefined) this.renderRecoveryKey(contentEl, pending);
       this.renderPairing(contentEl);
+      this.watchShape();
       return;
     }
 
@@ -2800,19 +2862,7 @@ class BasaltPanel {
     // Browse deleted that opened a recovery modal against a vault with no
     // credential. Reported from the settings tab, which is the surface most
     // likely to be sitting open while something else does the unlinking.
-    const shapeOf = () =>
-      JSON.stringify([
-        this.plugin.configProblem !== undefined,
-        this.plugin.paired,
-        (this.freshRecoveryKey ?? this.plugin.pendingFirstPairing()) !== undefined,
-        offersRejoin(this.plugin.currentState),
-      ]);
-    const drewShape = shapeOf();
-    this.unwatch = this.plugin.watchState(() => {
-      if (shapeOf() !== drewShape) {
-        this.render();
-        return;
-      }
+    this.watchShape(() => {
       const state = this.plugin.currentState;
       status.setText(longStatus(state));
       const busy =
@@ -2820,15 +2870,17 @@ class BasaltPanel {
       syncButton
         .setDisabled(busy)
         .setButtonText(
-          state.kind === "offline"
-            ? "Reconnect"
-            : state.kind === "connecting"
-              ? "Connecting…"
-              : state.kind === "loading"
-                ? "Loading…"
-                : state.kind === "syncing"
-                  ? "Syncing…"
-                  : "Sync now",
+          state.kind === "paused"
+            ? "Resume sync"
+            : state.kind === "offline"
+              ? "Reconnect"
+              : state.kind === "connecting"
+                ? "Connecting…"
+                : state.kind === "loading"
+                  ? "Loading…"
+                  : state.kind === "syncing"
+                    ? "Syncing…"
+                    : "Sync now",
         );
       // Both cursors, so "behind and nothing arriving" is something a person
       // can see (I11).
@@ -2950,6 +3002,22 @@ class BasaltPanel {
     );
 
     docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "Basalt documentation");
+  }
+
+  /** Form fields survive ordinary updates; a different pairing redraws every surface. */
+  private watchShape(update: () => void = () => {}): void {
+    const shape = () =>
+      JSON.stringify([
+        this.plugin.configProblem !== undefined,
+        this.plugin.paired,
+        (this.freshRecoveryKey ?? this.plugin.pendingFirstPairing()) !== undefined,
+        offersRejoin(this.plugin.currentState),
+      ]);
+    const drawn = shape();
+    this.unwatch = this.plugin.watchState(() => {
+      if (shape() !== drawn) this.render();
+      else update();
+    });
   }
 
   private renderServerAddress(contentEl: HTMLElement): void {
@@ -3112,37 +3180,19 @@ class BasaltPanel {
     said = later(contentEl, "basalt-advice");
   }
 
-  /** Poll only an open, visible panel; update text without redrawing controls. */
+  /** Share delivery checks across open settings surfaces without rebuilding controls. */
   private renderDelivery(host: HTMLElement): void {
-    const generation = this.renderGeneration;
     const line = later(host, "setting-item-description basalt-delivery");
     line.setAttribute("aria-live", "polite");
-    const current = () => !this.closed && this.renderGeneration === generation;
-    const refresh = async () => {
-      try {
-        if (!current() || globalThis.document?.visibilityState === "hidden") return;
-        const state = this.plugin.currentState;
-        if (state.kind !== "synced") {
-          say(line, "Device delivery unconfirmed.");
-          return;
-        }
-        if (!this.plugin.deliveryReady) {
-          say(line, "Waiting for this device to finish syncing.");
-          return;
-        }
-        const answer = await this.plugin.devices();
-        if (!current()) return;
-        const cursor = this.plugin.cursors()?.server;
-        const message =
-          cursor === undefined || !this.plugin.deliveryReady
-            ? "Device delivery unconfirmed."
-            : deliverySummary(answer.devices, answer.thisDevice, cursor);
+    this.stopDelivery = watchDelivery(
+      this.plugin,
+      (message) => {
         if (line.textContent !== message) say(line, message);
-      } catch {
-        if (current()) say(line, "Device delivery unavailable.");
-      }
-    };
-    this.stopDelivery = pollWhileVisible(refresh, 1000);
+      },
+      typeof line.ownerDocument?.addEventListener === "function"
+        ? line.ownerDocument
+        : globalThis.document,
+    );
   }
 
   /** Show the QR and a selectable pairing code, with Copy beside the code. */
@@ -3299,6 +3349,7 @@ class BasaltPanel {
     );
     setting.addText((t) => {
       t.setPlaceholder("laptop");
+      t.inputEl.setAttribute("aria-label", "This device's name");
       t.setValue(this.plugin.deviceName ?? "");
       field = t;
     });
@@ -3336,6 +3387,7 @@ class BasaltPanel {
     )
       .addText((t) => {
         t.setPlaceholder("Current recovery key");
+        t.inputEl.setAttribute("aria-label", "Current recovery key");
         literalInput(t);
         keyField = t;
       })
@@ -3513,6 +3565,7 @@ class BasaltPanel {
     row(contentEl, "Device name", "Shown in the device list and future sync activity.").addText(
       (t) => {
         t.setPlaceholder("laptop");
+        t.inputEl.setAttribute("aria-label", "Device name");
         t.setValue(
           this.joining === "invite"
             ? (this.joinDraft?.device ?? suggestedDeviceName())
@@ -3530,6 +3583,7 @@ class BasaltPanel {
         "Paste an invite from a paired device, or use your saved recovery key.",
       ).addText((t) => {
         t.setPlaceholder("basalt3i_...");
+        t.inputEl.setAttribute("aria-label", "Invite or recovery key");
         literalInput(t);
         const key = this.joinDraft?.key ?? this.incomingInvite;
         if (key !== undefined) t.setValue(key);
@@ -3559,6 +3613,7 @@ class BasaltPanel {
         "Paste your server's setup string, including its secure address.",
       ).addText((t) => {
         t.setPlaceholder("homelab:3003#K7M2PQR4-...");
+        t.inputEl.setAttribute("aria-label", "Setup string");
         literalInput(t, true);
         setupField = t;
       });

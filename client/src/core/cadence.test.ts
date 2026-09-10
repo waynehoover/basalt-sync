@@ -73,6 +73,44 @@ async function pair(
 }
 
 describe("automatic sync cadence", () => {
+  it("wakes at a transient read retry deadline without another file event", async () => {
+    const completed = deferred<SyncReport>();
+    const { a, b, av, bv } = await pair(
+      {},
+      {},
+      {
+        onPass: (report) => {
+          if (report.uploaded === 1) completed.resolve(report);
+        },
+      },
+    );
+    let unavailable = true;
+    const read = av.read.bind(av);
+    av.read = async (path) => {
+      if (unavailable) throw new Error("temporarily unavailable");
+      return read(path);
+    };
+    await av.edit("retry.md", "Saved content survives a transient read failure.\n");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const now = Date.now();
+      const failed = await a.sync();
+      expect(failed?.nextUploadAt).toBe(now + 10_000);
+      loops.push(a.runUntilClosed());
+      unavailable = false;
+      await vi.advanceTimersByTimeAsync(10_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    const retried = await within(completed.promise, "scheduled retry upload");
+    expect(retried.retrying).toBe(0);
+    expect(retried.nextUploadAt).toBeUndefined();
+    await receiveCommitted(b.transport);
+    await b.settle();
+    expect(bv.text("retry.md")).toBe("Saved content survives a transient read failure.\n");
+    expect(av.text("retry.md")).toBe(bv.text("retry.md"));
+  });
+
   it("sends the current note before a slow background note can hold the pass", async () => {
     const { a, b, av, bv } = await pair({}, {}, { activePath: () => "z-current.md" });
     loops.push(b.runUntilClosed());

@@ -114,6 +114,22 @@ describe("a vault with no index at all", () => {
 });
 
 describe("an ordinary sequence of passes", () => {
+  it("persists in-place changes to loaded entries and nested chunk arrays", async () => {
+    const files = new FakeFiles();
+    const first = new JournalIndexStore(files);
+    await first.save(state({ entries: { "a.md": { ...entry("a.md", 1), chunks: ["old"] } } }));
+    const reopened = new JournalIndexStore(files);
+    const loaded = (await reopened.load())!;
+    const note = loaded.entries["a.md"] as { size: number; chunks: string[] };
+    note.size = 2;
+    note.chunks[0] = "new";
+    await reopened.save(loaded);
+    note.chunks.push("newer");
+    await reopened.save(loaded);
+    const restored = (await new JournalIndexStore(files).load())!;
+    expect(restored.entries["a.md"]).toMatchObject({ size: 2, chunks: ["new", "newer"] });
+  });
+
   it("appends what changed and does not rewrite the snapshot", async () => {
     const files = new FakeFiles();
     const store = new JournalIndexStore(files);

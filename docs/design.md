@@ -111,11 +111,26 @@ Repeat binary uploads wait 1 second for files up to 10 KiB, 2 seconds up to
 New files and incoming reconciliation have no upload cooldown. “Sync now”
 bypasses the binary upload cooldown.
 
-Each pass reports the earliest deferred upload deadline. A running client wakes
-at that deadline, replaces it when an earlier one appears, and cancels it when
-the work clears or the client closes. All passes use the existing serial queue.
+Each pass reports the earliest deferred upload or transient retry deadline.
+A running client wakes at that deadline, replaces it when an earlier one appears,
+and cancels it when the work clears or the client closes. All passes use the
+existing serial queue.
 The 30-second scan and keepalive remain a fallback; they do not set the normal
 cadence. One-shot and inspection clients do not start deadline timers.
+
+“Sync now” and content verification retry transient failures immediately. A file
+change also releases that file's retry delay. Failed retries retain exponential
+backoff; permanent refusals still require the reported problem to be corrected.
+
+The CLI reuses file listings only while a healthy watcher is active. Known file
+edits refresh individual stats; namespace changes and uncertain events invalidate
+the listing. Periodic scans, content verification, and inspection use a full walk.
+Recovery inventory remains fresh on every pass. The plugin uses Obsidian's file
+inventory instead of this filesystem cache.
+Before reconciling, the engine checks missing paths that were previously synced.
+A restored path triggers a full scan instead of trusting a cached absence. This
+happens before writes, so case-only renames and file/folder transitions retain
+their normal ordering.
 
 Foreground, focus, and network-online events check the socket immediately and
 interrupt local reconnect backoff. An idle socket gets a two-second probe;
@@ -123,12 +138,21 @@ active transfers keep their normal progress timeouts. Sync passes remain serial.
 Folders and text files are processed before binary attachments, and queued
 notes are transferred before attachment reading and chunking starts.
 
+Large uploads use a temporary authenticated connection while the owning engine
+can send independent saved text edits through the main connection between chunks.
+This path is limited to existing notes up to 512 KiB; conflicts, renames, and
+overlapping paths use ordinary reconciliation. The engine remains the sole index
+writer. Before recording an auxiliary upload, a main-connection ping and metadata
+drain establish ordering with that upload's broadcast. Both connections close
+with the client; the temporary connection also closes when the sync finishes.
+
 A completed local checkpoint is reported only after a clean pass flushes files
 and saves the index. The device list exposes this separately from metadata
-receipt. An open panel refreshes delivery status once per second; hidden or
-closed panels do not poll. Receipts expire with the connection and are not
-stored in SQLite, avoiding a database write per edit. Hidden panels cancel their
-poll timer and refresh immediately when the app becomes visible again.
+receipt. Visible panels share one delivery request: every 250 ms while online
+peers are behind, every two seconds for offline peers or errors, and every ten
+seconds when settled. State changes invalidate the result immediately. Hidden
+or closed panels do not poll. Receipts expire with the connection and are not
+stored in SQLite, avoiding a database write per edit.
 
 Version history keeps only the selected preview in memory, sharing an in-flight
 download and reusing it when switching between text and changes. Comparisons
@@ -142,6 +166,11 @@ the same work, and the panel shows a disabled busy action while connecting,
 loading, or visibly syncing. Automatic passes shorter than 200 ms keep the last
 status; sustained work updates at most five times per second, including scanning
 and saving the index.
+
+Open setup panels follow pairing changes without replacing unfinished inputs on
+routine updates. Activity updates on the next visible animation frame. Status
+icons retain their elements during progress updates, and history pagination
+preserves keyboard focus. Preview opens with a loading state while its scan runs.
 
 During sync transfers, the panel reports upload or download activity, the file
 or batch count, and encrypted body bytes sent or received. Reused chunks are

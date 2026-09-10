@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -1833,7 +1834,8 @@ type Verification struct {
 }
 
 // Verify walks every live entry and checks that its chunks exist. With deep, it
-// also reads each chunk and checks the body against its name.
+// also reads each distinct vault/chunk body once and checks it against its name.
+// Counts and faults still include every reference to that body.
 //
 // A dangling reference makes a client retry one download forever, which presents
 // as a sync that never finishes rather than as an error, so it is surfaced
@@ -1851,36 +1853,9 @@ type Verification struct {
 // numbers rather than the pass.
 func (s *Store) Verify(deep bool) (Verification, error) {
 	var v Verification
-	rows, err := s.db.Query(
-		`SELECT e.vault_id, e.uid, e.path, c.name
-		   FROM entries e JOIN entry_chunks c
-		     ON c.vault_id = e.vault_id AND c.uid = e.uid
-		  ORDER BY e.vault_id, e.uid, c.ord`)
+	var err error
+	v.Faults, v.Chunks, err = s.verifyChunkRefs(deep)
 	if err != nil {
-		return v, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var f Fault
-		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &f.Chunk); err != nil {
-			return v, err
-		}
-		v.Chunks++
-		if !s.chunks.Has(f.VaultID, f.Chunk) {
-			f.Reason = "missing"
-			v.Faults = append(v.Faults, f)
-			continue
-		}
-		if deep {
-			if err := s.chunks.Check(f.VaultID, f.Chunk); err != nil {
-				f.Reason = "corrupt"
-				f.Detail = err.Error()
-				v.Faults = append(v.Faults, f)
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return v, err
 	}
 
@@ -1895,6 +1870,77 @@ func (s *Store) Verify(deep bool) (Verification, error) {
 	v.Faults = append(v.Faults, registryFaults...)
 	v.Rows = rowsChecked
 	return v, err
+}
+
+func (s *Store) verifyChunkRefs(deep bool) (faults []Fault, count int, err error) {
+	order := "e.vault_id, e.uid, c.ord"
+	if deep {
+		// The name index groups references without retaining a cache of every
+		// healthy body. Only failures need storage proportional to history.
+		order = "c.vault_id, c.name"
+	}
+	rows, err := s.db.Query(
+		`SELECT e.vault_id, e.uid, e.path, c.name, c.ord
+		   FROM entries e JOIN entry_chunks c
+		     ON c.vault_id = e.vault_id AND c.uid = e.uid
+		  ORDER BY ` + order)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	type orderedFault struct {
+		Fault
+		ordinal int64
+	}
+	var found []orderedFault
+	defer func() {
+		// Grouping by body must not change the diagnostic order operators see.
+		if deep {
+			sort.Slice(found, func(i, j int) bool {
+				a, b := found[i], found[j]
+				if a.VaultID != b.VaultID {
+					return a.VaultID < b.VaultID
+				}
+				if a.UID != b.UID {
+					return a.UID < b.UID
+				}
+				return a.ordinal < b.ordinal
+			})
+		}
+		if len(found) > 0 {
+			faults = make([]Fault, len(found))
+			for i, f := range found {
+				faults[i] = f.Fault
+			}
+		}
+	}()
+
+	var last Fault
+	haveLast := false
+	for rows.Next() {
+		var f orderedFault
+		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &f.Chunk, &f.ordinal); err != nil {
+			return nil, count, err
+		}
+		count++
+		if !deep || !haveLast || f.VaultID != last.VaultID || f.Chunk != last.Chunk {
+			last = f.Fault
+			haveLast = true
+			if !s.chunks.Has(f.VaultID, f.Chunk) {
+				last.Reason = "missing"
+			} else if deep {
+				if err := s.chunks.Check(f.VaultID, f.Chunk); err != nil {
+					last.Reason = "corrupt"
+					last.Detail = err.Error()
+				}
+			}
+		}
+		if last.Reason != "" {
+			f.Reason, f.Detail = last.Reason, last.Detail
+			found = append(found, f)
+		}
+	}
+	return nil, count, rows.Err()
 }
 
 // verifyRegistry decodes every device row and every invite, which nothing else

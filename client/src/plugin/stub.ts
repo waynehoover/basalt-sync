@@ -33,12 +33,42 @@ export { normalizePath };
  */
 export class FakeEl {
   readonly children: FakeEl[] = [];
+  private parent: FakeEl | undefined;
+  get firstElementChild(): FakeEl | null {
+    return this.children[0] ?? null;
+  }
+  get nextElementSibling(): FakeEl | null {
+    return this.parent?.children[this.parent.children.indexOf(this) + 1] ?? null;
+  }
+  appendChild(el: FakeEl): FakeEl {
+    return this.insertBefore(el, null);
+  }
+  insertBefore(el: FakeEl, before: FakeEl | null): FakeEl {
+    if (el === before) return el;
+    el.remove();
+    const index = before ? this.children.indexOf(before) : this.children.length;
+    if (index < 0) throw new Error("Reference is not a child");
+    this.children.splice(index, 0, el);
+    el.parent = this;
+    return el;
+  }
+  remove(): void {
+    if (!this.parent) return;
+    if (FakeEl.activeElement && this.contains(FakeEl.activeElement))
+      FakeEl.activeElement = undefined;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = undefined;
+  }
   text = "";
   disabled = false;
   value = "";
   static activeElement: FakeEl | undefined;
   get ownerDocument() {
-    return { activeElement: FakeEl.activeElement };
+    return {
+      get activeElement() {
+        return FakeEl.activeElement;
+      },
+    };
   }
   focus(): void {
     FakeEl.activeElement = this;
@@ -53,7 +83,9 @@ export class FakeEl {
     const match = (el: FakeEl) =>
       selector.startsWith("[data-version=")
         ? el.attributes.get("data-version") === /"(.*)"/.exec(selector)?.[1]
-        : el.tag === selector;
+        : selector.startsWith(".")
+          ? el.cls.split(" ").includes(selector.slice(1))
+          : el.tag === selector;
     return this.children.flatMap((child) => [
       ...(match(child) ? [child] : []),
       ...child.querySelectorAll(selector),
@@ -71,7 +103,7 @@ export class FakeEl {
   createEl(tag: string, o?: { text?: string; cls?: string } | string): FakeEl {
     const el = new FakeEl(tag, typeof o === "string" ? o : (o?.cls ?? ""));
     if (typeof o === "object" && o?.text) el.text = o.text;
-    this.children.push(el);
+    this.appendChild(el);
     return el;
   }
 
@@ -84,7 +116,14 @@ export class FakeEl {
   }
 
   empty(): void {
+    if (FakeEl.activeElement && this.contains(FakeEl.activeElement))
+      FakeEl.activeElement = undefined;
+    for (const child of this.children) child.parent = undefined;
     this.children.length = 0;
+  }
+
+  contains(el: FakeEl): boolean {
+    return el === this || this.children.some((child) => child.contains(el));
   }
 
   setText(value: string): void {
@@ -506,6 +545,12 @@ export class TextComponent {
   private value = "";
   placeholder = "";
   readonly inputEl = new FakeEl("input");
+  private change: ((value: string) => unknown) | undefined;
+
+  onChange(callback: (value: string) => unknown): this {
+    this.change = callback;
+    return this;
+  }
 
   setPlaceholder(placeholder: string): this {
     this.placeholder = placeholder;
@@ -524,6 +569,7 @@ export class TextComponent {
   /** Types into the field, as a person would. */
   type(value: string): void {
     this.value = value;
+    this.change?.(value);
   }
 }
 
@@ -640,10 +686,10 @@ export class Setting {
   readonly descEl = new FakeEl("div", "setting-item-description");
 
   constructor(containerEl: FakeEl) {
-    this.settingEl.children.push(this.infoEl);
-    this.infoEl.children.push(this.nameEl);
-    this.infoEl.children.push(this.descEl);
-    containerEl.children.push(this.settingEl);
+    this.settingEl.appendChild(this.infoEl);
+    this.infoEl.appendChild(this.nameEl);
+    this.infoEl.appendChild(this.descEl);
+    containerEl.appendChild(this.settingEl);
     built.push(this);
   }
 
@@ -704,6 +750,7 @@ export const built: Setting[] = [];
 
 /** Forgets everything recorded, between tests. */
 export function resetStub(): void {
+  FakeEl.activeElement = undefined;
   notices.length = 0;
   built.length = 0;
   modals.length = 0;

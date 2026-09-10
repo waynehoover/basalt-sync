@@ -143,7 +143,7 @@ export interface Vault {
    * the way in; the engine's own folding is the fallback for one that does
    * not, and it errs towards refusing rather than overwriting.
    */
-  list(): Promise<FileStat[]>;
+  list(options?: { forceFull?: boolean }): Promise<FileStat[]>;
   /**
    * Paths the last `list` left out because two names on disk claim them.
    *

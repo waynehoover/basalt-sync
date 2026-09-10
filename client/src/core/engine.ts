@@ -395,6 +395,9 @@ export interface EngineOptions {
    */
   readonly dataKey: Uint8Array;
   readonly transport: Transport;
+  /** Keep the main wire available while a large upload sends its bodies. */
+  readonly withUploadTransport?: <T>(work: (transport: Transport) => Promise<T>) => Promise<T>;
+  readonly releaseUploadTransport?: () => void;
   readonly device: string;
   readonly vaultId: string;
   /** This device's row in the vault's device list. */
@@ -441,6 +444,10 @@ export interface EngineOptions {
 export interface SyncOptions {
   /** Read every file's contents instead of trusting the saved hash cache. */
   readonly verifyContents?: boolean;
+  /** Refresh the full listing, including changes a filesystem watcher missed. */
+  readonly forceFullScan?: boolean;
+  /** Retry transient failures once now; automatic failures keep their backoff. */
+  readonly retryFailures?: boolean;
   /**
    * Whether to hold back a file written moments ago, just for this pass.
    *
@@ -528,7 +535,7 @@ export interface SyncReport {
    * the exact lie that rule is about.
    */
   waiting: number;
-  /** Earliest deferred upload deadline; absent when no timed upload remains. */
+  /** Earliest deferred upload or transient retry; absent when no timed work remains. */
   nextUploadAt?: number;
   /** All server entries through this cursor were applied and the local pass saved. */
   appliedCursor?: number;
@@ -1292,6 +1299,10 @@ export class Engine {
     this.syncing = true;
     this.again = false;
     try {
+      if (opts.retryFailures || opts.verifyContents) {
+        const now = this.now();
+        for (const retry of this.retries.values()) retry.at = Math.min(retry.at, now);
+      }
       let report = await this.pass(opts);
       let rounds = 1;
       while (this.again && rounds < 8 && !this.opts.transport.isClosed) {
@@ -1308,6 +1319,7 @@ export class Engine {
       }
       return report;
     } finally {
+      this.opts.releaseUploadTransport?.();
       this.syncing = false;
     }
   }
@@ -1445,11 +1457,36 @@ export class Engine {
       this.inboxBytes = 0;
     }
 
-    const stats = await this.opts.vault.list();
+    let stats = await this.opts.vault.list({
+      forceFull: opts.verifyContents === true || opts.forceFullScan === true,
+    });
+    let onDisk = new Map(stats.map((s) => [s.path, s]));
+    // Never turn a cached absence into a deletion of a restored file. Check
+    // before this pass writes anything: later, a case-only rename or a folder
+    // replacing a deleted file can legitimately occupy the old physical path.
+    // Full reconciliation decides those cases from the refreshed inventory.
+    const omittedRefusals = new Map<string, unknown>();
+    let refreshed = false;
+    for (const [path, entry] of this.entries) {
+      if (onDisk.has(path) || (entry.synchash === "" && entry.synctime <= 0)) continue;
+      try {
+        if ((await this.opts.vault.exists(path)) && !refreshed) {
+          stats = await this.opts.vault.list({ forceFull: true });
+          onDisk = new Map(stats.map((s) => [s.path, s]));
+          refreshed = true;
+        }
+      } catch (err) {
+        const code = (err as { code?: string })?.code;
+        // Excluded is not absent. Route explicit path refusals through the
+        // ordinary reporting below; an unreadable presence check still stops
+        // the pass. Check every omitted entry, even after a forced rescan.
+        if (code !== "ignored" && code !== "neversync") throw err;
+        omittedRefusals.set(path, err);
+      }
+    }
     await this.confirmWork(stats);
     const dirty = new Set(this.dirty);
     this.dirty.clear();
-    const onDisk = new Map(stats.map((s) => [s.path, s]));
     for (const stat of stats) {
       const entry = this.entryFor(stat.path);
       if (dirty.has(stat.path) || opts.verifyContents) {
@@ -1562,6 +1599,10 @@ export class Engine {
         await this.flush(report);
       }
       previousPriority = priority;
+      if (omittedRefusals.has(path)) {
+        this.recordFailure(path, omittedRefusals.get(path), report);
+        continue;
+      }
       if (this.ignoredPaths.has(path)) {
         // Settled, and settled by the person who configured this device. It
         // is counted every pass so it stays visible, and nothing is fetched
@@ -1632,6 +1673,7 @@ export class Engine {
       const retry = this.retries.get(path);
       if (retry && retry.at > now) {
         noteRetrying(report, path);
+        report.nextUploadAt = Math.min(report.nextUploadAt ?? Infinity, retry.at);
         continue;
       }
       try {
@@ -1754,7 +1796,10 @@ export class Engine {
 
   /** An event invalidates content even when size and timestamps are unchanged. */
   noteChanged(path: string): void {
-    this.dirty.add(canonicalSpelling(path));
+    const canonical = canonicalSpelling(path);
+    this.dirty.add(canonical);
+    const retry = this.retries.get(canonical);
+    if (retry) retry.at = Math.min(retry.at, this.now());
     if (this.syncing) this.again = true;
   }
 
@@ -2400,19 +2445,31 @@ export class Engine {
             // batch, and send a file over the limit on its own with put. A
             // single put is bounded only by the per-file limit.
             const { entry } = alone;
-            const one = await this.opts.transport.put(
-              entry.path,
-              entry.meta,
-              entry.names,
-              bodyOf,
-              {
-                mac: entry.mac,
-                parent: entry.parent,
-                base: entry.base ?? 0,
-                prevBase: entry.prevBase ?? 0,
-              },
-              onBytes,
-            );
+            const send = (transport: Transport) =>
+              transport.put(
+                entry.path,
+                entry.meta,
+                entry.names,
+                bodyOf,
+                {
+                  mac: entry.mac,
+                  parent: entry.parent,
+                  base: entry.base ?? 0,
+                  prevBase: entry.prevBase ?? 0,
+                },
+                onBytes,
+                transport === this.opts.transport
+                  ? undefined
+                  : () =>
+                      this.sendInteractiveEdit(
+                        report,
+                        batch.map((q) => q.path),
+                      ),
+              );
+            const one =
+              this.opts.withUploadTransport && !this.servicingInteractive
+                ? await this.opts.withUploadTransport(send)
+                : await send(this.opts.transport);
             return { results: [{ uid: one.uid }], uploaded: one.uploaded, bytes: one.bytes };
           } else {
             return await this.opts.transport.putMany(
@@ -2452,6 +2509,127 @@ export class Engine {
           now: this.remote.get(q.path)?.uid,
         });
       }
+    }
+  }
+
+  private servicingInteractive = false;
+
+  /**
+   * Publish an independent small saved note while a bulk transfer yields.
+   * This stays inside the owning engine pass. Namespace changes and conflicts
+   * keep the ordinary full reconciliation path; no second engine edits the index.
+   */
+  private async sendInteractiveEdit(
+    report: SyncReport,
+    transferring: readonly string[],
+  ): Promise<void> {
+    if (
+      this.servicingInteractive ||
+      this.dirty.size === 0 ||
+      !this.sending ||
+      this.opts.transport.isClosed
+    )
+      return;
+    const active = this.opts.activePath?.();
+    const path =
+      active && this.dirty.has(active)
+        ? active
+        : [...this.dirty].find((candidate) => looksLikeText(candidate));
+    if (!path || !looksLikeText(path) || !this.opts.vault.stat) return;
+    const entry = this.entries.get(path);
+    const remote = this.remote.get(path);
+    // Work already planned under either spelling must finish before revisiting it.
+    const involved = [
+      ...transferring,
+      ...this.outbox.map((q) => q.path),
+      ...this.inbox.map((q) => q.path),
+      ...this.pendingDeletes.map((q) => q.path),
+    ];
+    const identity = this.identity(path);
+    if (
+      involved.some((other) => {
+        const id = this.identity(other);
+        return id === identity || id.startsWith(`${identity}/`) || identity.startsWith(`${id}/`);
+      })
+    )
+      return;
+    if (
+      !entry ||
+      entry.folder ||
+      entry.prev ||
+      remote?.wire ||
+      remote?.deleted ||
+      remote?.folder ||
+      (remote?.uid ?? 0) !== entry.syncuid ||
+      this.skipped.has(path) ||
+      this.ignoredPaths.has(path) ||
+      this.refusedInbound.has(path) ||
+      this.nowBlocked.has(path) ||
+      this.pending.has(path)
+    )
+      return;
+    if (
+      [...this.entries.values()].some(
+        (other) => other.prev && this.identity(other.prev) === identity,
+      )
+    )
+      return;
+    if (
+      (this.opts.vault.ambiguous?.() ?? []).some(
+        (clash) =>
+          this.identity(clash.path) === identity ||
+          identity.startsWith(`${this.identity(clash.path)}/`),
+      )
+    )
+      return;
+    const retry = this.retries.get(path);
+    if (retry && retry.at > this.now()) return;
+
+    this.servicingInteractive = true;
+    // Keep the outer queues intact. This path is disjoint from everything they name.
+    const queued = this.outbox;
+    const budget = this.outboxBudget;
+    const frame = this.outboxFrame;
+    this.outbox = [];
+    this.outboxBudget = 0;
+    this.outboxFrame = 0;
+    try {
+      const stat = await this.opts.vault.stat(path);
+      if (!stat || stat.folder || stat.size > Math.min(512 * 1024, this.limitOn("perFileMax")))
+        return;
+      // A newer edit during either await remains dirty for the next boundary.
+      this.dirty.delete(path);
+      entry.hash = "";
+      entry.chunks = [];
+      observe(entry, stat);
+      const sealed = await this.rehash(entry, path, stat.size);
+      // A save can grow the file after the stat. Keep bulk content off the
+      // interactive wire even when its original size fitted this path.
+      if (entry.size > Math.min(512 * 1024, this.limitOn("perFileMax"))) {
+        this.again = true;
+        return;
+      }
+      const current = this.remote.get(path);
+      const action = decide({
+        local: { folder: false, mtime: entry.mtime, size: entry.size, hash: entry.hash },
+        remote: current,
+        index: entry,
+        mergeable: this.mergeable(path),
+      });
+      if (action.kind !== "upload") {
+        this.again = true;
+        return;
+      }
+      await this.upload(path, entry, report, current?.uid, true, sealed);
+      await this.flush(report);
+    } catch (err) {
+      this.recordFailure(path, err, report);
+    } finally {
+      // A thrown preparation did not commit anything left in its temporary queue.
+      this.outbox = queued;
+      this.outboxBudget = budget;
+      this.outboxFrame = frame;
+      this.servicingInteractive = false;
     }
   }
 
@@ -3803,6 +3981,7 @@ export class Engine {
     retry.at = this.now() + Math.min(300_000, 5_000 * Math.pow(2, retry.count));
     this.retries.set(path, retry);
     noteRetrying(report, path);
+    report.nextUploadAt = Math.min(report.nextUploadAt ?? Infinity, retry.at);
     this.log("will retry", path, { attempt: retry.count, error: message });
     this.activity("error", path);
   }

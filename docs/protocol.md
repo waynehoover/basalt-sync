@@ -2,10 +2,19 @@
 
 [Developer documentation](development.md) · [Design and threat model](design.md)
 
-Basalt uses one WebSocket connection. Text frames carry JSON control messages;
+Basalt uses WebSocket connections. Text frames carry JSON control messages;
 binary frames carry encrypted chunk bodies. Contents and paths are encrypted,
 but sizes, timestamps, device labels, and routing metadata are readable by the
 server. Use TLS to protect credentials and traffic in transit.
+
+The client normally uses one connection. Large uploads can use a temporary
+second connection with the same device credentials, leaving the main connection
+available for note edits. Both use this protocol unchanged. Only the main
+connection feeds metadata to the engine. After an auxiliary upload is acknowledged,
+the client waits for a main-connection pong and authenticates all preceding
+metadata before saving that upload's checkpoint. The auxiliary connection never
+reports an applied cursor and closes at the end of the sync; delivery remains
+conservative while the two sessions overlap.
 
 Examples below are message shapes, not literal JSON: unquoted fields stand for
 values, `?` means optional, and `...` omits fields already described.

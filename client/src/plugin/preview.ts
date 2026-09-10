@@ -13,9 +13,10 @@ const LABELS: Record<PreviewAction, string> = {
 };
 export class SyncPreviewModal extends Modal {
   private answer: ((proceed: boolean) => void) | undefined;
+  isClosed = true;
   constructor(
     app: App,
-    private readonly preview: SyncPreview,
+    private preview?: SyncPreview,
     private readonly heading = "Preview sync",
   ) {
     super(app);
@@ -27,8 +28,16 @@ export class SyncPreviewModal extends Modal {
     });
   }
   override onOpen(): void {
+    this.isClosed = false;
     this.setTitle(this.heading);
     this.modalEl.addClass("mod-basalt-preview");
+    this.contentEl.empty();
+    if (!this.preview) {
+      this.contentEl
+        .createEl("p", { text: "Preparing sync preview…" })
+        .setAttribute("role", "status");
+      return;
+    }
     const counts = previewCounts(this.preview);
     this.contentEl.createEl("p", {
       text: "Based on the files here and the server history just read. Changes made while this is open will be checked again during sync.",
@@ -62,8 +71,21 @@ export class SyncPreviewModal extends Modal {
         );
   }
   override onClose(): void {
+    this.isClosed = true;
     this.answer?.(false);
     this.answer = undefined;
     this.contentEl.empty();
+  }
+
+  showPreview(preview: SyncPreview): void {
+    if (this.isClosed) return;
+    this.preview = preview;
+    this.onOpen();
+  }
+
+  showError(message: string): void {
+    if (this.isClosed) return;
+    this.contentEl.empty();
+    this.contentEl.createEl("p", { text: message }).setAttribute("role", "alert");
   }
 }

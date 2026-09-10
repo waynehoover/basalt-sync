@@ -12,13 +12,15 @@
  * and an invented one is worst of all.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   type JournalDelta,
   type Snapshot,
   applyDelta,
   decodeRecord,
   deltaBetween,
+  deltaFrom,
+  shapeOf,
   encodeRecord,
   replay,
 } from "./index-journal.ts";
@@ -166,6 +168,57 @@ describe("a vault that has always used a snapshot and no log", () => {
 });
 
 describe("what a pass changed", () => {
+  it("does not serialise unchanged records on another pass", () => {
+    const current = base().state;
+    const saved = shapeOf(current);
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      expect(deltaFrom(saved, current).delta).toBeUndefined();
+      expect(stringify).not.toHaveBeenCalled();
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it("detects in-place mutations of entries, chunk arrays, and remote metadata", () => {
+    const chunks = ["first"];
+    const note: Record<string, unknown> & { chunks: string[] } = { ...entry("one.md", 1), chunks };
+    const remote = { uid: 5, path: "one.md", chunks: ["remote"] };
+    const current = state({ entries: { "one.md": note }, remote: { "one.md": remote } });
+    const saved = shapeOf(current);
+    chunks[0] = "second";
+    note.size = 2;
+    remote.chunks.push("another");
+    const changed = deltaFrom(saved, current);
+    expect(changed.delta?.set?.["one.md"]).toEqual(note);
+    expect(changed.delta?.remote?.["one.md"]).toEqual(remote);
+    expect(deltaFrom(changed.shape, current).delta).toBeUndefined();
+    chunks.push("third");
+    expect(deltaFrom(changed.shape, current).delta?.set?.["one.md"]).toEqual(note);
+    // A failed append retains the older shape; retrying must still include it.
+    expect(deltaFrom(saved, current).delta?.set?.["one.md"]).toEqual(note);
+  });
+
+  it("preserves JSON normalization and detects additions, removals and nested changes", () => {
+    const before = state({
+      entries: { note: { size: null, when: "2026-09-10T00:00:00.000Z", chunks: [null] } },
+    });
+    const equivalent = state({
+      entries: {
+        note: { size: NaN, when: new Date("2026-09-10"), chunks: [undefined], omitted: undefined },
+      },
+    });
+    expect(deltaFrom(shapeOf(before), equivalent).delta).toBeUndefined();
+    const current = state({ entries: { note: { chunks: ["one", "two"], extra: { live: true } } } });
+    const saved = shapeOf(current);
+    delete (current.entries.note as { extra?: unknown }).extra;
+    expect(deltaFrom(saved, current).delta?.set?.note).toEqual({ chunks: ["one", "two"] });
+    (current.entries.note as { chunks: string[] }).chunks.reverse();
+    expect(deltaFrom(saved, current).delta?.set?.note).toEqual({ chunks: ["two", "one"] });
+    delete current.entries.note;
+    expect(deltaFrom(saved, current).delta?.del).toEqual(["note"]);
+  });
+
   it("is nothing at all for a settled vault", () => {
     // A settled vault passes on every watch tick and every keepalive. If this
     // ever answers with a delta, the journal grows for ever while nothing
