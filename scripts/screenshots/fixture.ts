@@ -1,3 +1,7 @@
+import { ActivityLog, ActivityModal } from "../../client/src/plugin/activity";
+import { ConflictsModal } from "../../client/src/plugin/conflicts";
+import { SyncPreviewModal } from "../../client/src/plugin/preview";
+import { PROTO } from "../../client/src/core/transport";
 // Desktop-only sample provider for scripts/screenshots.mjs; never shipped.
 import { Plugin, PluginSettingTab } from "obsidian";
 import { BasaltPanel, BasaltModal, RecoverModal, paintStatus } from "../../client/src/plugin/main";
@@ -104,7 +108,7 @@ export default class Screenshots extends Plugin {
       cursors: () => ({ local: 124, server: 124 }),
       connection: () => ({
         url: "wss://sync.example.com",
-        server: { proto: 6, version: __SCREENSHOT_SERVER_VERSION__ },
+        server: { proto: PROTO, version: __SCREENSHOT_SERVER_VERSION__ },
       }),
       watchState: (listener) => {
         listener();
@@ -209,6 +213,38 @@ export default class Screenshots extends Plugin {
         },
         "Weekend plans.md",
       );
+    } else if (name === "activity") {
+      const log = new ActivityLog(this.app.vault.adapter, "unused-screenshot-log.json");
+      log.events = [
+        { at: at - 180000, action: "uploaded", path: "Weekend plans.md" },
+        { at: at - 90000, action: "downloaded", path: "Ideas/Places to visit.md" },
+        { at: at - 60000, action: "merged", path: "Shopping list.md" },
+        { at: at - 30000, action: "conflict", path: "Weekend plans.md" },
+      ];
+      this.modal = new ActivityModal(this.app, log, () => {});
+    } else if (name === "preview") {
+      this.modal = new SyncPreviewModal(this.app, { cursor: 30, files: [
+        { path: "Weekend plans.md", action: "copy" },
+        { path: "Ideas/New idea.md", action: "upload" },
+        { path: "Shopping list.md", action: "download" },
+        { path: "Recipes/Pasta.md", action: "unchanged" },
+      ] }, "Review your first sync");
+    } else if (name === "conflicts") {
+      const pair = { original: "Weekend plans.md", copy: "Weekend plans (Conflicted copy Phone 202609101015).md" };
+      this.modal = new ConflictsModal(this.app, {
+        pairs: () => [pair], open: () => {}, resolve: async () => {},
+        review: async () => ({ ...pair,
+          current: { path: pair.original, digest: "sample-a", text: texts[0], stat: { path: pair.original, mtime: at, ctime: at, size: 180, folder: false } },
+          preserved: { path: pair.copy, digest: "sample-b", text: texts[1], stat: { path: pair.copy, mtime: at - 60000, ctime: at, size: 160, folder: false } },
+        }),
+      });
+    } else if (name === "attachment-history") {
+      this.modal = new HistoryModal(this.app, {
+        history: async () => [{ ...versions[0], path: "Attachments/Coastal walk.pdf", size: 16 * 1024 * 1024 }],
+        contentAt: async () => { throw new Error("Attachments must not be decoded for previews"); },
+        currentText: async () => undefined,
+        restoreVersion: async () => { throw new Error("Screenshot sample only"); },
+      }, "Attachments/Coastal walk.pdf");
     } else if (name === "deleted" || name === "deleted-empty") {
       if (name === "deleted-empty")
         this.model.deletedNotes = async () => ({ notes: [], more: false });
@@ -229,7 +265,8 @@ export default class Screenshots extends Plugin {
       }
       this.modal = new BasaltModal(this.model);
     }
-    this.modal.open();
+    if (name === "preview") void this.modal.confirm();
+    else this.modal.open();
     this.target = this.modal.modalEl;
     await settle();
     const content = this.modal.contentEl;
@@ -269,9 +306,18 @@ export default class Screenshots extends Plugin {
       this.target = button.closest(".setting-item").nextElementSibling;
       this.target.scrollIntoView({ block: "center" });
     }
-    if (name === "changes") {
-      content.querySelectorAll(".modal-sidebar-list-item")[1].click();
+    if (name === "conflicts") {
+      press("Compare");
       await settle();
+    }
+    if (name === "changes") {
+      const rows = content.querySelectorAll(".modal-sidebar-list-item");
+      rows[0].focus();
+      rows[0].dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      await settle();
+      const selected = content.querySelectorAll(".modal-sidebar-list-item")[1];
+      if (selected.getAttribute("aria-pressed") !== "true" || selected.ownerDocument.activeElement !== selected)
+        throw new Error("History keyboard selection did not preserve focus");
       press("Show changes");
     }
   }
@@ -333,15 +379,25 @@ export default class Screenshots extends Plugin {
     if (this.modal?.modalEl.hasClass("mod-basalt-history")) {
       const sidebar = host.querySelector(".modal-sidebar").getBoundingClientRect();
       const pane = host.querySelector(".basalt-history-content-container").getBoundingClientRect();
+      const row = host.querySelector(".modal-sidebar-list-item")?.getBoundingClientRect();
+      if (row && (sidebar.height < row.height || row.height < 44))
+        throw new Error("Phone history clips the version controls");
       if (sidebar.bottom > pane.top + 1 || pane.height < 160)
         throw new Error(
           "Phone version list overlaps the note preview or leaves it too little space: " +
             JSON.stringify({ sidebar, pane, content: host.getBoundingClientRect() }),
         );
     }
-    if (!host.hasClass("basalt-panel")) return;
     if (host.scrollWidth > host.clientWidth + 1)
-      throw new Error("Phone panel overflows horizontally");
+      throw new Error("Phone dialog overflows horizontally");
+    for (const row of host.querySelectorAll(".basalt-activity-list .setting-item")) {
+      const info = row.querySelector(".setting-item-info");
+      if (info?.getBoundingClientRect().width < 80)
+        throw new Error("Activity filename has no readable width");
+      if (row.scrollWidth > row.clientWidth + 1)
+        throw new Error("Activity row overflows horizontally");
+    }
+    if (!host.hasClass("basalt-panel")) return;
     for (const row of host.querySelectorAll(".setting-item")) {
       if (!row.getBoundingClientRect().height) continue;
       const info = row.querySelector(".setting-item-info");

@@ -35,6 +35,7 @@ export interface IndexEntry {
   ctime: number;
   mtime: number;
   size: number;
+  changeId?: string;
   /**
    * Content hash as of the last scan, or "" when unknown.
    *
@@ -328,7 +329,13 @@ function decideMissingLocally(remote: RemoteState, index: IndexEntry): Action {
  * Basalt extends it to the chunk list, because it uploads chunks rather than
  * whole files and re-deriving that list means redoing all of the above.
  */
-export function needsRehash(entry: IndexEntry, mtime: number, size: number): boolean {
+export function needsRehash(
+  entry: IndexEntry,
+  mtime: number,
+  size: number,
+  changeId?: string,
+): boolean {
+  if (changeId !== undefined && changeId !== entry.changeId) return true;
   // An empty file is made of no chunks, so "no chunks" cannot mean "not
   // hashed yet" for one: `contentId([])` is `-empty-`, and a synced empty
   // note was re-read, re-chunked and re-sealed on every pass for the life of
@@ -349,7 +356,7 @@ export function needsRehash(entry: IndexEntry, mtime: number, size: number): boo
  */
 export function observe(
   entry: IndexEntry,
-  obs: { folder: boolean; mtime: number; ctime: number; size: number },
+  obs: { folder: boolean; mtime: number; ctime: number; size: number; changeId?: string },
 ): void {
   const mtime = Math.ceil(obs.mtime);
   const ctime = Math.ceil(obs.ctime);
@@ -364,7 +371,7 @@ export function observe(
     return;
   }
 
-  if (needsRehash(entry, mtime, obs.size)) {
+  if (needsRehash(entry, mtime, obs.size, obs.changeId)) {
     entry.hash = "";
     entry.chunks = [];
   }
@@ -372,6 +379,7 @@ export function observe(
   entry.mtime = mtime;
   entry.ctime = ctime;
   entry.size = obs.size;
+  if (obs.changeId !== undefined) entry.changeId = obs.changeId;
 }
 
 /**

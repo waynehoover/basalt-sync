@@ -1,3 +1,5 @@
+import { validateUsage } from "./usage.ts";
+import { previewCounts } from "../core/preview.ts";
 /**
  * The headless client.
  *
@@ -112,6 +114,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt sync                               sync once and exit
   basalt sync --watch                       sync, then keep syncing
   basalt status                             what this device thinks the state is
+  basalt preview                            show planned sync changes without writing notes
   basalt devices                            every device that may reach this vault
   basalt rename NAME                        change this device's name in the device list
   basalt revoke ID                          stop one device connecting, from basalt devices
@@ -149,7 +152,8 @@ Options
   --uid N          restore one exact version, from basalt history
   --to PATH        restore somewhere other than where it came from
   --limit N        how many versions history or deleted shows (default: 20, or all deletions)
-  --before UID     for deleted: the page before this version, to walk further back
+  --before UID     for history or deleted: the page before this version
+  --verify         for sync: read every file to verify the content cache
   --key-file PATH  read the recovery key, invite or setup string from a file
   --key-out PATH   also write a newly generated recovery key here, readable only by you
   --config-dir DIR Obsidian's config folder, if it is not .obsidian
@@ -177,9 +181,15 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
   }
 
   try {
-    refuseExtras(args);
-    refuseRecoveryKey(args);
-    refuseForce(args);
+    validateUsage(args);
+  } catch (err) {
+    const error = (err as Error).message;
+    if (args.json) io.out(JSON.stringify({ ok: false, error }));
+    else io.err(`basalt: ${error}`);
+    return 2;
+  }
+
+  try {
     // Anything that changes the vault, its config or its index takes the
     // vault's lock for as long as it runs. Reading commands do not: they
     // load the index once and talk to the server, and holding a lock for
@@ -210,6 +220,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await locked(args, () => cmdSync(args, io));
       case "status":
         return await cmdStatus(args, io);
+      case "preview":
+        return await cmdPreview(args, io);
       case "repair":
         return await cmdRepair(args, io);
       case "deleted":
@@ -257,72 +269,6 @@ function withRecovery(err: unknown): string {
     return `${message}. ${REJOIN_ADVICE}`;
   }
   return message;
-}
-
-/**
- * How many positional arguments each command takes. Everything else takes none.
- *
- * `basalt sync ~/vault` used to be accepted and the path silently ignored, so
- * it synced the current directory and said it had synced: a wrong vault
- * reported as a right one, which is rule 7. The vault is chosen with `--dir`,
- * and the mistake is common enough that the refusal says so.
- */
-const POSITIONALS: Record<string, number> = {
-  init: 1,
-  pair: 1,
-  history: 1,
-  rename: 1,
-  restore: 1,
-  revoke: 1,
-  rotate: 1,
-  uninvite: 1,
-};
-
-/**
- * The three commands `--recovery-key` means something to.
- *
- * Everything else needs this device's own credential and would ignore the
- * flag, and a flag that is quietly ignored is how somebody comes to believe
- * they ran a command as the recovery key when they did not. The same reasoning
- * as refuseExtras: a word that had no effect is worth an error.
- */
-const TAKES_RECOVERY_KEY = new Set(["devices", "revoke", "uninvite"]);
-
-function refuseRecoveryKey(args: Args): void {
-  if (args.recoveryKey === undefined) return;
-  if (TAKES_RECOVERY_KEY.has(args.command ?? "")) return;
-  throw new Error(
-    `${args.command} does not take --recovery-key, so the key would have been ignored. ` +
-      `It is for ${[...TAKES_RECOVERY_KEY].join(", ")}; basalt rotate takes the key as its ` +
-      `argument instead.`,
-  );
-}
-
-/**
- * `--force` means one thing and only `unlock` does it.
- *
- * The same reasoning as refuseRecoveryKey: a word that had no effect is worth
- * an error, because somebody typing it believes it did something, and here
- * what they believe it did is break a lock.
- */
-function refuseForce(args: Args): void {
-  if (!args.force || args.command === "unlock") return;
-  throw new Error(
-    `${args.command} does not take --force, so it would have been ignored. It is for ` +
-      `basalt unlock, and only for a lock held on another machine.`,
-  );
-}
-
-function refuseExtras(args: Args): void {
-  const takes = POSITIONALS[args.command ?? ""] ?? 0;
-  if (args.rest.length <= takes) return;
-  const extra = args.rest.slice(takes);
-  const what = extra.map((e) => JSON.stringify(e)).join(", ");
-  throw new Error(
-    takes === 0
-      ? `${args.command} takes no arguments, so ${what} was not used. The vault is chosen with --dir.`
-      : `${args.command} takes one argument, so ${what} was not used.`,
-  );
 }
 
 /* ---------------------------------------------------------------- *
@@ -1348,7 +1294,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
 
   const client = await open(config, args, io);
   try {
-    const report = await client.settle();
+    const report = await client.settle({ verifyContents: args.verify });
     renderReport(
       report,
       args,
@@ -1996,6 +1942,23 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
 const HISTORY_LIMIT_MAX = 500;
 
 /** Every version of one note, newest first. */
+async function cmdPreview(args: Args, io: Console): Promise<number> {
+  const client = await open(await mustLoad(args.dir), args, io, { inspect: true });
+  try {
+    const preview = await client.preview();
+    if (args.json) io.out(JSON.stringify({ ok: true, ...preview, counts: previewCounts(preview) }));
+    else {
+      io.out("Preview only. Files are checked again during sync.");
+      for (const file of preview.files)
+        if (file.action !== "unchanged") io.out(`${file.action}: ${file.path}`);
+      io.out(JSON.stringify(previewCounts(preview)));
+    }
+    return preview.files.some((file) => file.action === "blocked") ? 1 : 0;
+  } finally {
+    await client.close();
+  }
+}
+
 async function cmdHistory(args: Args, io: Console): Promise<number> {
   const path = args.rest[0];
   if (!path) throw new Error("history needs the path of a note");
@@ -2008,9 +1971,13 @@ async function cmdHistory(args: Args, io: Console): Promise<number> {
     // the list as complete, in the one tool where a short list that looks
     // complete costs a note.
     const limit = Math.min(args.limit, HISTORY_LIMIT_MAX);
-    const versions = await client.history(path, { limit });
+    const versions = await client.history(path, {
+      limit,
+      ...(args.before ? { before: args.before } : {}),
+    });
+    const nextBefore = versions.length === limit ? versions.at(-1)!.uid : null;
     if (args.json) {
-      io.out(JSON.stringify({ ok: true, path, versions, limit }));
+      io.out(JSON.stringify({ ok: true, path, versions, limit, nextBefore }));
       return 0;
     }
     if (versions.length === 0) {
@@ -2032,6 +1999,7 @@ async function cmdHistory(args: Args, io: Console): Promise<number> {
       );
     }
     io.out("basalt restore PATH --uid N brings one of these back.");
+    if (nextBefore !== null) io.out(`Older versions: basalt history PATH --before ${nextBefore}`);
     return 0;
   } finally {
     await client.close();
@@ -2483,7 +2451,9 @@ export function renderReport(
  * Arguments
  * ---------------------------------------------------------------- */
 
-interface Args {
+export interface Args {
+  provided?: Set<string>;
+  verify: boolean;
   command?: string;
   rest: string[];
   dir: string;
@@ -2567,6 +2537,8 @@ interface Args {
 
 export function parseArgs(argv: readonly string[]): Args {
   const args: Args = {
+    provided: new Set(),
+    verify: false,
     rest: [],
     dir: process.cwd(),
     device: hostname().split(".")[0] || "device",
@@ -2627,6 +2599,7 @@ export function parseArgs(argv: readonly string[]): Args {
       onlyPositional = true;
       continue;
     }
+    if (arg.startsWith("-")) args.provided!.add(arg);
     let value: string | undefined;
     if (takes.has(arg)) {
       value = argv[++i];
@@ -2660,7 +2633,7 @@ export function parseArgs(argv: readonly string[]): Args {
       }
       case "--uid": {
         const uid = Number(value);
-        if (!Number.isInteger(uid) || uid <= 0)
+        if (!Number.isSafeInteger(uid) || uid <= 0)
           throw new Error(`--uid wants a version number, not ${value}`);
         args.uid = uid;
         break;
@@ -2696,7 +2669,7 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--limit": {
         const limit = Number(value);
-        if (!Number.isInteger(limit) || limit <= 0)
+        if (!Number.isSafeInteger(limit) || limit <= 0)
           throw new Error(`--limit wants a count, not ${value}`);
         args.limit = limit;
         args.limitGiven = true;
@@ -2710,11 +2683,14 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--before": {
         const before = Number(value);
-        if (!Number.isInteger(before) || before <= 0)
+        if (!Number.isSafeInteger(before) || before <= 0)
           throw new Error(`--before wants a version number, not ${value}`);
         args.before = before;
         break;
       }
+      case "--verify":
+        args.verify = true;
+        break;
       case "--backup-taken":
         args.backupTaken = true;
         break;

@@ -691,6 +691,25 @@ func (e Entry) Validate() error {
 // acknowledge the push until this returns. An ack sent earlier means "stored"
 // was a claim a crash can expose.
 func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
+	return s.appendEntry(vaultID, e, nil, 0)
+}
+
+// AppendCurrent commits only if this path still has the writer's base version.
+// A base of zero asserts there is no live entry (new file or recreation).
+func (s *Store) AppendCurrent(vaultID string, e Entry, base, prevBase int64) (int64, error) {
+	if e.Prev == "" && prevBase != 0 {
+		return 0, fmt.Errorf("%w: prevBase requires a previous path", ErrBadEntry)
+	}
+	if err := ValidateBase(base); err != nil {
+		return 0, err
+	}
+	if err := ValidateBase(prevBase); err != nil {
+		return 0, err
+	}
+	return s.appendEntry(vaultID, e, &base, prevBase)
+}
+
+func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64) (int64, error) {
 	if err := e.Validate(); err != nil {
 		return 0, err
 	}
@@ -733,6 +752,25 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+
+	if base != nil {
+		head, deleted, err := pathHead(tx, vaultID, e.Path)
+		if err != nil {
+			return 0, err
+		}
+		if head != *base && !(*base == 0 && deleted) {
+			return 0, ErrStale
+		}
+		if e.Prev != "" {
+			previous, gone, err := pathHead(tx, vaultID, e.Prev)
+			if err != nil {
+				return 0, err
+			}
+			if previous != prevBase && !(prevBase == 0 && gone) {
+				return 0, ErrStale
+			}
+		}
+	}
 
 	var uid int64
 	err = tx.QueryRow(

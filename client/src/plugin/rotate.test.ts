@@ -175,7 +175,7 @@ describe("replacing the vault's secret from the panel", () => {
     const before = { ...saved(plugin)! };
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const row = built.find((s) => s.name === "Replace the vault's secret")!;
     expect(row, "the panel offers no way to retire a leaked secret").toBeDefined();
     expect(row.desc).toMatch(/Existing devices keep syncing/);
@@ -255,7 +255,7 @@ describe("replacing the vault's secret from the panel", () => {
     const { plugin, key: oldKey } = await started();
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     built.find((s) => s.name === "Replace the vault's secret")!.texts[0]!.setValue(oldKey);
     const clicking = built
       .find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!
@@ -277,7 +277,7 @@ describe("replacing the vault's secret from the panel", () => {
 
     // And the panel can be used again.
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     expect(built.find((s) => s.name === "Replace the vault's secret")).toBeDefined();
   }, 300_000);
 

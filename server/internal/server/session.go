@@ -1556,7 +1556,7 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 
 	for i, in := range m.Entries {
 		e := in.Entry(s.device)
-		missing, spend, refusal := s.prepare(e)
+		missing, spend, refusal := s.prepare(e, in.Base, in.PrevBase)
 		if refusal != nil {
 			// One entry's refusal is one entry's result in the acks, and the
 			// rest of the batch still commits, so it is carried rather than
@@ -1591,7 +1591,7 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 			results[i] = wire.AckResult{Code: item.refusal.Code, Msg: item.refusal.Msg}
 			continue
 		}
-		uid, refusal := s.commit(item.entry)
+		uid, refusal := s.commit(item.entry, m.Entries[i].Base, m.Entries[i].PrevBase)
 		if refusal != nil {
 			results[i] = wire.AckResult{Code: refusal.Code, Msg: refusal.Msg}
 			continue
@@ -1612,7 +1612,19 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 // differently and deliberately: handlePut sends an error frame and logs it,
 // while one entry of a batch is only a result in the acks and the rest of the
 // batch still commits.
-func (s *Session) prepare(e store.Entry) (missing []string, allowance int64, refusal *wire.Err) {
+func (s *Session) prepare(e store.Entry, base, prevBase int64) (missing []string, allowance int64, refusal *wire.Err) {
+	if e.Prev == "" && prevBase != 0 {
+		r := wire.Error(wire.CodeBadEntry, "prevBase requires a previous path")
+		return nil, 0, &r
+	}
+	if err := store.ValidateBase(prevBase); err != nil {
+		r := wire.Error(wire.CodeBadEntry, err.Error())
+		return nil, 0, &r
+	}
+	if err := store.ValidateBase(base); err != nil {
+		r := wire.Error(wire.CodeBadEntry, err.Error())
+		return nil, 0, &r
+	}
 	if r := s.checkEntry(e); r != nil {
 		return nil, 0, r
 	}
@@ -1648,7 +1660,7 @@ func (s *Session) handlePut(m wire.In) error {
 	// a put under another device's name is unexpressible rather than commented.
 	e := m.Entry(s.device)
 
-	missing, allowance, refusal := s.prepare(e)
+	missing, allowance, refusal := s.prepare(e, m.Base, m.PrevBase)
 	if refusal != nil {
 		// reject rather than refuse: a single put's refusal is logged, where one
 		// entry of a batch is only a line in the acks.
@@ -1656,7 +1668,7 @@ func (s *Session) handlePut(m wire.In) error {
 	}
 
 	if len(missing) == 0 {
-		uid, refusal := s.commit(e)
+		uid, refusal := s.commit(e, m.Base, m.PrevBase)
 		if refusal != nil {
 			return s.refuse(refusal)
 		}
@@ -1670,7 +1682,7 @@ func (s *Session) handlePut(m wire.In) error {
 		return err
 	}
 
-	uid, refusal := s.commit(e)
+	uid, refusal := s.commit(e, m.Base, m.PrevBase)
 	if refusal != nil {
 		return s.refuse(refusal)
 	}
@@ -1784,6 +1796,9 @@ func (s *Session) readBodies(want []string, allowance int64) error {
 // string means the fault is not attributable to the entry, and a session that
 // cannot commit for reasons of its own has nothing useful left to say.
 func commitCode(err error) string {
+	if errors.Is(err, store.ErrStale) {
+		return wire.CodeStale
+	}
 	switch {
 	case errors.Is(err, store.ErrBadEntry):
 		return wire.CodeBadEntry
@@ -1831,7 +1846,7 @@ func putErrorCode(err error) string {
 // the handshake and catch-up, where there is nothing to continue with. Ending
 // it here used to cost a reconnect and a replayed handshake for a fault the
 // next put might not even see.
-func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
+func (s *Session) commit(e store.Entry, base, prevBase int64) (int64, *wire.Err) {
 	s.noteFutureMTime(e)
 
 	s.srv.commitMu.Lock()
@@ -1843,7 +1858,7 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 		err = s.srv.beforeAppend(e)
 	}
 	if err == nil {
-		uid, err = s.srv.st.AppendEntry(s.vaultID, e)
+		uid, err = s.srv.st.AppendCurrent(s.vaultID, e, base, prevBase)
 	}
 	if err != nil {
 		if code := commitCode(err); code != "" {

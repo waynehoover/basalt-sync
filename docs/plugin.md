@@ -19,8 +19,8 @@ services for that vault. Each device should have its own local copy.
    If you use a custom Obsidian configuration folder, use that folder instead
    of `.obsidian`.
 3. Reload Obsidian and enable **Basalt Sync** under **Settings → Community plugins**.
-4. Open the Basalt ribbon icon or run **Basalt Sync: Show status** from the
-   command palette.
+4. Open the Basalt ribbon icon and choose **Sync settings**, or run
+   **Basalt Sync: Show status** from the command palette.
 
 Manual installation is required while Basalt is outside the community directory.
 To upgrade, replace the same three files and reload Obsidian. When a release
@@ -68,7 +68,8 @@ join it with an invite.
 4. If this vault already contains files, Basalt asks you to confirm combining
    them with your synced vault. An older copy can bring back files moved or
    deleted elsewhere. **Cancel** leaves your files and invite untouched.
-5. Keep Obsidian open while the first sync finishes. Changes sync both ways.
+5. Review the first-sync counts, then choose **Continue sync**. An empty vault
+   starts downloading immediately. Keep Obsidian open until it finishes.
 
 To download a fresh copy, create a new empty Obsidian vault and keep the old
 vault as a backup. Basalt does not clear or move existing files during pairing.
@@ -96,7 +97,7 @@ or **Reconnect** to retry an offline connection without waiting.
 Open the panel for the result and any files needing attention. It includes the
 server address and version, useful when diagnosing a connection problem.
 On desktop, the status bar shows a cloud with a check when synced. Hover for
-details or click it to open the panel.
+details or click it for quick actions and settings.
 
 During longer transfers, the panel shows which file is uploading or downloading
 and how much data has moved. Keep Obsidian open until sync finishes.
@@ -104,6 +105,7 @@ and how much data has moved. Keep Obsidian open until sync finishes.
 | Status | What to do |
 |---|---|
 | Unpaired | Pair this vault. |
+| Paused | Choose **Resume sync** from the Basalt menu. |
 | Connecting, loading history, or syncing | Keep Obsidian open until sync finishes. |
 | Synced | No outstanding work was reported. |
 | Needs attention | Open the panel and follow the reason shown for each file. |
@@ -115,11 +117,47 @@ For a restored server, use **Rejoin this server** below. If the panel reports
 unreadable local state, preserve that state and your notes before attempting
 recovery; deleting the plugin's files is not a general troubleshooting step.
 
+## Activity and quick actions
+
+Click the Basalt status icon or tap its ribbon icon for **Sync activity**,
+**Review conflicts**, **Preview sync**, history, and settings. **Pause sync**
+stops this device until you resume it or restart Obsidian.
+
+The activity log keeps the latest 300 events on this device across restarts.
+Search by filename or filter errors and conflicts. **Copy diagnostics** omits
+filenames; note contents and credentials are never recorded in this log.
+
+A populated vault's first sync shows upload, download, and preserved-copy
+counts before it starts. Deleting an entire folder containing several synced
+files also opens a review. Choose **Pause sync** if the changes are unexpected.
+**Preview sync** lets you inspect planned changes at other times without writing
+notes. A preview is an estimate: files are checked again when sync runs.
+
+If a file changed outside Obsidian but did not sync, run **Basalt Sync: Verify
+vault contents**. This reads every file again and can take longer than a normal
+sync.
+
+<details>
+<summary>See activity, conflict review, and first-sync previews</summary>
+
+- [Recent activity](assets/screenshots/activity-phone.png)
+  ([dark theme](assets/screenshots/activity-phone-dark.png))
+- [Compare a conflict](assets/screenshots/conflicts-phone.png)
+  ([dark theme](assets/screenshots/conflicts-phone-dark.png))
+- [Review first-sync changes](assets/screenshots/preview-phone.png)
+  ([dark theme](assets/screenshots/preview-phone-dark.png))
+
+These phone layouts were captured in desktop Obsidian's mobile styles.
+
+</details>
+
 ## Version history
 
 Run **Basalt Sync: Show version history** for the open note, or use the note's
 right-click menu. Choose a version to read it or compare it with the local copy.
-Use **Show older** to go further back.
+Use **Load more** to go further back. Tab or the arrow keys move between
+versions. Attachments and large notes show their details without loading a text
+preview; restore a copy to open the complete file.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/changes-dark.png">
@@ -128,8 +166,8 @@ Use **Show older** to go further back.
 
 **Restore does not overwrite an existing file.** If the original path is
 occupied, the copy appears beside it, for example `Note (restored 42).md`.
-Basalt reports whether it was also sent to your other devices or is waiting
-for a successful sync.
+Restoring also tries to upload the copy to the server. Other devices receive
+it when they next sync.
 
 History remains available until the server operator
 [purges it](server-operations.md#purge).
@@ -163,10 +201,15 @@ Meeting notes.md
 Meeting notes (Conflicted copy laptop 202608311412).md
 ```
 
-Open both files, combine the parts you want, then delete the extra copy when
-you are satisfied. Usually the incoming version gets the conflict name. An edit
-that arrives during a file replacement can instead be preserved under a new
-name; the panel reports preserved versions that need attention.
+Choose **Review conflicts** from the Basalt menu. Compare the original and
+preserved copy, then keep either one or edit a combined version. **Decide later**
+leaves both files in place. If a file changes while you review it, refresh the
+comparison before choosing. The result syncs to your other devices.
+
+Attachments and large notes can be opened separately for comparison. You can
+also combine files manually and delete the extra copy. Usually the incoming
+version gets the conflict name; an edit made during replacement can instead be
+preserved there.
 
 Successful merges and ordinary downloads can update the original note. Keeping
 both versions on a conflict is not a promise that sync never changes an open file.
@@ -237,6 +280,9 @@ Revocation cannot erase notes or decryption keys already on a device. See
 Revoking the final device requires the recovery key and the
 [CLI](cli-reference.md#device-access).
 
+<details>
+<summary>Recovery and server maintenance</summary>
+
 ## Replacing the vault's secret
 
 If your recovery key was exposed, choose **Manage this vault → Replace the
@@ -283,6 +329,8 @@ locations. Copy a retained version to a new visible note and check it before
 removing any recovery material. Do not clear hidden files as a general cleanup.
 The [technical design](design.md#file-replacement) explains these paths.
 
+</details>
+
 ## Unlink
 
 **Manage this vault → Unlink this vault** stops syncing here and removes the
@@ -295,6 +343,11 @@ record; use **Devices** when you want to remove access.
 | Command-palette action | Result |
 |---|---|
 | Basalt Sync: Sync now | Run a sync. |
+| Basalt Sync: Verify vault contents | Re-read every file, then sync. |
+| Basalt Sync: Preview sync | Review planned changes without writing notes. |
+| Basalt Sync: Show sync activity | Search recent activity. |
+| Basalt Sync: Review conflicts | Compare and resolve preserved copies. |
+| Basalt Sync: Pause or resume sync | Stop or restart syncing on this device. |
 | Basalt Sync: Show status | Open the panel. |
 | Basalt Sync: Show version history | View history for the open note. |
 | Basalt Sync: Recover a deleted note | Browse deleted notes. |

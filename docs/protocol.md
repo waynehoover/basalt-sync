@@ -1,4 +1,4 @@
-# Wire protocol, v6
+# Wire protocol, v7
 
 [Developer documentation](development.md) · [Design and threat model](design.md)
 
@@ -29,21 +29,23 @@ A hello selects one of three session types.
 ### Device session
 
 ```text
--> {op:"hello", id, proto:6, vault, deviceId, token, device,
+-> {op:"hello", id, proto:7, vault, deviceId, token, device,
     crypto:"basalt/hkdf-aes-gcm/1", cursor}
-<- {res:"ready", id, proto:6, minProto:6, serverVersion, cursor,
+<- {res:"ready", id, proto:7, minProto:7, serverVersion, cursor,
     perFileMax, chunkMax, maxChunks, maxBatchBytes, maxFetchBytes, wrapped}
 ```
 
 `deviceId` identifies a registered device and `token` is its authentication key.
-`cursor` is the last applied UID, or 0. `ready` advertises limits before any
-catch-up and includes the vault's wrapped data key.
+`cursor` is the last locally recorded metadata UID, or 0. Its files may still
+be pending download; the separate `applied` message confirms completed local
+application. `ready` advertises limits before catch-up and includes the vault's
+wrapped data key.
 
 ### Registrar session
 
 ```text
--> {op:"hello", id, proto:6, vault, token, device, crypto, claim?, wrapped?}
-<- {res:"registrar", id, proto:6, minProto:6, serverVersion, maxDevices}
+-> {op:"hello", id, proto:7, vault, token, device, crypto, claim?, wrapped?}
+<- {res:"registrar", id, proto:7, minProto:7, serverVersion, maxDevices}
 ```
 
 With no `deviceId`, `token` is the root-derived vault credential. A registrar
@@ -59,7 +61,7 @@ A bootstrap-authenticated registrar cannot rotate the root.
 ### Invite redemption
 
 ```text
--> {op:"hello", id, proto:6, vault, device, crypto, invite, deviceId, auth, name?}
+-> {op:"hello", id, proto:7, vault, device, crypto, invite, deviceId, auth, name?}
 <- {res:"redeemed", id, sealed, deviceId}
 ```
 
@@ -69,8 +71,8 @@ device session. See [invites](#adding-a-device-with-a-single-use-invite).
 
 ### Validation and compatibility
 
-Only **protocol 6** is supported. It adds completed local checkpoints and live
-device delivery state; older protocols are refused with `proto`. Update the
+Only **protocol 7** is supported by this source tree. It adds conditional writes
+and rename-source checks; older protocols are refused with `proto`. Update the
 server and all clients together. Existing vault data and credentials are unchanged.
 A refusal names supported protocol numbers, not the server release;
 `serverVersion` is disclosed only after authentication.
@@ -90,7 +92,7 @@ restoring an older backup. Recovery requires an explicit rejoin.
 Requests expecting replies carry an integer `id` from **1 to 2^32−1**, unique
 among requests in flight. This applies to hello, put, putmany, get, fetch,
 resend, history, deleted, register, devices, rename, revoke, invite, uninvite,
-and rotate. Replies and request-specific errors echo the ID.
+rotate, and applied. Replies and request-specific errors echo the ID.
 
 Missing or invalid IDs cause `protostate` and end the session. Clients also end
 a session on an unknown reply ID. Unsolicited batches, caught-up notices, pings,
@@ -116,11 +118,16 @@ changes during catch-up are held and delivered in order afterwards.
 Continuity checks detect malformed ordering but do not prove that an untrusted
 server supplied every entry in a covered range.
 
+When a device has overlapping live sessions, delivery uses their lowest
+confirmed applied checkpoint. If any session has not confirmed a checkpoint,
+the device's applied checkpoint is unknown. A connection alone is not evidence
+that notes reached its filesystem.
+
 ## Writing a file
 
 ```text
 -> {op:"put", id, path, meta:{size, ctime, mtime, folder, deleted, prev?},
-    chunks:[h1,h2,h3], mac, parent}
+    chunks:[h1,h2,h3], mac, parent, base, prevBase?}
 <- {res:"want", id, chunks:[h2]}
 -> binary frame for h2
 <- {res:"ack", id, uid:152}
@@ -150,7 +157,7 @@ graceful shutdown. Idle sessions receive a retryable shutdown error.
 ## Writing many files at once
 
 ```text
--> {op:"putmany", id, entries:[{path, meta, chunks, mac, parent}, ...]}
+-> {op:"putmany", id, entries:[{path, meta, chunks, mac, parent, base, prevBase?}, ...]}
 <- {res:"want", id, chunks:[h1,h2,h3]}
 -> binary frames
 <- {res:"acks", id, results:[{uid:152}, {uid:153}, {code, msg}, ...]}
@@ -178,6 +185,26 @@ vault-key authenticator, not a per-device signature.
 previously unsynced file. It is authenticated, but clients do not yet enforce
 it as an ancestry chain. Replay of an older valid version under a newer UID and
 withholding remain possible; see [the threat model](design.md#what-the-server-can-and-cannot-do).
+
+### Conditional writes
+
+Every `put` and `putmany` entry includes `base`: the UID of the target version
+used to prepare the write. Zero means the target has no live entry, including
+recreation after a deletion. A nonzero base must match the current logical head.
+A rename also includes `prevBase`, which must match the source version.
+A rename creates a logical deletion at its old path with the same new UID.
+
+The server checks both preconditions inside the append transaction, after any
+body transfer. If either changed, `stale` refuses that entry without committing
+it. Other entries in a batch can still succeed. The client processes incoming
+metadata and reconciles before trying again, preserving overlapping edits as
+visible copies. It does not retry the same stale decision blindly.
+
+`base` and `prevBase` are request preconditions, protected by the authenticated
+TLS connection. They are not stored history fields and are not included in the
+entry MAC. This protects honest concurrent writers; it does not turn the server
+into an independently verifiable history authority. A lost reply can follow a
+successful commit, so clients reconcile ambiguous results too.
 
 ## Reading a file
 
@@ -397,7 +424,8 @@ It still controls availability and ordering, as described in the threat model.
 `code` is machine-readable; `msg` explains the problem. Request errors echo the
 ID. Unsolicited errors describe why a connection is closing. `retryable` says
 whether reconnecting later may help; clients retain defaults for malformed
-frames missing that field.
+frames missing that field. `stale` requires a new reconciliation decision,
+not an automatic retry of the unchanged request.
 
 | code | meaning | retryable | session |
 |---|---|---|---|
@@ -408,6 +436,7 @@ frames missing that field.
 | `busy` | Pre-authentication admission pressure or shutdown. | yes | ends with a delay hint. |
 | `protostate` | Unexpected message/state or invalid framing. | no | generally ends. Unknown ops and invalid history pagination reject that request. |
 | `badchunk` | Invalid name or body hash. | no | ends for bad bodies mid-upload, otherwise rejects the request. |
+| `stale` | Target or rename source changed before commit. Reconcile and retry. | no | keeps the session; batched refusal affects only that entry. |
 | `badentry` | Invalid entry or request incompatible with current state. | no | rejects the request, or ends for malformed claims at hello. |
 | `badname` | Invalid name or device ID. | no | ends at hello, otherwise rejects the request. |
 | `toolarge` | A limit or declared size was exceeded. | no | ends if upload framing cannot continue, otherwise rejects the request. |

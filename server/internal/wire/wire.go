@@ -21,12 +21,11 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // ship here is a device that connects and syncs under a credential nobody can
 // revoke.
 //
-// Protocol 6 adds completed local checkpoints to the device list. Only version
-// 6 is supported; update the server and every client together. Vault data and
-// device credentials use the same formats as before.
+// Protocol 7 requires conditional writes. Upgrade the server and every client
+// together; stored history and device credentials retain their formats.
 const (
-	Proto    = 6
-	MinProto = 6
+	Proto    = 7
+	MinProto = 7
 )
 
 // MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
@@ -54,6 +53,7 @@ const (
 	// size with no chunk list, a prev equal to path. Rejected before any body
 	// is read, and the session continues.
 	CodeBadEntry = "badentry"
+	CodeStale    = "stale" // the path changed; reconcile and retry the write
 	// CodeBadName is a path the server cannot store: empty, or over the length
 	// bound. The plaintext-name check is the client's, since the server holds
 	// no key; see docs/protocol.md.
@@ -222,8 +222,10 @@ type In struct {
 	Chunks []string `json:"chunks"`
 	// Mac authenticates the entry and Parent names what it was written on top
 	// of. Both are opaque to the server, which holds no key to check them.
-	Mac    string `json:"mac"`
-	Parent string `json:"parent"`
+	Mac      string `json:"mac"`
+	Parent   string `json:"parent"`
+	Base     int64  `json:"base"`
+	PrevBase int64  `json:"prevBase"`
 
 	// get
 	UID int64 `json:"uid"`
@@ -250,11 +252,13 @@ type In struct {
 // link with four hundred milliseconds in it that is eighty seconds of waiting
 // for permission to send things the server was always going to want.
 type PutEntry struct {
-	Path   string   `json:"path"`
-	Meta   PutMeta  `json:"meta"`
-	Chunks []string `json:"chunks"`
-	Mac    string   `json:"mac"`
-	Parent string   `json:"parent"`
+	Path     string   `json:"path"`
+	Meta     PutMeta  `json:"meta"`
+	Chunks   []string `json:"chunks"`
+	Mac      string   `json:"mac"`
+	Parent   string   `json:"parent"`
+	Base     int64    `json:"base"`
+	PrevBase int64    `json:"prevBase"`
 }
 
 // Entry converts one batched put into the store's record.

@@ -573,3 +573,55 @@ describe("a history page that does not arrive (P-D7)", () => {
     expect(rendered(modal)).not.toMatch(/could not be read/);
   });
 });
+
+describe("bounded, accessible previews", () => {
+  const version: Version = {
+    uid: 1,
+    path: "note.md",
+    contentId: "v1",
+    size: 4,
+    ctime: 0,
+    mtime: 1,
+    folder: false,
+    deleted: false,
+    device: "phone",
+    chunks: 1,
+  };
+  it.each([
+    { path: "book.pdf", size: 1000 },
+    { path: "large.md", size: 1024 * 1024 },
+  ])("does not fetch $path for a text preview", async (meta) => {
+    const source = {
+      history: async () => [{ ...version, ...meta }],
+      contentAt: vi.fn(async () => "bytes"),
+      currentText: async () => "",
+      restoreVersion: async () => ({ path: meta.path, sent: true }),
+    };
+    const modal = new HistoryModal(new App() as never, source, meta.path);
+    modal.open();
+    await nextTurn();
+    expect(source.contentAt).not.toHaveBeenCalled();
+    expect(rendered(modal)).toMatch(/Restore a copy/);
+    modal.close();
+  });
+  it("provides focusable version buttons and arrow navigation", async () => {
+    const source = {
+      history: async () => [version, { ...version, uid: 2 }],
+      contentAt: async (v: Version) => `version ${v.uid}`,
+      currentText: async () => "",
+      restoreVersion: async () => ({ path: "note.md", sent: true }),
+    };
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    modal.open();
+    await nextTurn();
+    const list = (modal.contentEl as unknown as import("./stub.ts").FakeEl).querySelectorAll(
+      '[data-version="1"]',
+    );
+    expect(list[0]?.tag).toBe("button");
+    list[0]!.focus();
+    list[0]!.fire("keydown", { key: "ArrowDown", preventDefault() {} });
+    await nextTurn();
+    expect(rendered(modal)).toContain("version 2");
+    modal.close();
+  });
+});

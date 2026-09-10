@@ -30,6 +30,7 @@ func (h *Hub) deviceStatus(vaultID string, devices []store.Device) []wire.Device
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	status := make(map[string]wire.DeviceStatus, len(devices))
+	unconfirmed := make(map[string]bool)
 	for _, d := range devices {
 		status[d.ID] = wire.DeviceStatus{Device: d}
 	}
@@ -49,12 +50,18 @@ func (h *Hub) deviceStatus(vaultID string, devices []store.Device) []wire.Device
 			if d.Applied == nil || cursor < *d.Applied {
 				d.Applied = &cursor
 			}
+		} else {
+			unconfirmed[s.deviceID] = true
 		}
 		status[s.deviceID] = d
 	}
 	rows := make([]wire.DeviceStatus, 0, len(devices))
 	for _, d := range devices {
-		rows = append(rows, status[d.ID])
+		row := status[d.ID]
+		if unconfirmed[d.ID] {
+			row.Applied = nil
+		}
+		rows = append(rows, row)
 	}
 	return rows
 }

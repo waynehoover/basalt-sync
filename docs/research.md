@@ -2,11 +2,67 @@
 
 [Developer documentation](development.md) · [Product comparison](compared.md)
 
-This page records dated measurements and design evaluations. The historical
-transfer tables were **not rerun for the September 8, 2026 documentation
-review**; newer measurements state their own methods below. Do not present
-these as a speed ranking against another product. The original transfer results
-remain in `git show 573617c:docs/compared.md`.
+This page records dated measurements and design evaluations. Results describe
+specific fixtures, not a speed ranking against another product. The original
+transfer tables remain in `git show 573617c:docs/compared.md`.
+
+## Current measurements — September 10, 2026
+
+Unreleased protocol 7 changes on top of `920324c`; Node 22.23.2, Go 1.27.1,
+Apple M4 Pro, macOS arm64. [Raw results](reviews/0.7.1-metrics.json) include
+sample arrays and environment details. Benchmarks ran sequentially, outside
+the test gate.
+
+| Saved-file event → content at every receiver | 2 clients p50 / p95 | 5 clients p50 / p95 |
+|---|---:|---:|
+| New note | 21 / 22 ms | 21 / 22 ms |
+| Repeat edit | 22 / 33 ms | 31 / 32 ms |
+| Note alongside an attachment with a 500 ms read | 21 / 32 ms | 21 / 33 ms |
+| Active note alongside another note with a 500 ms read | 21 / 31 ms | 31 / 33 ms |
+
+Twenty samples per row, real local server and encryption, in-memory client
+vaults and simulated Obsidian events. A 200-note burst reached every receiver
+in 1.49 / 1.59 seconds (one burst each). The benchmark polls for completion,
+so these values include observation granularity. They exclude editor autosave,
+network latency, and phone filesystem writes.
+
+Five fresh clients replayed 1,000 versions of one path in **11–23 ms**;
+including the newest content took **12–25 ms**. This fixture does not justify
+adding a snapshot protocol. Measure much larger histories and actual mobile
+resume before revisiting that decision.
+
+On Node with real client filesystems, median of three passes after warm-up:
+
+| Workload | 500 notes | 2,000 notes |
+|---|---:|---:|
+| No changes | 8.3 ms | 21.6 ms |
+| One changed note | 27.4 ms | 55.5 ms |
+| Folder rename | 98.4 ms | 549.2 ms |
+| Catch-up | 340.3 ms | 386.9 ms |
+
+Keep fallback scans for missed events. Dirty-path invalidation prevents stale
+hash reuse; active-note work can resume between background files, and active
+sessions use smaller batches. A binary exchange already in progress remains
+serialized. No filesystem flush or compare-before-write check was removed.
+
+Native Obsidian's twelve-update editor check also passed split views, cursor
+stability, disjoint unsaved typing, and undo/redo. Local application took
+**30.1–65.0 ms**. This is separate from the network benchmark. Android runtime,
+TalkBack, keyboard-open layouts, and phone delivery timings remain unmeasured
+in this pass.
+
+```bash
+cd client
+BASALT_BENCH_CLIENTS=2 BASALT_BENCH_SAMPLES=20 node --experimental-transform-types bench-cadence.ts
+BASALT_BENCH_CLIENTS=5 BASALT_BENCH_SAMPLES=20 node --experimental-transform-types bench-cadence.ts
+BASALT_BENCH_HISTORY=1000 node --experimental-transform-types bench-history.ts
+BENCH_NODE=1 BENCH_SIZES=500,2000 BENCH_REPEATS=3 node --experimental-transform-types bench-pass.ts
+```
+
+The [September 9 prior-art review](reviews/0.7.1.md#what-to-borrow-from-other-plugins)
+records the inspected official Sync, Remotely Save, and LiveSync source revisions.
+Its activity log, conflict review, and preview recommendations are implemented
+in the [follow-up](reviews/0.7.1-fixes.md).
 
 ## Reproduce before making a claim
 

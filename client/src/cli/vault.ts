@@ -1268,6 +1268,7 @@ export class NodeVault implements Vault {
             // nothing that decides.
             ctime: s.birthtimeMs || s.ctimeMs,
             size: s.size,
+            changeId: `${s.dev}:${s.ino}:${s.ctimeMs}`,
           });
         }
       }
@@ -1325,6 +1326,7 @@ export class NodeVault implements Vault {
         mtime: st.mtimeMs,
         ctime: st.birthtimeMs || st.ctimeMs,
         size: st.size,
+        changeId: `${st.dev}:${st.ino}:${st.ctimeMs}`,
       };
     } catch {
       return undefined;
@@ -2075,7 +2077,7 @@ export class NodeVault implements Vault {
    */
   watch(onChange: (path: string) => void): () => void {
     let timer: NodeJS.Timeout | undefined;
-    let last = "";
+    const changed = new Set<string>();
     let watcher: FSWatcher | undefined;
 
     try {
@@ -2087,11 +2089,13 @@ export class NodeVault implements Vault {
         // scheduled the next one, forever.
         if (this.neverSynced(path)) return;
         if (isTemporary(basename(path), join(this.root, path))) return;
-        last = path;
+        changed.add(path);
         if (timer) return;
         timer = setTimeout(() => {
           timer = undefined;
-          onChange(last);
+          const paths = [...changed];
+          changed.clear();
+          for (const path of paths) onChange(path);
         }, 0);
       });
       watcher.on("error", () => {

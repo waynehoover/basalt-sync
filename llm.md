@@ -277,3 +277,12 @@ Obsidian. It needs Node 22 or newer and its **own local directory**. Follow the
 an invite through `--key-file` or standard input. Do not run it in a vault the
 plugin is already syncing. Read-only mode is local behavior, not a server access
 restriction.
+
+## Working from development source
+
+This source tree uses protocol 7. Build both server and clients from the same
+checkout; do not combine them with the released protocol-6 Compose image.
+Keep existing data and credentials, and verify the reported protocol after
+connecting. Pairing a populated vault now pauses for a preview: review its
+counts with the user before choosing Continue sync. `basalt preview --json`
+provides a read-only plan for CLI vaults.

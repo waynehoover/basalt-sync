@@ -122,6 +122,8 @@ async function load(
   const app = new App();
   if (configDir !== undefined) app.vault.configDir = configDir;
   const plugin = makePlugin(app, manifest);
+  // These lifecycle tests accept sync previews; preview controls have their own tests.
+  (plugin as unknown as { confirmSync: () => Promise<boolean> }).confirmSync = async () => true;
   plugin.savedData = saved;
   loaded.push(plugin);
   beforeLoad?.(plugin);
@@ -195,7 +197,7 @@ async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promis
  */
 function choosePairing(plugin: Testable, path: "invite" | "first"): void {
   built.length = 0;
-  plugin.ribbonIcons[0]!.callback();
+  plugin.commands.find((c) => c.id === "show-status")!.callback!();
   const label = path === "invite" ? "Paste an invite" : "Use a setup line";
   const choice = built.find((s) => s.buttons.some((b) => b.label === label));
   if (!choice) throw new Error(`the panel offers no ${label}: ${built.map((s) => s.name)}`);
@@ -252,9 +254,14 @@ describe("loading", () => {
   it("registers the things a plugin registers", async () => {
     const { plugin, app } = await load();
     expect(plugin.commands.map((c) => c.id).sort()).toEqual([
+      "activity",
+      "pause-resume",
+      "preview-sync",
       "recover-deleted",
+      "review-conflicts",
       "show-status",
       "sync-now",
+      "verify-contents",
       "version-history",
     ]);
     expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt Sync"]);
@@ -380,7 +387,7 @@ describe("where its own state goes", () => {
     // sync, with a status bar still saying "connecting".
     await fresh();
     const { plugin } = await load(null, { id: "basalt", dir: "somewhere/else" });
-    await startVault(plugin, "laptop");
+    await expect(startVault(plugin, "laptop")).rejects.toThrow(/outside/);
     await until("it to give up", () => plugin.currentState.kind === "stopped");
     expect(notices.map((n) => n.message).join(" ")).toMatch(/would sync/);
     expect(statusIcon(plugin)).toBe("alert-triangle");
@@ -508,7 +515,7 @@ describe("pairing", () => {
     expect(stored["deviceId"]).toMatch(/^[A-Za-z0-9_-]+$/);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const row = built.find((s) => s.name === "Recovery key")!;
     expect(panelText()).toMatch(/Not stored on this device/);
     // The description points to the user's saved copy.
@@ -532,7 +539,7 @@ describe("renaming this device from the panel", () => {
     expect(plugin.deviceName).toBe("laptop");
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const setting = built.find((s) => s.name === "This device's name")!;
     expect(setting, "the panel offers no way to rename this device").toBeDefined();
     setting.texts[0]!.type("the-good-laptop");
@@ -569,7 +576,7 @@ describe("renaming this device from the panel", () => {
 
     // b takes a new name, with its loop running, which is the case that broke.
     built.length = 0;
-    b.plugin.ribbonIcons[0]!.callback();
+    b.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const setting = built.find((s) => s.name === "This device's name")!;
     setting.texts[0]!.type("renamed-desktop");
     await setting.buttons.find((btn) => btn.label === "Rename")!.click();
@@ -606,7 +613,7 @@ describe("renaming this device from the panel", () => {
     await startVault(plugin, "laptop");
     await synced(plugin);
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const setting = built.find((s) => s.name === "This device's name")!;
 
     notices.length = 0;
@@ -727,7 +734,7 @@ describe("syncing while it runs", () => {
       for (let i = 0; i < 20; i++) {
         body += `\nKept paragraph ${burst}-${i}.\n`;
         a.app.vault.adapter.seed("burst.md", body);
-        a.app.vault.fire("modify");
+        a.app.vault.fire("modify", { path: "note.md" });
       }
       await until(
         "all paragraphs in the burst to arrive automatically",
@@ -749,7 +756,7 @@ describe("syncing while it runs", () => {
     await peer.plugin.pair(keyOf(plugin), "peer");
     await synced(peer.plugin);
     app.vault.adapter.seed("busy.md", "a saved note during a busy vault\n");
-    const events = setInterval(() => app.vault.fire("modify"), 20);
+    const events = setInterval(() => app.vault.fire("modify", { path: "note.md" }), 20);
     try {
       await until(
         "delivery while events are still arriving",
@@ -776,7 +783,7 @@ describe("syncing while it runs", () => {
     // here: the 30 second backstop would not have fired yet.
     const before = a.plugin.currentState;
     a.app.vault.adapter.seed("fresh.md", "written just now");
-    a.app.vault.fire("create");
+    a.app.vault.fire("create", { path: "note.md" });
 
     // The nudge briefly coalesces events, so this waits for the
     // state to move rather than for a state it is already in.
@@ -902,7 +909,7 @@ describe("when things go wrong", () => {
     const { plugin, app } = await load();
     await startVault(plugin);
     await synced(plugin);
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const button = built.find((s) => s.name === "Sync status")!.buttons[0]!;
     const client = (plugin as unknown as { client: Client }).client;
     const list = client.vault.list.bind(client.vault);
@@ -1293,7 +1300,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     const inTab = built.map((s) => s.name);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const inModal = built.map((s) => s.name);
 
     expect(inTab, "the settings tab drew nothing").not.toEqual([]);
@@ -1312,7 +1319,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     // was reported from a phone. So the question comes first, and it is a
     // question about the device rather than about the protocol.
     const { plugin } = await load();
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
 
     const asked = built.map((s) => s.name);
     expect(asked).toContain("Join an existing vault");
@@ -1393,7 +1400,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const adding = built.find((s) => s.name === "Add another device")!;
     expect(adding, "the panel offers no way to add a device").toBeDefined();
     expect(adding.buttons.map((b) => b.label)).toContain("Create invite");
@@ -1428,7 +1435,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     await synced(plugin);
     const watching = vi.spyOn(plugin, "watchState");
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const panel = modals.at(-1)!;
     const row = built.find((setting) => setting.name === "This device's name")!;
     row.texts[0]!.type("new name");
@@ -1459,7 +1466,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const names = built.map((s) => s.name);
     expect(names).toContain("Sync status");
     expect(names).toContain("Devices");
@@ -1487,7 +1494,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const disclosures = modals.at(-1)!.contentEl.children.filter((el) => el.tag === "details");
     const adding = disclosures.find((el) => el.children[0]?.text === "Add another device");
     expect(adding, "adding a device needs its own collapsed section").toBeDefined();
@@ -1578,7 +1585,7 @@ describe("on a device with no status bar", () => {
       expect(phone.plugin.connection()?.server?.proto).toBe(PROTO);
       expect(phone.plugin.cursors()).toEqual({ local: 0, server: 1 });
       built.length = 0;
-      phone.plugin.ribbonIcons[0]!.callback();
+      phone.plugin.commands.find((c) => c.id === "show-status")!.callback!();
       expect(built.find((s) => s.name === "Sync status")!.descEl.allText()).toMatch(
         /Loading sync history/,
       );
@@ -1647,7 +1654,7 @@ describe("on a device with no status bar", () => {
     await until("it to notice", () => plugin.currentState.kind === "offline");
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await until("the modal to say so", () =>
       modals.at(-1)!.contentEl.allText().includes("-allow-origin"),
     );
@@ -1670,7 +1677,7 @@ describe("on a device with no status bar", () => {
     await until("it to notice", () => plugin.currentState.kind === "offline");
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
   }, 300_000);
 
@@ -1681,7 +1688,7 @@ describe("on a device with no status bar", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
   }, 300_000);
 });
@@ -1716,7 +1723,7 @@ describe("saying what it is working on", () => {
           await gate;
           return result;
         };
-      subject.ribbonIcons[0]!.callback();
+      subject.commands.find((c) => c.id === "show-status")!.callback!();
       const row = built.filter((s) => s.name === "Sync status").at(-1)!;
       const original = "Exact attachment content while a transfer waits.\n";
       a.app.vault.adapter.seed("attachment.pdf", original);
@@ -2387,7 +2394,7 @@ describe("a config that cannot be read", () => {
     expect(plugin.currentState.kind).toBe("stopped");
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     expect(built.map((s) => s.name)).not.toContain("Pairing string");
     const shown = modals.at(-1)!.contentEl.allText();
     expect(shown).toMatch(/root secret is 32 bytes/);
@@ -2463,7 +2470,7 @@ describe("what is announced, and how often", () => {
     // And a save, which syncs through the nudge, says nothing new either.
     const beforeSave = plugin.cursors()!.local;
     app.vault.adapter.seed("fine.md", "edited", 9_000_000_000_000);
-    app.vault.fire("modify");
+    app.vault.fire("modify", { path: "note.md" });
     await until(
       "the edit to upload and its pass to finish",
       () => plugin.cursors()!.local > beforeSave && plugin.currentState.kind === "synced",
@@ -2809,7 +2816,7 @@ describe("on a phone", () => {
     vi.stubGlobal("document", doc);
     vi.useFakeTimers();
     try {
-      plugin.ribbonIcons[0]!.callback();
+      plugin.commands.find((c) => c.id === "show-status")!.callback!();
       await vi.advanceTimersByTimeAsync(0);
       expect(vi.getTimerCount()).toBe(0);
       expect(requests).not.toHaveBeenCalled();
@@ -3149,7 +3156,7 @@ describe("what History says after a restore (P-D1)", () => {
     const said = await restoreFromHistory(plugin);
     expect(said, "the notice was built from another notice").not.toMatch(/Restored to Restored/);
     expect(said).toMatch(
-      /^Restored to note \(restored \d+\)\.md, because something is already at note\.md\. Sent to your other devices\.$/,
+      /^Restored to note \(restored \d+\)\.md, because something is already at note\.md\. Uploaded to server\. Other devices will receive it when they sync\.$/,
     );
 
     // The other half: a restore that landed here and could not be uploaded
@@ -3424,9 +3431,14 @@ describe("an older Obsidian", () => {
     });
 
     expect(plugin.commands.map((c) => c.id).sort()).toEqual([
+      "activity",
+      "pause-resume",
+      "preview-sync",
       "recover-deleted",
+      "review-conflicts",
       "show-status",
       "sync-now",
+      "verify-contents",
       "version-history",
     ]);
     expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt Sync"]);
@@ -3719,7 +3731,7 @@ describe("adding a device from the panel", () => {
     // The invite comes out of the panel, from the live connection, because
     // the server has to store it.
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const adding = built.find((s) => s.name === "Add another device")!;
     await adding.buttons.find((b) => b.label === "Create invite")!.click();
     const shown = notices.map((n) => n.message).join(" ");
@@ -4009,7 +4021,7 @@ describe("adding a device from the panel", () => {
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
     modals.at(-1)!.close();
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
     await synced(plugin);
   }, 300_000);
@@ -4111,7 +4123,7 @@ describe("adding a device from the panel", () => {
     await startVault(plugin, "laptop");
     await synced(plugin);
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
 
     const key = keyOf(plugin);
     expect(modals.at(-1)!.contentEl.allText(), "the key was on screen unasked").not.toContain(key);
@@ -4131,7 +4143,7 @@ describe("adding a device from the panel", () => {
     await synced(plugin);
     await until("the cursor to move", () => (plugin.cursors()?.local ?? 0) > 0);
 
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const shown = modals.at(-1)!.contentEl.allText();
     const at = plugin.cursors()!;
     expect(at.local).toBeGreaterThan(0);
@@ -4222,7 +4234,7 @@ describe("what the panel knows and used to keep to itself", () => {
     await startVault(plugin, "laptop");
     await synced(plugin);
 
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const shown = modals.at(-1)!.contentEl.allText();
     const to = plugin.connection()!;
     // The address this device actually holds, rather than the one this test
@@ -4325,7 +4337,7 @@ describe("changing the server address", () => {
     expect(server.wsUrl).not.toBe(saved["url"]);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const setting = built.find((s) => s.name === "Server address")!;
     setting.texts[0]!.type(`  ${server.wsUrl.replace("ws://", "http://")}/  `);
     await setting.buttons[0]!.click();
@@ -4401,7 +4413,7 @@ describe("the device list in the panel", () => {
     await startVault(plugin, "laptop");
     await synced(plugin);
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const button = built.find((s) => s.name === "Devices")!.buttons[0]!;
     await button.click();
     const oldRow = built.find((s) => s.name.startsWith("laptop"))!.settingEl;
@@ -4427,7 +4439,7 @@ describe("the device list in the panel", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
 
     const row = built.find((s) => s.name.startsWith("laptop"))!;
@@ -4468,7 +4480,7 @@ describe("the device list in the panel", () => {
     await synced(plugin);
 
     built.length = 0;
-    plugin.ribbonIcons[0]!.callback();
+    plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const heading = built.find((s) => s.name === "Devices")!;
     await heading.buttons[0]!.click();
     await until("the list to arrive", () => built.some((s) => s.name.includes("laptop")));
@@ -4500,7 +4512,7 @@ describe("the device list in the panel", () => {
     const issued = await first.plugin.createInvite();
 
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
     await until("the list to arrive", () => built.some((s) => s.name === "Outstanding invite"));
 
@@ -4540,7 +4552,7 @@ describe("the device list in the panel", () => {
     await redeemInvite(parseInvite(issued.invite), "the-one-that-crashed");
 
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
     await until("the list to arrive", () =>
       built.some((s) =>
@@ -4575,7 +4587,7 @@ describe("the device list in the panel", () => {
     await synced(second.plugin);
 
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
     const row = built.find((s) => s.name === "phone")!;
     const button = row.buttons[0]!;
@@ -4610,7 +4622,7 @@ describe("the device list in the panel", () => {
     await second.plugin.pair((await first.plugin.createInvite()).invite, "phone");
     await synced(second.plugin);
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
     const listed = await first.plugin.devices();
     for (const device of listed.devices) {
@@ -4828,7 +4840,7 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     // The panel offers it, and the first press is a question rather than an
     // answer: nothing has been touched by it.
     built.length = 0;
-    first.plugin.ribbonIcons[0]!.callback();
+    first.plugin.commands.find((c) => c.id === "show-status")!.callback!();
     const row = built.find((s) => s.name === "Rejoin this server")!;
     expect(row, "the panel offered no way back").toBeDefined();
     expect(panelText()).toMatch(/local notes are kept/);
@@ -5229,4 +5241,47 @@ describe("handing over a replacement recovery key", () => {
     const out = await rotating;
     expect(out instanceof Error ? out.message : "rotated").toBeTruthy();
   }, 90_000);
+});
+
+describe("compact sync menu", () => {
+  it("opens quick actions and pauses and resumes the live client", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+    const { Menu } = await import("./stub.ts");
+    plugin.ribbonIcons[0]!.callback();
+    expect(Menu.latest!.items.map((item) => item.label)).toContain("Sync activity");
+    expect(Menu.latest!.items.map((item) => item.label)).toContain("Review conflicts");
+    await Menu.latest!.items.find((item) => item.label === "Pause sync")!.click();
+    await until("paused", () => plugin.currentState.kind === "paused");
+    await until("pause drained", () => !(plugin as unknown as { pausing?: Promise<void> }).pausing);
+    plugin.ribbonIcons[0]!.callback();
+    await Menu.latest!.items.find((item) => item.label === "Resume sync")!.click();
+    await synced(plugin);
+  });
+});
+
+it("unload waits for a pause that is still draining writes", async () => {
+  const { plugin } = await load();
+  const pending = deferred<void>();
+  const state = plugin as unknown as {
+    config: unknown;
+    client: { close(): Promise<void> };
+    togglePause(): Promise<void>;
+  };
+  state.config = {};
+  state.client = { close: () => pending.promise };
+  const pause = state.togglePause();
+  plugin.onunload();
+  let drained = false;
+  void plugin.closing?.then(() => {
+    drained = true;
+  });
+  await nextTurn();
+  expect(drained).toBe(false);
+  pending.resolve();
+  await pause;
+  await plugin.closing;
+  expect(drained).toBe(true);
 });

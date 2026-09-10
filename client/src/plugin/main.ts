@@ -1,7 +1,13 @@
+import { SyncPreviewModal } from "./preview.ts";
+import type { SyncPreview } from "../core/preview.ts";
+import { ActivityLog, ActivityModal } from "./activity.ts";
+import { ConflictsModal } from "./conflicts.ts";
+import { conflictOriginal, reviewConflict, type ConflictPair } from "../core/conflicts.ts";
 /** Obsidian plugin: lifecycle, platform adapter, and sync/recovery interfaces. */
 
 import {
   Modal,
+  Menu,
   Notice,
   Platform,
   Plugin,
@@ -135,6 +141,7 @@ export type State =
    * reason pointed at docs/server.md, which is not somewhere a phone goes at
    * the moment its notes have stopped syncing. See `recoveryFor`.
    */
+  | { kind: "paused" }
   | { kind: "stopped"; why: string; recovery?: "rejoin" };
 
 export default class BasaltPlugin extends Plugin {
@@ -152,6 +159,10 @@ export default class BasaltPlugin extends Plugin {
   private statusEl: HTMLElement | undefined;
   private ribbonEl: HTMLElement | undefined;
   private running = false;
+  private paused = false;
+  private pausing: Promise<void> | undefined;
+  private activityLog: ActivityLog | undefined;
+  private readonly syncPrompts = new Set<() => void>();
 
   /**
    * Which run is the current one. Bumped by every start, by unlink and by
@@ -214,9 +225,20 @@ export default class BasaltPlugin extends Plugin {
     // addStatusBarItem is "not available on mobile". The ribbon is on both,
     // so the state goes there too: its tooltip is the same sentence, and it
     // is the thing somebody taps when they want to know.
-    if (!Platform.isMobileApp) this.statusEl = this.addStatusBarItem();
-    this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt Sync", () =>
-      new BasaltModal(this).open(),
+    if (!Platform.isMobileApp) {
+      this.statusEl = this.addStatusBarItem();
+      this.statusEl.setAttribute("role", "button");
+      this.statusEl.setAttribute("tabindex", "0");
+      this.registerDomEvent(this.statusEl, "click", (event) => this.showMenu(event));
+      this.registerDomEvent(this.statusEl, "keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          this.showMenu();
+        }
+      });
+    }
+    this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt Sync", (event) =>
+      this.showMenu(event),
     );
     this.ribbonEl.addClass("basalt-sync-ribbon");
     // Settings is where somebody looks for a plugin's interface, and Obsidian
@@ -226,9 +248,34 @@ export default class BasaltPlugin extends Plugin {
     this.addSettingTab(new BasaltSettingTab(this));
 
     this.addCommand({
+      id: "preview-sync",
+      name: "Preview sync",
+      callback: () => void this.openPreview(),
+    });
+    this.addCommand({
+      id: "activity",
+      name: "Show sync activity",
+      callback: () => this.openActivity(),
+    });
+    this.addCommand({
+      id: "review-conflicts",
+      name: "Review conflicts",
+      callback: () => this.openConflicts(),
+    });
+    this.addCommand({
+      id: "pause-resume",
+      name: "Pause or resume sync",
+      callback: () => void this.togglePause(),
+    });
+    this.addCommand({
       id: "sync-now",
       name: "Sync now",
       callback: () => void this.syncNow(),
+    });
+    this.addCommand({
+      id: "verify-contents",
+      name: "Verify vault contents",
+      callback: () => void this.syncNow(true),
     });
     this.addCommand({
       id: "show-status",
@@ -310,9 +357,9 @@ export default class BasaltPlugin extends Plugin {
     // thousands of pointless things rather than about correctness. The
     // callback runs immediately if the layout is already up.
     this.app.workspace.onLayoutReady(() => {
-      this.registerEvent(this.app.vault.on("create", () => this.nudge()));
-      this.registerEvent(this.app.vault.on("modify", () => this.nudge()));
-      this.registerEvent(this.app.vault.on("delete", () => this.nudge()));
+      this.registerEvent(this.app.vault.on("create", (file) => this.nudge(file.path)));
+      this.registerEvent(this.app.vault.on("modify", (file) => this.nudge(file.path)));
+      this.registerEvent(this.app.vault.on("delete", (file) => this.nudge(file.path)));
       // The old path is the whole point of this event. A rename that
       // arrives as a delete plus an add still moves the file, but it
       // retires the old path as a deletion, and the list of deleted notes
@@ -332,6 +379,11 @@ export default class BasaltPlugin extends Plugin {
     });
 
     try {
+      this.activityLog = new ActivityLog(
+        this.app.vault.adapter,
+        `${this.pluginDir()}/activity.json`,
+      );
+      await this.activityLog.load();
       this.config = await this.readConfig();
     } catch (err) {
       // Rule 2: an unreadable config is not an unpaired vault. Starting
@@ -384,7 +436,14 @@ export default class BasaltPlugin extends Plugin {
     this.wakeLoop?.();
     this.wakeLoop = undefined;
     const { live, client } = this.retireClients();
-    this.closing = Promise.all([live?.close(), client?.close(), this.unlinking, ...this.settling])
+    this.closing = Promise.all([
+      live?.close(),
+      client?.close(),
+      this.unlinking,
+      this.pausing,
+      ...this.settling,
+      this.activityLog?.flush(),
+    ])
       .then(() => undefined)
       .catch(() => undefined);
   }
@@ -393,9 +452,170 @@ export default class BasaltPlugin extends Plugin {
    * Running
    * ------------------------------------------------------------ */
 
+  private async openPreview(): Promise<void> {
+    if (!this.client) {
+      new Notice(this.whyNoClient());
+      return;
+    }
+    try {
+      new SyncPreviewModal(this.app, await this.client.preview()).open();
+    } catch (error) {
+      new Notice(`Could not preview sync: ${(error as Error).message}`);
+    }
+  }
+
+  private async confirmSync(
+    preview: SyncPreview,
+    heading: string,
+    current: () => boolean,
+  ): Promise<boolean> {
+    if (!current()) return false;
+    const modal = new SyncPreviewModal(this.app, preview, heading);
+    const close = () => modal.close();
+    this.syncPrompts.add(close);
+    const detach = this.watchUnload(close);
+    try {
+      const proceed = await modal.confirm();
+      if (!proceed && current()) void this.togglePause();
+      return proceed && current();
+    } finally {
+      this.syncPrompts.delete(close);
+      detach();
+    }
+  }
+
+  private openActivity(): void {
+    if (this.activityLog)
+      new ActivityModal(this.app, this.activityLog, (path) => this.openExisting(path)).open();
+  }
+
+  private openExisting(path: string): void {
+    const file = this.app.vault.getFileByPath(path);
+    if (!file) {
+      new Notice("This file has moved or was deleted. Look in version history or deleted notes.");
+      return;
+    }
+    void this.app.workspace.getLeaf().openFile(file);
+  }
+
+  private conflictPairs(): ConflictPair[] {
+    return this.app.vault.getFiles().flatMap((file) => {
+      const original = conflictOriginal(file.path);
+      return original ? [{ original, copy: file.path }] : [];
+    });
+  }
+
+  private openConflicts(): void {
+    new ConflictsModal(this.app, {
+      pairs: () => this.conflictPairs(),
+      open: (path) => this.openExisting(path),
+      review: (pair) => {
+        if (!this.client)
+          return reviewConflict(new ObsidianVault(this.app.vault, this.app.vault.configDir), pair);
+        return this.client.reviewConflict(pair);
+      },
+      resolve: async (review, choice, edited) => {
+        const client = this.client;
+        if (!client) throw new Error(this.whyNoClient());
+        await client.resolveConflict(review, choice, edited);
+        await this.activityLog?.flush();
+        await this.syncNow();
+      },
+    }).open();
+  }
+
+  private showMenu(event?: MouseEvent): void {
+    const menu = new Menu();
+    menu.addItem((item) =>
+      item
+        .setTitle("Sync now")
+        .setIcon("refresh-cw")
+        .setDisabled(this.paused)
+        .onClick(() => void this.syncNow()),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Preview sync")
+        .setIcon("list-checks")
+        .onClick(() => void this.openPreview()),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Sync activity")
+        .setIcon("list")
+        .onClick(() => this.openActivity()),
+    );
+    const conflicts = this.conflictPairs().length;
+    menu.addItem((item) =>
+      item
+        .setTitle(`Review conflicts${conflicts ? ` (${conflicts})` : ""}`)
+        .setIcon("files")
+        .onClick(() => this.openConflicts()),
+    );
+    const file = this.app.workspace.getActiveFile();
+    menu.addItem((item) =>
+      item
+        .setTitle("Version history")
+        .setIcon("history")
+        .setDisabled(!file)
+        .onClick(() => {
+          if (file) this.openHistory(file.path);
+        }),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Browse deleted")
+        .setIcon("trash-2")
+        .onClick(() => new RecoverModal(this).open()),
+    );
+    menu.addSeparator();
+    menu.addItem((item) =>
+      item
+        .setTitle(this.paused ? "Resume sync" : "Pause sync")
+        .setIcon(this.paused ? "play" : "pause")
+        .setDisabled(!this.config || !!this.pausing)
+        .onClick(() => void this.togglePause()),
+    );
+    menu.addItem((item) =>
+      item
+        .setTitle("Sync settings")
+        .setIcon("settings")
+        .onClick(() => new BasaltModal(this).open()),
+    );
+    if (event) menu.showAtMouseEvent(event);
+    else {
+      const rect = this.statusEl?.getBoundingClientRect();
+      menu.showAtPosition({ x: rect?.left ?? 0, y: rect?.top ?? 0 });
+    }
+  }
+
+  private async togglePause(): Promise<void> {
+    if (!this.config || this.pausing) return;
+    if (this.paused) {
+      this.paused = false;
+      this.start();
+      return;
+    }
+    this.paused = true;
+    this.running = false;
+    this.generation++;
+    this.clearTimers();
+    this.wakeLoop?.();
+    const { live, client } = this.retireClients();
+    const closing = Promise.all([live?.close(), client?.close()]).then(() => undefined);
+    this.pausing = closing;
+    this.setState({ kind: "paused" });
+    try {
+      await closing;
+      await this.activityLog?.flush();
+    } finally {
+      this.pausing = undefined;
+    }
+  }
+
   private start(): void {
     const config = this.config;
-    if (!config || this.running) return;
+    if (!config || this.running || this.paused || this.pausing) return;
     this.running = true;
     this.everConnected = false;
     this.announced = { attention: "", waiting: "", unknown: "" };
@@ -622,6 +842,11 @@ export default class BasaltPlugin extends Plugin {
       // Which key authenticates and what the vault is bound to, worked out in
       // core so that both shells cannot answer it differently.
       ...(await credentialsFor(config)),
+      confirmFirstSync: (preview) => this.confirmSync(preview, "Review your first sync", current),
+      confirmDeletions: (preview) => this.confirmSync(preview, "Review folder deletions", current),
+      onActivity: (event) => {
+        if (current()) this.activityLog?.add(event);
+      },
       onSyncStart: () => {
         if (!current()) return;
         this.working(undefined);
@@ -664,6 +889,7 @@ export default class BasaltPlugin extends Plugin {
           recoveryUnknown: vault.recovery.complete ? undefined : vault.recovery.why,
         });
         this.announce(report, vault.displaced, vault.recovery);
+        void this.activityLog?.flush();
       },
       // A pass that failed outright, from wherever it was started (F16).
       //
@@ -736,7 +962,8 @@ export default class BasaltPlugin extends Plugin {
    * folder in produces one per file. Without this the engine would start a
    * pass per event and spend the copy re-scanning.
    */
-  private nudge(): void {
+  private nudge(path?: string): void {
+    if (path !== undefined) this.client?.noteChanged(path);
     // Bound the wait from the first event. Resetting on every event let a
     // busy vault postpone syncing indefinitely until the fallback poll.
     if (!this.client || this.nudgeTimer !== undefined) return;
@@ -881,9 +1108,11 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /** Syncs on demand, and says so, because a command with no feedback is a guess. */
-  syncNow(): Promise<void> {
-    if (this.manualSync) return this.manualSync;
-    const work = this.syncOnDemand();
+  syncNow(verifyContents = false): Promise<void> {
+    if (this.manualSync) {
+      return verifyContents ? this.manualSync.then(() => this.syncNow(true)) : this.manualSync;
+    }
+    const work = this.syncOnDemand(verifyContents);
     this.manualSync = work;
     void work.then(
       () => {
@@ -896,7 +1125,7 @@ export default class BasaltPlugin extends Plugin {
     return work;
   }
 
-  private async syncOnDemand(): Promise<void> {
+  private async syncOnDemand(verifyContents = false): Promise<void> {
     if (!this.config) {
       new Notice("Basalt: this vault is not paired yet.");
       new BasaltModal(this).open();
@@ -934,7 +1163,7 @@ export default class BasaltPlugin extends Plugin {
         if (typeof view.save === "function") await view.save();
       }
       if (mine !== this.generation || this.client !== client) return;
-      report = await client.settle({ coalesceWrites: false });
+      report = await client.settle({ coalesceWrites: false, verifyContents });
     } catch (err) {
       if (mine !== this.generation) return;
       // Both callers discarded this promise, so a pass that threw was a
@@ -950,6 +1179,8 @@ export default class BasaltPlugin extends Plugin {
   }
 
   private passFailed(why: string): void {
+    this.activityLog?.add({ at: Date.now(), action: "error" });
+    void this.activityLog?.flush();
     this.working(undefined);
     this.setState({ kind: "failed", why, at: Date.now() });
   }
@@ -962,6 +1193,8 @@ export default class BasaltPlugin extends Plugin {
    */
   private whyNoClient(): string {
     switch (this.state.kind) {
+      case "paused":
+        return "Sync is paused. Resume it from the Basalt menu.";
       case "stopped":
         return `Basalt has stopped: ${this.state.why}. It will not reconnect until that is fixed.`;
       case "connecting":
@@ -1559,14 +1792,19 @@ export default class BasaltPlugin extends Plugin {
       // The outcome, not a sentence: the modal says it with the same
       // describeRestore every other restore surface uses.
       restoreVersion: (version) => this.restoreAndSend(version),
-      currentText: async (path) => {
+      currentText: async (path, maxBytes) => {
         // The note can go between the look and the read: somebody deleting
         // it while its history is loading. That is a diff against nothing,
         // not a version that could not be read.
         try {
+          const stat = await this.app.vault.adapter.stat(path);
+          if (maxBytes !== undefined && stat && stat.size > maxBytes)
+            throw new Error(
+              "The current note is too large to compare here. Restore a copy to compare it.",
+            );
           return await this.app.vault.adapter.read(path);
-        } catch {
-          if (await this.app.vault.adapter.exists(path)) throw new Error(`cannot read ${path}`);
+        } catch (err) {
+          if (await this.app.vault.adapter.exists(path)) throw err;
           return undefined;
         }
       },
@@ -1895,6 +2133,7 @@ export default class BasaltPlugin extends Plugin {
     const { live, client } = this.retireClients();
     await live?.close();
     await client?.close();
+    await this.pausing;
     // Their callers report failures. Shutdown needs completion, including a
     // failed write, so unlink can perform and verify its own cleanup next.
     await Promise.allSettled([...this.settling]);
@@ -2061,11 +2300,14 @@ export default class BasaltPlugin extends Plugin {
       );
     }
     this.config = undefined;
+    this.paused = false;
     this.setState({ kind: "unpaired" });
   }
 
   /** Takes the clients off the plugin, so nothing reaches for them again. */
   private retireClients(): { live: Client | undefined; client: Client | undefined } {
+    for (const close of this.syncPrompts) close();
+    this.syncPrompts.clear();
     const taken = { live: this.live, client: this.client };
     this.live = undefined;
     this.client = undefined;
@@ -2295,6 +2537,8 @@ function paintStatus(el: HTMLElement, state: State): void {
  */
 function iconFor(state: State): string {
   switch (state.kind) {
+    case "paused":
+      return "pause";
     case "unpaired":
       return "link";
     case "connecting":
@@ -2326,6 +2570,7 @@ function toneFor(state: State): string {
     // sit at the same weight as every item beside them; the glyph is what
     // tells them apart.
     case "offline":
+    case "paused":
     case "unpaired":
       return "";
     case "connecting":
@@ -3793,6 +4038,8 @@ function opens(fragment: string): string {
 
 function longStatus(state: State): string {
   switch (state.kind) {
+    case "paused":
+      return "Sync is paused on this device until you resume it or restart Obsidian.";
     case "unpaired":
       return "Not paired.";
     case "connecting":

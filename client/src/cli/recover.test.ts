@@ -150,7 +150,7 @@ describe("history", () => {
   it("needs a path", async () => {
     const dir = await paired();
     const h = await cli("history", "--dir", dir);
-    expect(h.code).toBe(1);
+    expect(h.code).toBe(2);
     expect(h.all).toMatch(/needs the path/);
   }, 300_000);
 

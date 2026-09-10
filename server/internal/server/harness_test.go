@@ -595,7 +595,7 @@ func (c *client) put(path string, bodies ...string) int64 {
 	c.t.Helper()
 	names, size := chunkNames(bodies)
 	c.sendJSON(wire.In{
-		Op: "put", Path: path, Chunks: names, Mac: testMac,
+		Op: "put", Path: path, Chunks: names, Mac: testMac, Base: c.head(path),
 		Meta: wire.PutMeta{Size: size, MTime: 5},
 	})
 
@@ -615,6 +615,17 @@ func (c *client) put(path string, bodies ...string) int64 {
 		c.t.Fatalf("%s: put %s: unexpected reply %v", c.name, path, m)
 		return 0
 	}
+}
+
+// head prepares a current-version precondition for ordinary fixture writes.
+// Stale-write tests use explicit bases on raw put/putmany messages instead.
+func (c *client) head(path string) int64 {
+	c.t.Helper()
+	uid, err := c.rig.st.CurrentUID(testVault, path)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return uid
 }
 
 func chunkNames(bodies []string) ([]string, int64) {

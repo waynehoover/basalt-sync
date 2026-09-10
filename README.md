@@ -12,26 +12,11 @@ you reconnect, and recover earlier versions from inside Obsidian.
 
 **[Get started](docs/server.md)** · [How it compares](docs/compared.md) · [Documentation](docs/index.md)
 
-<table>
-  <tr>
-    <th align="center">Sync status at a glance</th>
-    <th align="center">Find and restore an earlier version</th>
-  </tr>
-  <tr>
-    <td align="center">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
-        <img src="docs/assets/screenshots/panel.png" alt="Basalt's panel with Sync now and Browse deleted, plus collapsed sections for pairing, server settings, and vault management.">
-      </picture>
-    </td>
-    <td align="center">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/changes-dark.png">
-        <img src="docs/assets/screenshots/changes.png" alt="A note's version history, showing changes against the current copy.">
-      </picture>
-    </td>
-  </tr>
-</table>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
+  <img src="docs/assets/screenshots/panel.png" alt="Basalt's simple sync panel." width="700">
+</picture>
+
 
 ## Made for your personal vault
 
@@ -45,7 +30,8 @@ you reconnect, and recover earlier versions from inside Obsidian.
 - **Recover your work.** Browse history, compare changes, and restore deleted
   notes. Restoring creates a separate copy when a file already exists.
 - **Handle conflicting edits.** Basalt combines edits when its merge checks
-  pass and keeps both versions when they do not.
+  pass and keeps both versions when they do not. Review preserved copies
+  together and choose what to keep.
 - **Add devices with an invite.** Scan a QR code or copy a pairing code. There
   is no fixed device limit, and you can revoke a lost device from another one.
 

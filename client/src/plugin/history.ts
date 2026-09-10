@@ -1,32 +1,3 @@
-/**
- * Version history for one note.
- *
- * The server has kept every version since the first commit and nothing in the
- * plugin could reach them: recovery started from the deleted list, so a note you
- * still have but want an older copy of was not reachable at all.
- *
- * ## Why it looks like Obsidian Sync's
- *
- * Sync's own history modal was read in the shipped application to find out what
- * shape people already know: a sidebar of versions newest first, a content pane
- * showing the one you picked, a toggle between the text and a diff against what
- * is on disk, a restore action in the pane's title bar, and a button that pages
- * further back. Arrow keys move between versions and Enter selects.
- *
- * The layout classes here are Obsidian's own (`modal-sidebar`,
- * `modal-sidebar-list-item`, `modal-setting-titlebar`). Using the app's
- * stylesheet is how a plugin looks native rather than approximately native, and
- * it is the same reason a web page uses its framework's classes.
- *
- * ## Where it deliberately differs
- *
- * Restoring never overwrites. If the path is occupied the version lands beside
- * it as `Note (restored 42).md` and the notice says where it went. Sync writes
- * over the file. The whole project's position on this is in
- * docs/design.md: a sync you did not ask for should never rewrite the file
- * you have open, and restoring is a sync you asked for pointed at the past.
- */
-
 import { diff_match_patch } from "diff-match-patch";
 import { Modal, Notice, type App } from "obsidian";
 
@@ -46,21 +17,13 @@ export interface Restored {
   readonly willRetry?: boolean;
 }
 
-/**
- * One sentence for a restore: where it landed, and whether it went further.
- *
- * Lives here, next to the modal, because both restore surfaces say it and both
- * used to say it their own way. The modal's producer returned this sentence and
- * the modal then wrapped it in a second one, so a restore read "Restored to
- * Restored note.md. Sent to your other devices., because something is already
- * at note.md." One sentence, written once, from the structured outcome.
- */
 export function describeRestore(version: Version, done: Restored): string {
   const where =
     done.path === version.path
       ? `Restored ${done.path}.`
       : `Restored to ${done.path}, because something is already at ${version.path}.`;
-  if (done.sent) return `${where} Sent to your other devices.`;
+  if (done.sent)
+    return `${where} Uploaded to server. Other devices will receive it when they sync.`;
   return done.willRetry === false
     ? `${where} It is on this device and nowhere else: ${done.why}`
     : `${where} It is on this device and will be sent when the next sync succeeds: ${done.why}`;
@@ -81,11 +44,33 @@ export interface HistorySource {
    */
   restoreVersion(version: Version): Promise<Restored>;
   /** What is on disk now, for the diff. Undefined when the note is gone. */
-  currentText(path: string): Promise<string | undefined>;
+  currentText(path: string, maxBytes?: number): Promise<string | undefined>;
 }
 
 /** How many versions a page holds. Sync pages too, and for the same reason. */
 export const PAGE = 20;
+export const PREVIEW_BYTES = 128 * 1024;
+const PREVIEW_LINES = 2000;
+
+export function previewReason(version: Version): string | undefined {
+  if (version.deleted)
+    return "This version records a deletion. Choose an earlier version to restore.";
+  if (version.folder) return "This version is a folder.";
+  if (!/\.(md|txt|csv|json|canvas|css|js|ts|html|xml|yaml|yml|svg)$/i.test(version.path))
+    return "Attachment preview unavailable. Restore a copy to open the complete file.";
+  if (version.size > PREVIEW_BYTES)
+    return "This version is too large to preview. Restore a copy to open the complete file.";
+  return undefined;
+}
+
+function boundedPreview(text: string): string {
+  const lines = text.slice(0, PREVIEW_BYTES).split("\n");
+  const clipped = text.length > PREVIEW_BYTES || lines.length > PREVIEW_LINES;
+  return (
+    lines.slice(0, PREVIEW_LINES).join("\n") +
+    (clipped ? "\n… Preview shortened. Restore a copy for the complete version." : "")
+  );
+}
 
 export class HistoryModal extends Modal {
   private closed = false;
@@ -207,6 +192,7 @@ export class HistoryModal extends Modal {
   }
 
   private renderList(): void {
+    const focused = this.listEl.ownerDocument?.activeElement?.getAttribute("data-version");
     this.listEl.empty();
     if (this.paging && this.versions.length === 0) {
       this.listEl.createEl("p", { cls: "basalt-history-empty", text: "Loading history…" });
@@ -231,17 +217,38 @@ export class HistoryModal extends Modal {
 
     const list = this.listEl.createDiv("modal-sidebar-list");
     this.versions.forEach((version, i) => {
-      const item = list.createDiv({
+      const item = list.createEl("button", {
         cls:
           "modal-sidebar-list-item tappable" +
           (this.chosen?.uid === version.uid ? " is-active" : ""),
       });
-      item.createDiv({ cls: "modal-sidebar-list-item-header", text: when(version.mtime) });
-      item.createDiv({
+      item.setAttribute("type", "button");
+      item.setAttribute("data-version", String(version.uid));
+      item.setAttribute("aria-pressed", String(this.chosen?.uid === version.uid));
+      if (focused === String(version.uid)) item.focus();
+      item.createSpan({ cls: "modal-sidebar-list-item-header", text: when(version.mtime) });
+      item.createSpan({
         cls: "modal-sidebar-list-item-details",
         text: describe(version, i === 0),
       });
       item.addEventListener("click", () => void this.choose(version));
+      item.addEventListener("keydown", (event) => {
+        const next =
+          event.key === "ArrowDown"
+            ? i + 1
+            : event.key === "ArrowUp"
+              ? i - 1
+              : event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? this.versions.length - 1
+                  : undefined;
+        if (next === undefined) return;
+        event.preventDefault();
+        const target = this.versions[Math.max(0, Math.min(next, this.versions.length - 1))]!;
+        void this.choose(target);
+        this.listEl.querySelector<HTMLElement>(`[data-version="${target.uid}"]`)?.focus();
+      });
     });
 
     if (!this.exhausted) {
@@ -278,15 +285,19 @@ export class HistoryModal extends Modal {
       this.showDiff = !this.showDiff;
       void this.choose(version);
     });
-    toggle.disabled = this.restoring;
+    toggle.disabled = this.restoring || previewReason(version) !== undefined;
 
     const restore = actions.createEl("button", {
       cls: "mod-cta",
       text: this.restoring ? "Restoring…" : "Restore",
     });
-    restore.disabled = this.reading || this.restoring;
+    restore.disabled = this.reading || this.restoring || version.deleted || version.folder;
     restore.addEventListener("click", () => void this.restore(version));
 
+    if (previewReason(version) !== undefined) {
+      this.paneEl.createEl("p", { cls: "basalt-history-content-empty", text: this.text });
+      return;
+    }
     const pre = this.paneEl.createEl("pre", {
       cls: this.showDiff ? "basalt-history-diff" : "basalt-history-text",
     });
@@ -319,6 +330,14 @@ export class HistoryModal extends Modal {
     this.render();
     let text: string;
     try {
+      const reason = previewReason(version);
+      if (reason) {
+        this.preview = undefined;
+        this.text = reason;
+        this.reading = false;
+        this.renderPane();
+        return;
+      }
       if (this.preview?.uid !== version.uid) {
         const preview = { uid: version.uid, text: this.source.contentAt(version) };
         this.preview = preview;
@@ -329,9 +348,12 @@ export class HistoryModal extends Modal {
       const older = await this.preview.text;
       if (mine !== this.loading) return;
       if (this.showDiff) {
-        const now = (await this.source.currentText(this.path)) ?? "";
+        const now = (await this.source.currentText(this.path, PREVIEW_BYTES)) ?? "";
         if (mine !== this.loading) return;
-        text = diffLines(older, now);
+        text =
+          older.length > PREVIEW_BYTES || now.length > PREVIEW_BYTES
+            ? "These notes are too large to compare here. Restore a copy to compare the complete files."
+            : diffLines(older, now);
       } else {
         text = older;
       }
@@ -343,14 +365,14 @@ export class HistoryModal extends Modal {
     // would label one version's text with another's name.
     if (mine !== this.loading) return;
     this.reading = false;
-    this.text = text;
+    this.text = boundedPreview(text);
     // Only the pane, so a slow read does not rebuild the list under the
     // pointer of somebody about to click the next version.
     this.renderPane();
   }
 
   private async restore(version: Version): Promise<void> {
-    if (this.closed || this.restoring || this.reading) return;
+    if (this.closed || this.restoring || this.reading || version.deleted || version.folder) return;
     this.restoring = true;
     this.renderPane();
     try {
@@ -422,6 +444,7 @@ function describe(version: Version, newest: boolean): string {
  */
 export function diffLines(older: string, current: string): string {
   const dmp = new diff_match_patch();
+  dmp.Diff_Timeout = 0.1;
   const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(older, current);
   const diffs = dmp.diff_main(chars1, chars2, false);
   dmp.diff_charsToLines_(diffs, lineArray);

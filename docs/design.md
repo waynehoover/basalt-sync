@@ -322,3 +322,17 @@ Provenance identifies a build; it does not establish that the code is secure.
 
 A change to the deployment model should revisit these assumptions before adding
 mechanisms intended to cover it.
+
+## Concurrent branch preservation
+
+For honest devices, every independent edit must remain in a current note or an
+accessible preserved copy after reconciliation, including when an author goes
+offline after its first accepted write. Agreement among clients is insufficient.
+
+Protocol 7 appends only when the writer's target UID and, for a rename, source
+UID still match. A refused writer reads intervening metadata and reconciles
+before retrying. Merged local text retains the remote ancestor it incorporated,
+even if publishing that merge is refused. Renames retire their source at the
+same UID; a concurrent source edit prevents that retirement and is preserved.
+See [conditional writes](protocol.md#conditional-writes) and the
+[multi-device regression cases](../client/src/stress/preservation.stress.ts).

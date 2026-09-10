@@ -6,6 +6,9 @@ Definitions of the review IDs cited in code, such as `(R40)` and `(I29)`.
 These titles preserve the original reviewers' wording. They describe historical
 work recorded as resolved or deliberately declined, not a fresh readiness audit.
 
+For 0.7.1, see the [September 9 review](reviews/0.7.1.md) and
+[September 10 fixes and verification](reviews/0.7.1-fixes.md).
+
 Reproductions, acceptance criteria, and verification evidence remain in Git
 history: `git log -- FOLLOW_UP_REVIEW.md IMPROVEMENTS.md READINESS.md TODO.md
 PRODUCT_READINESS.md`.

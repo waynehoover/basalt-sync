@@ -1,3 +1,12 @@
+import type { SyncPreview } from "./preview.ts";
+import {
+  reviewConflict,
+  resolveConflict,
+  type ConflictPair,
+  type ConflictReview,
+  type ConflictChoice,
+} from "./conflicts.ts";
+import type { Activity } from "./activity.ts";
 /**
  * A connected client, which is everything both shells have in common.
  *
@@ -90,6 +99,9 @@ export interface ClientOptions {
   /** Whether this device may send anything to the server. Default false (I29). */
   readonly readOnly?: boolean;
   readonly log?: (message: string, ...rest: unknown[]) => void;
+  readonly onActivity?: (activity: Activity) => void;
+  readonly confirmFirstSync?: (preview: SyncPreview) => Promise<boolean>;
+  readonly confirmDeletions?: (preview: SyncPreview) => Promise<boolean>;
   readonly activePath?: () => string | undefined;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
@@ -232,6 +244,9 @@ export class Client {
       ...(opts.merge !== undefined ? { merge: opts.merge } : {}),
       ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
+      ...(opts.confirmFirstSync ? { confirmFirstSync: opts.confirmFirstSync } : {}),
+      ...(opts.confirmDeletions ? { confirmDeletions: opts.confirmDeletions } : {}),
+      ...(opts.onActivity !== undefined ? { onActivity: opts.onActivity } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
       ...(opts.onTransfer !== undefined ? { onTransfer: opts.onTransfer } : {}),
       ...(opts.activePath !== undefined ? { activePath: opts.activePath } : {}),
@@ -446,7 +461,10 @@ export class Client {
     if (this.endedWith) return this.endedWith;
     this.watching = true;
     this.scheduleUpload();
-    const stop = this.opts.vault.watch?.(() => void this.sync());
+    const stop = this.opts.vault.watch?.((path) => {
+      this.noteChanged(path);
+      void this.sync();
+    });
     // A sync with nothing to do sends nothing, so a settled vault is a
     // silent connection, and the server closes a silent one after five
     // minutes. Observed against a real server: a vault that had finished
@@ -630,6 +648,10 @@ export class Client {
     return this.serial(async () => this.engine.noteRename(from, to));
   }
 
+  noteChanged(path: string): void {
+    this.engine.noteChanged(path);
+  }
+
   /* ------------------------------------------------------------ *
    * Recovery
    * ------------------------------------------------------------ */
@@ -788,21 +810,36 @@ export class Client {
     return this.serial(() => this.engine.contentOf(version.uid, version.contentId, version.size));
   }
 
-  /**
-   * Puts a version back into the vault.
-   *
-   * Deliberately not a server operation. Restoring is fetching the content
-   * and writing it where it belongs; the ordinary sync then uploads it as a
-   * new version, through the one put path that everything else already uses
-   * and that is tested to death. A server-side restore would be a second way
-   * to change a vault, and the client would have had to download the content
-   * anyway.
-   *
-   * Nothing is overwritten. If something already occupies the path, the
-   * restored copy goes beside it under a distinct name and both are returned,
-   * because a recovery tool that can destroy the thing you have is worse than
-   * no recovery tool.
-   */
+  preview(): Promise<SyncPreview> {
+    return this.serial(() => this.engine.preview());
+  }
+
+  reviewConflict(pair: ConflictPair): Promise<ConflictReview> {
+    return this.serial(() => reviewConflict(this.opts.vault, pair));
+  }
+
+  resolveConflict(review: ConflictReview, choice: ConflictChoice, edited?: string): Promise<void> {
+    return this.serial(async () => {
+      if (this.closing) throw new Error("This client is closed.");
+      if (this.opts.readOnly)
+        throw new Error("Turn off receive-only mode before resolving conflicts.");
+      await resolveConflict(this.opts.vault, review, choice, edited);
+      this.engine.noteChanged(review.original);
+      this.engine.noteChanged(review.copy);
+      try {
+        this.opts.onActivity?.({
+          at: Date.now(),
+          action: "resolved",
+          path: review.original,
+          copy: review.copy,
+        });
+      } catch {
+        /* optional observer */
+      }
+    });
+  }
+
+  /** Restore beside any existing file; ordinary sync publishes the new copy. */
   async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
     // Keep both the fetch and the local publication in the queue. Closing a
     // client must wait for its last filesystem write before the caller can

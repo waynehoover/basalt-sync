@@ -368,7 +368,7 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 			defer wg.Done()
 			if _, refusal := s.commit(store.Entry{
 				Path: fmt.Sprintf("f%d.md", i), MTime: 1, Device: "d", Mac: testMac,
-			}); refusal != nil {
+			}, 0, 0); refusal != nil {
 				t.Errorf("commit refused: %s: %s", refusal.Code, refusal.Msg)
 			}
 		}(i, s)

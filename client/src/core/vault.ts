@@ -30,6 +30,8 @@ export interface FileStat {
    */
   readonly ctime: number;
   readonly size: number;
+  /** Local filesystem change identity, when available; never sent to peers. */
+  readonly changeId?: string;
 }
 
 /**

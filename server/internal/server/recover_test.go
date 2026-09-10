@@ -95,22 +95,23 @@ func TestHistoryPaginatesBackwards(t *testing.T) {
 	cl := r.dial("a")
 	cl.hello(0)
 	uids := []int64{}
-	for _, body := range []string{"one", "two", "three", "four", "five"} {
-		uids = append(uids, cl.put("note.md", body))
+	for i := 0; i < 502; i++ {
+		uids = append(uids, cl.put("note.md", fmt.Sprintf("revision %d", i)))
 	}
+	uids = append(uids, cl.remove("note.md"))
 
 	var page wire.History
-	cl.sendJSON(wire.In{Op: "history", Path: "note.md", Limit: 2})
+	cl.sendJSON(wire.In{Op: "history", Path: "note.md", Limit: 500})
 	cl.recvInto("history", &page)
-	if len(page.Entries) != 2 || page.Entries[0].UID != uids[4] {
+	if len(page.Entries) != 500 || page.Entries[0].UID != uids[502] || !page.Entries[0].Deleted {
 		t.Fatalf("first page is %v", uidsOf(page.Entries))
 	}
 
 	oldest := page.Entries[len(page.Entries)-1].UID
-	cl.sendJSON(wire.In{Op: "history", Path: "note.md", Before: oldest, Limit: 2})
+	cl.sendJSON(wire.In{Op: "history", Path: "note.md", Before: oldest, Limit: 500})
 	cl.recvInto("history", &page)
-	if len(page.Entries) != 2 || page.Entries[0].UID != uids[2] {
-		t.Fatalf("second page is %v, want the two before %d", uidsOf(page.Entries), oldest)
+	if len(page.Entries) != 3 || page.Entries[0].UID != uids[2] || page.Entries[2].UID != uids[0] {
+		t.Fatalf("second page is %v, want the three before %d", uidsOf(page.Entries), oldest)
 	}
 }
 
@@ -260,7 +261,7 @@ func (c *client) rawEntries(want string) string {
 // remove puts a deletion, which is a put like any other.
 func (c *client) remove(path string) int64 {
 	c.t.Helper()
-	c.sendJSON(wire.In{Op: "put", Path: path, Meta: wire.PutMeta{Deleted: true, MTime: 9}, Mac: testMac})
+	c.sendJSON(wire.In{Op: "put", Path: path, Base: c.head(path), Meta: wire.PutMeta{Deleted: true, MTime: 9}, Mac: testMac})
 	// "have" rather than "ack": a deletion carries no chunks, so every body the
 	// server needs is already present, vacuously.
 	var have wire.Have
@@ -274,7 +275,7 @@ func (c *client) rename(to, from string, bodies ...string) int64 {
 	c.t.Helper()
 	names, size := chunkNames(bodies)
 	c.sendJSON(wire.In{
-		Op: "put", Path: to, Chunks: names, Mac: testMac,
+		Op: "put", Path: to, Chunks: names, Mac: testMac, Base: c.head(to), PrevBase: c.head(from),
 		Meta: wire.PutMeta{Size: size, MTime: 6, Prev: from},
 	})
 	m := c.recv()

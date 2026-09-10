@@ -1,13 +1,5 @@
-/**
- * Two things asking the server at once.
- *
- * The transport allows one request in flight and throws otherwise, on purpose:
- * replies carry no request id, so a second question would resolve into the
- * first one's slot. The engine is single-flight and so never trips it.
- *
- * Recovery is not part of the engine. Somebody browsing deleted notes while the
- * background sync ticks is two callers, and nothing was stopping them.
- */
+/** Sync, history and restore share one operation queue. Request IDs route
+ * replies, while the queue also protects binary exchanges and local writes. */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 

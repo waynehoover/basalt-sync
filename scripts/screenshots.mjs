@@ -23,6 +23,10 @@ const scenes = [
   "deleted",
   "deleted-empty",
   "changes",
+  "activity",
+  "conflicts",
+  "preview",
+  "attachment-history",
   "settings",
   "status",
   "loading",
@@ -33,7 +37,7 @@ const options = new Map();
 for (const [i, arg] of process.argv.slice(2).entries()) {
   if (arg === "--help") {
     console.log(`Usage: node scripts/screenshots.mjs --vault NAME [--scene NAME] [--theme light|dark]
-  [--device desktop|phone] [--output DIRECTORY]
+  [--device desktop|phone] [--output DIRECTORY] [--server-version VERSION]
 
 Use an open test vault in desktop Obsidian with its CLI enabled.
 Requires installed client dependencies. Writes docs/assets/screenshots/*.png.
@@ -42,11 +46,12 @@ Phone previews use a narrow desktop window and Obsidian's mobile CSS;
 they check layout, not the Android/iOS runtime. Use --output for review captures.
 The status bar and desktop Settings window are desktop-only scenes.
 The temporary preview plugin never connects to a server or reads your notes.
+Server information uses "dev" unless --server-version names the matching release.
 It restores the theme, window bounds and clipboard, and removes itself afterward.`);
     process.exit(0);
   }
   if (i % 2 === 0) {
-    if (!["--vault", "--scene", "--theme", "--device", "--output"].includes(arg))
+    if (!["--vault", "--scene", "--theme", "--device", "--output", "--server-version"].includes(arg))
       throw new Error(`Unknown option: ${arg}`);
     const value = process.argv[i + 3];
     if (!value || value.startsWith("--")) throw new Error(`Missing value for ${arg}`);
@@ -112,10 +117,7 @@ async function waitFor(path, cleanup = false) {
 
 try {
   const manifest = JSON.parse(await readFile(join(root, "manifest.json"), "utf8"));
-  const serverVersion = (await readFile(join(root, "compose.yaml"), "utf8")).match(
-    /^\s*image:\s*ghcr\.io\/waynehoover\/basalt-sync:([^@\s]+)/m,
-  )?.[1];
-  if (!serverVersion) throw new Error("Cannot read the example server version from compose.yaml");
+  const serverVersion = options.get("--server-version") ?? "dev";
   const { build } = require("esbuild");
   await build({
     entryPoints: [join(root, "scripts/screenshots/fixture.ts")],

@@ -41,6 +41,17 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 const samples: Record<string, number[]> = {};
 const passes: Record<string, number> = {};
 const baselineNotes = Number(process.env["BASALT_BENCH_NOTES"] ?? 0);
+const clientCount = Number(process.env["BASALT_BENCH_CLIENTS"] ?? 2);
+const sampleCount = Number(process.env["BASALT_BENCH_SAMPLES"] ?? 5);
+if (
+  !Number.isSafeInteger(clientCount) ||
+  clientCount < 2 ||
+  clientCount > 20 ||
+  !Number.isSafeInteger(sampleCount) ||
+  sampleCount < 1 ||
+  sampleCount > 100
+)
+  throw new Error("Invalid benchmark client or sample count");
 const prioritizeActive = process.env["BASALT_BENCH_PRIORITY"] !== "0";
 let activePath: string | undefined;
 if (!Number.isSafeInteger(baselineNotes) || baselineNotes < 0)
@@ -76,31 +87,37 @@ try {
   };
   const a = await make("sender", av);
   await make("receiver", bv);
+  const receivers = [bv];
+  for (let i = 2; i < clientCount; i++) {
+    const vault = new PluginEvents();
+    receivers.push(vault);
+    await make(`receiver-${i}`, vault);
+  }
   const send = async (scenario: string, path: string, body: string, forceSender = false) => {
     const start = performance.now();
     await av.edit(path, body);
     // Bypass only the sender to isolate the receiving client's arrival delay.
     if (forceSender) await a.sync({ coalesceWrites: false });
-    await until(scenario, () => bv.text(path) === body, 60_000);
+    await until(scenario, () => receivers.every((vault) => vault.text(path) === body), 60_000);
     (samples[scenario] ??= []).push(Math.round(performance.now() - start));
     if (av.text(path) !== body) throw new Error(`${scenario}: sender's edit was lost`);
   };
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sampleCount; i++) {
     await send("new note", `new-${i}.md`, `# Note ${i}\n\nSaved content.\n`);
   }
   let body = "# Rapid edits\n";
   await send("initial note", "repeat.md", body);
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sampleCount; i++) {
     await sleep(100);
     body += `\nSaved paragraph ${i}.\n`;
     await send("repeat edit", "repeat.md", body);
   }
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sampleCount; i++) {
     await sleep(100);
     body += `\nIncoming paragraph ${i}.\n`;
     await send("incoming update (sender forced)", "repeat.md", body, true);
   }
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sampleCount; i++) {
     const path = `a-slow-attachment-${i}.bin`;
     av.readDelays.set(path, 500);
     await av.edit(path, "complete attachment bytes\n");
@@ -112,7 +129,7 @@ try {
     await until("the attachment to finish", () => bv.text(path) === "complete attachment bytes\n");
     av.readDelays.delete(path);
   }
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sampleCount; i++) {
     const background = `a-background-note-${i}.md`;
     activePath = `z-current-note-${i}.md`;
     av.readDelays.set(background, 500);
@@ -130,9 +147,10 @@ try {
   const burst = performance.now();
   for (let i = 0; i < 200; i++) await av.edit(`burst/note-${i}.md`, `Exact burst content ${i}.\n`);
   await until("all burst notes", () =>
-    Array.from(
-      { length: 200 },
-      (_, i) => bv.text(`burst/note-${i}.md`) === `Exact burst content ${i}.\n`,
+    Array.from({ length: 200 }, (_, i) =>
+      receivers.every(
+        (vault) => vault.text(`burst/note-${i}.md`) === `Exact burst content ${i}.\n`,
+      ),
     ).every(Boolean),
   );
   samples["200-note event burst"] = [Math.round(performance.now() - burst)];
@@ -154,6 +172,20 @@ try {
         environment:
           "loopback; real Go server; in-memory vaults; production sync timers; simulated Obsidian events",
         samplesMs: samples,
+        clientCount,
+        percentilesMs: Object.fromEntries(
+          Object.entries(samples).map(([name, values]) => {
+            const sorted = values.slice().sort((a, b) => a - b);
+            return [
+              name,
+              {
+                n: sorted.length,
+                p50: sorted[Math.ceil(sorted.length * 0.5) - 1],
+                p95: sorted[Math.ceil(sorted.length * 0.95) - 1],
+              },
+            ];
+          }),
+        ),
         baselineNotes,
         prioritizeActive,
         burstPasses,

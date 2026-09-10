@@ -85,7 +85,7 @@ function checkEntry(path: string, entry: unknown, refuse: (what: string) => Erro
   if ("folder" in entry && typeof entry["folder"] !== "boolean") {
     throw refuse(`${at}.folder is ${describe(entry["folder"])}, not a boolean`);
   }
-  for (const field of ["hash", "synchash", "prev"]) {
+  for (const field of ["hash", "synchash", "prev", "changeId"]) {
     if (field in entry && typeof entry[field] !== "string") {
       throw refuse(`${at}.${field} is ${describe(entry[field])}, not a string`);
     }
@@ -133,6 +133,14 @@ function checkRemote(path: string, state: unknown, refuse: (what: string) => Err
   }
   if (typeof state["hash"] !== "string") {
     throw refuse(`${at}.hash is ${describe(state["hash"])}, not a string`);
+  }
+  if (state["heads"] !== undefined) {
+    if (
+      !isObject(state["heads"]) ||
+      !Object.entries(state["heads"]).every(([path, uid]) => isPath(path) && isCount(uid))
+    ) {
+      throw refuse(`${at}.heads is not a map of path version numbers`);
+    }
   }
 }
 

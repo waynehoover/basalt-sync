@@ -19,8 +19,9 @@ for the installed version's usage.
 | `uninvite ID` | Cancel an outstanding invite. |
 | `rotate KEY` | Replace the recovery key; keep history and existing devices. |
 | `sync [--watch]` | Sync once, or keep syncing. |
+| `preview` | Show planned changes without writing notes; `--json` includes paths and counts. |
 | `status` | Check connection, local state, and recovery issues. |
-| `history PATH` | List versions of a note, newest first. |
+| `history PATH [--before UID]` | Page through versions, newest first. |
 | `deleted` | List deleted notes and recovery availability. |
 | `restore PATH` | Restore the newest version with content, or use `--uid`. |
 | `repair` | Resend missing server content available on this device. |
@@ -33,6 +34,7 @@ for the installed version's usage.
 
 | Option | Applies to / meaning |
 |---|---|
+| `--verify` | `sync` only, without `--watch`: re-read all file contents before syncing. |
 | `--dir DIR` | Local vault directory. |
 | `--device NAME` | Device label at pairing; default is hostname plus a random suffix. |
 | `--vault-id ID` | Vault name for `init`; default `default`. |
@@ -110,6 +112,19 @@ local restoration separately from overall `ok`; `sent` says whether that copy
 was acknowledged by the server. After `restored: true`, retry `sync` if needed
 instead of restoring again. Sync counters include uploads,
 downloads, merges, conflicts, ignored paths, and changes held back on this device.
+
+For history, `--before UID` selects versions older than that UID. JSON output
+includes `nextBefore`; use it for the next page until it is `null` (an exactly
+full final page may require one empty request):
+
+```bash
+basalt history "Notes/Meeting.md" --limit 100 --json
+basalt history "Notes/Meeting.md" --limit 100 --before 1234 --json
+basalt preview --dir ~/vault --json
+basalt sync --dir ~/vault --verify
+```
+
+Command-specific flags used on another command are refused with exit 2.
 
 ## Files and locking
 

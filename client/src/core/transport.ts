@@ -42,10 +42,10 @@ import { CRYPTO_SUITE, chunkName, isChunkName } from "./crypto.ts";
 /**
  * The protocol version this client speaks. A mismatch is refused, not negotiated.
  *
- * Six adds completed local checkpoints and device delivery state. Upgrade
+ * Seven adds conditional writes to preserve concurrent edits. Upgrade
  * the server and all clients together; there is no older-protocol fallback.
  */
-export const PROTO = 6;
+export const PROTO = 7;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
@@ -223,6 +223,9 @@ export interface BatchEntry {
   readonly names: readonly string[];
   readonly mac: string;
   readonly parent: string;
+  /** Expected current UID; zero (the default) asserts there is no live entry. */
+  readonly base?: number;
+  readonly prevBase?: number;
 }
 
 /** What became of one entry in a batch. */
@@ -259,6 +262,8 @@ function wireEntry(e: BatchEntry): Record<string, unknown> {
     chunks: [...e.names],
     mac: e.mac,
     parent: e.parent,
+    base: e.base ?? 0,
+    prevBase: e.prevBase ?? 0,
   };
 }
 
@@ -1435,7 +1440,7 @@ export class Transport {
      * which every device on the vault would then refuse to act on and
      * nothing here would have said so.
      */
-    auth: { mac: string; parent: string },
+    auth: { mac: string; parent: string; base?: number; prevBase?: number },
     onBytes?: (bytes: number) => void,
   ): Promise<{ uid: number; uploaded: number; bytes: number }> {
     notifyTransfer(onBytes, 0);
@@ -1447,6 +1452,8 @@ export class Transport {
         chunks: [...names],
         mac: auth.mac,
         parent: auth.parent,
+        base: auth.base ?? 0,
+        prevBase: auth.prevBase ?? 0,
       },
       "want or have",
     );

@@ -254,13 +254,31 @@
   .mod-basalt-history .modal-title {
     font-size: var(--font-ui-medium);
     overflow-wrap: anywhere;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
   }
 
   .mod-basalt-history .modal-sidebar.mod-history {
-    flex: 0 1 220px;
+    flex: 0 0 auto;
     width: 100%;
+    max-height: 220px;
     overflow: hidden;
     border-bottom: 1px solid var(--background-modifier-border);
+  }
+
+  .mod-basalt-history .modal-sidebar-inner {
+    display: block;
+    flex: none;
+    height: auto;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .mod-basalt-history .modal-sidebar-list {
+    display: block;
+    flex: none;
+    overflow: visible;
   }
 
   .mod-basalt-history .basalt-history-heading {
@@ -443,4 +461,121 @@
   .status-bar-item.plugin-basalt-sync.basalt-working .basalt-status-icon {
     animation: none;
   }
+}
+
+/* Native buttons keep history usable with a keyboard and screen reader. */
+.mod-basalt-history button.modal-sidebar-list-item {
+  width: 100%;
+  height: auto;
+  min-height: 44px;
+  text-align: start;
+  align-items: stretch;
+  white-space: normal;
+  box-shadow: none;
+  border: 0;
+  background: transparent;
+}
+.mod-basalt-history button.modal-sidebar-list-item.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.mod-basalt-history button.modal-sidebar-list-item:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+
+.mod-basalt-activity .setting-item,
+.mod-basalt-conflicts .setting-item {
+  gap: var(--size-4-3);
+}
+.mod-basalt-activity .setting-item-info,
+.mod-basalt-conflicts .setting-item-info {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.basalt-activity-list {
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.basalt-conflict-preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 35vh;
+  overflow: auto;
+  font-size: var(--font-ui-small);
+}
+.basalt-conflict-editor {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+}
+.is-mobile .mod-basalt-activity .setting-item,
+.is-mobile .mod-basalt-conflicts .setting-item {
+  flex-wrap: wrap;
+}
+.is-mobile .mod-basalt-activity .setting-item-control,
+.is-mobile .mod-basalt-conflicts .setting-item-control {
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+}
+.is-mobile .mod-basalt-conflicts button,
+.is-mobile .mod-basalt-activity button {
+  min-height: 44px;
+}
+
+.is-mobile .mod-basalt-conflicts .setting-item:not(.basalt-conflict-actions) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+.is-mobile .mod-basalt-conflicts .setting-item:not(.basalt-conflict-actions) .setting-item-control {
+  width: auto;
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+.is-mobile .mod-basalt-conflicts .setting-item:not(.basalt-conflict-actions) button {
+  width: auto;
+}
+
+.is-mobile .mod-basalt-activity .basalt-activity-list .setting-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  padding: var(--size-4-3) 0;
+}
+.is-mobile .mod-basalt-activity .basalt-activity-list .setting-item-control {
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+.is-mobile .mod-basalt-activity .basalt-activity-list .setting-item-info {
+  margin-inline-end: 0;
+  align-self: center;
+}
+.is-mobile .mod-basalt-activity .clickable-icon {
+  min-width: 44px;
+  min-height: 44px;
+}
+.is-mobile .mod-basalt-activity .basalt-activity-filter .setting-item-control,
+.is-mobile .mod-basalt-activity .search-input-container,
+.is-mobile .mod-basalt-activity .search-input-container input {
+  width: 100%;
+}
+
+.mod-basalt-conflicts details > summary,
+.mod-basalt-preview details > summary {
+  cursor: pointer;
+  min-height: 44px;
+  align-content: center;
+}
+.mod-basalt-preview .setting-item-info {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.is-mobile .mod-basalt-preview button {
+  min-height: 44px;
 }

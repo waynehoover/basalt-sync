@@ -228,13 +228,13 @@ async function load(saved: unknown = null): Promise<Testable> {
   return plugin;
 }
 
-/** Opens the panel the way a person does, through the ribbon icon. */
+/** Opens the panel the way a person does, through the settings command. */
 function openPanel(plugin: Testable): void {
   const ribbon = plugin.ribbonIcons[0];
   if (!ribbon) throw new Error("the plugin drew no ribbon icon");
   built.length = 0;
   modals.length = 0;
-  ribbon.callback();
+  plugin.commands.find((command) => command.id === "show-status")!.callback!();
 }
 
 /**

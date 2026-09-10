@@ -95,6 +95,7 @@ type Server = TestServer;
 class Client {
   readonly batches: Batch[] = [];
   readonly entries = new Map<number, Batch["entries"][number]>();
+  readonly heads = new Map<string, number>();
   caughtUpAt: number | undefined;
   transport!: Transport;
 
@@ -107,7 +108,10 @@ class Client {
     this.transport = new Transport(server.wsUrl, {
       onBatch: (b) => {
         this.batches.push(b);
-        for (const e of b.entries) this.entries.set(e.uid, e);
+        for (const e of b.entries) {
+          this.entries.set(e.uid, e);
+          this.heads.set(e.path, e.uid);
+        }
       },
       onCaughtUp: (c) => {
         this.caughtUpAt = c;
@@ -150,8 +154,9 @@ class Client {
       meta,
       names,
       async (n) => sealed.find((c) => c.name === n)!.bytes,
-      { mac, parent },
+      { mac, parent, base: this.heads.get(sealedPath) ?? 0 },
     );
+    this.heads.set(sealedPath, result.uid);
     return { ...result, chunks: names, plaintext: data };
   }
 
@@ -174,6 +179,7 @@ class Client {
       const parent = await parentOf("");
       entries.push({
         path,
+        base: this.heads.get(path) ?? 0,
         meta,
         names,
         parent,
@@ -190,6 +196,9 @@ class Client {
       });
     }
     const out = await this.transport.putMany(entries, async (n) => bodies.get(n)!);
+    out.results.forEach((result, i) => {
+      if (!result.error) this.heads.set(entries[i]!.path, result.uid);
+    });
     return { ...out, entries };
   }
 

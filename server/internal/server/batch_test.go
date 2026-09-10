@@ -14,6 +14,10 @@ import (
 
 func (c *client) putMany(entries []wire.PutEntry, bodies map[string]string) wire.Acks {
 	c.t.Helper()
+	entries = append([]wire.PutEntry(nil), entries...)
+	for i := range entries {
+		entries[i].Base = c.head(entries[i].Path)
+	}
 	c.sendJSON(wire.In{Op: "putmany", Entries: entries})
 
 	frame := c.recvRaw()

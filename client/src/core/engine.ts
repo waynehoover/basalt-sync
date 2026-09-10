@@ -1,3 +1,5 @@
+import type { SyncPreview, PreviewAction } from "./preview.ts";
+import type { Activity, ActivityAction } from "./activity.ts";
 /**
  * The engine: everything that decides, and nothing that knows where files live.
  *
@@ -401,6 +403,9 @@ export interface EngineOptions {
   readonly token: string;
   readonly now?: () => number;
   readonly log?: (message: string, ...rest: unknown[]) => void;
+  readonly onActivity?: (activity: Activity) => void;
+  readonly confirmFirstSync?: (preview: SyncPreview) => Promise<boolean>;
+  readonly confirmDeletions?: (preview: SyncPreview) => Promise<boolean>;
   /** The open note gets its own first batch before background text or attachments. */
   readonly activePath?: () => string | undefined;
   /** Path preparation, and undefined before the pass flushes files and saves its index. */
@@ -434,6 +439,8 @@ export interface EngineOptions {
 
 /** Overrides for a single pass. */
 export interface SyncOptions {
+  /** Read every file's contents instead of trusting the saved hash cache. */
+  readonly verifyContents?: boolean;
   /**
    * Whether to hold back a file written moments ago, just for this pass.
    *
@@ -749,7 +756,28 @@ interface Retry {
  * say which name it used to have. Without that the upload is a second note
  * with a name nobody can tell from the first.
  */
-type Remote = RemoteState & { readonly wire?: string };
+type Remote = RemoteState & { readonly wire?: string; readonly heads?: Record<string, number> };
+
+function spellingHeads(
+  prior: Remote | undefined,
+  path: string,
+  wire: string,
+  uid: number,
+): Pick<Remote, "wire" | "heads"> {
+  if (wire === path && !prior?.heads && !prior?.wire) return {};
+  return {
+    ...(wire !== path ? { wire } : {}),
+    heads: { ...prior?.heads, ...(prior ? { [prior.wire ?? path]: prior.uid } : {}), [wire]: uid },
+  };
+}
+
+function pathBase(state: Remote | undefined, path: string, basedOn: number | undefined): number {
+  if (basedOn !== undefined && state && state.uid !== basedOn)
+    throw new ProtocolError("stale", "The path changed while preparing this write.");
+  if (!state?.wire) return basedOn ?? 0;
+  const head = state.heads?.[path];
+  return typeof head === "number" ? head : 0;
+}
 
 export class Engine {
   private readonly entries = new Map<string, IndexEntry>();
@@ -891,6 +919,15 @@ export class Engine {
 
   private log(message: string, ...rest: unknown[]): void {
     this.opts.log?.(message, ...rest);
+  }
+
+  private activity(action: ActivityAction, path: string, copy?: string): void {
+    // Diagnostics must never prevent a completed write from being recorded.
+    try {
+      this.opts.onActivity?.({ at: this.now(), action, path, ...(copy ? { copy } : {}) });
+    } catch {
+      /* optional observer */
+    }
   }
 
   private mergeable(path: string): boolean {
@@ -1189,7 +1226,7 @@ export class Engine {
         // device uses (R10). It is what the next upload of this path names
         // as the path it used to have, so the correction travels as a
         // rename rather than as a second note.
-        ...(wire !== path ? { wire } : {}),
+        ...spellingHeads(staged.get(path) ?? this.remote.get(path), path, wire, e.uid),
       });
 
       if (e.prev) {
@@ -1215,7 +1252,11 @@ export class Engine {
             mtime: e.mtime,
             size: 0,
             hash: "",
+            ...spellingHeads(staged.get(old) ?? this.remote.get(old), old, olds[at]!, e.uid),
           });
+        } else {
+          const state = staged.get(path)!;
+          staged.set(path, { ...state, heads: { ...state.heads, [olds[at]!]: e.uid } });
         }
       }
     }
@@ -1249,17 +1290,133 @@ export class Engine {
       return emptyReport();
     }
     this.syncing = true;
+    this.again = false;
     try {
       let report = await this.pass(opts);
-      while (this.again) {
+      let rounds = 1;
+      while (this.again && rounds < 8 && !this.opts.transport.isClosed) {
         this.again = false;
+        await this.opts.transport.drainReceived();
         const next = await this.pass(opts);
         report = combinePasses(report, next);
+        rounds++;
+      }
+      if (this.again) {
+        report.waiting = Math.max(report.waiting, 1);
+        report.nextUploadAt = this.now();
+        delete report.appliedCursor;
       }
       return report;
     } finally {
       this.syncing = false;
     }
+  }
+
+  /** A content-based estimate. Sync rechecks all decisions before writing. */
+  async preview(stats?: FileStat[]): Promise<SyncPreview> {
+    const remote = new Map(this.remote);
+    const preview: SyncPreview = { cursor: this.cursor, files: [] };
+    const disk = new Map(
+      (stats ?? (await this.opts.vault.list())).map((stat) => [stat.path, stat]),
+    );
+    const moving = new Set(
+      [...this.entries].flatMap(([path, entry]) =>
+        entry.prev && disk.has(path) && !disk.has(entry.prev) ? [entry.prev] : [],
+      ),
+    );
+    for (const path of new Set([...disk.keys(), ...remote.keys(), ...this.entries.keys()])) {
+      if (moving.has(path)) continue;
+      const stat = disk.get(path);
+      const other = remote.get(path);
+      if (stat?.folder || other?.folder || this.entries.get(path)?.folder) continue;
+      const stored = this.entries.get(path);
+      const index = stored ? { ...stored, chunks: [...stored.chunks] } : newEntry(path);
+      let action: PreviewAction;
+      try {
+        if (stat) {
+          observe(index, stat);
+          // A preview is explicitly requested and must not hide a same-stat edit.
+          if (stat.size > this.limitOn("perFileMax")) throw new Error("File too large");
+          await this.rehash(index, path, stat.size);
+        }
+        const local = stat
+          ? { folder: false, mtime: index.mtime, size: index.size, hash: index.hash }
+          : undefined;
+        const kind = decide({ local, remote: other, index, mergeable: this.mergeable(path) }).kind;
+        action =
+          kind === "nothing"
+            ? "unchanged"
+            : kind === "conflict"
+              ? "copy"
+              : kind === "deleteLocal"
+                ? "delete-local"
+                : kind === "deleteRemote"
+                  ? "delete-server"
+                  : kind === "restoreLocal"
+                    ? "download"
+                    : kind === "upload" || kind === "download" || kind === "merge"
+                      ? kind
+                      : "blocked";
+        if (!this.sending && (action === "upload" || action === "delete-server"))
+          action = "held-back";
+        if (this.ignoredPaths.has(path) || this.skipped.has(path) || this.refusedInbound.has(path))
+          action = "blocked";
+      } catch {
+        action = "blocked";
+      }
+      preview.files.push({ path, action });
+    }
+    return preview;
+  }
+
+  private firstSyncConfirmed = false;
+  private readonly approvedDeletions = new Set<string>();
+
+  private async confirmWork(stats: FileStat[]): Promise<void> {
+    const disk = new Map(stats.map((stat) => [stat.path, stat]));
+    const first =
+      !this.firstSyncConfirmed &&
+      this.opts.confirmFirstSync &&
+      ![...this.entries.values()].some((entry) => entry.syncuid > 0) &&
+      stats.some((stat) => !stat.folder) &&
+      [...this.remote.values()].some((entry) => !entry.deleted && !entry.folder);
+    const removedFolders = this.opts.confirmDeletions
+      ? [...new Set([...this.entries.keys(), ...this.remote.keys()])].filter(
+          (path) =>
+            (this.remote.get(path)?.folder && this.remote.get(path)?.deleted && disk.has(path)) ||
+            (this.sending &&
+              this.entries.get(path)?.folder &&
+              !disk.has(path) &&
+              !this.remote.get(path)?.deleted),
+        )
+      : [];
+    if (!first && !removedFolders.length) return;
+    const preview = await this.preview(stats);
+    if (first) {
+      if (!(await this.opts.confirmFirstSync!(preview)))
+        throw new Error("First sync paused for review.");
+      this.firstSyncConfirmed = true;
+    }
+    const deletes = preview.files.filter(
+      (file) => file.action === "delete-local" || file.action === "delete-server",
+    );
+    // Confirm a whole folder's files, not ordinary individual note deletions.
+    if (
+      !removedFolders.some(
+        (folder) => deletes.filter((file) => file.path.startsWith(`${folder}/`)).length > 1,
+      )
+    )
+      return;
+    const key = JSON.stringify(
+      deletes.map((file) => [file.path, file.action, this.remote.get(file.path)?.uid]).sort(),
+    );
+    if (this.approvedDeletions.has(key)) return;
+    if (!(await this.opts.confirmDeletions!(preview)))
+      throw new Error("Folder deletion paused for review.");
+    if (this.cursor !== preview.cursor)
+      throw new Error("Server changes arrived during review. Review the updated deletion plan.");
+    this.approvedDeletions.clear();
+    this.approvedDeletions.add(key);
   }
 
   private async pass(opts: SyncOptions = {}): Promise<SyncReport> {
@@ -1288,14 +1445,27 @@ export class Engine {
       this.inboxBytes = 0;
     }
 
-    // 1. What the filesystem says. The index's cache means an unchanged file
-    //    costs one stat, so a full pass over a large vault is affordable and
-    //    there is no need to track dirtiness separately.
     const stats = await this.opts.vault.list();
+    await this.confirmWork(stats);
+    const dirty = new Set(this.dirty);
+    this.dirty.clear();
     const onDisk = new Map(stats.map((s) => [s.path, s]));
     for (const stat of stats) {
       const entry = this.entryFor(stat.path);
+      if (dirty.has(stat.path) || opts.verifyContents) {
+        entry.hash = "";
+        entry.chunks = [];
+      }
       observe(entry, stat);
+    }
+    const moving = new Set<string>();
+    for (const [to, entry] of this.entries) {
+      if (!entry.prev || entry.folder) continue;
+      const from = canonicalSpelling(entry.prev);
+      if (from === to) continue;
+      if (onDisk.has(from))
+        entry.prev = ""; // a new file now occupies the source
+      else if (this.sending && onDisk.has(to)) moving.add(from);
     }
 
     // Paths that are files, so a path whose parent is one can be spotted
@@ -1361,7 +1531,16 @@ export class Engine {
       .map((path) => ({ path, priority: priority(path) }))
       .sort((a, b) => a.priority - b.priority || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     let previousPriority = 0;
+    let visitedActive = false;
     for (const { path, priority } of ordered) {
+      // Yield background preparation at a file boundary when the open note changes.
+      // The next pass still scans and revalidates paths before publishing anything.
+      if (active && visitedActive && (this.dirty.has(active) || this.pending.has(active))) {
+        this.again = true;
+        break;
+      }
+      if (path === active) visitedActive = true;
+      if (moving.has(path)) continue; // the conditional rename retires its source
       if (previousPriority > 0 && priority > previousPriority) {
         // Publish the current note before background notes, and all notes
         // before attachments. A slow file must not hold an interactive edit
@@ -1558,9 +1737,17 @@ export class Engine {
     return entry;
   }
 
+  private readonly dirty = new Set<string>();
+
+  /** An event invalidates content even when size and timestamps are unchanged. */
+  noteChanged(path: string): void {
+    this.dirty.add(canonicalSpelling(path));
+    if (this.syncing) this.again = true;
+  }
+
   private async reconcile(
     path: string,
-    stat: { folder: boolean; mtime: number; ctime: number; size: number } | undefined,
+    stat: FileStat | undefined,
     report: SyncReport,
     now: number,
     coalesce: boolean,
@@ -1583,7 +1770,7 @@ export class Engine {
     let local: LocalState | undefined;
     let sealed: Scanned | undefined;
     if (stat) {
-      if (!stat.folder && needsRehash(entry, Math.ceil(stat.mtime), stat.size)) {
+      if (!stat.folder && needsRehash(entry, Math.ceil(stat.mtime), stat.size, stat.changeId)) {
         // The only place a file is read for its content, and only when
         // the stat says it moved.
         sealed = await this.rehash(entry, path, stat.size);
@@ -1867,7 +2054,11 @@ export class Engine {
           {
             path,
             size: 0,
-            entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
+            entry: {
+              ...facts,
+              ...(await this.authFor(facts, entry.synchash)),
+              base: remote?.uid ?? 0,
+            },
             bodyOf: noBodies,
             basedOn: remote?.uid,
             commit: (uid) => {
@@ -1887,6 +2078,7 @@ export class Engine {
               this.entries.delete(path);
               report.deletedRemotely++;
               this.log("deleted on the server", path, action.why);
+              this.activity("deleted-server", path);
             },
           },
           report,
@@ -1924,6 +2116,7 @@ export class Engine {
      */
     sealed?: Scanned,
   ): Promise<void> {
+    const base = pathBase(this.remote.get(path), path, basedOn);
     // Here rather than at the decision, because this is the choke point (I29).
     //
     // The first version guarded the `upload` action in the switch above and a
@@ -1971,7 +2164,7 @@ export class Engine {
           path,
           size: 0,
           // A folder has no content and so no lineage.
-          entry: { ...facts, ...(await this.authFor(facts, "")) },
+          entry: { ...facts, ...(await this.authFor(facts, "")), base },
           bodyOf: noBodies,
           basedOn,
           commit: (uid) => {
@@ -2000,13 +2193,15 @@ export class Engine {
     const size = entry.size;
     const mtime = entry.mtime;
 
+    const previous = entry.prev;
+    const prevBase = previous ? (this.entries.get(canonicalSpelling(previous))?.syncuid ?? 0) : 0;
     const facts: PutFacts = {
       path: await this.sealedPath(path),
       meta: {
         size,
         ctime: entry.ctime,
         mtime,
-        ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
+        ...(previous ? { prev: await this.sealedPath(previous) } : {}),
       },
       names: plan.names,
     };
@@ -2017,7 +2212,7 @@ export class Engine {
         size,
         // Built on whatever this device last had in sync, which is what lets
         // a receiver tell a new version from a replayed old one.
-        entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
+        entry: { ...facts, ...(await this.authFor(facts, entry.synchash)), base, prevBase },
         bodyOf: plan.bodyOf,
         basedOn,
         commit: (uid) => {
@@ -2031,9 +2226,22 @@ export class Engine {
             mtime,
             size,
             hash,
+            ...spellingHeads(this.remote.get(path), path, path, uid),
           });
+          if (previous) {
+            const old = canonicalSpelling(previous);
+            if (old !== path && (this.remote.get(old)?.uid ?? 0) <= uid) {
+              this.remote.set(old, { uid, folder: false, deleted: true, mtime, size: 0, hash: "" });
+              this.entries.delete(old);
+              this.pending.delete(old);
+            } else if (old === path) {
+              const state = this.remote.get(path)!;
+              this.remote.set(path, { ...state, heads: { ...state.heads, [previous]: uid } });
+            }
+          }
           if (count) report.uploaded++;
           this.log("uploaded", path);
+          this.activity("uploaded", path);
         },
       },
       report,
@@ -2102,12 +2310,18 @@ export class Engine {
 
   /** The batched-write cap this device keeps to: the server's, or its own if smaller. */
   private get batchCap(): number {
-    return this.limitOn("maxBatchBytes");
+    return Math.min(
+      this.limitOn("maxBatchBytes"),
+      this.opts.activePath?.() ? 2 * 1024 * 1024 : Infinity,
+    );
   }
 
   /** The fetch cap this device keeps to, the same way. */
   private get fetchCap(): number {
-    return this.limitOn("maxFetchBytes");
+    return Math.min(
+      this.limitOn("maxFetchBytes"),
+      this.opts.activePath?.() ? 2 * 1024 * 1024 : Infinity,
+    );
   }
 
   /**
@@ -2162,6 +2376,8 @@ export class Engine {
               {
                 mac: entry.mac,
                 parent: entry.parent,
+                base: entry.base ?? 0,
+                prevBase: entry.prevBase ?? 0,
               },
               onBytes,
             );
@@ -2176,8 +2392,8 @@ export class Engine {
         },
       );
     } catch (err) {
-      // The exchange itself failed, so nothing in it committed. Every path
-      // in the batch is retried, exactly as it would have been alone.
+      // A lost reply can follow a commit. Reconcile before retrying; the
+      // server's conditional write prevents replacing a newer branch.
       for (const q of batch) this.recordFailure(q.path, err, report);
       return;
     }
@@ -2483,8 +2699,10 @@ export class Engine {
         const from = local.get(d);
         const reused = from === undefined ? "ask" : await this.landFromLocal(d, from, report);
         if (reused === "landed") {
-          if (d.kind === "download") report.downloaded++;
-          else report.restored++;
+          if (d.kind === "download") {
+            report.downloaded++;
+            this.activity("downloaded", d.path);
+          } else report.restored++;
           this.log(d.kind, d.path, `${d.why}, from ${from} without asking`);
           continue;
         }
@@ -2504,8 +2722,10 @@ export class Engine {
         // about: the incoming version is on this disk either way, but under
         // a different name and with the local file untouched.
         if (!wrote) continue;
-        if (d.kind === "download") report.downloaded++;
-        else report.restored++;
+        if (d.kind === "download") {
+          report.downloaded++;
+          this.activity("downloaded", d.path);
+        } else report.restored++;
         this.log(d.kind, d.path, d.why);
       } catch (err) {
         this.recordFailure(d.path, err, report);
@@ -2693,6 +2913,7 @@ export class Engine {
             keptAt,
           });
           this.landed(keptAt);
+          this.activity("conflict", path, keptAt);
           report.conflicted++;
           this.entries.delete(path);
           continue;
@@ -2700,6 +2921,7 @@ export class Engine {
         this.entries.delete(path);
         report.deletedLocally++;
         this.log("deleted locally", path, why);
+        this.activity("deleted-local", path);
       } catch (err) {
         this.recordFailure(path, err, report);
       }
@@ -2970,6 +3192,7 @@ export class Engine {
         keptAt: out.keptAt,
       });
       this.landed(out.keptAt);
+      this.activity("conflict", path, out.keptAt);
       report.conflicted++;
     }
     if (!out.landed) {
@@ -2986,6 +3209,7 @@ export class Engine {
       const beside = await placeBeside(() => this.freeConflictPath(path), content, times, vault);
       this.landed(beside);
       this.log("kept the incoming version beside", path, { at: beside });
+      this.activity("conflict", path, beside);
       if (out.keptAt === undefined) report.conflicted++;
     }
     return out.keptAt !== undefined || !out.landed;
@@ -3324,7 +3548,7 @@ export class Engine {
     };
     const theirsBytes = await this.contentOf(remote.uid, remote.hash, remote.size);
 
-    const dec = new TextDecoder("utf-8", { fatal: true });
+    const dec = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     let base: string;
     let mine: string;
     let theirs: string;
@@ -3379,7 +3603,7 @@ export class Engine {
       if (
         await this.writePreserving(
           path,
-          { contentId: await plainDigest(new TextEncoder().encode(mine)), idOf: plainDigest },
+          { contentId: await plainDigest(mineBytes), idOf: plainDigest },
           new TextEncoder().encode(text),
           { mtime: this.now(), ctime: entry.ctime },
           report,
@@ -3390,8 +3614,10 @@ export class Engine {
         return;
       }
     }
-    // Uploaded whatever the outcome, because even "take theirs" has to be
-    // acknowledged for this path before the ancestor can move.
+    // The local result now incorporates this remote version. Retain that
+    // ancestor even if another writer wins the upload, so the next merge
+    // does not treat the same already-incorporated edit as a new conflict.
+    reconciled(entry, remote.hash, remote.uid, this.now());
     observe(entry, { folder: false, mtime: this.now(), ctime: entry.ctime, size: text.length });
     await this.upload(path, entry, report, remote.uid);
     // Counted here, where the merge happened, and not where the put commits.
@@ -3403,6 +3629,7 @@ export class Engine {
     // flush for a counter.
     report.merged++;
     this.log("merged", path, outcome.kind === "merged" ? "three-way" : outcome.why);
+    this.activity("merged", path);
   }
 
   /**
@@ -3478,6 +3705,7 @@ export class Engine {
     // both copies are on this disk whatever the flush then does.
     report.conflicted++;
     this.log("kept both", path, { copy: copyPath, why });
+    this.activity("conflict", path, copyPath);
   }
 
   private async sealedPath(path: string): Promise<string> {
@@ -3497,6 +3725,17 @@ export class Engine {
   private recordFailure(path: string, err: unknown, report: SyncReport): void {
     const message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: string })?.code;
+    if (code === "stale") {
+      // A changed source must survive under its original name. Retrying as
+      // a copy lets ordinary reconciliation preserve it and the moved draft.
+      const entry = this.entries.get(path);
+      if (entry?.prev && canonicalSpelling(entry.prev) !== path) entry.prev = "";
+      this.retries.delete(path);
+      report.waiting++;
+      this.again = true;
+      this.log("another device wrote first, reconciling next pass", path);
+      return;
+    }
     // Not a failure at all: this device was told not to sync under that name
     // and did not (R2). Remembered so no later pass fetches it again, counted
     // so it stays visible, and out of the exit code.
@@ -3523,6 +3762,7 @@ export class Engine {
       });
       noteSkipped(report, path);
       this.log("skipped for good", path, message);
+      this.activity("error", path);
       return;
     }
 
@@ -3533,6 +3773,7 @@ export class Engine {
     this.retries.set(path, retry);
     noteRetrying(report, path);
     this.log("will retry", path, { attempt: retry.count, error: message });
+    this.activity("error", path);
   }
 
   /**
@@ -3685,19 +3926,8 @@ export class Engine {
     renamed(moved, from, to);
     this.entries.set(to, moved);
 
-    // The old path keeps its entry, and that is the whole correction.
-    //
-    // It used to be deleted here, which looked right: the file is not there
-    // any more. But an index with no entry for a path reads as a path this
-    // device has never synced, and the server still holds content at the old
-    // name until it is told otherwise, so `decideMissingLocally` saw
-    // `synchash === ""` and answered "new on the server". Every move in
-    // Obsidian downloaded its own source back, one pass later, and the person
-    // was left with the file in both places.
-    //
-    // Left in place, the next pass sees a path that was synced and is now gone
-    // locally, which is `deleteRemote`, which is what a move's old half is.
-    // The server suppresses it from the deleted list by matching `prev`.
+    // Keep the observed source UID until the conditional rename commits.
+    // If another writer changed it, the source must be reconciled too.
   }
 }
 

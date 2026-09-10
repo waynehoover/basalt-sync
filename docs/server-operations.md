@@ -185,15 +185,20 @@ With the repository's Compose setup, the equivalent maintenance commands reuse
 its image and volume:
 
 ```bash
+sudo install -d -m 700 -o 65532 -g 65532 /srv/basalt-backups
 docker compose stop basalt
-docker compose run --rm --no-deps basalt backup -to /data/before-purge
-docker compose run --rm --no-deps basalt verify -deep -data /data/before-purge
-docker compose run --rm --no-deps basalt purge -confirm default -backup /data/before-purge -grace 0
+docker compose run --rm --no-deps -v /srv/basalt-backups:/backup \
+  basalt backup -to /backup/before-purge
+docker compose run --rm --no-deps -v /srv/basalt-backups:/backup \
+  basalt verify -deep -data /backup/before-purge
+docker compose run --rm --no-deps -v /srv/basalt-backups:/backup \
+  basalt purge -confirm default -backup /backup/before-purge -grace 0
 docker compose start basalt
 ```
 
-Copy that backup off the server as well. These Compose commands are for the
-included Compose installation, not a separately created `docker run` volume.
+Use a fresh backup name and stop on any error. The backup must be outside
+`/data`; a path such as `/data/before-purge` is refused. Copy it off the server
+as well. These commands use the included Compose installation's data volume.
 
 Purge refuses a running server, a mismatched confirmation, or a backup that does
 not meet its checks. The default one-hour grace period retains recent

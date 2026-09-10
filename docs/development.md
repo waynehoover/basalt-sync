@@ -16,6 +16,7 @@ use, start with the [server](server.md), [plugin](plugin.md), or
 | [Engineering notes](research.md) | Historical measurements, design evaluations, and credits. |
 | [Findings index](findings.md) | Definitions of review IDs cited in code. |
 | [Documentation review](documentation-review.md) | Editorial changes and guidance for future docs. |
+| [0.7.1 review](reviews/0.7.1.md) | Concurrency, CLI, plugin, and UX review with reproductions and implementation follow-up. |
 
 ## Repository layout
 
@@ -118,6 +119,8 @@ and pairing details in both themes. It writes `docs/assets/screenshots/`, then
 removes its temporary preview plugin and restores the window and appearance.
 It never connects to a server. Review the images before committing them.
 Use `--scene invite --theme dark` to recapture one view; `--help` lists the scenes.
+For release captures, pass `--server-version VERSION` with the matching server
+version. Source previews otherwise label the server `dev`.
 The `uploading` and `downloading` scenes show transfer activity, including in
 phone previews.
 Keep the test vault open until cleanup finishes.
@@ -198,3 +201,13 @@ gh attestation verify main.js --repo waynehoover/basalt-sync
 
 An attestation identifies the build source. It is not a security audit or proof
 that the application is defect-free.
+
+The current source uses protocol 7. Build the server and clients together for
+local testing; release 0.8.0 uses protocol 7 and 0.7.x uses protocol 6. No compatibility
+fallback is provided. Tests exercise preserved bytes across concurrent writers,
+not just final agreement.
+
+The screenshot script includes activity, conflict comparison, first-sync
+preview, and attachment history scenes. Use a disposable Obsidian vault and
+`--output /tmp/basalt-captures` for review images. Phone CSS previews are not
+native Android acceptance.

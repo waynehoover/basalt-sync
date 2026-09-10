@@ -530,7 +530,7 @@ func TestDeletionsAndFoldersCommitWithNoUpload(t *testing.T) {
 	cl.put("note.md", "content")
 	cl.nextBatch() // own echo
 
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Mac: testMac, Meta: wire.PutMeta{Deleted: true, MTime: 9}})
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Base: cl.head("note.md"), Mac: testMac, Meta: wire.PutMeta{Deleted: true, MTime: 9}})
 	var have wire.Have
 	cl.recvInto("have", &have)
 

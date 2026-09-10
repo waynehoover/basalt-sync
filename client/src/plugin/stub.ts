@@ -35,6 +35,33 @@ export class FakeEl {
   readonly children: FakeEl[] = [];
   text = "";
   disabled = false;
+  value = "";
+  static activeElement: FakeEl | undefined;
+  get ownerDocument() {
+    return { activeElement: FakeEl.activeElement };
+  }
+  focus(): void {
+    FakeEl.activeElement = this;
+  }
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+  getBoundingClientRect() {
+    return { left: 0, top: 0 };
+  }
+  querySelectorAll(selector: string): FakeEl[] {
+    const match = (el: FakeEl) =>
+      selector.startsWith("[data-version=")
+        ? el.attributes.get("data-version") === /"(.*)"/.exec(selector)?.[1]
+        : el.tag === selector;
+    return this.children.flatMap((child) => [
+      ...(match(child) ? [child] : []),
+      ...child.querySelectorAll(selector),
+    ]);
+  }
+  querySelector(selector: string): FakeEl | undefined {
+    return this.querySelectorAll(selector)[0];
+  }
 
   constructor(
     readonly tag: string,
@@ -89,16 +116,16 @@ export class FakeEl {
    * plugin drew. A modal whose buttons cannot be pressed is a modal whose
    * behaviour is untested no matter how much of its markup is asserted on.
    */
-  private readonly listeners = new Map<string, (() => void)[]>();
+  private readonly listeners = new Map<string, ((event?: unknown) => void)[]>();
 
-  addEventListener(event: string, handler: () => void): void {
+  addEventListener(event: string, handler: (event?: unknown) => void): void {
     const list = this.listeners.get(event) ?? [];
     list.push(handler);
     this.listeners.set(event, list);
   }
 
-  fire(event: string): void {
-    for (const h of this.listeners.get(event) ?? []) h();
+  fire(event: string, value?: unknown): void {
+    for (const h of this.listeners.get(event) ?? []) h(value);
   }
 
   addClass(...classes: string[]): void {
@@ -175,6 +202,12 @@ export class FakeVault {
   /** What the plugin reads instead of asking the adapter about every file. */
   getAllLoadedFiles() {
     return this.adapter.index();
+  }
+  getFiles() {
+    return this.getAllLoadedFiles().filter((file) => "extension" in file);
+  }
+  getFileByPath(path: string) {
+    return this.getFiles().find((file) => file.path === path) ?? null;
   }
   getAbstractFileByPath(path: string) {
     return this.getAllLoadedFiles().find((file) => file.path === normalizePath(path)) ?? null;
@@ -375,6 +408,10 @@ export class Plugin extends Component {
     this.cliHandlers.set(command, { description, handler });
   }
 
+  registerDomEvent(el: FakeEl, event: string, handler: (event?: unknown) => void): void {
+    el.addEventListener(event, handler);
+  }
+
   registerEvent(ref: unknown): void {
     this.registeredEvents.push(ref);
   }
@@ -496,6 +533,10 @@ export class DropdownComponent {
   private value = "";
   private change: ((value: string) => unknown) | undefined;
 
+  addOptions(options: Record<string, string>): this {
+    for (const [value, label] of Object.entries(options)) this.addOption(value, label);
+    return this;
+  }
   addOption(value: string, label: string): this {
     this.options.set(value, label);
     return this;
@@ -526,6 +567,12 @@ export class ButtonComponent {
   warning = false;
   private onClickHandler: (() => unknown) | undefined;
 
+  setIcon(_icon: string): this {
+    return this;
+  }
+  setTooltip(_tip: string): this {
+    return this;
+  }
   setButtonText(name: string): this {
     this.label = name;
     return this;
@@ -615,6 +662,12 @@ export class Setting {
     return this;
   }
 
+  addSearch(cb: (component: TextComponent) => unknown): this {
+    return this.addText(cb);
+  }
+  addExtraButton(cb: (component: ButtonComponent) => unknown): this {
+    return this.addButton(cb);
+  }
   addText(cb: (component: TextComponent) => unknown): this {
     const component = new TextComponent();
     this.texts.push(component);
@@ -654,4 +707,28 @@ export function resetStub(): void {
   notices.length = 0;
   built.length = 0;
   modals.length = 0;
+}
+
+export class MenuItem extends ButtonComponent {
+  setTitle(title: string): this {
+    return this.setButtonText(title);
+  }
+}
+export class Menu {
+  static latest: Menu | undefined;
+  items: MenuItem[] = [];
+  constructor() {
+    Menu.latest = this;
+  }
+  addItem(build: (item: MenuItem) => unknown): this {
+    const item = new MenuItem();
+    build(item);
+    this.items.push(item);
+    return this;
+  }
+  addSeparator(): this {
+    return this;
+  }
+  showAtMouseEvent(_event: unknown): void {}
+  showAtPosition(_position: unknown): void {}
 }

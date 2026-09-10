@@ -494,7 +494,7 @@ describe("two devices", () => {
 });
 
 describe("concurrent edits, which is where notes get lost", () => {
-  it("keeps both edits when an upload ack overtakes metadata verification", async () => {
+  it("keeps both edits when a stale refusal overtakes metadata verification", async () => {
     await fresh();
     const a = await device("a");
     const b = await device("b");
@@ -523,11 +523,26 @@ describe("concurrent edits, which is where notes get lost", () => {
     try {
       await b.engine.sync();
       await until("a to start verifying b's edit", () => entered);
-      const before = b.batchesWithEntries;
+      let refused = false;
+      let draining = false;
+      const drain = a.transport.drainReceived.bind(a.transport);
+      a.transport.drainReceived = async () => {
+        draining = true;
+        await drain();
+      };
+      const putMany = a.transport.putMany.bind(a.transport);
+      a.transport.putMany = async (...args) => {
+        const reply = await putMany(...args);
+        refused ||= reply.results.some((result) => result.error?.code === "stale");
+        return reply;
+      };
       pass = a.engine.sync();
-      await until("a's edit to commit", () => b.batchesWithEntries > before);
-      // The pong follows the upload ack while metadata verification stays gated.
+      await until("a's reply to reach the metadata barrier", () => draining);
+      // The pong follows the refusal while metadata verification stays gated.
       await a.transport.ping();
+      release();
+      await pass;
+      expect(refused).toBe(true);
     } finally {
       release();
       await pass;

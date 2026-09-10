@@ -194,7 +194,7 @@ describe("pairing a vault", () => {
     expect(noHash.stderr).toMatch(/host:3003#TOKEN/);
 
     const both = await cli("init", server.setup, "--server", server.wsUrl, "--dir", a);
-    expect(both.code).toBe(1);
+    expect(both.code).toBe(2);
     expect(both.stderr).toMatch(/not both/);
   });
 
@@ -791,7 +791,7 @@ describe("saying no clearly", () => {
   it("refuses init without somewhere to init against", async () => {
     const dir = await vaultDir("noserver");
     const r = await cli("init", "--dir", dir);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(2);
     expect(r.all).toMatch(/host:3003#TOKEN/);
   });
 
@@ -1416,7 +1416,7 @@ describe("the device list", () => {
     // With it and no key: refused before anything is sent, with the whole
     // command to run rather than a hint.
     const bare = await cli("revoke", only, "--dir", a, "--allow-last");
-    expect(bare.code).toBe(1);
+    expect(bare.code).toBe(2);
     expect(bare.all).toMatch(/--allow-last --recovery-key/);
     // Still there, and still syncing.
     expect((await cli("sync", "--dir", a)).code, (await cli("sync", "--dir", a)).all).toBe(0);
@@ -1547,9 +1547,8 @@ describe("the device list", () => {
     await fresh();
     const { dir: a, recoveryKey } = await startedWithKey();
     const refused = await cli("sync", "--dir", a, "--recovery-key", recoveryKey);
-    // 1 rather than 2, the same as the refusal of a stray positional: the
-    // argument parsed, and it is the command that will not take it.
-    expect(refused.code).toBe(1);
+    // An ineffective option is a usage error, just like a stray positional.
+    expect(refused.code).toBe(2);
     expect(refused.all).toMatch(/does not take --recovery-key/);
     expect(refused.all).toMatch(/basalt rotate takes the key as its argument/);
   }, 60_000);
@@ -1651,7 +1650,7 @@ describe("rotating the secret (I5)", () => {
     await fresh();
     const { dir: a } = await startedWithKey();
     const bare = await cli("rotate", "--dir", a);
-    expect(bare.code).toBe(1);
+    expect(bare.code).toBe(2);
     expect(bare.all).toMatch(/needs the vault's current recovery key/);
   }, 60_000);
 
@@ -2050,7 +2049,7 @@ describe("an argument the command does not take", () => {
   it("is refused, rather than ignored", async () => {
     const dir = await vaultDir("a");
     const r = await cli("sync", "/somewhere/else", "--dir", dir);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(2);
     expect(r.all).toMatch(/takes no arguments/);
     // And says how the vault is actually chosen, because that is the mistake.
     expect(r.all).toMatch(/--dir/);
@@ -2059,7 +2058,7 @@ describe("an argument the command does not take", () => {
   it("is refused past the one a command does take", async () => {
     const dir = await vaultDir("a");
     const r = await cli("restore", "note.md", "also-note.md", "--dir", dir);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(2);
     expect(r.all).toMatch(/takes one argument/);
   });
 
