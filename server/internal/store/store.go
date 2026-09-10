@@ -970,7 +970,7 @@ const DeletedMax = 1000
 
 // Deletion is a deleted path, and whether anything survives to restore it from.
 //
-// The two are separate facts and used to be conflated. Purge keeps only the
+// The two are separate facts and used to be conflated. Purge keeps the
 // newest version per path, which for a deleted note is the deletion record, so
 // after a purge the note is still listed and its content is gone. A client
 // saying "all still recoverable" over that list, which one did, is telling
@@ -992,10 +992,12 @@ type Deletion struct {
 //
 // # Recognising the tail of a rename
 //
-// A rename is two entries: the new path carrying prev, and the old path
-// retired. The test for "this deletion is a rename" cannot be "some later entry
-// names this path as its prev", because a client does the two halves in
-// whichever order its scan reaches them, and the natural order is to publish
+// Older history represents a rename with two entries: the new path carrying
+// prev, and an explicit deletion at the old path. Current writers retire the
+// source through prev alone. For those older deletion records, the test for
+// "this deletion is a rename" cannot be "some later entry names this path as
+// its prev", because older clients did the two halves in whichever order
+// their scans reached them, and the natural order was to publish
 // the new path first. That version of this query suppressed one order and not
 // the other, and the only test it had used the order clients do not produce.
 //
@@ -1317,7 +1319,7 @@ type Stats struct {
 	Folders int64
 	Deleted int64 // paths whose newest version is a deletion
 	// Recoverable is how many of those still have a version with content
-	// behind them. Purge keeps only the newest version per path, and for a
+	// behind them. Purge keeps the newest version per path, and for a
 	// deleted note that is the deletion record, so a purge can leave a path
 	// deleted and unrecoverable. Reporting only Deleted said "still
 	// recoverable" over those, which is rule 7: the two are separate facts.
@@ -1355,7 +1357,7 @@ func (s *Store) Stats(vaultID string) (Stats, error) {
 		 FROM entries e
 		 JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
 		   ON e.path = latest.path AND e.uid = latest.uid
-		 WHERE e.vault_id = ?`, vaultID, vaultID)
+		 WHERE e.vault_id = ? AND `+notRetiredByRename, vaultID, vaultID)
 	if err := row.Scan(&st.Files, &st.Folders, &st.Deleted, &st.Recoverable, &st.Bytes); err != nil {
 		return st, err
 	}
@@ -1412,7 +1414,7 @@ func (s *Store) FilesOver(vaultID string, limit int64) ([]Oversize, error) {
 		   FROM entries e
 		   JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
 		     ON e.path = latest.path AND e.uid = latest.uid
-		  WHERE e.vault_id = ? AND e.deleted = 0 AND e.folder = 0 AND e.size > ?
+		  WHERE e.vault_id = ? AND `+notRetiredByRename+` AND e.deleted = 0 AND e.folder = 0 AND e.size > ?
 		  ORDER BY e.size DESC, e.uid ASC`, vaultID, vaultID, limit)
 	if err != nil {
 		return nil, err
@@ -1493,7 +1495,7 @@ type PurgeReport struct {
 	SweepComplete bool
 }
 
-// Purge drops version history, keeping only the newest entry per path, then
+// Purge drops version history, keeping current paths and source retirements, then
 // deletes chunk bodies that no surviving entry references and that are older
 // than grace.
 //
@@ -1536,11 +1538,32 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 			return err
 		}
 
+		// Capture the required UIDs before deleting. Counting distinct paths
+		// afterward cannot detect a lost retirement record, or a whole path
+		// removed by a faulty delete predicate.
+		rows, err := tx.Query(purgeSurvivorUIDs, vaultID, vaultID)
+		if err != nil {
+			return err
+		}
+		required := map[int64]struct{}{}
+		for rows.Next() {
+			var uid int64
+			if err := rows.Scan(&uid); err != nil {
+				rows.Close()
+				return err
+			}
+			required[uid] = struct{}{}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
 		res, err := tx.Exec(
 			`DELETE FROM entries
 			  WHERE vault_id = ?
-			    AND uid NOT IN (SELECT MAX(uid) FROM entries WHERE vault_id = ? GROUP BY path)`,
-			vaultID, vaultID)
+			    AND uid NOT IN (`+purgeSurvivorUIDs+`)`,
+			vaultID, vaultID, vaultID)
 		if err != nil {
 			return err
 		}
@@ -1556,18 +1579,28 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 			`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&rep.VersionsAfter); err != nil {
 			return err
 		}
-		// The purge keeps one version per path, so what remains must equal the
-		// number of distinct paths. Checking it inside the transaction means a
-		// future change to the delete predicate that removes a live entry rolls
-		// back here instead of being discovered as a missing note.
-		var paths int64
-		if err := tx.QueryRow(
-			`SELECT COUNT(DISTINCT path) FROM entries WHERE vault_id = ?`, vaultID).Scan(&paths); err != nil {
+		if rep.VersionsAfter != int64(len(required)) {
+			return fmt.Errorf("purge left %d versions, want %d required entries in vault %q",
+				rep.VersionsAfter, len(required), vaultID)
+		}
+		rows, err = tx.Query(`SELECT uid FROM entries WHERE vault_id = ?`, vaultID)
+		if err != nil {
 			return err
 		}
-		if rep.VersionsAfter != paths {
-			return fmt.Errorf("purge left %d versions for %d paths in vault %q",
-				rep.VersionsAfter, paths, vaultID)
+		for rows.Next() {
+			var uid int64
+			if err := rows.Scan(&uid); err != nil {
+				rows.Close()
+				return err
+			}
+			if _, ok := required[uid]; !ok {
+				rows.Close()
+				return fmt.Errorf("purge retained unexpected UID %d in vault %q", uid, vaultID)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
 		}
 		if rep.VersionsBefore-rep.VersionsRemoved != rep.VersionsAfter {
 			return fmt.Errorf("purge arithmetic: %d - %d != %d",
@@ -1650,8 +1683,8 @@ func (s *Store) inTx(fn func(*sql.Tx) error) error {
 // command that destroys something no device holds, and it stays a deliberate
 // ceremony on a stopped server.
 type Reclaimable struct {
-	// Versions is the history a purge would drop: every entry beyond the
-	// newest of each path. Exact, and free, because it is two counts.
+	// Versions is the history a purge would drop after retaining current
+	// paths and the rename records that still retire their sources.
 	Versions int64
 	// Bodies and Bytes are the chunk bodies that no surviving version
 	// references and that are older than the grace window, which is what a
@@ -1684,22 +1717,17 @@ type Reclaimable struct {
 // TestReclaimablePredictsExactlyWhatAPurgeThenFrees.
 func (s *Store) Reclaimable(vaultID string, grace time.Duration) (Reclaimable, error) {
 	var r Reclaimable
-	var total, paths int64
 	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&total); err != nil {
+		`SELECT COUNT(*) FROM entries WHERE vault_id = ? AND uid NOT IN (`+purgeSurvivorUIDs+`)`,
+		vaultID, vaultID, vaultID).Scan(&r.Versions); err != nil {
 		return r, err
 	}
-	if err := s.db.QueryRow(
-		`SELECT COUNT(DISTINCT path) FROM entries WHERE vault_id = ?`, vaultID).Scan(&paths); err != nil {
-		return r, err
-	}
-	r.Versions = total - paths
 
 	rows, err := s.db.Query(
 		`SELECT DISTINCT name FROM entry_chunks
 		  WHERE vault_id = ?
-		    AND uid IN (SELECT MAX(uid) FROM entries WHERE vault_id = ? GROUP BY path)`,
-		vaultID, vaultID)
+		    AND uid IN (`+purgeSurvivorUIDs+`)`,
+		vaultID, vaultID, vaultID)
 	if err != nil {
 		return r, err
 	}

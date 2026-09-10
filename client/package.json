@@ -1,6 +1,6 @@
 {
   "name": "basalt-sync",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Fast, secure, self-hosted sync for Obsidian. Simple setup.",
   "keywords": [
     "obsidian",

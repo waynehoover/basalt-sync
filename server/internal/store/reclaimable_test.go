@@ -17,9 +17,10 @@ import (
 // Reclaimable exists so `stats` and the startup line can say what a purge
 // would give back, and the only way that figure is worth anything is if it is
 // the same figure the purge then reports. The two are computed by different
-// SQL: Purge deletes every entry that is not MAX(uid) per path and sweeps what
-// the survivors no longer reference; Reclaimable asks the inverse question of
-// the same subquery and walks without deleting. Two predicates that must agree
+// SQL: Purge deletes entries outside the required path and source-retirement
+// heads and sweeps what the survivors no longer reference; Reclaimable asks
+// the inverse question of the same subquery and walks without deleting.
+// Two predicates that must agree
 // forever is exactly the kind of pair that drifts, and a preview promising
 // space a purge does not free is worse than no preview, because somebody stops
 // the server for it.

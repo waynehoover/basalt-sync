@@ -184,6 +184,7 @@ run "typecheck" client bun run typecheck
 run "test" client bun run test
 run "compression golden, under bun" client bun run src/core/compression-golden.run.ts
 run "build" client bun run build
+run "gallery screenshots contain PNG images" "" node "$root/scripts/check-screenshots.mjs"
 run "the packed CLI installs and runs under node" "" \
   bash "$root/scripts/pack-check.sh"
 

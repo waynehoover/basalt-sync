@@ -366,9 +366,17 @@ export default class Screenshots extends Plugin {
       };
       crop.width = Math.min(crop.width, bounds.width - crop.x);
       crop.height = Math.min(crop.height, bounds.height - crop.y);
+      if (crop.width <= 0 || crop.height <= 0)
+        throw new Error("Screenshot target is outside the window");
       const picture = await window.webContents.capturePage(crop);
-      fs.writeFileSync(path, picture.toPNG());
+      const png = picture.toPNG();
+      if (picture.isEmpty() || png.length === 0)
+        throw new Error("Obsidian returned an empty screenshot; keep the test window visible");
       if (device === "phone") this.checkPhoneLayout();
+      // The runner treats this path's existence as completion. Expose it only
+      // after layout checks and the entire PNG have finished successfully.
+      fs.writeFileSync(path + ".tmp", png);
+      fs.renameSync(path + ".tmp", path);
     } catch (err) {
       fs.writeFileSync(path + ".error", String(err.stack ?? err));
     }

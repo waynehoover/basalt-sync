@@ -193,6 +193,12 @@ runbook. `scripts/release.sh --runbook` prints instructions without building or
 publishing. The workflows build and check release assets; verify the published
 files with [scripts/verify-release.sh](../scripts/verify-release.sh).
 
+Every GitHub release must include a short user-facing changelog: what is new
+or fixed since that component's previous release, upgrade steps, and known
+issues. Include CLI changes in the plugin notes when they ship together.
+Publish the notes with `--notes-file` and read the release body back to verify
+it. GitHub is the home for changelogs; do not duplicate them in repository docs.
+
 To check an asset's build provenance:
 
 ```bash

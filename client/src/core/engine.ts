@@ -1532,14 +1532,27 @@ export class Engine {
       .sort((a, b) => a.priority - b.priority || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     let previousPriority = 0;
     let visitedActive = false;
+    let activeRemoteUid: number | undefined;
     for (const { path, priority } of ordered) {
       // Yield background preparation at a file boundary when the open note changes.
-      // The next pass still scans and revalidates paths before publishing anything.
-      if (active && visitedActive && (this.dirty.has(active) || this.pending.has(active))) {
+      // Already pending work may be refused or backing off; only a new revision
+      // should interrupt unrelated files. Keep the refusal visible in pending.
+      const latestActiveUid = active ? this.remote.get(active)?.uid : undefined;
+      if (
+        active &&
+        visitedActive &&
+        (this.dirty.has(active) ||
+          (latestActiveUid !== undefined &&
+            latestActiveUid !== activeRemoteUid &&
+            latestActiveUid > (this.entries.get(active)?.syncuid ?? 0)))
+      ) {
         this.again = true;
         break;
       }
-      if (path === active) visitedActive = true;
+      if (path === active) {
+        visitedActive = true;
+        activeRemoteUid = this.remote.get(path)?.uid;
+      }
       if (moving.has(path)) continue; // the conditional rename retires its source
       if (previousPriority > 0 && priority > previousPriority) {
         // Publish the current note before background notes, and all notes

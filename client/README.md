@@ -185,4 +185,4 @@ verify that it is stopped. Shared network vaults remain unsupported.
 Add `--json` for file actions and counts. Run `basalt sync --verify --dir ~/vault`
 to re-read every file when an external edit may have preserved its timestamps.
 History supports `--before UID` for older pages; see the
-[CLI reference](../docs/cli-reference.md).
+[CLI reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md).

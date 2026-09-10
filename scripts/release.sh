@@ -296,6 +296,7 @@ if [ -n "$serverversion" ]; then
   serverblock=$(cat <<'BLOCK'
   git tag -a server/v@SERVER@ -m "basaltd @SERVER@" && git push origin server/v@SERVER@
   gh release create server/v@SERVER@ --draft --title "basaltd @SERVER@" \
+    --notes-file /tmp/basalt-server-@SERVER@-notes.md \
     release/server/*
 
 A draft here too, and finished the same way:
@@ -331,11 +332,18 @@ fi
 template=$(mktemp); trap 'rm -f "$template"' EXIT
 cat > "$template" <<'RUNBOOK'
 
+Before publishing, draft user-facing notes in /tmp/basalt-plugin-@PLUGIN@-notes.md
+and, when shipping a server, /tmp/basalt-server-X.Y.Z-notes.md with its version.
+Summarize additions, fixes, upgrade steps and known issues since the previous
+component release. Include CLI changes in the plugin notes when they ship
+together. Publish the notes on GitHub; do not commit duplicate changelog docs.
+
 To publish the plugin, tagged bare because the community directory requires the
 tag to be exactly the manifest version:
 
   git tag -a @PLUGIN@ -m "Basalt Sync @PLUGIN@" && git push origin @PLUGIN@
   gh release create @PLUGIN@ --draft --title "Basalt Sync @PLUGIN@" \
+    --notes-file /tmp/basalt-plugin-@PLUGIN@-notes.md \
     release/plugin/main.js release/plugin/manifest.json release/plugin/styles.css \
     release/plugin/SHA256SUMS
 
@@ -363,6 +371,14 @@ client/package.json on its own clock, then:
   git tag -a cli/v1.2.3 -m "basalt CLI 1.2.3" && git push origin cli/v1.2.3
 
 That tag publishes it over OIDC, with no token and no 2FA code.
+
+After publication, read each GitHub release body back and check that its
+changelog and upgrade instructions are present:
+
+  gh release view @PLUGIN@ --json body,url
+
+Use the server tag for the server release. To correct published notes, prepare
+a temporary body file and use `gh release edit TAG --notes-file FILE`.
 
 Then check the release from the outside, which is the only place several of
 these can be wrong: the attestations are rebuilt and re-uploaded after the

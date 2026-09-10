@@ -2,6 +2,8 @@ import { Modal, Notice, Setting, type App } from "obsidian";
 import { diffLines, when } from "./history.ts";
 import type { ConflictPair, ConflictReview, ConflictChoice } from "../core/conflicts.ts";
 
+const DIFF_PREVIEW_CHARS = 128 * 1024;
+
 export interface ConflictSource {
   pairs(): ConflictPair[];
   review(pair: ConflictPair): Promise<ConflictReview>;
@@ -85,16 +87,24 @@ export class ConflictsModal extends Modal {
       }
       let edited: string | undefined = draft;
       let editControls: HTMLElement | undefined;
+      let editor: HTMLTextAreaElement | undefined;
       const text = review.current?.text !== undefined && review.preserved.text !== undefined;
       if (text) {
+        const comparison = diffLines(review.current!.text!, review.preserved.text!);
+        if (comparison.length > DIFF_PREVIEW_CHARS)
+          this.contentEl.createEl("p", {
+            cls: "setting-item-description",
+            text: "Comparison shortened. Open both files to review all changes before choosing a version.",
+          });
         this.contentEl.createEl("pre", {
           cls: "basalt-conflict-preview",
-          text: diffLines(review.current!.text!, review.preserved.text!).slice(0, 128 * 1024),
+          text: comparison.slice(0, DIFF_PREVIEW_CHARS),
         });
         const edit = this.contentEl.createEl("details");
         editControls = edit;
         edit.createEl("summary", { text: "Edit a combined version" });
         const field = edit.createEl("textarea", { cls: "basalt-conflict-editor" });
+        editor = field;
         field.value = draft ?? review.current!.text!;
         if (draft !== undefined) edit.open = true;
         field.setAttribute("aria-label", "Combined note text");
@@ -115,7 +125,12 @@ export class ConflictsModal extends Modal {
       const apply = async (choice: ConflictChoice) => {
         if (this.busy) return;
         this.busy = true;
-        const controls = Array.from(this.contentEl.querySelectorAll<HTMLButtonElement>("button"));
+        // Freeze the draft as well as the actions: resolve receives this text now,
+        // so edits accepted while it waits would be discarded after success.
+        const controls: (HTMLButtonElement | HTMLTextAreaElement)[] = Array.from(
+          this.contentEl.querySelectorAll<HTMLButtonElement>("button"),
+        );
+        if (editor) controls.push(editor);
         const disabled = controls.map((control) => control.disabled);
         for (const control of controls) control.disabled = true;
         try {

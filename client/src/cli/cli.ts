@@ -1946,14 +1946,15 @@ async function cmdPreview(args: Args, io: Console): Promise<number> {
   const client = await open(await mustLoad(args.dir), args, io, { inspect: true });
   try {
     const preview = await client.preview();
-    if (args.json) io.out(JSON.stringify({ ok: true, ...preview, counts: previewCounts(preview) }));
+    const ok = !preview.files.some((file) => file.action === "blocked");
+    if (args.json) io.out(JSON.stringify({ ok, ...preview, counts: previewCounts(preview) }));
     else {
       io.out("Preview only. Files are checked again during sync.");
       for (const file of preview.files)
         if (file.action !== "unchanged") io.out(`${file.action}: ${file.path}`);
       io.out(JSON.stringify(previewCounts(preview)));
     }
-    return preview.files.some((file) => file.action === "blocked") ? 1 : 0;
+    return ok ? 0 : 1;
   } finally {
     await client.close();
   }

@@ -280,8 +280,9 @@ restriction.
 
 ## Working from development source
 
-This source tree uses protocol 7. Build both server and clients from the same
-checkout; do not combine them with the released protocol-6 Compose image.
+This source tree, the Compose image, and released 0.8.x clients use protocol 7.
+Version 0.7.x uses protocol 6 and cannot connect. For source builds, build the
+server and clients from the same checkout.
 Keep existing data and credentials, and verify the reported protocol after
 connecting. Pairing a populated vault now pauses for a preview: review its
 counts with the user before choosing Continue sync. `basalt preview --json`

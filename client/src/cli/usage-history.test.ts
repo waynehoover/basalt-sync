@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { run } from "./cli.ts";
@@ -54,6 +54,43 @@ it("history can page to an older version with the existing before argument", asy
 });
 it("invalid command arguments use the documented exit code 2", async () => {
   expect((await cli("sync", "unexpected-vault-argument")).code).toBe(2);
+});
+it("preview JSON reports blocked files as unsuccessful without changing the note", async () => {
+  server = new TestServer();
+  server.extraArgs = ["-max-file", "10"];
+  await server.start();
+  dir = await mkdtemp(join(tmpdir(), "basalt-preview-cli-"));
+  const init = await cli(
+    "init",
+    "--dir",
+    dir,
+    "--server",
+    server.wsUrl,
+    "--token",
+    server.token,
+    "--json",
+  );
+  expect(init.code).toBe(0);
+  const text = "This note exceeds the server's ten-byte file limit.";
+  await writeFile(join(dir, "note.md"), text);
+  const blocked = await cli("preview", "--dir", dir, "--json");
+  expect(blocked.code).toBe(1);
+  expect(JSON.parse(blocked.output)).toMatchObject({
+    ok: false,
+    files: [{ path: "note.md", action: "blocked" }],
+    counts: { blocked: 1 },
+  });
+  expect(await readFile(join(dir, "note.md"), "utf8")).toBe(text);
+
+  await writeFile(join(dir, "note.md"), "Small");
+  const ready = await cli("preview", "--dir", dir, "--json");
+  expect(ready.code).toBe(0);
+  expect(JSON.parse(ready.output)).toMatchObject({
+    ok: true,
+    files: [{ path: "note.md", action: "upload" }],
+    counts: { blocked: 0, upload: 1 },
+  });
+  expect(await readFile(join(dir, "note.md"), "utf8")).toBe("Small");
 });
 it("the documented nested backup is refused and a separate destination works", async () => {
   server = new TestServer();

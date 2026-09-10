@@ -156,7 +156,8 @@ not the first recovery step.
 ## Purge
 
 **Purge permanently removes older versions from the live server.** It keeps only
-the newest entry for each path and removes unreferenced content. If the newest
+the newest entry for each path, retains records needed to keep moved-away names
+retired, and removes unreferenced content. If the newest
 entry is a deletion, that note's older content is no longer recoverable there.
 Nothing purges automatically.
 

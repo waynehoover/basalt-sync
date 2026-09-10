@@ -1,6 +1,7 @@
 import { afterEach, expect, it } from "vitest";
-import { readFile, writeFile, rename, rm, utimes } from "node:fs/promises";
+import { readFile, writeFile, rename, rm, utimes, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { Client } from "../core/client.ts";
 import { TestServer } from "../core/test-server.ts";
 import { ProtocolError } from "../core/transport.ts";
@@ -173,6 +174,41 @@ it("a rename does not retire an edit its source received meanwhile", async () =>
   for (const d of [a!, b!]) {
     expect(await readFile(join(d.dir, "note.md"), "utf8")).toContain("BRAVO NEW SOURCE EDIT");
     expect(await readFile(join(d.dir, "moved.md"), "utf8")).toContain("Original first line.");
+  }
+});
+it("purge preserves a moved note and permits reusing its old name after restart", async () => {
+  const [a] = await setup(1, "original content\n");
+  await rename(join(a!.dir, "note.md"), join(a!.dir, "moved.md"));
+  await a!.c.noteRename("note.md", "moved.md");
+  await settle([a!]);
+  await writeFile(join(a!.dir, "moved.md"), "current content at the new name\n");
+  await settle([a!]);
+  const before = await device(server, "before-purge", dirs, open);
+  await settle([before]);
+  expect([...(await fingerprint(before.dir)).keys()]).toEqual(["moved.md"]);
+  await Promise.all(open.map((client) => client.close()));
+  const backup = await mkdtemp(join(tmpdir(), "basalt-purge-preservation-"));
+  dirs.push(backup);
+  await server.whileStopped(async () => {
+    await server.cli("backup", "-to", join(backup, "snapshot"));
+    await server.cli("purge", "-confirm", "default", "-backup", join(backup, "snapshot"));
+  });
+  const resumed = await reopen(server, "a", a!.dir, open);
+  const fresh = await device(server, "after-purge", dirs, open);
+  await settle([resumed, fresh]);
+  for (const d of [resumed, fresh]) {
+    expect([...(await fingerprint(d.dir)).keys()]).toEqual(["moved.md"]);
+    expect(await readFile(join(d.dir, "moved.md"), "utf8")).toBe(
+      "current content at the new name\n",
+    );
+  }
+  await writeFile(join(resumed.dir, "note.md"), "a new note using the old name\n");
+  await settle([resumed, fresh]);
+  for (const d of [resumed, fresh]) {
+    expect(await readFile(join(d.dir, "note.md"), "utf8")).toBe("a new note using the old name\n");
+    expect(await readFile(join(d.dir, "moved.md"), "utf8")).toBe(
+      "current content at the new name\n",
+    );
   }
 });
 it("deterministic three stale uploads preserve every independent edit", async () => {
