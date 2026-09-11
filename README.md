@@ -1,4 +1,4 @@
-# <img src="docs/assets/logo.svg" width="40" height="40" alt=""> Basalt Sync
+# <img src="docs/assets/logo.svg" width="40" height="40" align="top" alt=""> Basalt Sync
 
 **Fast, secure, self-hosted sync for Obsidian. Simple setup.**
 
