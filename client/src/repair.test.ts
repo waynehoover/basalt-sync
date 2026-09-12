@@ -81,6 +81,122 @@ async function loseOneBody(server: TestServer, which = 0): Promise<string> {
   return victim;
 }
 
+describe("what repair costs the device running it", () => {
+  it("reads nothing when the server is not missing anything", async () => {
+    // The offer is the index's own chunk names, so making it opens no files
+    // (R083-09). It used to plan an upload for every synced note before
+    // offering anything, which on a phone meant reading, chunking and sealing
+    // the whole vault to find out the server had lost nothing.
+    await serverBinary();
+    const server = new TestServer();
+    await server.start();
+    cleanups.push(() => server.cleanup());
+
+    const a = await device(server, "a");
+    for (let i = 0; i < 12; i++) await a.vault.edit(`note-${i}.md`, `note number ${i}\n`);
+    await a.c.settle({}, 8);
+
+    const read = a.vault.read.bind(a.vault);
+    const opened: string[] = [];
+    a.vault.read = async (path) => {
+      opened.push(path);
+      return read(path);
+    };
+
+    const out = await a.c.repair();
+    expect(out.scanned, "there was nothing to scan, so this proves nothing").toBeGreaterThan(0);
+    expect(out.offered).toBeGreaterThan(0);
+    expect(out.stored).toBe(0);
+    expect(out.failed).toEqual([]);
+    expect(opened, "repair read files the server never asked for").toEqual([]);
+  }, 120_000);
+
+  it("offers a whole vault in a handful of round trips", async () => {
+    // One `resend` per file meant one round trip per file whatever the answer
+    // was, and the answer is almost always "I have all of those". At ten
+    // thousand notes and 200 ms to the server that is over half an hour of
+    // waiting on the connection's serial queue (Codex-01).
+    await serverBinary();
+    const server = new TestServer();
+    await server.start();
+    cleanups.push(() => server.cleanup());
+
+    const a = await device(server, "a");
+    for (let i = 0; i < 40; i++) await a.vault.edit(`note-${i}.md`, `note number ${i}\n`);
+    await a.c.settle({}, 8);
+
+    let requests = 0;
+    const resend = a.c.transport.resend.bind(a.c.transport);
+    a.c.transport.resend = async (...args) => {
+      requests++;
+      return resend(...args);
+    };
+    const out = await a.c.repair();
+    expect(out.scanned).toBe(40);
+    expect(out.offered).toBeGreaterThan(0);
+    expect(requests, `${requests} round trips for 40 files`).toBe(1);
+  }, 120_000);
+
+  it("reads only the note whose body is missing", async () => {
+    await serverBinary();
+    const server = new TestServer();
+    await server.start();
+    cleanups.push(() => server.cleanup());
+
+    const a = await device(server, "a");
+    for (let i = 0; i < 12; i++) await a.vault.edit(`note-${i}.md`, `note number ${i}\n`);
+    await a.c.settle({}, 8);
+    await loseOneBody(server, 3);
+
+    const read = a.vault.read.bind(a.vault);
+    const opened: string[] = [];
+    a.vault.read = async (path) => {
+      opened.push(path);
+      return read(path);
+    };
+
+    const out = await a.c.repair();
+    expect(out.stored, "nothing was put back, so the read count means nothing").toBeGreaterThan(0);
+    // One note, because one body was lost. The old shape read all twelve.
+    expect(new Set(opened).size, `repair opened ${[...new Set(opened)].join(", ")}`).toBe(1);
+  }, 120_000);
+});
+
+describe("a note that changed after the last sync", () => {
+  it("is skipped without taking the rest of the run with it", async () => {
+    // The read moved to the first body the server asks for (R083-09), and the
+    // check that the disk still matches the index moved with it. That is the
+    // one moment the disagreement cannot be withdrawn: the server has sent
+    // `want` and is reading binary frames, so a refusal there ends the
+    // connection and every later path fails with it, listed as though this
+    // device could not read them. A stat before the offer is what keeps the
+    // common case off the wire.
+    await serverBinary();
+    const server = new TestServer();
+    await server.start();
+    cleanups.push(() => server.cleanup());
+
+    const a = await device(server, "a");
+    await a.vault.edit("changed.md", "the version the server acknowledged\n");
+    await a.vault.edit("steady.md", "this one has not moved\n");
+    await a.c.settle({}, 8);
+
+    // Both bodies lost, and one of the two notes edited since that sync
+    // without a pass having noticed: the index still says it holds what the
+    // server acknowledged, and the disk does not.
+    await loseOneBody(server, 0);
+    await loseOneBody(server, 0);
+    await a.vault.edit("changed.md", "but this device has moved on\n");
+
+    const out = await a.c.repair();
+    expect(out.couldNotOffer, "the changed note was offered anyway").toBeGreaterThan(0);
+    expect(out.failed, "a changed note took the rest of the run down with it").toEqual([]);
+    expect(out.stored, "the unchanged note's body was not put back").toBeGreaterThan(0);
+    // And the connection is still usable, which is what the acks depend on.
+    await expect(a.c.settle({}, 2)).resolves.toBeTruthy();
+  }, 120_000);
+});
+
 describe("a body the server has lost", () => {
   it("is put back by a device that still has the note, and no version is written", async () => {
     await serverBinary();

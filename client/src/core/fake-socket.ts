@@ -158,7 +158,7 @@ export async function engineOnFakeSocket(
     maxFetchBytes?: number;
     cursor?: number;
   } = {},
-  opts: { vault?: MemoryVault } = {},
+  opts: { vault?: MemoryVault; store?: MemoryIndexStore } = {},
 ): Promise<{
   engine: Engine;
   socket: FakeSocket;
@@ -166,6 +166,7 @@ export async function engineOnFakeSocket(
   vault: MemoryVault;
   logs: string[];
   keys: Schedule;
+  store: MemoryIndexStore;
 }> {
   const socket = new FakeSocket();
   const logs: string[] = [];
@@ -181,10 +182,13 @@ export async function engineOnFakeSocket(
   await connecting;
 
   const vault = opts.vault ?? new MemoryVault();
+  // Sharable, so a test can build a second engine on the state the first
+  // wrote and ask what survives a restart.
+  const store = opts.store ?? new MemoryIndexStore();
   const keys = await testKeys(RIG_SECRET);
   engine = new Engine({
     vault,
-    store: new MemoryIndexStore(),
+    store,
     dataKey: TEST_DATA_KEY,
     transport: t,
     device: "d",
@@ -208,5 +212,5 @@ export async function engineOnFakeSocket(
   await settle();
   socket.raw({ op: "caught-up", cursor: limits.cursor ?? 0 });
   await started;
-  return { engine, socket, t, vault, logs, keys };
+  return { engine, socket, t, vault, logs, keys, store };
 }

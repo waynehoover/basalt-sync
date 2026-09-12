@@ -270,6 +270,35 @@ export function formatInvite(inv: Invite): string {
 }
 
 /**
+ * Where a pasted invite, recovery key or setup line would connect this device.
+ *
+ * Every one of the three carries a server address, and until this existed the
+ * panel showed none of them: a person pressed Pair on a string of base64 and
+ * found out where their vault had gone by watching it upload (R083-05). An
+ * invite that arrived through `obsidian://basalt-sync?invite=...` is worse
+ * again, because it can be sent by anybody who can get a link in front of
+ * somebody, and the panel filled the field in for them.
+ *
+ * Throws for anything it cannot read, with the message that says why, so a
+ * caller can put the reason on screen and leave the button disabled: no
+ * address on screen, nothing to press.
+ */
+export function joinDestination(
+  input: string,
+  /** Which field this was typed into, so the refusal names the right shape. */
+  kind: "join" | "first",
+): { url: string; vaultId?: string } {
+  const text = input.trim();
+  if (kind === "first") return { url: parseSetup(text).url };
+  if (isInvite(text)) {
+    const invite = parseInvite(text);
+    return { url: invite.url, vaultId: invite.vaultId };
+  }
+  const pairing = parsePairing(text);
+  return { url: pairing.url, vaultId: pairing.vaultId };
+}
+
+/**
  * Reads an invite string, refusing anything it cannot read completely.
  *
  * The same rule as `parsePairing`, for the same reason: a half-read invite
@@ -416,6 +445,21 @@ export interface DeviceConfig {
    */
   readonly readOnly?: boolean;
   /**
+   * Folder and file names this device never syncs, at any depth (R083-13).
+   *
+   * Per device and never sent anywhere, which is the point: a phone can leave
+   * a media folder alone while the desktop keeps it. A path another device
+   * syncs and this one ignores is counted as `ignored`, kept out of the exit
+   * code and out of the attention list, so it reads as configuration rather
+   * than as something going wrong.
+   *
+   * One name per entry, not a path: it matches that segment wherever it
+   * appears, which is what `--ignore` means on the CLI and what `isNeverSynced`
+   * implements. Absent and empty are the same thing, so a config written
+   * before this existed reads exactly as it did.
+   */
+  readonly ignore?: readonly string[];
+  /**
    * The vault's data key, unwrapped.
    *
    * Held directly rather than as the wrapping the server returns, because the
@@ -512,7 +556,46 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
     // was before this existed, and an older build reading it sees a field it
     // does not know and ignores rather than a value it misreads.
     ...(config.readOnly === true ? { readOnly: "true" } : {}),
+    // JSON rather than a separator, because the names are somebody's folders
+    // and a separator is a character a folder is allowed to contain. Written
+    // only when there is something to write, for the reason above.
+    ...(config.ignore?.length ? { ignore: JSON.stringify(config.ignore) } : {}),
   };
+}
+
+/**
+ * Whether a string is one name this device can be told to skip.
+ *
+ * One segment: `isNeverSynced` matches a name against each segment of a path,
+ * so a value with a slash in it would match nothing and quietly sync the
+ * folder somebody asked it not to. `.` and `..` are not names, and a
+ * dot-prefixed name is already covered by the rule every device shares.
+ */
+export function isIgnorableName(value: string): boolean {
+  return value !== "" && value !== "." && value !== ".." && !value.includes("/");
+}
+
+/**
+ * The ignore list out of a stored config, or nothing.
+ *
+ * Anything unreadable is dropped rather than refused. This list is a
+ * preference: a config whose ignore field somebody hand-edited into nonsense
+ * must still open, because it also holds the only copy of a recovery key
+ * (rule 2). Dropping a name syncs a folder that was meant to be skipped, which
+ * is visible and fixable; refusing the file is not.
+ */
+function ignoreList(record: Record<string, unknown>): { ignore?: readonly string[] } {
+  const raw = record["ignore"];
+  if (typeof raw !== "string" || raw === "") return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (!Array.isArray(parsed)) return {};
+  const names = parsed.filter((v): v is string => typeof v === "string" && isIgnorableName(v));
+  return names.length > 0 ? { ignore: [...new Set(names)] } : {};
 }
 
 /**
@@ -552,6 +635,7 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     // because a device silently refusing to send would look exactly like a
     // device with nothing to send (I29).
     ...(record["readOnly"] === "true" ? { readOnly: true } : {}),
+    ...ignoreList(record),
   };
   if (config.secret === undefined && config.deviceId === undefined) {
     // Neither credential, which is not a state anything here writes: a config
@@ -678,11 +762,23 @@ function asciiHost(url: string): string {
  * line as printed, because it used to be two fields and the line had to be
  * split by hand, which is a step nobody should have to be told about.
  *
- * Everything before the last `#` is the address and goes through
+ * Everything before the first `#` is the address and goes through
  * `normaliseUrl`, so `homelab:3003`, `ws://127.0.0.1:3003` and
- * `wss://homelab.tailnet.ts.net` all work. Everything after it is the token.
+ * `wss://homelab.tailnet.ts.net` all work. After it is the token, and after an
+ * optional second `#` is the vault name.
+ *
+ * The vault name is there so the plugin can start a vault that is not called
+ * `default` (R083-14). It could not, and the documented answer was to install
+ * the CLI, run `basalt init --vault-id` into a throwaway directory, issue an
+ * invite from it, pair the plugin with that, then unlink and revoke the
+ * throwaway device. That is a lot of steps to name something, and every one of
+ * them is a step at which the only copy of a recovery key is somewhere
+ * temporary.
+ *
+ * Absent means `default`, which is what every line printed before this said
+ * and still means.
  */
-export function parseSetup(input: string): { url: string; token: string } {
+export function parseSetup(input: string): { url: string; token: string; vaultId?: string } {
   const text = input.trim();
   if (text.startsWith(PAIRING_PREFIX)) {
     throw new Error(
@@ -696,14 +792,30 @@ export function parseSetup(input: string): { url: string; token: string } {
         "to start a new one, paste the line the server printed, like host:3003#TOKEN",
     );
   }
-  const hash = text.lastIndexOf("#");
+  const hash = text.indexOf("#");
   if (hash < 0) {
     throw new Error(
       "a server setup line looks like host:3003#TOKEN, exactly as the server printed it",
     );
   }
   const url = normaliseUrl(text.slice(0, hash));
-  const token = text.slice(hash + 1).trim();
-  if (token === "") throw new Error("the server's token is missing after the #");
-  return { url, token };
+  // The first `#` separates the address, and a second one names the vault.
+  // Split from the front rather than the back, which is what let the vault
+  // name be added at all: a token is base32 with dashes and holds no `#`, and
+  // a WebSocket address with a fragment in it is not an address.
+  const [token, named, ...extra] = text
+    .slice(hash + 1)
+    .split("#")
+    .map((part) => part.trim());
+  if (token === undefined || token === "") {
+    throw new Error("the server's token is missing after the #");
+  }
+  if (extra.length > 0) {
+    throw new Error(
+      "a setup line has at most two # in it: host:3003#TOKEN, or host:3003#TOKEN#VAULT",
+    );
+  }
+  if (named === undefined) return { url, token };
+  if (named === "") throw new Error("the vault name is missing after the second #");
+  return { url, token, vaultId: named };
 }

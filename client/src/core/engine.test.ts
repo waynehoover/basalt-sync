@@ -28,7 +28,7 @@ import {
 import { chunkBytes, sizesFor } from "./chunk.ts";
 import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
 import { TEST_DATA_KEY, otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
-import { ProtocolError, Transport, type WireEntry } from "./transport.ts";
+import { ConnectionError, ProtocolError, Transport, type WireEntry } from "./transport.ts";
 import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault, type FileStat, type Times } from "./vault.ts";
 import { firstFreeName, ignoredHereError, neverSync } from "./paths.ts";
@@ -58,6 +58,15 @@ class Device {
   readonly batches: { from: number; to: number; entries: unknown[] }[] = [];
   caughtUp = false;
   clock = 1_000_000;
+  /**
+   * How far the clock moves per reading.
+   *
+   * Sixty seconds by default, so the size-scaled write debounce never decides
+   * when a sync may happen. A test that is about a computed deadline sets it
+   * to zero, so the deadline can be compared against the reading it was
+   * computed from rather than against a moving target.
+   */
+  step = 60_000;
 
   constructor(
     readonly name: string,
@@ -91,7 +100,7 @@ class Device {
       ...(await server.deviceCredentials(SECRET, wrapped, this.name)),
       // A clock the test advances, so the size-scaled write debounce does
       // not decide when a sync may happen.
-      now: () => (this.clock += 60_000),
+      now: () => (this.clock += this.step),
       ...(log ? { log } : {}),
     });
     await this.transport.connect();
@@ -168,6 +177,31 @@ class EditsAfterLooking extends MemoryVault {
       await this.write(path, new TextEncoder().encode(this.text_), { mtime: 99_000, ctime: 1000 });
     }
     return was;
+  }
+}
+
+/**
+ * A memory vault told to leave one folder alone, the way `--ignore` and the
+ * plugin's skip list tell the real ones: the name is not listed and a write
+ * under it is refused as ignored rather than as a failure.
+ */
+class SkippingVault extends MemoryVault {
+  constructor(private readonly skip: string) {
+    super();
+  }
+  private skipped(path: string): boolean {
+    return path.split("/").includes(this.skip);
+  }
+  override async list(): Promise<FileStat[]> {
+    return (await super.list()).filter((stat) => !this.skipped(stat.path));
+  }
+  override async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
+    if (this.skipped(path)) throw ignoredHereError(`not writing under ${this.skip}: ${path}`);
+    return super.write(path, bytes, times);
+  }
+  override async mkdir(path: string): Promise<void> {
+    if (this.skipped(path)) throw ignoredHereError(`not writing under ${this.skip}: ${path}`);
+    return super.mkdir(path);
   }
 }
 
@@ -493,6 +527,208 @@ describe("two devices", () => {
   }, 240_000);
 });
 
+describe("an acknowledgement lost after the server committed the write", () => {
+  /**
+   * The one head a device is never told (R083-01).
+   *
+   * The server broadcasts a device's own commit back to it as an empty batch:
+   * the cursor advance without the payload, because the device already has the
+   * bytes. So if the connection drops between that echo and the reply to the
+   * `putmany`, the device saves a cursor above an entry it will never be shown.
+   * Catch-up starts above it, `remote` keeps the version before it, and every
+   * upload of that path is refused as out of date, including every later edit.
+   *
+   * Reproduced exactly there: the real reply is taken from the wire and thrown
+   * away after the echo has been applied, which is what a socket closing in
+   * that window looks like from inside the engine.
+   */
+  it("does not strand the path as stale forever", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    await a.vault.edit("note.md", "first version\n");
+    await convergeBoth(a, b);
+    expect(b.vault.text("note.md")).toBe("first version\n");
+
+    // The write whose acknowledgement is lost.
+    await a.vault.edit("note.md", "second version\n");
+    const putMany = a.transport.putMany.bind(a.transport);
+    let dropped = 0;
+    a.transport.putMany = async (...args) => {
+      await putMany(...args);
+      // The commit is in the server's log, so it has already been broadcast.
+      // Applying the echo here is what moves this device's cursor past an
+      // entry no later catch-up will carry.
+      await receiveCommitted(a.transport);
+      dropped++;
+      throw new ConnectionError("the connection dropped before the reply arrived");
+    };
+    await a.engine.sync().catch(() => undefined);
+    a.transport.putMany = putMany;
+    expect(dropped, "the test did not reach the window it is about").toBe(1);
+
+    // What the bug looked like from here: A's own version 2 is on the server,
+    // A does not know it, and A is about to be refused for ever.
+    await convergeBoth(a, b, 6);
+    expect(b.vault.text("note.md"), "b never received the committed write").toBe(
+      "second version\n",
+    );
+
+    // And the part that made it permanent rather than a hiccup: the *next*
+    // edit is refused too, because it is still based on version 1.
+    await a.vault.edit("note.md", "third version\n");
+    await convergeBoth(a, b, 6);
+    expect(b.vault.text("note.md"), "b never received the edit after the lost ack").toBe(
+      "third version\n",
+    );
+    expect(a.vault.text("note.md")).toBe("third version\n");
+  }, 240_000);
+
+  /**
+   * A sync that ends still wanting another round must not ask for one now
+   * (R083-02).
+   *
+   * The client turns `nextUploadAt` into its next timer, so zero means the
+   * whole vault is listed and re-decided as fast as the disk allows, for as
+   * long as whatever is setting `again` keeps setting it. A second between
+   * rounds is imperceptible to a person and is the difference between catching
+   * up and spinning.
+   */
+  it("asks again on a floor rather than immediately", async () => {
+    await fresh();
+    const a = await device("a");
+    await a.vault.edit("note.md", "first version\n");
+    await a.settle();
+
+    // Something changing under the pass, every pass, which is the shape of the
+    // problem: an editor saving continuously, or a peer writing the path this
+    // device is uploading. Eight rounds later `sync` gives up and says when to
+    // come back.
+    let saves = 0;
+    const list = a.vault.list.bind(a.vault);
+    a.vault.list = async () => {
+      const was = await list();
+      if (saves < 40) {
+        saves++;
+        await a.vault.edit("note.md", `version ${saves}\n`);
+        a.engine.noteChanged("note.md");
+      }
+      return was;
+    };
+    // A clock that does not move, so the deadline can be compared with the
+    // reading it was computed from rather than with a moving target.
+    a.step = 0;
+    const now = a.clock;
+    const report = await a.engine.sync();
+    a.vault.list = list;
+    a.step = 60_000;
+
+    expect(saves, "nothing kept the pass coming back, so this proves nothing").toBeGreaterThan(1);
+    expect(report.nextUploadAt, "a sync that wants another round said nothing").toBeDefined();
+    expect(report.nextUploadAt!, "a retry scheduled for now is a hot loop").toBe(now + 1000);
+  }, 240_000);
+});
+
+describe("a device told to skip part of the vault", () => {
+  /**
+   * An exclusion is a decision, not a delay.
+   *
+   * A path this device was configured to skip never becomes a path it will
+   * apply, so counting it as outstanding meant `applied` was never sent again:
+   * every other device said "Waiting for Phone" for the life of the vault, and
+   * polled the server every second to keep saying it (Codex-10). "Waiting" and
+   * "not coming" are different answers and the first one was wrong.
+   */
+  it("still tells the other devices how far it has got", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    await a.vault.edit("notes/keep.md", "this one syncs everywhere\n");
+    await a.vault.edit("Attachments/big.md", "this one is skipped on b\n");
+    await convergeBoth(a, b, 6);
+
+    // A third device configured the way `--ignore` and the plugin's skip list
+    // configure one: the vault refuses to write under that name, and the
+    // engine counts it as ignored rather than as a failure.
+    const c = await device("c", undefined, new SkippingVault("Attachments"));
+    await c.settle();
+    await a.vault.edit("Attachments/another.md", "and so is this one\n");
+    await a.settle();
+    await receiveCommitted(c.transport);
+    const report = await c.settle();
+
+    expect(report.ignored, "nothing was actually skipped, so this proves nothing").toBeGreaterThan(
+      0,
+    );
+    expect(c.vault.text("notes/keep.md"), "the rest of the vault did not arrive").toBe(
+      "this one syncs everywhere\n",
+    );
+    expect(
+      report.appliedCursor,
+      "a device that skips a folder never told anyone where it had got to",
+    ).toBeDefined();
+  }, 240_000);
+});
+
+describe("a big file edited on the other device", () => {
+  /**
+   * The receiver already holds almost all of it.
+   *
+   * Chunk names are hashes of ciphertext and sealing is deterministic, so a
+   * name the receiver's own index lists is a body the receiver can make from
+   * its own disk. Editing one paragraph of a large attachment renames one
+   * chunk and leaves the rest alone; downloading all of it again is the whole
+   * of what a person on a phone connection would feel.
+   */
+  it("makes the unchanged chunks itself instead of downloading them", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    // Big enough to be chunked into many pieces, and incompressible, so the
+    // chunk boundaries are content-defined rather than an artefact of a
+    // repeating pattern.
+    const size = 4 * 1024 * 1024;
+    const original = new Uint8Array(size);
+    let seed = 12345;
+    for (let i = 0; i < size; i++) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      original[i] = seed & 0xff;
+    }
+    await a.vault.write("big.bin", original, { mtime: 1000, ctime: 1000 });
+    await convergeBoth(a, b, 6);
+    expect(await b.vault.read("big.bin")).toEqual(original);
+
+    // One region changed on A, which renames the chunks covering it and
+    // leaves every other chunk exactly as it was.
+    const edited = new Uint8Array(original);
+    edited.set(new Uint8Array(4096).fill(7), size / 2);
+    await a.vault.write("big.bin", edited, { mtime: 2000, ctime: 1000 });
+    await a.settle();
+
+    // What B asks the server for, from here on.
+    let askedFor = 0;
+    const fetch = b.transport.fetch.bind(b.transport);
+    b.transport.fetch = async (names, onBytes) => {
+      askedFor += names.length;
+      return fetch(names, onBytes);
+    };
+    await receiveCommitted(b.transport);
+    const report = await b.engine.sync();
+    b.transport.fetch = fetch;
+
+    expect(await b.vault.read("big.bin"), "b did not end up with a's edit").toEqual(edited);
+    expect(report.reusedChunks, "nothing was reused").toBeGreaterThan(0);
+    // The property: the fetch is proportional to what changed, not to the
+    // file. A whole-file download would ask for every chunk it has.
+    expect(askedFor, `asked for ${askedFor} chunks and reused ${report.reusedChunks}`).toBeLessThan(
+      report.reusedChunks,
+    );
+  }, 240_000);
+});
+
 describe("concurrent edits, which is where notes get lost", () => {
   it("keeps both edits when a stale refusal overtakes metadata verification", async () => {
     await fresh();
@@ -553,6 +789,46 @@ describe("concurrent edits, which is where notes get lost", () => {
       expect(copies, `${d.name} lost A's edit`).toContain(onA);
       expect(copies, `${d.name} lost B's edit`).toContain(onB);
     }
+  }, 240_000);
+
+  it("records the merged note's byte length and its real timestamp", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+    // Accented and multi-byte, so the UTF-16 count and the byte count differ:
+    // `text.length` is code units and a file's size is bytes (R083-20).
+    const base = ["# Notes é 🌋", "", "First paragraph.", "", "Second paragraph."].join("\n");
+    await a.vault.edit("note.md", base);
+    await convergeBoth(a, b);
+
+    await a.vault.edit("note.md", base.replace("First paragraph.", "First paragraph, on A é."));
+    await b.vault.edit("note.md", base.replace("Second paragraph.", "Second paragraph, on B 🌋."));
+    // B publishes, A receives it, and A's next pass is the merge.
+    await b.settle();
+    await receiveCommitted(a.transport);
+    const report = await a.engine.sync();
+    expect(report.merged, "the pass under test did not merge").toBeGreaterThan(0);
+
+    const text = a.vault.text("note.md") ?? "";
+    expect(text).toContain("on A");
+    expect(text).toContain("on B");
+
+    // What the index wrote down about the file it has just written, against
+    // the file. These two are what `needsRehash` compares a later stat with,
+    // so a wrong size or a wrong timestamp is a note read, chunked and sealed
+    // again on the very next pass to discover that nothing had changed.
+    const stat = (await a.vault.stat("note.md"))!;
+    const stored = (await a.store.load())!.entries["note.md"] as {
+      size: number;
+      mtime: number;
+    };
+    expect(stored.size, "the index recorded UTF-16 code units as a byte count").toBe(
+      new TextEncoder().encode(text).length,
+    );
+    expect(stored.size).toBe(stat.size);
+    expect(stored.mtime, "the index recorded a second clock reading, not the write").toBe(
+      Math.ceil(stat.mtime),
+    );
   }, 240_000);
 
   it("merges edits to different parts of one note, keeping both", async () => {

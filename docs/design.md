@@ -232,6 +232,12 @@ support depends on the concrete mount and adapter, not just an OS label.
 The server stores encrypted content and paths. It does not hold the plaintext
 data key, but does hold wrapped keys, credential hashes, and readable metadata.
 It sees sizes, timestamps, device labels, update activity, and repeated chunks.
+It also sees the byte length of every filename, and which filenames are the same
+length as each other: `sealPath` is AES-GCM over the UTF-8 path with a fixed
+28-byte overhead, so a sealed name is exactly 28 bytes longer than the name
+(R083-25). Padding names to a bucket would hide it, and would change every
+sealed path in every vault, so it is a migration rather than a fix and is
+recorded here instead.
 
 The entry authenticator covers the sealed path, size, timestamps, folder and
 deleted flags, previous path, ordered chunk list, and parent. Clients verify it

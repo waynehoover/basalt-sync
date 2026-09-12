@@ -126,8 +126,14 @@ class DeliveryMonitor {
       const pending = answer.devices.filter(
         (device) => device.id !== answer.thisDevice && !receivedLatest(device, cursor),
       );
+      // A second, not a quarter of one (R083-19). Every tick is a `devices`
+      // request on the same socket the sync uses, and each answer costs the
+      // server two queries and a scan of the hub. Four times a second was
+      // four times the cost for a line that reads the same to a person, and
+      // it ran for as long as a peer was online and behind, which on a phone
+      // link is exactly when the socket is worth leaving alone.
       this.interval = pending.some((device) => device.online)
-        ? 250
+        ? 1000
         : pending.length
           ? 2000
           : 10_000;

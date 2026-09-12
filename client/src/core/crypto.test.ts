@@ -216,10 +216,25 @@ describe("sealing", () => {
     const a = await sealChunk(k, compressible);
     const b = await sealChunk(k, random);
     expect(a.length).toBeLessThan(b.length);
+
     // Byte 12 is the first byte of ciphertext in both, and carries no
-    // recognisable marker value.
-    expect(a[12]).not.toBe(0);
-    expect(b[12]).not.toBe(0);
+    // recognisable marker value: across many chunks it is spread over the byte
+    // range rather than fixed, whether they compressed or not.
+    //
+    // Over a sample rather than over one chunk. Asserting that one ciphertext
+    // byte was not zero was a test that failed once in every two hundred and
+    // fifty-six runs, on a random input, for a reason that had nothing to do
+    // with the property: one byte cannot tell a marker from a coincidence, and
+    // a gate that fails by chance teaches people to re-run it.
+    const spread = async (make: (i: number) => Uint8Array): Promise<number> => {
+      const seen = new Set<number>();
+      for (let i = 0; i < 64; i++) seen.add((await sealChunk(k, make(i)))[12]!);
+      return seen.size;
+    };
+    expect(await spread((i) => enc.encode("a".repeat(200 - i)))).toBeGreaterThan(8);
+    expect(
+      await spread(() => globalThis.crypto.getRandomValues(new Uint8Array(200))),
+    ).toBeGreaterThan(8);
   });
 
   it("refuses a chunk whose marker it does not know", async () => {

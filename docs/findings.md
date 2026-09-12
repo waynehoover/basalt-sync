@@ -7,7 +7,9 @@ These titles preserve the original reviewers' wording. They describe historical
 work recorded as resolved or deliberately declined, not a fresh readiness audit.
 
 For 0.7.1, see the [September 9 review](reviews/0.7.1.md) and
-[September 10 fixes and verification](reviews/0.7.1-fixes.md).
+[September 10 fixes and verification](reviews/0.7.1-fixes.md). For 0.8.3, see
+the 0.8.3 round below. What is still deliberately undone is in
+[open work](open-work.md).
 
 Reproductions, acceptance criteria, and verification evidence remain in Git
 history: `git log -- FOLLOW_UP_REVIEW.md IMPROVEMENTS.md READINESS.md TODO.md
@@ -116,6 +118,62 @@ revisiting I25 (a codec replacement) or I26 (a diff-match-patch fork).
 - **I30** Let a person turn merging off
 - **I31** Give markup the validity gate that JSON has
 
+## R083: the 0.8.3 reading review
+
+A reading review of the shipped source, and the fixes for it. All are
+implemented except the two marked declined, and each says why.
+
+- **R083-01** A lost `acks` after the own-write echo strands paths as `stale`
+- **R083-02** Persistent `again` re-arms the next pass immediately
+- **R083-03** A dropped connection charges every queued path exponential backoff
+- **R083-04** Refused inbound paths are reported until restart, then vanish
+- **R083-05** Pairing with an invite never shows which server it will join
+- **R083-06** `assemble()` holds three copies of a downloaded file
+- **R083-07** `landFromLocal` seals a whole attachment at once
+- **R083-08** Preview and folder-deletion review seal the whole vault and discard it
+- **R083-09** Repair reads and seals every synced file to offer names it has
+- **R083-10** Downloads are one round trip per 2 MiB while a note is open
+- **R083-11** A save to the open note restarts the whole pass
+- **R083-12** `.base` files are treated as attachments
+- **R083-13** No folder exclusion in the plugin
+- **R083-14** One vault per server. Half done: a setup line can name its vault,
+  so the plugin can start one. Lifting the one-vault-per-server rule itself is
+  declined because it is a scope decision recorded in [the design](design.md),
+  not a defect.
+- **R083-15** Dismissing a review modal silently pauses sync
+- **R083-16** No visible status on phones
+- **R083-17** Deleted-note browser has no search
+- **R083-18** Attachment replacement reads the old file twice more than it needs
+- **R083-19** Delivery polling at 250 ms
+- **R083-20** Merge records a UTF-16 length as the file size
+- **R083-21** Report list caps disagree
+- **R083-22** Upload pacing polls every 5 ms
+- **R083-23** One transaction per entry inside a `putmany`
+- **R083-24** Latest-per-path is recomputed per call. Declined: the maintained
+  table it proposes also feeds `purgeSurvivorUIDs`, so a table that falls behind
+  deletes live versions, and no measurement here says the recomputation costs
+  anything worth that.
+- **R083-25** Sealed paths reveal filename length
+
+## Codex: the 0.8.3 performance and interface reading
+
+A second reading of the same commit plus the R083 fixes, asked to look only at
+speed and at what a person can see and do. All are implemented except Codex-02,
+which is declined; [open work](open-work.md) has the measurement that would
+change the answer.
+
+- **Codex-01** A large download blocks a saved note until it finishes
+- **Codex-02** A one-note save reconciles and compares the whole vault.
+  Declined for now; see [open work](open-work.md).
+- **Codex-03** Pending failures show a checked cloud, and their reasons vanish
+- **Codex-04** Receivers download unchanged chunks again after an ordinary edit
+- **Codex-05** Phone exclusions cannot be chosen before pairing starts downloading
+- **Codex-06** Renaming a note makes its earlier history unreachable
+- **Codex-07** Repair pays one serial network round trip per file
+- **Codex-08** Preserved hidden copies have no in-app recovery action
+- **Codex-09** The server serialises directory flushes after parallel chunk writes
+- **Codex-10** Intentional exclusions leave delivery permanently described as unfinished
+- **Codex-11** Recovering a deleted folder is one restore and one sync per note
 
 ## Removed citation schemes
 

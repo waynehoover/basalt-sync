@@ -1635,3 +1635,102 @@ func TestAQuarantineCannotOvertakeACommit(t *testing.T) {
 		t.Errorf("chunks = %v", got.Chunks)
 	}
 }
+
+/* ---------------------------------------------------------------- *
+ * Batched commits (R083-23)
+ * ---------------------------------------------------------------- */
+
+// entryFor builds an entry over bodies already uploaded, without committing it.
+func (h *harness) entryFor(t *testing.T, path string, bodies ...string) Entry {
+	t.Helper()
+	names := h.put(t, "v1", bodies...)
+	size := 0
+	for _, b := range bodies {
+		size += len(b)
+	}
+	return Entry{Path: path, Size: int64(size), MTime: 42, Device: "d1", Chunks: names, Mac: testMac}
+}
+
+// The property the savepoints exist for: one fsync for the batch must not mean
+// one verdict for the batch. A stale entry is refused by itself, and the
+// entries around it commit.
+func TestAppendManyRefusesOneEntryAndCommitsTheRest(t *testing.T) {
+	h := newTestStore(t)
+	live := h.file(t, "taken.md", "first")
+
+	entries := []Entry{
+		h.entryFor(t, "a.md", "a body"),
+		// Based on a version that is not the head, which is the refusal a
+		// concurrent writer earns.
+		h.entryFor(t, "taken.md", "second"),
+		h.entryFor(t, "b.md", "b body"),
+		// Malformed rather than stale: prevBase with no previous path.
+		h.entryFor(t, "c.md", "c body"),
+	}
+	bases := []int64{0, live.UID - 1, 0, 0}
+	prevBases := []int64{0, 0, 0, 7}
+
+	out, err := h.AppendMany("v1", entries, bases, prevBases)
+	if err != nil {
+		t.Fatalf("AppendMany: %v", err)
+	}
+	if len(out) != 4 {
+		t.Fatalf("got %d results for 4 entries", len(out))
+	}
+	if out[0].Err != nil || out[0].UID == 0 {
+		t.Errorf("a.md: %+v, want a uid", out[0])
+	}
+	if !errors.Is(out[1].Err, ErrStale) {
+		t.Errorf("taken.md: %+v, want ErrStale", out[1])
+	}
+	if out[2].Err != nil || out[2].UID == 0 {
+		t.Errorf("b.md: %+v, want a uid", out[2])
+	}
+	if !errors.Is(out[3].Err, ErrBadEntry) {
+		t.Errorf("c.md: %+v, want ErrBadEntry", out[3])
+	}
+
+	// The refused entries left nothing behind, and the committed ones are
+	// readable: a rolled-back savepoint must give back its uid as well as its
+	// rows, or the cursor a client saves would name a gap.
+	if out[2].UID != out[0].UID+1 {
+		t.Errorf("uids %d and %d are not consecutive; a refusal consumed one",
+			out[0].UID, out[2].UID)
+	}
+	head, _, err := pathHead(h.db, "v1", "taken.md")
+	if err != nil {
+		t.Fatalf("head: %v", err)
+	}
+	if head != live.UID {
+		t.Errorf("taken.md head = %d, want the version that was already there (%d)", head, live.UID)
+	}
+	for _, path := range []string{"a.md", "b.md"} {
+		uid, _, err := pathHead(h.db, "v1", path)
+		if err != nil || uid == 0 {
+			t.Errorf("%s did not commit: uid %d, err %v", path, uid, err)
+		}
+	}
+	if uid, _, err := pathHead(h.db, "v1", "c.md"); err != nil || uid != 0 {
+		t.Errorf("c.md committed at %d despite being refused (err %v)", uid, err)
+	}
+}
+
+// A batch commits as one transaction, so an entry later in it sees the one
+// before it. A folder rename is exactly that shape.
+func TestAppendManySeesItsOwnEarlierEntries(t *testing.T) {
+	h := newTestStore(t)
+	first := h.entryFor(t, "note.md", "one")
+	second := h.entryFor(t, "note.md", "two")
+
+	out, err := h.AppendMany("v1", []Entry{first, second}, []int64{0, 0}, []int64{0, 0})
+	if err != nil {
+		t.Fatalf("AppendMany: %v", err)
+	}
+	if out[0].Err != nil {
+		t.Fatalf("the first write of note.md was refused: %v", out[0].Err)
+	}
+	// The second declares "there is no live entry here", and by then there is.
+	if !errors.Is(out[1].Err, ErrStale) {
+		t.Errorf("the second entry did not see the first: %+v", out[1])
+	}
+}

@@ -202,19 +202,21 @@ the version used by this source tree.
 
 ## A vault that is not called `default`
 
-A server serves one vault, named by `-vault` (default `default`). To use another
-name, set it on the server and initialize the first device with the CLI:
+A server serves one vault, named by `-vault` (default `default`). Run it with
+`-vault work` and its setup line carries the name:
 
-```bash
-basalt init 'wss://homelab.example.ts.net#TOKEN' --vault-id work --dir ~/basalt-setup
-basalt invite --dir ~/basalt-setup
+```text
+wss://homelab.example.ts.net#TOKEN#work
 ```
 
-Run the server with `-vault work`. Other devices, including the plugin, learn
-the name from the invite. Use a separate setup directory, not a vault the plugin
-syncs. Save the recovery key, pair the plugin, then run
-`basalt unlink --dir ~/basalt-setup` and revoke that setup device from the plugin.
-The plugin cannot initialize a custom vault name.
+Paste that whole line into the plugin under **Start a new vault**, or give it to
+`basalt init`. The panel shows which vault and which server the line claims
+before you press the button. Other devices learn the name from the invite, so
+they need nothing extra.
+
+A line with no second `#` claims `default`, which is what every line printed by
+an older server does. A named line needs a plugin or CLI from 0.8.4 or newer:
+older ones read everything after the last `#` as the token and will reject it.
 
 ## Connection troubleshooting
 

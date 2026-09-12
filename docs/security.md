@@ -9,8 +9,9 @@ remains ordinary, readable files, so your device's security matters too.
 ## What the server can see
 
 The server stores encrypted notes and filenames without the keys needed to
-read them. It can see file sizes, timestamps, activity, device labels, and when
-encrypted pieces repeat. Encryption does not hide all metadata.
+read them. It can see file sizes, timestamps, activity, device labels, how long
+each filename is, and when encrypted pieces repeat. Encryption does not hide all
+metadata.
 
 Use a secure `wss://` connection, normally through Tailscale Serve or a TLS
 proxy. Note encryption alone does not protect the device credentials sent over

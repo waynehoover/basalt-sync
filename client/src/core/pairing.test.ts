@@ -17,6 +17,8 @@ import {
   normaliseUrl,
   parseInvite,
   parsePairing,
+  isIgnorableName,
+  joinDestination,
   parseSetup,
   type DeviceConfig,
   type Invite,
@@ -336,8 +338,63 @@ function reChecksum(raw: Uint8Array): Uint8Array {
   return out;
 }
 
+describe("the names a device is told to skip", () => {
+  const paired = () => ({
+    url: "wss://homelab.example.ts.net",
+    vaultId: "default",
+    device: "phone",
+    deviceId: "aaaaaaaaaaaaaaaaaaaaaa",
+    deviceSecret: new Uint8Array(32).fill(4),
+    dataKey: new Uint8Array(32).fill(5),
+  });
+
+  it("survives a round trip through the stored config", () => {
+    // Per device, and it goes nowhere near the server (R083-13): a phone
+    // leaves a media folder alone while the desktop keeps it.
+    const config = { ...paired(), ignore: ["Attachments", "Scratch"] };
+    expect(decodeConfig(encodeConfig(config), "data.json").ignore).toEqual([
+      "Attachments",
+      "Scratch",
+    ]);
+  });
+
+  it("is absent from a config that skips nothing", () => {
+    // Byte for byte what an older build wrote, so an older build reading it
+    // back sees exactly what it wrote.
+    expect(encodeConfig(paired())["ignore"]).toBeUndefined();
+    expect(encodeConfig({ ...paired(), ignore: [] })["ignore"]).toBeUndefined();
+    expect(decodeConfig(encodeConfig(paired()), "data.json").ignore).toBeUndefined();
+  });
+
+  it("drops a name it cannot use rather than refusing the file", () => {
+    // Rule 2: this config also holds the only copy of a recovery key, so a
+    // preference somebody hand-edited into nonsense must not make it
+    // unreadable. A dropped name syncs a folder that was meant to be skipped,
+    // which is visible and fixable; a config that will not open is not.
+    const record = { ...encodeConfig(paired()), ignore: '["ok","a/b","",".",".."]' };
+    expect(decodeConfig(record, "data.json").ignore).toEqual(["ok"]);
+    expect(
+      decodeConfig({ ...encodeConfig(paired()), ignore: "not json" }, "data.json").ignore,
+    ).toBeUndefined();
+    expect(
+      decodeConfig({ ...encodeConfig(paired()), ignore: '"a string"' }, "data.json").ignore,
+    ).toBeUndefined();
+  });
+
+  it("accepts one name and no path", () => {
+    // `isNeverSynced` matches a name against each segment of a path, so a
+    // value with a slash in it would match nothing and quietly sync the folder
+    // somebody asked it to skip.
+    expect(isIgnorableName("Attachments")).toBe(true);
+    expect(isIgnorableName("a b.md")).toBe(true);
+    for (const bad of ["", ".", "..", "a/b", "/"]) {
+      expect(isIgnorableName(bad), bad).toBe(false);
+    }
+  });
+});
+
 describe("the line the server prints for the first device", () => {
-  it("splits the address from the token at the last #", () => {
+  it("splits the address from the token at the first #", () => {
     expect(parseSetup("homelab:3003#K7M2PQR4-9XBCDEFGHJKMNPQRSTVWXYZ2")).toEqual({
       url: "wss://homelab:3003",
       token: "K7M2PQR4-9XBCDEFGHJKMNPQRSTVWXYZ2",
@@ -360,6 +417,43 @@ describe("the line the server prints for the first device", () => {
   it("tells a pairing string apart from a setup line", () => {
     expect(() => parseSetup(formatPairing(sample()))).toThrow(/joins an existing vault/);
     expect(() => parseSetup(formatInvite(sampleInvite()))).toThrow(/an invite from another device/);
+  });
+
+  it("carries the vault name after a second #", () => {
+    // A server started with `-vault work` prints its name in the line, so the
+    // plugin can start a vault that is not called `default` without a CLI on
+    // another machine to do it for it (R083-14).
+    expect(parseSetup("wss://homelab.example.ts.net#TOKEN#work")).toEqual({
+      url: "wss://homelab.example.ts.net",
+      token: "TOKEN",
+      vaultId: "work",
+    });
+    // Absent means `default`, which is what every line printed before this
+    // said and still means: the field is simply not there.
+    expect(parseSetup("homelab:3003#TOKEN").vaultId).toBeUndefined();
+    expect(() => parseSetup("homelab:3003#TOKEN#")).toThrow(/vault name is missing/);
+    expect(() => parseSetup("homelab:3003#TOKEN#work#more")).toThrow(/at most two #/);
+  });
+
+  it("names the vault and the server a pasted string would join", () => {
+    // Nothing is pressable in the panel until this can answer, because an
+    // invite from the wrong chat points an unpaired vault at a stranger's
+    // server and the first sync uploads to it (R083-05).
+    expect(joinDestination(formatInvite(sampleInvite()), "join")).toEqual({
+      url: sampleInvite().url,
+      vaultId: sampleInvite().vaultId,
+    });
+    expect(joinDestination(formatPairing(sample()), "join")).toEqual({
+      url: sample().url,
+      vaultId: sample().vaultId,
+    });
+    expect(joinDestination("wss://homelab.example.ts.net#TOKEN#work", "first")).toEqual({
+      url: "wss://homelab.example.ts.net",
+    });
+    // And it refuses in the shape of the field it was typed into, so the
+    // reason on screen tells somebody what they should have pasted.
+    expect(() => joinDestination("not a key at all", "join")).toThrow(/basalt3_/);
+    expect(() => joinDestination("not a line at all", "first")).toThrow(/host:3003#TOKEN/);
   });
 });
 

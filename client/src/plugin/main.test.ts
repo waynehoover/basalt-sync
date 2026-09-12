@@ -37,7 +37,13 @@ import { describeRestore } from "./history.ts";
 import { Engine, type SyncReport } from "../core/engine.ts";
 import { Client, redeemInvite } from "../core/client.ts";
 import { ObsidianIndexStore } from "./vault.ts";
-import { parseInvite, parsePairing } from "../core/pairing.ts";
+import {
+  INVITE_ID_LENGTH,
+  INVITE_KEY_LENGTH,
+  formatInvite,
+  parseInvite,
+  parsePairing,
+} from "../core/pairing.ts";
 import { INVITE_ACTION, inviteLink, inviteQrImage } from "./invite-qr.ts";
 
 beforeAll(async () => {
@@ -1547,13 +1553,102 @@ describe("the panel, which is a modal and a settings tab", () => {
       .find((s) => s.name === "Invite or recovery key")!
       .texts[0]!.type("this is not a pairing string");
     notices.length = 0;
+    const pair = built
+      .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+      .buttons.find((b) => b.label === "Pair")!;
+    // On screen, where the string was typed, and the button is not offered:
+    // pairing points a vault at a server, so nothing is pressable until the
+    // panel can say which one (R083-05).
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/basalt3_/);
+    expect(pair.disabled).toBe(true);
+    await pair.click();
+    expect(plugin.paired).toBe(false);
+  });
+
+  it("carries a skip list chosen before pairing into the vault it pairs", async () => {
+    // Pairing starts the download the moment it finishes, and the exclusion
+    // controls used to exist only in the paired panel: adding a phone to a
+    // vault holding gigabytes of attachments meant racing your own sync to the
+    // settings screen (Codex-05).
+    const { plugin } = await load();
+    choosePairing(plugin, "invite");
+    const skip = built.find((s) => s.name === "Skip on this device")!;
+    skip.texts[0]!.type("Attachments");
+    await skip.buttons.find((b) => b.label === "Skip")!.click();
+
+    let carried: readonly string[] | undefined;
+    plugin.pair = async (_key, _device, _merge, ignore) => {
+      carried = ignore;
+    };
+    built
+      .find((s) => s.name === "Invite or recovery key")!
+      .texts[0]!.type(
+        formatInvite({
+          url: "wss://homelab.example.ts.net",
+          vaultId: "default",
+          id: new Uint8Array(INVITE_ID_LENGTH).fill(3),
+          key: new Uint8Array(INVITE_KEY_LENGTH).fill(4),
+        }),
+      );
     await built
       .find((s) => s.buttons.some((b) => b.label === "Pair"))!
       .buttons.find((b) => b.label === "Pair")!
       .click();
 
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt3_/);
-    expect(plugin.paired).toBe(false);
+    expect(carried, "the skip list did not reach the pairing").toEqual(["Attachments"]);
+  });
+
+  it("names the vault and server an invite would join, before pairing", async () => {
+    const { plugin } = await load();
+    choosePairing(plugin, "invite");
+    const field = built.find((s) => s.name === "Invite or recovery key")!.texts[0]!;
+    const pair = () =>
+      built
+        .find((s) => s.buttons.some((b) => b.label === "Pair"))!
+        .buttons.find((b) => b.label === "Pair")!;
+    expect(pair().disabled, "nothing typed, so nothing to join").toBe(true);
+
+    field.type(
+      formatInvite({
+        url: "wss://someone-elses.example.org",
+        vaultId: "their-vault",
+        id: new Uint8Array(INVITE_ID_LENGTH).fill(7),
+        key: new Uint8Array(INVITE_KEY_LENGTH).fill(9),
+      }),
+    );
+    const shown = modals.at(-1)!.contentEl.allText();
+    expect(shown).toContain("their-vault");
+    expect(shown).toContain("wss://someone-elses.example.org");
+    expect(pair().disabled).toBe(false);
+  });
+});
+
+describe("a version kept where Obsidian cannot see it", () => {
+  it("can be recovered from the panel, without disturbing the hidden copy", async () => {
+    // Preservation parks bytes under a hidden name when it cannot place them
+    // beside the note, and that was the end of the story: the panel said it
+    // had happened and nothing could act on it, so getting them back meant a
+    // file manager on a device that has none. Sometimes it is the only
+    // surviving copy of the note (Codex-08).
+    const { plugin, app } = await load();
+    const hidden = "Notes/.basalt-tmp-review/Note.md";
+    app.vault.adapter.seed(hidden, "the paragraph that was displaced\n");
+    app.vault.adapter.seed("Notes/Note.md", "what replaced it\n");
+
+    const at = await plugin.recoverDisplaced({
+      at: hidden,
+      from: "Notes/Note.md",
+      why: "a save raced the write",
+      when: 1,
+    });
+
+    // Beside, never over: the name that displaced it is untouched.
+    expect(at).not.toBe("Notes/Note.md");
+    expect(app.vault.adapter.text("Notes/Note.md")).toBe("what replaced it\n");
+    expect(app.vault.adapter.text(at)).toBe("the paragraph that was displaced\n");
+    // And the hidden copy stays. Removing it is the one destructive step in a
+    // recovery path and there is no "it worked" worth that risk.
+    expect(app.vault.adapter.text(hidden)).toBe("the paragraph that was displaced\n");
   });
 });
 
@@ -2547,6 +2642,7 @@ describe("what is announced, and how often", () => {
       inTheWay: [],
       chunksSent: 0,
       bytesSent: 0,
+      reusedChunks: 0,
     } as unknown as SyncReport;
     (plugin as unknown as { announce(report: SyncReport): void }).announce(report);
     expect(notices.map((n) => n.message).join(" ")).toMatch(/cannot sync 1 file\(s\)\./);
@@ -2885,7 +2981,11 @@ describe("recovery taps and late responses", () => {
     done.resolve({ path: "gone.md", sent: true });
     await Promise.all([first, second]);
     expect(recover).toHaveBeenCalledTimes(1);
-    expect(listed).toHaveBeenCalledTimes(2);
+    // The restored note leaves the list without asking the server again: a
+    // refetch would throw away every older page that had been loaded, which
+    // is what the filter searches (R083-17).
+    expect(listed).toHaveBeenCalledTimes(1);
+    expect(modals.at(-1)!.contentEl.allText()).toContain("No deleted notes to restore");
     modals.at(-1)!.close();
     vi.restoreAllMocks();
   });
@@ -5053,6 +5153,7 @@ describe("what a restore is allowed to claim", () => {
       needsAttention: [],
       chunksSent: 0,
       bytesSent: 0,
+      reusedChunks: 0,
       heldBack: 0,
       heldBackPaths: [],
     };

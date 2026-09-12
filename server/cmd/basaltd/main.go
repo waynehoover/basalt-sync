@@ -267,7 +267,7 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	var allowOrigin stringList
 	fs.Var(&allowOrigin, "allow-origin",
 		"additional browser origin allowed to connect, repeatable (see the log line a refused client produces)")
-	vault := fs.String("vault", "default", "the one vault this server serves")
+	vault := fs.String("vault", defaultVault, "the one vault this server serves")
 	maxFile := fs.Int64("max-file", store.DefaultPerFileMax,
 		"largest file to accept, in bytes, up to 256 MiB; the cost is the plugin's memory, about 210 MB plus 2.7 MB per MiB of file")
 	maxBatch := fs.Int64("max-batch-bytes", wire.MaxBatchBytes,
@@ -679,6 +679,10 @@ func pairingHosts(addr string) []string {
 	return out
 }
 
+// defaultVault is the name every client assumes when a setup line, an invite or
+// a pairing string does not carry one.
+const defaultVault = "default"
+
 // printSetup says what the server is and, if it is still waiting for its first
 // device, how to give it one.
 //
@@ -708,6 +712,16 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaime
 	fmt.Fprintln(out, "Basalt on your first device, under \"Start a new vault\", or run")
 	fmt.Fprintln(out, "`basalt init <line>` there:")
 	fmt.Fprintln(out)
+	// The vault's name, in the line, when it is not the one every client
+	// assumes. Without it the only way to start a vault called anything else
+	// was to install the CLI somewhere, claim the vault into a throwaway
+	// directory, invite the real device from it and then revoke the throwaway
+	// (R083-14). Both clients read the second # as the vault name, and a line
+	// for `default` is byte-for-byte what it always was.
+	named := ""
+	if vault != defaultVault {
+		named = "#" + vault
+	}
 	for _, host := range pairingHosts(addr) {
 		// The scheme only where it is not the usual one. A pairing string with
 		// no scheme becomes wss://, which is right behind a tunnel and wrong for
@@ -715,13 +729,13 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaime
 		if local {
 			host = "ws://" + host
 		}
-		fmt.Fprintf(out, "  %s#%s\n", host, token)
+		fmt.Fprintf(out, "  %s#%s%s\n", host, token, named)
 	}
 	fmt.Fprintln(out)
 	if !local {
 		// The addresses above are this machine's interfaces, and the device
 		// reaches whatever terminates TLS, which is usually somewhere else.
-		fmt.Fprintf(out, "If TLS is in front, use that hostname instead: wss://your-host#%s\n", token)
+		fmt.Fprintf(out, "If TLS is in front, use that hostname instead: wss://your-host#%s%s\n", token, named)
 		fmt.Fprintln(out)
 	}
 	fmt.Fprintln(out, "The part after the # is a one-time token. It is not the encryption key:")
@@ -948,7 +962,7 @@ func cmdVerify(args []string, out io.Writer) error {
 func cmdPurge(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
-	vault := fs.String("vault", "default", "vault to purge")
+	vault := fs.String("vault", defaultVault, "vault to purge")
 	// Friction proportional to what is lost (I18). Purge is the one command
 	// that destroys something no device holds, so it wants the vault's name
 	// typed a second time, and proof of a backup newer than the newest entry,

@@ -123,6 +123,51 @@ describe("transfer byte progress", () => {
     },
   );
 
+  it("stops polling the socket buffer four times a second while it sits still", async () => {
+    // A fixed 5 ms poll woke the event loop two hundred times a second for the
+    // length of an upload, which on a phone is the radio and the CPU kept
+    // awake to read one number that has not changed (R083-22). The wait widens
+    // while nothing moves and resets the moment something does, so the thing
+    // that matters, noticing the buffer clear, is as prompt as it was.
+    let reads = 0;
+    let buffered = 0;
+    class CountingSocket extends FakeSocket {
+      get bufferedAmount(): number {
+        reads++;
+        return buffered;
+      }
+      override send(data: string | ArrayBufferLike | Uint8Array): void {
+        super.send(data);
+        if (typeof data !== "string") buffered += data.byteLength;
+      }
+    }
+    const socket = new CountingSocket();
+    const { t } = await helloed(0, { socket });
+    const body = new Uint8Array(8 * 1024 * 1024); // over UPLOAD_HIGH_WATER
+    const name = await chunkName(body);
+    const meta = { size: body.length, ctime: 0, mtime: 0 };
+    const putting = t.put("p", meta, [name], async () => body, unsigned);
+    try {
+      socket.reply({ res: "want", chunks: [name] });
+      await expect.poll(() => reads > 0).toBe(true);
+      // A quarter of a second with the buffer stuck. At a flat 5 ms that is
+      // about fifty looks; widening towards 50 ms it is under ten.
+      const before = reads;
+      await new Promise((r) => setTimeout(r, 250));
+      const looks = reads - before;
+      expect(looks, `${looks} looks at a buffer that never moved`).toBeLessThan(15);
+
+      // And it comes straight back when the buffer moves.
+      buffered = 0;
+      await expect.poll(() => reads > 0).toBe(true);
+      socket.reply({ res: "ack", uid: 1 });
+      await putting;
+    } finally {
+      t.close();
+      await putting.catch(() => {});
+    }
+  });
+
   it("reports received bodies while later bodies are still outstanding", async () => {
     const { t, socket } = await helloed();
     const bodies = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5])];

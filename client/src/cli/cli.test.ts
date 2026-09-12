@@ -1896,6 +1896,7 @@ describe("what the CLI says about itself and the vault", () => {
       needsAttention: [],
       chunksSent: 0,
       bytesSent: 0,
+      reusedChunks: 0,
     };
     expect(exitCodeFor(clean)).toBe(0);
     expect(exitCodeFor({ ...clean, uploaded: 2, waiting: 1 })).toBe(0);
@@ -2123,6 +2124,7 @@ describe("what needs attention looks like on the way out", () => {
     needsAttention: [],
     chunksSent: 0,
     bytesSent: 0,
+    reusedChunks: 0,
   };
 
   /** What `renderReport` writes, given a report. */

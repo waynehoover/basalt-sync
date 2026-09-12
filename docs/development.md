@@ -15,6 +15,7 @@ use, start with the [server](server.md), [plugin](plugin.md), or
 | [Index journal](index-journal.md) | Client state format and recovery behavior. |
 | [Engineering notes](research.md) | Historical measurements, design evaluations, and credits. |
 | [Findings index](findings.md) | Definitions of review IDs cited in code. |
+| [Open work](open-work.md) | What is deliberately not done, and what would change that. |
 | [Documentation review](documentation-review.md) | Editorial changes and guidance for future docs. |
 | [0.7.1 review](reviews/0.7.1.md) | Concurrency, CLI, plugin, and UX review with reproductions and implementation follow-up. |
 

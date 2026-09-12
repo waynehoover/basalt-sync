@@ -742,7 +742,13 @@ export class Client {
     const entries = await this.serial(() => this.transport.history(sealed, opts));
     await this.recoveryIsOurs(entries);
     this.recoveryIsAboutThisPath(entries, sealed, path, opts.before);
-    return entries.map((e) => this.asVersion(e, path));
+    // The names these versions were moved from, so a rename does not end a
+    // note's history (Codex-06). Unsealed together rather than one at a time,
+    // and only where there is one to unseal.
+    const from = await Promise.all(
+      entries.map((e) => (e.prev ? openPath(this.keys, e.prev) : undefined)),
+    );
+    return entries.map((e, i) => this.asVersion(e, path, from[i]));
   }
 
   /**
@@ -1007,10 +1013,11 @@ export class Client {
     }
   }
 
-  private asVersion(e: WireEntry, path: string): Version {
+  private asVersion(e: WireEntry, path: string, previousPath?: string): Version {
     return {
       uid: e.uid,
       path,
+      ...(previousPath !== undefined && previousPath !== path ? { previousPath } : {}),
       size: e.size,
       ctime: e.ctime,
       mtime: e.mtime,
@@ -1244,6 +1251,17 @@ export interface Version {
    * another file's chunks.
    */
   readonly contentId: string;
+  /**
+   * The name this version was moved from, where it carries one (Codex-06).
+   *
+   * A rename travels as one signed operation, so this is authenticated with
+   * the rest of the entry. History matches one exact sealed path, so without
+   * it a note renamed today has a history that starts today, however many
+   * months of it the server is still holding under the old name.
+   *
+   * Unsealed here, because it is a sealed path on the wire like any other.
+   */
+  readonly previousPath?: string;
 }
 
 /**
@@ -1707,6 +1725,14 @@ export interface JoiningVault {
    */
   readonly readOnly?: boolean;
   /**
+   * Names this device will never sync, chosen before it starts (Codex-05).
+   *
+   * Carried through registration for the same reason `readOnly` is: the config
+   * this produces *replaces* whatever was on disk, so a list written
+   * beforehand and left to registration to preserve is a list that vanishes.
+   */
+  readonly ignore?: readonly string[];
+  /**
    * The server's first-run token, present only while this device is claiming
    * an unclaimed vault. The claim rides on the registrar hello below, so it is
    * spent by the same exchange that registers this device's row.
@@ -1808,6 +1834,7 @@ export async function registerAsDevice(
     deviceSecret,
     dataKey,
     ...(joining.readOnly === true ? { readOnly: true } : {}),
+    ...(joining.ignore?.length ? { ignore: joining.ignore } : {}),
   };
   await save(device);
 

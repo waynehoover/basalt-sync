@@ -710,50 +710,162 @@ func (s *Store) AppendCurrent(vaultID string, e Entry, base, prevBase int64) (in
 	return s.appendEntry(vaultID, e, &base, prevBase)
 }
 
-func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64) (int64, error) {
-	if err := e.Validate(); err != nil {
-		return 0, err
+// ManyResult is one entry's outcome inside an AppendMany, in the order the
+// entries were given. Exactly one of UID and Err is set.
+type ManyResult struct {
+	UID int64
+	Err error
+}
+
+// AppendMany commits a batch of conditional writes in one transaction, keeping
+// each entry's own refusal (R083-23).
+//
+// The cost this exists to remove is fsync. Every commit is a transaction under
+// `synchronous=FULL`, so a batch of N entries was N fsyncs, and research.md
+// measured a 2,000-note folder rename at 549 ms of almost nothing else: the
+// batch carries no bodies, so the syncs are the whole of it. The same document
+// records one-transaction-per-batch as saving 0.7% of an *upload*, which is
+// true and is a different shape of batch, one dominated by the chunk bodies
+// that were already written before any of this runs.
+//
+// A savepoint per entry is what keeps the two properties from fighting. The
+// outer transaction pays one fsync; the inner savepoint is rolled back for an
+// entry that is stale or malformed, so that entry is refused by itself and the
+// rest of the batch still commits, which is what the acks promise. A rolled
+// back savepoint also gives back the uid it took, because the base checks run
+// before the sequence is touched.
+//
+// All or nothing on infrastructure failure, and per entry on the client's own
+// mistakes. That is the same division the per-entry version had: a disk error
+// took the whole batch down there too, because it took the connection with it.
+func (s *Store) AppendMany(vaultID string, entries []Entry, bases, prevBases []int64) ([]ManyResult, error) {
+	if len(bases) != len(entries) || len(prevBases) != len(entries) {
+		return nil, fmt.Errorf("%d entries with %d bases and %d prevBases", len(entries), len(bases), len(prevBases))
+	}
+	out := make([]ManyResult, len(entries))
+
+	// Every refusal that needs no transaction, before one is opened. These are
+	// the same checks `AppendCurrent` makes and in the same order, so a batch
+	// of one refuses exactly what a single put refuses.
+	pending := make([]int, 0, len(entries))
+	for i, e := range entries {
+		if err := checkConditional(e, bases[i], prevBases[i]); err != nil {
+			out[i] = ManyResult{Err: err}
+			continue
+		}
+		if err := e.Validate(); err != nil {
+			out[i] = ManyResult{Err: err}
+			continue
+		}
+		pending = append(pending, i)
+	}
+	if len(pending) == 0 {
+		return out, nil
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	// Presence is checked here, under the lock, and not by the caller. A caller
-	// that checked earlier would be racing the chunk sweep; holding the lock
-	// across the check and the commit is what makes "committed implies
-	// serveable" true rather than likely.
-	//
-	// The same stat yields each body's size, and the total is checked against
-	// what the declared plaintext size can account for. This is the
-	// authoritative check: the session bounds uploads as they arrive so a
-	// hostile client cannot write the disk full before being refused, but that
-	// pre-check can be bypassed by referencing chunks the server already holds,
-	// and this one cannot be bypassed at all.
-	var stored int64
-	for i, n := range e.Chunks {
-		size, ok := s.chunks.Size(vaultID, n)
-		if !ok {
-			return 0, fmt.Errorf("%w: chunk %d of %d: %s", ErrChunkMissing, i+1, len(e.Chunks), n)
+	// Presence under the lock, for the reason `appendEntry` gives: checking it
+	// earlier would race the chunk sweep, and holding the lock across the check
+	// and the commit is what makes "committed implies serveable" true rather
+	// than likely.
+	still := pending[:0]
+	for _, i := range pending {
+		if err := s.chunksAccountedFor(vaultID, entries[i]); err != nil {
+			out[i] = ManyResult{Err: err}
+			continue
 		}
-		stored += size
+		still = append(still, i)
 	}
-	if budget := CiphertextBudget(e.Size, len(e.Chunks)); stored > budget {
-		return 0, fmt.Errorf("%w: %d chunks holding %d bytes for a declared size of %d, budget %d",
-			ErrOverBudget, len(e.Chunks), stored, e.Size, budget)
+	pending = still
+	if len(pending) == 0 {
+		return out, nil
 	}
 
-	// The gap the lock exists to cover: the bodies have been found and nothing
-	// is committed yet. Nil in every non-test build.
 	if s.betweenCheckAndCommit != nil {
 		s.betweenCheckAndCommit()
 	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer tx.Rollback()
 
+	committed := 0
+	for _, i := range pending {
+		name := fmt.Sprintf("basalt_entry_%d", i)
+		if _, err := tx.Exec("SAVEPOINT " + name); err != nil {
+			return nil, err
+		}
+		uid, err := writeEntry(tx, vaultID, entries[i], &bases[i], prevBases[i])
+		if err == nil {
+			if _, err := tx.Exec("RELEASE SAVEPOINT " + name); err != nil {
+				return nil, err
+			}
+			out[i] = ManyResult{UID: uid}
+			committed++
+			continue
+		}
+		// A refusal this entry earned, rolled back on its own. Anything else is
+		// the database itself, and a batch that cannot talk to its database has
+		// no per-entry answer to give.
+		if !errors.Is(err, ErrStale) && !errors.Is(err, ErrBadEntry) && !errors.Is(err, ErrUnknownVault) {
+			return nil, err
+		}
+		if _, rerr := tx.Exec("ROLLBACK TO SAVEPOINT " + name); rerr != nil {
+			return nil, rerr
+		}
+		if _, rerr := tx.Exec("RELEASE SAVEPOINT " + name); rerr != nil {
+			return nil, rerr
+		}
+		out[i] = ManyResult{Err: err}
+	}
+
+	// The one fsync. Nothing above has been acknowledged and nothing has been
+	// broadcast: the caller does both from the results, after this returns.
+	if committed > 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// checkConditional is the argument check `AppendCurrent` makes before it looks
+// at the entry, kept in one place so a batch refuses what a single put refuses.
+func checkConditional(e Entry, base, prevBase int64) error {
+	if e.Prev == "" && prevBase != 0 {
+		return fmt.Errorf("%w: prevBase requires a previous path", ErrBadEntry)
+	}
+	if err := ValidateBase(base); err != nil {
+		return err
+	}
+	return ValidateBase(prevBase)
+}
+
+// chunksAccountedFor is the presence and budget check, which the caller must
+// hold writeMu across.
+func (s *Store) chunksAccountedFor(vaultID string, e Entry) error {
+	var stored int64
+	for i, n := range e.Chunks {
+		size, ok := s.chunks.Size(vaultID, n)
+		if !ok {
+			return fmt.Errorf("%w: chunk %d of %d: %s", ErrChunkMissing, i+1, len(e.Chunks), n)
+		}
+		stored += size
+	}
+	if budget := CiphertextBudget(e.Size, len(e.Chunks)); stored > budget {
+		return fmt.Errorf("%w: %d chunks holding %d bytes for a declared size of %d, budget %d",
+			ErrOverBudget, len(e.Chunks), stored, e.Size, budget)
+	}
+	return nil
+}
+
+// writeEntry is the conditional check and the three inserts, inside whatever
+// transaction or savepoint the caller has opened.
+func writeEntry(tx *sql.Tx, vaultID string, e Entry, base *int64, prevBase int64) (int64, error) {
 	if base != nil {
 		head, deleted, err := pathHead(tx, vaultID, e.Path)
 		if err != nil {
@@ -774,7 +886,7 @@ func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64
 	}
 
 	var uid int64
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		`UPDATE vaults SET next_uid = next_uid + 1 WHERE vault_id = ?
 		 RETURNING next_uid - 1`, vaultID).Scan(&uid)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -799,6 +911,51 @@ func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64
 			vaultID, uid, i, n); err != nil {
 			return 0, err
 		}
+	}
+	return uid, nil
+}
+
+func (s *Store) appendEntry(vaultID string, e Entry, base *int64, prevBase int64) (int64, error) {
+	if err := e.Validate(); err != nil {
+		return 0, err
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	// Presence is checked here, under the lock, and not by the caller. A caller
+	// that checked earlier would be racing the chunk sweep; holding the lock
+	// across the check and the commit is what makes "committed implies
+	// serveable" true rather than likely.
+	//
+	// The same stat yields each body's size, and the total is checked against
+	// what the declared plaintext size can account for. This is the
+	// authoritative check: the session bounds uploads as they arrive so a
+	// hostile client cannot write the disk full before being refused, but that
+	// pre-check can be bypassed by referencing chunks the server already holds,
+	// and this one cannot be bypassed at all.
+	if err := s.chunksAccountedFor(vaultID, e); err != nil {
+		return 0, err
+	}
+
+	// The gap the lock exists to cover: the bodies have been found and nothing
+	// is committed yet. Nil in every non-test build.
+	if s.betweenCheckAndCommit != nil {
+		s.betweenCheckAndCommit()
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	// The same function `AppendMany` runs inside a savepoint, so a single put
+	// and one entry of a batch cannot come to different conclusions about the
+	// same write.
+	uid, err := writeEntry(tx, vaultID, e, base, prevBase)
+	if err != nil {
+		return 0, err
 	}
 
 	if err := tx.Commit(); err != nil {

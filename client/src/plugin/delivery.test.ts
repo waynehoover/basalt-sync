@@ -56,7 +56,10 @@ it("shares delivery requests, slows settled polling, and checks immediately afte
   expect(source.devices).toHaveBeenCalledTimes(2);
   expect(b).toHaveBeenLastCalledWith("Waiting for Phone.");
   peer.applied = 3;
-  await vi.advanceTimersByTimeAsync(250);
+  // A second while a peer is online and behind, which is the busy cadence.
+  await vi.advanceTimersByTimeAsync(999);
+  expect(source.devices).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(1);
   expect(source.devices).toHaveBeenCalledTimes(3);
   expect(a).toHaveBeenLastCalledWith("Latest changes received on Phone.");
 });

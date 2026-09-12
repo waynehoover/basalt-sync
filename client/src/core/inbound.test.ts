@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
 import { FakeSocket, engineOnFakeSocket, settle } from "./fake-socket.ts";
 import type { WireEntry } from "./transport.ts";
-import { MemoryVault } from "./vault.ts";
+import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 const enc = new TextEncoder();
 
@@ -25,6 +25,8 @@ async function entryFor(
   path: string,
   text: string,
   bodies: Map<string, Uint8Array>,
+  /** The name this is moved from, for an entry that carries a rename. */
+  from?: string,
 ): Promise<WireEntry> {
   const plain = enc.encode(text);
   const [chunk] = await sealChunks(keys, [plain]);
@@ -38,6 +40,9 @@ async function entryFor(
     deleted: false,
     chunks: [chunk!.name],
     parent: "",
+    // In the authenticator, because a rename is one operation and the old
+    // name is part of what was signed.
+    ...(from !== undefined ? { prev: await sealPath(keys, from) } : {}),
   };
   return { uid, ...facts, device: "other", mac: await macEntry(keys, facts) };
 }
@@ -147,6 +152,66 @@ describe("a wire path that is not canonical", () => {
     // The session survives: a wrong path from a peer is not a reason to
     // disconnect from the server.
     expect(socket.closed).toBe(false);
+  });
+
+  it("is still refused, and still counted, after a restart", async () => {
+    // The refusal used to live only in memory: the version was dropped on the
+    // floor at accept, so a restart forgot both the refusal and the fact that
+    // anything had been refused, and the panel's count of written-off paths
+    // reset itself to zero with nothing having been fixed (R083-04, rule 7).
+    const store = new MemoryIndexStore();
+    const bodies = new Map<string, Uint8Array>();
+    const odd = ["a//b.md", "a/./c.md", "d/e.md/", "/f.md", "g/../h.md"];
+
+    const first = await engineOnFakeSocket({}, { store });
+    serving(first.socket, bodies);
+    const entries = await Promise.all(
+      odd.map((p, i) => entryFor(first.keys, i + 1, p, `odd ${i}`, bodies)),
+    );
+    first.socket.raw({ op: "batch", from: 1, to: entries.length, entries });
+    await accepted(first.engine, 1);
+    const before = await first.engine.sync();
+    expect(before.skipped).toBe(odd.length);
+    first.socket.close();
+
+    // A second engine on the state the first one saved, told nothing new.
+    const again = await engineOnFakeSocket({ cursor: odd.length }, { store });
+    serving(again.socket, bodies);
+    const after = await again.engine.sync();
+    expect(after.skipped, "the refusals were forgotten across a restart").toBe(odd.length);
+    expect(after.retrying).toBe(0);
+    expect(again.vault.paths()).toEqual([]);
+  });
+
+  it("stops being refused once the peer that wrote it takes it away", async () => {
+    // Persisting the refusal is only half of it. The other half is that there
+    // has to be a way back: a peer renaming `a//b.md` to `a/b.md` sends the
+    // removal of the old name, and if that removal is itself refused and
+    // pinned in `pending` for ever, the vault can never report a clean sync
+    // again and nobody can do anything about it (rule 7).
+    const { engine, socket, keys, vault } = await engineOnFakeSocket();
+    const bodies = new Map<string, Uint8Array>();
+    serving(socket, bodies);
+    socket.raw({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [await entryFor(keys, 1, "a//b.md", "written wrong", bodies)],
+    });
+    await accepted(engine, 1);
+    expect((await engine.sync()).skipped).toBe(1);
+
+    // The rename, as a peer sends one: the new name, moved from the old.
+    const fixed = await entryFor(keys, 2, "a/b.md", "written wrong", bodies, "a//b.md");
+    socket.raw({ op: "batch", from: 2, to: 2, entries: [fixed] });
+    await accepted(engine, 1);
+    await engine.sync();
+    const settled = await engine.sync();
+    expect(vault.text("a/b.md")).toBe("written wrong");
+    expect(settled.skipped, "the refusal outlived the path it was about").toBe(0);
+    // Not `retrying`: the download created the folder `a`, which this device
+    // now wants to publish, and the rig's socket answers no upload.
+    expect(settled.skippedPaths).toEqual([]);
   });
 });
 

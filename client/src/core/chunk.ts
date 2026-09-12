@@ -503,7 +503,7 @@ export async function* blobBlocks(blob: Blob, blockSize = 1024 * 1024): AsyncGen
  * rather than content sniffing, because the answer is wanted before the file is
  * read.
  */
-const TEXT_EXTENSIONS = new Set([
+export const TEXT_EXTENSIONS = new Set([
   "md",
   "txt",
   "canvas",
@@ -511,6 +511,12 @@ const TEXT_EXTENSIONS = new Set([
   "csv",
   "yml",
   "yaml",
+  // Obsidian's Bases. YAML, a few hundred bytes, and edited from a table view
+  // on every device, so it is the shape of file this project exists for: as an
+  // attachment it took the 128 KiB binary minimum for a one-line change, it
+  // conflicted rather than merged, and its history showed "preview
+  // unavailable" (R083-12).
+  "base",
   "xml",
   "html",
   "css",
@@ -556,6 +562,23 @@ export function looksLikeText(path: string): boolean {
  * corpus, the control that keeps it honest, and the twelve adversarial pairs.
  */
 const JSON_EXTENSIONS = new Set(["canvas", "json"]);
+
+/**
+ * Extensions whose contents have to be readable as YAML.
+ *
+ * `.base` is Obsidian's own, and the same argument as `.canvas`: it is edited
+ * as structure from a table view, a merge of two structural edits is usually
+ * right, and the one that is not is worth catching before it reaches a reader
+ * that will silently drop half of it. See `parsesAsYaml` for which of YAML's
+ * rules the gate checks and why the rest are out of scope.
+ */
+const YAML_EXTENSIONS = new Set(["base", "yml", "yaml"]);
+
+export function looksLikeYaml(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return false;
+  return YAML_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+}
 
 export function looksLikeJson(path: string): boolean {
   const dot = path.lastIndexOf(".");

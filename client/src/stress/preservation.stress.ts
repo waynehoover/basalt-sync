@@ -55,10 +55,24 @@ it("continuous competing writes yield a waiting report instead of hanging", asyn
     };
   };
   const report = await within(a!.c.engine.sync(), "a bounded reconciliation call");
-  expect(attempts).toBe(8);
-  expect(report.waiting).toBeGreaterThan(0);
+  // It gives up before the round cap, rather than running it out (R083-01).
+  // A stale refusal now means "ask the server what it holds and decide again",
+  // which is what breaks the case where the head this device is missing is its
+  // own; a peer that keeps winning is a different thing, and after a few tries
+  // running the eight rounds out changes nothing except how hard this device
+  // works. So it becomes an ordinary backed-off retry that says why.
+  expect(attempts).toBeGreaterThan(1);
+  expect(attempts).toBeLessThan(8);
+  // Retrying, not waiting, and the difference is the point of stopping (rule
+  // 7). "Waiting" is a path the next round of this sync will look at again;
+  // once this device has asked the server and been refused anyway, the next
+  // look is a scheduled one, and saying "waiting" about it would be a panel
+  // that never stops saying something is about to happen.
+  expect(report.retrying).toBeGreaterThan(0);
   expect(report.appliedCursor).toBeUndefined();
   expect(report.nextUploadAt).toBeDefined();
+  // And the retry is not scheduled for now, which is the loop it replaces.
+  expect(report.nextUploadAt!).toBeGreaterThan(Date.now());
 });
 
 it("five offline writers preserve disjoint edits after the first writer exits", async () => {

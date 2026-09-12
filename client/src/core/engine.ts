@@ -44,7 +44,15 @@ import type { Activity, ActivityAction } from "./activity.ts";
  */
 
 import { notifyTransfer, type TransferActivity } from "./transfer.ts";
-import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
+import {
+  looksLikeJson,
+  looksLikeText,
+  looksLikeYaml,
+  chunkBytes,
+  chunkStream,
+  sizesFor,
+} from "./chunk.ts";
+import { parsesAsYaml } from "./yaml.ts";
 import { drawingGate, looksLikeExcalidraw } from "./excalidraw.ts";
 import { looksLikeMarkupPath, wellFormedMarkup } from "./markup.ts";
 import {
@@ -77,6 +85,7 @@ import {
   reconciled,
 } from "./index-state.ts";
 import {
+  ConnectionError,
   MAX_BATCH_ENTRIES,
   MAX_FETCH_NAMES,
   encodedEntryBytes,
@@ -656,19 +665,63 @@ export interface SyncReport {
   /** Chunk bodies actually sent, and their size. The measure that matters. */
   chunksSent: number;
   bytesSent: number;
+  /**
+   * Chunk bodies a download did not have to ask for, because this device
+   * already held them in the file it was replacing.
+   *
+   * The download's own measure, and the reason it is counted separately from
+   * `downloaded`: a file that arrives is a file that arrived either way, and
+   * what changed is how much of somebody's connection it took.
+   */
+  reusedChunks: number;
 }
 
 /**
- * How many blocked paths are named before the list stops being a message.
+ * How many paths any of the report's lists names before it stops being a
+ * message.
  *
  * One file where a folder belongs blocks every path beneath it, so the count
  * can be a whole subtree while the *cause* is a single name. Naming a few is
  * enough to act on; naming four hundred is a wall.
+ *
+ * One constant for every list, because there were three: blocked and written
+ * off at five, held back at twenty, and only one renderer said how many it was
+ * not showing. Two bounds is two answers to "is this list the whole of it", and
+ * the count beside each list is what a renderer says the remainder from.
  */
-const IN_THE_WAY_SHOWN = 5;
+const LISTED_PATHS = 5;
 
-/** The same bound, and the same reason, for the paths written off. */
-const SKIPPED_SHOWN = 5;
+/**
+ * How many `stale` refusals of one path are answered by asking the server for
+ * its head before the path is put on ordinary backoff instead (R083-01).
+ *
+ * Three, because one refusal is the ordinary case of another device writing
+ * first, a second says the head this device then fetched was already old, and
+ * a third says asking is not what this path is short of.
+ */
+const STALE_REFUSALS_BEFORE_BACKOFF = 3;
+
+/**
+ * How long a path waits after the connection went away under it (R083-03).
+ *
+ * Flat, and short, because it is not a fact about the file: the reconnect is
+ * what decides when this can be tried, and `runForever` builds a fresh engine
+ * for it anyway. What matters is that it is not `5 * 2^n` per path.
+ */
+const RECONNECT_RETRY_MS = 5_000;
+
+/**
+ * The floor under a pass that asked to run again immediately (R083-02).
+ *
+ * `again` means a pass found work it could not finish, and eight rounds of it
+ * end with `nextUploadAt` set to now, which the client turns into
+ * `setTimeout(0)`. Anything that sets `again` on every pass is then a
+ * continuous loop of whole-vault passes: a peer editing the note this device
+ * is uploading, or a path the server keeps refusing. A second between rounds
+ * is imperceptible to a person and is the difference between catching up and
+ * spinning.
+ */
+const AGAIN_FLOOR_MS = 1_000;
 
 /**
  * Counts one path as written off, and records which one.
@@ -742,6 +795,7 @@ function emptyReport(): SyncReport {
     inTheWay: [],
     needsAttention: [],
     chunksSent: 0,
+    reusedChunks: 0,
     bytesSent: 0,
   };
 }
@@ -811,6 +865,46 @@ export class Engine {
    * retried, since nothing about them changes by waiting.
    */
   private readonly refusedInbound = new Map<string, string>();
+
+  /**
+   * Paths the server refused as `stale`, and how many times in a row (R083-01).
+   *
+   * A stale refusal means the server's head for this path is not the version
+   * this device based its write on, and the ordinary way to learn the new head
+   * is the batch that carries it. There is one head this device is never sent:
+   * its own. A device's own write comes back as an empty batch, the cursor
+   * advance without the payload, so if the acknowledgement is lost after that
+   * echo was applied, the cursor is past the entry, catch-up will never replay
+   * it, and `remote` keeps the version before it for ever. Every upload of that
+   * path is then refused, including every later edit, and the retry is
+   * immediate because `stale` sets `again` rather than a backoff.
+   *
+   * So a refusal puts the path in here and the next round asks the server what
+   * the head actually is, once, before deciding again. The count is what stops
+   * that becoming its own loop: a path refused this many times running has not
+   * been helped by asking, and it goes to the ordinary retry backoff with a
+   * reason a person can read.
+   */
+  private readonly staleHeads = new Map<string, number>();
+
+  /**
+   * Whether this sync has already abandoned a walk to publish the open note.
+   *
+   * Per sync rather than per round, because the cost being bounded is the
+   * re-listing the next round does. See the yield in `pass`.
+   */
+  private yieldedThisSync = false;
+
+  /**
+   * How many times each path has been refused since it last settled, carried
+   * across the ask.
+   *
+   * Separate from `staleHeads`, which is only the queue of paths still to ask
+   * about: a path comes off that queue the moment it is asked, so nothing
+   * accumulates there for a path that never comes back. This is the count, and
+   * it is cleared everywhere a path settles.
+   */
+  private readonly asked = new Map<string, number>();
 
   /**
    * Paths another device syncs that this device is configured to ignore, and
@@ -1005,7 +1099,7 @@ export class Engine {
    */
   private heldBack(path: string, report: SyncReport, why: string): void {
     report.heldBack++;
-    if (report.heldBackPaths.length < 20) report.heldBackPaths.push(path);
+    if (report.heldBackPaths.length < LISTED_PATHS) report.heldBackPaths.push(path);
     this.log("held back", path, why);
   }
 
@@ -1206,16 +1300,26 @@ export class Engine {
       const e = batch.entries[at]!;
       const path = paths[at]!;
       const wire = wires[at]!;
-      // A path this device would never list is refused here, once, as a
-      // fact about the path rather than filed for retry: written, it
-      // would be invisible to the next scan and reported deleted. A path
-      // that is not in canonical form is refused the same way: a
-      // filesystem collapses `a//b` onto `a/b`, and the engine keys its
-      // whole idea of a file on the string, so two spellings of one file
-      // would be two entries here and one file there. Neither ends the
-      // session: a peer that is wrong about one path is still the vault.
-      const why = refusedInboundPath(path);
-      if (why !== undefined) {
+      // A name this device would never list, or would list as a different
+      // string, is refused: written, `a//b` would be invisible to the next
+      // scan as `a//b` and reported deleted, and the engine keys its whole
+      // idea of a file on the string, so two spellings of one file would be
+      // two entries here and one file there. A peer that is wrong about one
+      // path is still the vault, so this ends nothing.
+      //
+      // Refused in the pass rather than here, because a refusal decided here
+      // lived only in memory: the version was dropped on the floor, so a
+      // restart forgot both the refusal and the fact that anything had been
+      // refused, and the panel's count of written-off paths silently reset
+      // (R083-04, rule 7). Staged, the version persists in the state file
+      // like any other, the pass re-decides it from a pure function of the
+      // name, and the report says the same thing after a restart as before.
+      //
+      // Except a name that cannot be a key at all. The empty path is not a
+      // path (`isPath`), so a state file containing one is refused on load,
+      // and staging it would make this device unable to read its own index.
+      if (path === "" || path.includes("\0")) {
+        const why = refusedInboundPath(path) ?? "a path containing a NUL byte";
         if (!this.refusedInbound.has(path)) {
           this.log("refused a path from another device", path, why);
         }
@@ -1298,6 +1402,7 @@ export class Engine {
     }
     this.syncing = true;
     this.again = false;
+    this.yieldedThisSync = false;
     try {
       if (opts.retryFailures || opts.verifyContents) {
         const now = this.now();
@@ -1308,19 +1413,105 @@ export class Engine {
       while (this.again && rounds < 8 && !this.opts.transport.isClosed) {
         this.again = false;
         await this.opts.transport.drainReceived();
+        // Before the round, so a round that only exists because of a stale
+        // refusal has something new to decide from (R083-01). A round that
+        // re-decides from the same `remote` reaches the same conclusion and is
+        // refused again, which is the loop this whole mechanism is about.
+        await this.refreshStaleHeads(report);
         const next = await this.pass(opts);
         report = combinePasses(report, next);
         rounds++;
       }
       if (this.again) {
         report.waiting = Math.max(report.waiting, 1);
-        report.nextUploadAt = this.now();
+        // Not `now` (R083-02). The client turns this into its next timer, and
+        // zero means the whole vault is re-decided as fast as the disk allows
+        // for as long as whatever set `again` keeps setting it.
+        report.nextUploadAt = this.now() + AGAIN_FLOOR_MS;
         delete report.appliedCursor;
       }
       return report;
     } finally {
       this.opts.releaseUploadTransport?.();
       this.syncing = false;
+    }
+  }
+
+  /**
+   * Asks the server for the current version of every path it refused as stale,
+   * and folds the answer into `remote` (R083-01).
+   *
+   * The one head a device is never sent is its own. A device's own write comes
+   * back as an empty batch, the cursor advance without the payload, so an
+   * acknowledgement lost after that echo has been applied leaves the cursor
+   * past an entry this device will never be shown: catch-up starts above it,
+   * `remote` keeps the version before it for ever, and every upload of that
+   * path is refused as out of date. Including every later edit of it, which is
+   * how a note stops leaving this device while the panel says it is waiting.
+   *
+   * Asking is the only thing that breaks that, because the missing fact is one
+   * the fan-out will never carry. `history` with a limit of one is the ask, the
+   * answer is authenticated exactly as a batch entry is, and no cursor moves.
+   *
+   * Under the server's own spelling where that differs, since the name this
+   * device files a note under need not be the name the server has (`Remote.wire`).
+   *
+   * A failure is recorded against the path rather than thrown: this runs
+   * between rounds of a sync that is already under way, and one path that
+   * cannot be asked about must not end the pass for the rest of the vault.
+   */
+  private async refreshStaleHeads(report: SyncReport): Promise<void> {
+    if (this.staleHeads.size === 0 || this.opts.transport.isClosed) return;
+    for (const [path, refusals] of [...this.staleHeads]) {
+      // Asked, so it comes off the queue. The next refusal of this path puts
+      // it back with its count carried in `asked`, and a path that leaves by
+      // any other route, a deletion, a conflict copy, a prune, leaves nothing
+      // behind to ask about on every round of every sync for the session.
+      this.staleHeads.delete(path);
+      this.asked.set(path, refusals);
+      const known = this.remote.get(path);
+      const wire = known?.wire ?? path;
+      try {
+        const sealed = await this.sealedPath(wire);
+        const [newest] = await this.opts.transport.history(sealed, { limit: 1 });
+        if (newest === undefined) {
+          // The server holds no version of this path at all: purged, or a
+          // vault restored from before it existed. The next decision is made
+          // against no remote version rather than against one that is gone.
+          this.remote.delete(path);
+          this.pending.delete(path);
+          continue;
+        }
+        // The two checks a batch entry gets, and one the batch path does not
+        // need: a batch says which path each entry is for, and an answer to a
+        // question does not, so a version of another note would otherwise be
+        // recorded as this path's head.
+        await mustBeOurs(this.keys, [newest], ", so it is not this vault's version of that path");
+        checkEntryShape(newest);
+        if (newest.path !== sealed) {
+          throw new Error(
+            `the server answered a request for the newest version of ${path} with a version of ` +
+              `another note, so the current version of this path is still not known here`,
+          );
+        }
+        if (known !== undefined && newest.uid <= known.uid) continue;
+        this.remote.set(path, {
+          uid: newest.uid,
+          folder: newest.folder,
+          deleted: newest.deleted,
+          mtime: newest.mtime,
+          size: newest.size,
+          hash: contentId(newest.chunks),
+          ...spellingHeads(known, path, wire, newest.uid),
+        });
+        this.pending.add(path);
+        this.log("asked the server which version of a refused path it holds", path, {
+          was: known?.uid ?? 0,
+          now: newest.uid,
+        });
+      } catch (err) {
+        this.recordFailure(path, err, report);
+      }
     }
   }
 
@@ -1347,9 +1538,25 @@ export class Engine {
       try {
         if (stat) {
           observe(index, stat);
-          // A preview is explicitly requested and must not hide a same-stat edit.
           if (stat.size > this.limitOn("perFileMax")) throw new Error("File too large");
-          await this.rehash(index, path, stat.size);
+          // The same cache the pass honours, for the same reason. This used
+          // to read, chunk and seal every file on disk unconditionally, and
+          // then throw the work away: `index` is a copy, so the fresh hashes
+          // went nowhere and the pass that followed did it all again. A
+          // folder deletion on a 5,000-note phone vault therefore sealed the
+          // whole vault twice before the dialog appeared (R083-08).
+          //
+          // The comment that stood here said a preview must not hide a
+          // same-stat edit. It must not, and `changeId` is what catches one
+          // where the adapter has it. Where it does not, `dirty` does: an
+          // editor that saved a note told this device so, and that is exactly
+          // the edit a stat cannot see.
+          if (
+            this.dirty.has(path) ||
+            needsRehash(index, Math.ceil(stat.mtime), stat.size, stat.changeId)
+          ) {
+            await this.rehash(index, path, stat.size);
+          }
         }
         const local = stat
           ? { folder: false, mtime: index.mtime, size: index.size, hash: index.hash }
@@ -1371,7 +1578,15 @@ export class Engine {
                       : "blocked";
         if (!this.sending && (action === "upload" || action === "delete-server"))
           action = "held-back";
-        if (this.ignoredPaths.has(path) || this.skipped.has(path) || this.refusedInbound.has(path))
+        // The refusal from the name, not from the map: a restart has the
+        // version back from the state file before it has run a pass to
+        // refuse it again, and a preview run in between must not offer to
+        // download a name this device will never write (R083-04).
+        if (
+          this.ignoredPaths.has(path) ||
+          this.skipped.has(path) ||
+          refusedInboundPath(path) !== undefined
+        )
           action = "blocked";
       } catch {
         action = "blocked";
@@ -1574,15 +1789,30 @@ export class Engine {
       // Yield background preparation at a file boundary when the open note changes.
       // Already pending work may be refused or backing off; only a new revision
       // should interrupt unrelated files. Keep the refusal visible in pending.
+      //
+      // Once per sync, not once per round (R083-11). The yield discards the
+      // ordered walk and the round after it lists the vault and re-decides
+      // every path from the start, so a save per round is a whole re-decision
+      // per save: somebody typing through a first sync on a phone spent more
+      // on re-listing five thousand notes than on the sync. Worse, with a
+      // steady typist the pass never got past the point it kept yielding at,
+      // because every round threw away the same prefix of work.
+      //
+      // One interruption buys what the yield is for, which is a save reaching
+      // the server without waiting out a scan of the whole vault, and bounds
+      // the cost of it at one extra listing. A save made after that is picked
+      // up by the next sync, a second later.
       const latestActiveUid = active ? this.remote.get(active)?.uid : undefined;
       if (
         active &&
         visitedActive &&
+        !this.yieldedThisSync &&
         (this.dirty.has(active) ||
           (latestActiveUid !== undefined &&
             latestActiveUid !== activeRemoteUid &&
             latestActiveUid > (this.entries.get(active)?.syncuid ?? 0)))
       ) {
+        this.yieldedThisSync = true;
         this.again = true;
         break;
       }
@@ -1591,6 +1821,29 @@ export class Engine {
         activeRemoteUid = this.remote.get(path)?.uid;
       }
       if (moving.has(path)) continue; // the conditional rename retires its source
+      // Refused for what the name is, not for anything that happened to it,
+      // so it is decided here from the name rather than remembered from the
+      // batch that carried it (R083-04). The version stays in `remote` and
+      // the path stays in `pending`, both of which persist, so the refusal
+      // and its count survive a restart. Nothing is written and nothing is
+      // fetched: there is no local file to compare and no name to write to.
+      const refused = refusedInboundPath(path);
+      if (refused !== undefined) {
+        if (this.refusedInbound.get(path) !== refused) {
+          this.log("refused a path from another device", path, refused);
+        }
+        this.refusedInbound.set(path, refused);
+        // Owed nothing, for the reason an ignored path is owed nothing: it
+        // will never be fetched and never be written, so leaving it on the
+        // inbound work list is a device reporting work it has decided not to
+        // do. It also has to leave, or the record can never go: `prune` keeps
+        // a deleted path that anything is still pending on, and the way a
+        // vault recovers from a peer that wrote `a//b.md` is that peer
+        // renaming it, which arrives as a deletion of exactly this path.
+        this.pending.delete(path);
+        noteSkipped(report, path);
+        continue;
+      }
       if (previousPriority > 0 && priority > previousPriority) {
         // Publish the current note before background notes, and all notes
         // before attachments. A slow file must not hold an interactive edit
@@ -1641,7 +1894,7 @@ export class Engine {
         nowBlocked.add(path);
         if (!this.blocked.has(path)) this.log("cannot be both", path, why);
         report.blocked++;
-        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+        if (report.inTheWay.length < LISTED_PATHS) {
           report.inTheWay.push({ path, blockedBy: claimed, why });
         }
         continue;
@@ -1664,7 +1917,7 @@ export class Engine {
           this.log("cannot be both", path, `${blockedBy} is a file here and a folder elsewhere`);
         }
         report.blocked++;
-        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+        if (report.inTheWay.length < LISTED_PATHS) {
           report.inTheWay.push({ path, blockedBy });
         }
         continue;
@@ -1700,13 +1953,19 @@ export class Engine {
     await this.flush(report);
 
     this.opts.onProgress?.(undefined);
-    for (const path of this.refusedInbound.keys()) noteSkipped(report, path);
+    // The ones the walk cannot reach, which is the empty path and anything
+    // else `isPath` will not have as a key: those are refused at accept and
+    // never staged, so nothing in `remote` names them and the loop above never
+    // sees them. Everything else was counted where it was refused.
+    for (const [path] of this.refusedInbound) {
+      if (!this.remote.has(path)) noteSkipped(report, path);
+    }
     // Sorted and capped once, here, after everything that could add to it.
     // Sorted because the plugin keys its notice on the names and the same set
     // reached in a different order is the same set; capped for the reason
     // above the constant.
-    report.skippedPaths = [...new Set(report.skippedPaths)].sort().slice(0, SKIPPED_SHOWN);
-    report.retryingPaths = [...new Set(report.retryingPaths)].sort().slice(0, SKIPPED_SHOWN);
+    report.skippedPaths = [...new Set(report.skippedPaths)].sort().slice(0, LISTED_PATHS);
+    report.retryingPaths = [...new Set(report.retryingPaths)].sort().slice(0, LISTED_PATHS);
 
     // Replaced rather than added to, so a path stops being blocked the
     // moment the file in its way is gone.
@@ -1724,11 +1983,27 @@ export class Engine {
       report.retrying === 0 &&
       report.skipped === 0 &&
       report.blocked === 0 &&
-      report.ignored === 0 &&
+      // Not `ignored`. A path this device was configured to skip is settled,
+      // by the person who configured it, and no later pass will change that.
+      // Counting it as outstanding meant a phone that skips one attachment
+      // folder never reported an applied cursor again: `applied` was never
+      // sent, so every other device said "Waiting for Phone" for the life of
+      // the vault, and polled it at a second to keep saying so (Codex-10).
+      //
+      // "Waiting" and "not coming" are different answers and the first one was
+      // wrong. What the count still is, and what the panel still says, is that
+      // N paths are not synced here; that is this device's business and it is
+      // on this device's screen. What goes to the other devices is how far
+      // through the log this one has got, which is all `applied` ever meant.
       report.heldBack === 0 &&
       report.conflicted === 0 &&
       [...this.remote].every(
-        ([path, remote]) => (this.entries.get(path)?.syncuid ?? -1) >= remote.uid,
+        ([path, remote]) =>
+          // A path this device was told to skip has no entry and never will,
+          // so measuring it against one is asking whether a decision has
+          // finished happening (Codex-10). It is counted and named as ignored
+          // on this device's own screen, which is where it belongs.
+          this.ignoredPaths.has(path) || (this.entries.get(path)?.syncuid ?? -1) >= remote.uid,
       )
     ) {
       report.appliedCursor = this.cursor;
@@ -1777,7 +2052,8 @@ export class Engine {
       // counted as skipped in every report and has its own map, so both are
       // asked; a path in neither is one a pass recorded and then cleared, and
       // a bare path with no sentence is worse than no line.
-      const why = this.skipped.get(path)?.why ?? this.refusedInbound.get(path);
+      const why =
+        this.skipped.get(path)?.why ?? this.refusedInbound.get(path) ?? refusedInboundPath(path);
       if (why !== undefined) add(path, why);
     }
     return out;
@@ -2014,6 +2290,10 @@ export class Engine {
     switch (action.kind) {
       case "nothing":
         report.unchanged++;
+        // Agreement settles a refusal too, so a later genuine race starts its
+        // own count rather than inheriting one (R083-01).
+        this.staleHeads.delete(path);
+        this.asked.delete(path);
         // Two sides agreeing *is* a sync: the ancestor moves, or the next
         // divergence would merge against a version neither side has.
         if (local && remote && !remote.deleted) {
@@ -2496,6 +2776,10 @@ export class Engine {
         this.recordFailure(q.path, result.error, report);
         continue;
       }
+      // Settled, so a later genuine race starts its own count rather than
+      // inheriting one (R083-01).
+      this.staleHeads.delete(q.path);
+      this.asked.delete(q.path);
       const remoteIsNewer = (this.remote.get(q.path)?.uid ?? 0) > result.uid;
       // A successful conditional write is an accepted ancestor even if a
       // peer edits it before the ack arrives. Record that local checkpoint
@@ -2563,7 +2847,7 @@ export class Engine {
       (remote?.uid ?? 0) !== entry.syncuid ||
       this.skipped.has(path) ||
       this.ignoredPaths.has(path) ||
-      this.refusedInbound.has(path) ||
+      refusedInboundPath(path) !== undefined ||
       this.nowBlocked.has(path) ||
       this.pending.has(path)
     )
@@ -2694,10 +2978,16 @@ export class Engine {
       failed: [],
     };
 
-    // One path at a time. The names could be offered all at once, and then a
-    // wanted body would have to be traced back to the file that can make it;
-    // per path the answer is already in hand, and a file that has changed under
-    // us costs one path rather than the run.
+    // Offers are gathered first and sent in batches (Codex-01). One `resend`
+    // per file meant one round trip per file whatever the answer was, and the
+    // answer is almost always "I have all of those": at ten thousand notes and
+    // 200 ms to the server that is over half an hour of nothing but waiting,
+    // on the client's serial queue, to put back a handful of bodies.
+    //
+    // The offer itself is free to make. It is the index's own chunk names, so
+    // a batch reads nothing; the server answers `want` with the subset it
+    // actually lacks, and only those files are read.
+    const offers: { path: string; entry: IndexEntry; names: readonly string[] }[] = [];
     for (const [path, entry] of [...this.entries]) {
       if (entry.folder || entry.chunks.length === 0) continue;
       report.scanned++;
@@ -2712,24 +3002,107 @@ export class Engine {
         continue;
       }
 
-      try {
-        const plan = await this.planUpload(entry, path);
-        // The scan has to agree with the index, or the file changed since the
-        // last sync and these are not the bodies the server wants.
-        if (plan.names.length !== names.length || plan.names.some((n, i) => n !== names[i])) {
-          report.couldNotOffer += names.length;
-          continue;
+      // And what the disk still agrees with, from a stat rather than a read.
+      //
+      // This is the check that used to happen inside `planUpload`, before the
+      // offer went out. Deferring the read means the disagreement is found
+      // while the server is already reading bodies, which is the one moment
+      // there is no way to withdraw: the connection has to be ended, and every
+      // path after this one in the run fails with it. A stat is what stops the
+      // common case, a note edited since the last pass, from ever getting
+      // there. The exact check still runs on the bytes; this only decides
+      // whether to offer at all.
+      const disk = this.opts.vault.stat ? await this.opts.vault.stat(path) : undefined;
+      if (
+        disk === undefined ||
+        disk.folder ||
+        needsRehash(entry, Math.ceil(disk.mtime), disk.size, disk.changeId)
+      ) {
+        report.couldNotOffer += names.length;
+        continue;
+      }
+      offers.push({ path, entry, names });
+    }
+
+    for (let at = 0; at < offers.length;) {
+      // A batch, by name count. The server refuses a resend naming more than
+      // `MAX_FETCH_NAMES` chunks, and one file may be most of a batch on its
+      // own, so a file whose names exceed the cap goes alone and is bounded by
+      // the same rule a put is.
+      const batch: typeof offers = [];
+      let named = 0;
+      while (
+        at < offers.length &&
+        (batch.length === 0 || named + offers[at]!.names.length <= REPAIR_BATCH_NAMES)
+      ) {
+        named += offers[at]!.names.length;
+        batch.push(offers[at]!);
+        at++;
+      }
+
+      // Which file can make which name. A chunk two files share is offered
+      // once and produced from whichever holds it; they are the same bytes,
+      // because the name is a hash of them.
+      const owner = new Map<
+        string,
+        { path: string; entry: IndexEntry; names: readonly string[] }
+      >();
+      const names: string[] = [];
+      for (const offer of batch) {
+        for (const name of offer.names) {
+          if (owner.has(name)) continue;
+          owner.set(name, offer);
+          names.push(name);
         }
+      }
+
+      // The read, still deferred to the first body the server asks for, and
+      // still checked against the index before any of it goes on the wire.
+      const plans = new Map<string, UploadPlan>();
+      let stale: string | undefined;
+      const bodyOf = async (name: string): Promise<Uint8Array> => {
+        const from = owner.get(name);
+        if (!from) throw new Error(`the server asked for ${name}, which this repair did not offer`);
+        let plan = plans.get(from.path);
+        if (plan === undefined) {
+          plan = await this.planUpload(from.entry, from.path);
+          if (
+            plan.names.length !== from.names.length ||
+            plan.names.some((n, i) => n !== from.names[i])
+          ) {
+            stale = from.path;
+            throw new Error(
+              `${from.path} has changed since the version the server acknowledged, so its chunks were not sent`,
+            );
+          }
+          plans.set(from.path, plan);
+        }
+        return plan.bodyOf(name);
+      };
+
+      try {
+        const out = await this.opts.transport.resend(names, bodyOf);
         report.offered += names.length;
-        const out = await this.opts.transport.resend(names, plan.bodyOf);
         report.stored += out.stored;
         report.stillMissing += out.missing;
       } catch (err) {
-        // One path's failure is one path. A repair run is somebody acting on a
-        // vault that is already damaged, and stopping at the first file it
-        // could not read would leave the rest unrepaired with no list of what
+        // One batch's failure is one batch. A repair run is somebody acting on
+        // a vault that is already damaged, and stopping at the first thing it
+        // could not send would leave the rest unrepaired with no list of what
         // was skipped.
-        report.failed.push({ path, why: (err as Error).message });
+        //
+        // The file that could not produce a body is named apart from the rest,
+        // because it is not a failure: it is the same "cannot help with this
+        // one" the `synchash` test above reports, found one step later because
+        // that is where the file is read.
+        for (const offer of batch) {
+          if (offer.path === stale) report.couldNotOffer += offer.names.length;
+          else report.failed.push({ path: offer.path, why: (err as Error).message });
+        }
+        // Unless the connection is what failed, in which case every batch
+        // after this one would fail the same way and be listed as though this
+        // device could not read it (rule 7). Stopping says what happened once.
+        if (this.opts.transport.isClosed) break;
       }
     }
     return report;
@@ -2862,12 +3235,27 @@ export class Engine {
       if (from !== undefined && from !== d.path) local.set(d, from);
     }
 
+    // And the parts of a file this device is already storing under the very
+    // name being replaced.
+    //
+    // The whole-file check above catches a move. This catches an edit, which
+    // is the common case and the expensive one: a paragraph changed in a
+    // 200 MB recording renames one chunk and leaves the other eight hundred
+    // alone, and the receiver downloaded all of it. Chunk names are hashes of
+    // ciphertext and sealing is deterministic, so a name this device's own
+    // index lists is a body this device can make, exactly, from the file on
+    // its disk. Making it costs a read and a seal; fetching it costs the
+    // bytes over somebody's phone connection.
+    const reuse = this.reusableFrom(batch, local);
+
     const wanted: string[] = [];
     const budgets = new Map<string, number>();
     for (const d of batch) {
       if (local.has(d)) continue;
+      const mine = reuse.get(d);
       const each = perChunkBudget(d.remote.size, d.chunks.length);
       for (const name of d.chunks) {
+        if (mine?.has(name)) continue;
         const known = budgets.get(name);
         if (known === undefined) wanted.push(name);
         // A chunk two files share is fetched once, and costed at the larger
@@ -2884,6 +3272,14 @@ export class Engine {
           wanted,
           (name) => budgets.get(name)!,
           batch.filter((d) => !local.has(d)).map((d) => d.path),
+          // The open note, published between bodies. A download of one large
+          // attachment is a single request, so without this a save made
+          // during it waited out the whole download.
+          () =>
+            this.sendInteractiveEdit(
+              report,
+              batch.map((d) => d.path),
+            ),
         );
         for (let i = 0; i < wanted.length; i++) held.set(wanted[i]!, bodies[i]!);
       } catch (err) {
@@ -2920,12 +3316,18 @@ export class Engine {
         // and finished: asking the server for bytes already on the disk
         // would only displace them again.
         if (reused === "kept") continue;
+        // Whatever this file's own copy can supply, made now rather than
+        // asked for. A name that does not come out of the local file is one
+        // the index was wrong about, and it is fetched below like any other.
+        const mine = reuse.get(d);
+        const bodies =
+          mine === undefined ? held : await this.withLocalChunks(d, mine, held, report);
         const wrote =
           from !== undefined || fetchIndividually
             ? // Isolate missing bodies, or fetch after local reuse could not
               // be verified. Ordinary healthy batches keep the shared fetch.
               await this.land(d, await this.fetchFor(d), report)
-            : await this.land(d, held, report);
+            : await this.land(d, bodies, report);
         // Counted only when it happened. A conflict copy is not a download,
         // and reporting one is the kind of true-sounding status rule 7 is
         // about: the incoming version is on this disk either way, but under
@@ -2989,7 +3391,7 @@ export class Engine {
       for (const d of group) {
         const other = localInTheWay ? local! : group.find((g) => g.path !== d.path)!.path;
         report.blocked++;
-        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+        if (report.inTheWay.length < LISTED_PATHS) {
           report.inTheWay.push({ path: d.path, blockedBy: other });
         }
         if (!this.blocked.has(d.path)) {
@@ -3086,7 +3488,7 @@ export class Engine {
           // deletion comes back every pass and never lands: a report that
           // said nothing happened described a vault that never settles.
           report.blocked++;
-          if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+          if (report.inTheWay.length < LISTED_PATHS) {
             report.inTheWay.push({ path, blockedBy: same.wrote });
           }
           this.log(
@@ -3161,6 +3563,109 @@ export class Engine {
     return by;
   }
 
+  /**
+   * Which incoming chunks this device can make from the file already at that
+   * path, without asking for them.
+   *
+   * A name test only. Nothing is read here: the index already holds the sealed
+   * names of what is on this disk, so the intersection with the incoming
+   * version's names is free, and it is exact, because a chunk name is a hash
+   * of the ciphertext and sealing is deterministic.
+   *
+   * Two gates, both about not making a small download slower. Under
+   * `REUSE_ABOVE` there is nothing to save: a note's whole body is smaller
+   * than the bookkeeping. And under half the chunks in common, the read and
+   * the seal of the local file cost more than fetching the difference would.
+   */
+  private reusableFrom(
+    batch: readonly Incoming[],
+    moved: ReadonlyMap<Incoming, string>,
+  ): Map<Incoming, Set<string>> {
+    const out = new Map<Incoming, Set<string>>();
+    for (const d of batch) {
+      if (moved.has(d) || d.remote.size < REUSE_ABOVE) continue;
+      const entry = this.entries.get(d.path);
+      if (!entry || entry.folder || entry.chunks.length === 0) continue;
+      const here = new Set(entry.chunks);
+      const shared = new Set(d.chunks.filter((name) => here.has(name)));
+      if (shared.size * 2 < d.chunks.length) continue;
+      out.set(d, shared);
+    }
+    return out;
+  }
+
+  /**
+   * `held`, plus the bodies made from the file this version is replacing.
+   *
+   * The file is cut exactly as the scan cut it, so piece `i` is the piece the
+   * index named `entry.chunks[i]`, and each piece is sealed again to confirm
+   * it: sealing is deterministic, so a name that comes back different is a
+   * file that has changed under the index, and that piece is simply not
+   * offered. Nothing is trusted here that is not re-derived.
+   *
+   * Streamed where the vault can, which is what keeps a 200 MB file to one
+   * piece at a time plus the bodies actually reused. Where it cannot, the file
+   * is read whole, and only up to the size the scan is willing to hold.
+   *
+   * A failure is not a failure of the download. Whatever could not be made is
+   * fetched, which is what would have happened anyway.
+   */
+  private async withLocalChunks(
+    d: Incoming,
+    shared: ReadonlySet<string>,
+    held: ReadonlyMap<string, Uint8Array>,
+    report: SyncReport,
+  ): Promise<Map<string, Uint8Array>> {
+    const out = new Map(held);
+    const need = new Set([...shared].filter((name) => !out.has(name)));
+    if (need.size === 0) return out;
+
+    const entry = this.entries.get(d.path);
+    const vault = this.opts.vault;
+    const isText = this.mergeable(d.path);
+    let made = 0;
+    try {
+      const sizes = this.sizesFor(entry?.size ?? d.remote.size, isText);
+      const pieces =
+        vault.readBlocks && !this.cannotStream
+          ? chunkStream(vault.readBlocks(d.path), sizes, isText)
+          : (entry?.size ?? Infinity) <= KEEP_SEALED_BELOW
+            ? chunkBytes(await vault.read(d.path), sizes, isText)
+            : undefined;
+      if (pieces === undefined) return out;
+      for await (const piece of pieces) {
+        if (need.size === 0) break;
+        const [sealed] = await sealChunks(this.keys, [piece.bytes]);
+        if (sealed === undefined || !need.has(sealed.name)) continue;
+        out.set(sealed.name, sealed.bytes);
+        need.delete(sealed.name);
+        made++;
+      }
+    } catch (err) {
+      // Reading this device's own copy of a file it is about to replace is
+      // never required. Say so once and fetch the rest.
+      this.log("could not reuse this device's copy, fetching instead", d.path, {
+        why: (err as Error).message,
+      });
+    }
+
+    if (need.size > 0) {
+      const each = perChunkBudget(d.remote.size, d.chunks.length);
+      const names = [...need];
+      const bodies = await this.fetchAll(names, () => each, [d.path]);
+      names.forEach((name, i) => out.set(name, bodies[i]!));
+    }
+    if (made > 0) {
+      this.log("reused this device's own copy", d.path, {
+        chunks: made,
+        of: d.chunks.length,
+        fetched: need.size,
+      });
+      report.reusedChunks += made;
+    }
+    return out;
+  }
+
   /** The chunks for one entry, asked for on their own. */
   private async fetchFor(d: Incoming): Promise<Map<string, Uint8Array>> {
     const each = perChunkBudget(d.remote.size, d.chunks.length);
@@ -3185,23 +3690,73 @@ export class Engine {
     names: readonly string[],
     budgetOf: (name: string) => number,
     paths: readonly string[] = [],
+    /** Run between bodies on the second wire, for the open note's sake. */
+    interleave?: () => Promise<void>,
   ): Promise<Uint8Array[]> {
     // History previews call this without paths: they are not a sync pass and
     // must not leave the vault's sync status busy after the preview closes.
     return this.transferring("download", paths, async (onBytes) => {
-      const out: Uint8Array[] = [];
-      let received = 0;
-      for (const ask of planFetches(names, budgetOf, this.fetchCap, MAX_FETCH_NAMES)) {
-        const bodies = await this.opts.transport.fetch(
-          ask,
-          onBytes === undefined ? undefined : (n) => onBytes(received + n),
-        );
-        for (const b of bodies) {
-          out.push(b);
-          received += b.length;
+      const collect = async (
+        transport: Transport,
+        cap: number,
+        interleave?: () => Promise<void>,
+      ): Promise<Uint8Array[]> => {
+        const out: Uint8Array[] = [];
+        let received = 0;
+        for (const ask of planFetches(names, budgetOf, cap, MAX_FETCH_NAMES)) {
+          const bodies = await transport.fetch(
+            ask,
+            onBytes === undefined ? undefined : (n) => onBytes(received + n),
+            interleave,
+          );
+          for (const b of bodies) {
+            out.push(b);
+            received += b.length;
+          }
         }
+        return out;
+      };
+
+      // A large download goes down the second wire, uncapped, the way a large
+      // upload already does (R083-10).
+      //
+      // `fetchCap` is 2 MiB whenever a note is open in Obsidian, which is
+      // nearly always, and a fetch cannot overlap another on the same stream:
+      // a 64 MiB attachment was therefore 32 asks in series, and on a phone
+      // 200 ms from its server that is over six seconds of nothing but
+      // waiting. The cap is there to keep the interactive wire free, so the
+      // answer is the one the uploads found: take the bulk off that wire
+      // rather than slice it thinner. What is left on the main wire is
+      // whatever the person is doing right now.
+      const serverCap = this.limitOn("maxFetchBytes");
+      const cap = this.fetchCap;
+      let total = 0;
+      for (const name of names) total += budgetOf(name);
+      // Only when the interactive cap is the one biting. Where `fetchCap` is
+      // already the server's own limit there is nothing to escape: the split
+      // is the server's rule, the second wire would keep to it too, and all
+      // that would change is which socket the same round trips go down.
+      //
+      // Only inside a sync. The second wire is opened for the length of one
+      // and released in `sync`'s `finally`; a history preview or a restore
+      // calls this outside one, and would leave an idle connection open until
+      // whenever the next pass happened to end.
+      if (
+        this.syncing &&
+        cap < serverCap &&
+        total > cap &&
+        this.opts.withUploadTransport &&
+        !this.servicingInteractive
+      ) {
+        // With the same interleave a large upload gets: an independent saved
+        // note goes out on the main wire between bodies rather than waiting
+        // out the download. Sixty-four mebibytes at a megabyte a second is a
+        // minute of a person's note sitting on one device.
+        return await this.opts.withUploadTransport((transport) =>
+          collect(transport, serverCap, interleave),
+        );
       }
-      return out;
+      return await collect(this.opts.transport, cap);
     });
   }
 
@@ -3262,7 +3817,12 @@ export class Engine {
     const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map(
       (c) => c.bytes,
     );
-    const names = (await sealChunks(this.keys, parts)).map((c) => c.name);
+    // A window at a time, because only the names are wanted: sealing every
+    // part at once held a whole sealed copy of the file beside the plaintext,
+    // which is the peak `rehash` was already windowed to avoid. Moving a
+    // 64 MiB attachment on one device makes every other device take this
+    // path, on the hardware with the least memory (R083-07).
+    const names = await sealedNames(this.keys, parts);
     if (contentId(names) !== contentId(d.chunks)) return "ask";
 
     // The same check as `land`, for the same reason: this writes over
@@ -3525,16 +4085,17 @@ export class Engine {
       if (!body) throw new Error(`the server did not send ${name}, which ${d.path} is made of`);
       return body;
     });
-    const content = await this.assemble(d.remote.uid, bodies);
-    // The declared size is the count of the bytes that were chunked, so this
-    // is exact rather than approximate, and a mismatch means the chunk list
-    // is not the one that file was made of. Checked here as well as on
-    // arrival because this is the line that overwrites somebody's note.
-    if (content.length !== d.remote.size) {
-      throw new Error(
-        `version ${d.remote.uid} of ${d.path} assembled to ${content.length} bytes, not the ${d.remote.size} it declares`,
-      );
-    }
+    // The declared size is the count of the bytes that were chunked, so the
+    // check inside `assemble` is exact rather than approximate, and a mismatch
+    // means the chunk list is not the one that file was made of. It runs here
+    // as well as on arrival because this is the line that overwrites
+    // somebody's note.
+    const content = await this.assemble(
+      d.remote.uid,
+      `version ${d.remote.uid} of ${d.path}`,
+      bodies,
+      d.remote.size,
+    );
 
     // The last thing before the bytes go down (F01).
     if (!(await this.unchangedSince(d.path, d.based))) {
@@ -3634,13 +4195,12 @@ export class Engine {
     }
     this.checkChunkCount(uid, meta.chunks.length);
     const each = perChunkBudget(meta.size, meta.chunks.length);
-    const content = await this.assemble(uid, await this.fetchAll(meta.chunks, () => each));
-    if (content.length !== declared) {
-      throw new Error(
-        `version ${uid} assembled to ${content.length} bytes, not the ${declared} it declares`,
-      );
-    }
-    return content;
+    return await this.assemble(
+      uid,
+      `version ${uid}`,
+      await this.fetchAll(meta.chunks, () => each),
+      declared,
+    );
   }
 
   /**
@@ -3657,19 +4217,63 @@ export class Engine {
     }
   }
 
-  /** Opens sealed bodies in order and joins the plaintext. */
-  private async assemble(uid: number, bodies: readonly Uint8Array[]): Promise<Uint8Array> {
-    if (bodies.length === 0) return new Uint8Array(0);
-    const opened: Uint8Array[] = [];
-    let total = 0;
+  /**
+   * Opens sealed bodies in order and joins the plaintext.
+   *
+   * Into one buffer of the declared size, filled window by window, rather than
+   * a list of opened parts joined at the end. The old shape held three copies
+   * of the file at its peak, the sealed bodies, every opened part and the
+   * join, on the device with the least memory to spare: a 64 MiB attachment on
+   * a phone wanted around 192 MiB plus the fetch buffers (R083-06). The
+   * comment that used to be here said the window kept a large file from
+   * holding every opened chunk at once, and it did not; the window bounds how
+   * many are opened at a time, not how many are kept.
+   *
+   * Each sealed body is dropped from the list as it is opened, which is why
+   * `bodies` is mutable: both callers build it for this call alone. That is
+   * the whole saving for `contentOf`, where the list is the only reference to
+   * them. It is not for `land`, whose bodies are also held by the inbox until
+   * the file is written; `INBOX_BYTES` bounds that for many small files and
+   * not for one large one, which is a separate thing and still true.
+   *
+   * `declared` is the size the entry says it is, already checked against the
+   * signed size by the caller. Allocating from it is what makes one buffer
+   * possible, and it is why the size check that used to be the caller's is
+   * now made here: `out.length` is the declared length by construction, so a
+   * caller comparing the two would be comparing a number with itself.
+   */
+  private async assemble(
+    uid: number,
+    what: string,
+    bodies: (Uint8Array | undefined)[],
+    declared: number,
+  ): Promise<Uint8Array> {
+    if (bodies.length === 0) {
+      if (declared !== 0) {
+        throw new Error(`${what} assembled to 0 bytes, not the ${declared} it declares`);
+      }
+      return new Uint8Array(0);
+    }
     const perFileMax = this.limitOn("perFileMax");
+    // Before the allocation, not after it. This is the server's own number and
+    // nothing has held it to anything yet, so a version claiming 4 GiB would
+    // otherwise be answered by trying to allocate 4 GiB.
+    if (declared > perFileMax) {
+      throw new Error(
+        `version ${uid} is offered as ${declared} bytes, and this server said it stores at most ${perFileMax}`,
+      );
+    }
+    const out = new Uint8Array(declared);
+    let total = 0;
     // A window at a time, for the reason sealChunks takes one: opening is
-    // mostly waiting on WebCrypto, and one at a time leaves it idle. The
-    // window is what keeps a large file from holding every opened chunk at
-    // once.
+    // mostly waiting on WebCrypto, and one at a time leaves it idle.
     for (let at = 0; at < bodies.length; at += SEAL_WINDOW) {
       const window = await Promise.all(
-        bodies.slice(at, at + SEAL_WINDOW).map((b) => openChunk(this.keys, b)),
+        bodies.slice(at, at + SEAL_WINDOW).map(async (b, i) => {
+          if (b === undefined) throw new Error(`version ${uid} is missing one of its chunks`);
+          bodies[at + i] = undefined;
+          return openChunk(this.keys, b);
+        }),
       );
       for (const part of window) {
         total += part.length;
@@ -3678,14 +4282,19 @@ export class Engine {
             `version ${uid} is over ${total} bytes, and this server said it stores at most ${perFileMax}`,
           );
         }
-        opened.push(part);
+        // More bytes than the entry declares is the entry contradicting
+        // itself. Kept counting so the refusal below can name the real total,
+        // and not written, because there is no room for it.
+        if (total <= declared) out.set(part, total - part.length);
       }
     }
-    const out = new Uint8Array(total);
-    let at = 0;
-    for (const b of opened) {
-      out.set(b, at);
-      at += b.length;
+    // Rule 5, and the line that enforces it: a version made of chunks holding
+    // five bytes and declaring five hundred is refused rather than written.
+    // Here rather than in the callers, because `out` is allocated at the
+    // declared length and a caller comparing `content.length` to `declared`
+    // would now be comparing that number with itself.
+    if (total !== declared) {
+      throw new Error(`${what} assembled to ${total} bytes, not the ${declared} it declares`);
     }
     return out;
   }
@@ -3794,6 +4403,11 @@ export class Engine {
     }
 
     const text = outcome.text;
+    // What is on disk when this is done, and when it was put there. Defaults
+    // to the local side, because a merge whose result is already the local
+    // text writes nothing and must not claim it did.
+    let merged = mineBytes;
+    let wroteAt = entry.mtime;
     if (text !== mine) {
       if (!(await this.unchangedSince(path, mineAt))) {
         // The merge is of a version that is no longer here, so writing it
@@ -3809,12 +4423,14 @@ export class Engine {
       // from, so a digest of them says precisely "is the file still the one I
       // merged". The metadata check above was taken *after* those bytes were
       // read, which let a newer file wear an older baseline's stat.
+      merged = new TextEncoder().encode(text);
+      wroteAt = this.now();
       if (
         await this.writePreserving(
           path,
           { contentId: await plainDigest(mineBytes), idOf: plainDigest },
-          new TextEncoder().encode(text),
-          { mtime: this.now(), ctime: entry.ctime },
+          merged,
+          { mtime: wroteAt, ctime: entry.ctime },
           report,
         )
       ) {
@@ -3827,7 +4443,19 @@ export class Engine {
     // ancestor even if another writer wins the upload, so the next merge
     // does not treat the same already-incorporated edit as a new conflict.
     reconciled(entry, remote.hash, remote.uid, this.now());
-    observe(entry, { folder: false, mtime: this.now(), ctime: entry.ctime, size: text.length });
+    // The bytes that were written and the timestamp they were written with,
+    // not `text.length` and a fresh clock reading (R083-20). `text.length` is
+    // UTF-16 code units, so any merged note with an accent or an emoji in it
+    // recorded a size the file does not have, and a second reading of the
+    // clock recorded an mtime the file does not have either. Both are what
+    // `needsRehash` compares against, so the note was read, chunked and
+    // sealed again on the very next pass to discover it had not changed.
+    observe(entry, {
+      folder: false,
+      mtime: wroteAt,
+      ctime: entry.ctime,
+      size: merged.length,
+    });
     await this.upload(path, entry, report, remote.uid);
     // Counted here, where the merge happened, and not where the put commits.
     // `uploaded` is the other way round, so a flush that fails reports merges
@@ -3932,17 +4560,56 @@ export class Engine {
    * shape: `5 * 2^n` seconds, capped at five minutes.
    */
   private recordFailure(path: string, err: unknown, report: SyncReport): void {
-    const message = err instanceof Error ? err.message : String(err);
+    let message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: string })?.code;
     if (code === "stale") {
       // A changed source must survive under its original name. Retrying as
       // a copy lets ordinary reconciliation preserve it and the moved draft.
       const entry = this.entries.get(path);
       if (entry?.prev && canonicalSpelling(entry.prev) !== path) entry.prev = "";
-      this.retries.delete(path);
-      report.waiting++;
-      this.again = true;
-      this.log("another device wrote first, reconciling next pass", path);
+      const refusals = (this.staleHeads.get(path) ?? this.asked.get(path) ?? 0) + 1;
+      if (refusals <= STALE_REFUSALS_BEFORE_BACKOFF) {
+        // Ask for the head before deciding again (R083-01). `again` is what
+        // schedules that round, and `refreshStaleHeads` is what makes the
+        // round see something this one did not.
+        this.staleHeads.set(path, refusals);
+        this.retries.delete(path);
+        report.waiting++;
+        this.again = true;
+        this.log("another device wrote first, reconciling next pass", path);
+        return;
+      }
+      // Asked, told, and refused anyway. Whatever is wrong is not a head this
+      // device has failed to hear about, so it stops being a same-second retry
+      // and becomes an ordinary backed-off one that says so.
+      this.staleHeads.delete(path);
+      this.asked.delete(path);
+      // Falls through to the retry below, saying what actually happened rather
+      // than repeating the server's one-line refusal for the fourth time.
+      message =
+        `${message} (refused as out of date ${refusals} times running, ` +
+        `even after asking the server for this path's current version)`;
+    }
+    // A connection that went away is not a fact about this file (R083-03).
+    //
+    // `flush` records every path its batch was carrying, so one dropped socket
+    // charged two hundred and fifty-six notes a failure each and started them
+    // climbing `5 * 2^n` seconds towards five minutes, for something that was
+    // never about any of them. On a link that drops every few minutes the
+    // counts only go up, and a note that was fine sat out five minutes for a
+    // fault it had no part in.
+    //
+    // So it is counted as retrying, which it is, and given a flat wait instead
+    // of a place in an escalation. Nothing is written off and no count is kept:
+    // the next pass decides about the file again from scratch, which is the
+    // right amount of memory to have about somebody's wifi.
+    if (err instanceof ConnectionError) {
+      noteRetrying(report, path);
+      report.nextUploadAt = Math.min(
+        report.nextUploadAt ?? Infinity,
+        this.now() + RECONNECT_RETRY_MS,
+      );
+      this.log("will retry when the connection is back", path, message);
       return;
     }
     // Not a failure at all: this device was told not to sync under that name
@@ -4032,6 +4699,14 @@ export class Engine {
       if (this.entries.has(path)) continue;
       if (this.pending.has(path)) continue;
       this.remote.delete(path);
+      this.staleHeads.delete(path);
+      this.asked.delete(path);
+      // With the reason it was refused, if it was. A path this device would
+      // not file, whose newest word from the server is that it is gone, is
+      // finished business: keeping the refusal would go on reporting a written
+      // off path that no longer exists anywhere, and there would be nothing
+      // anybody could do about it (R083-04, rule 7).
+      this.refusedInbound.delete(path);
     }
 
     // The sealed-path cache, kept to what the two indexes still name.
@@ -4173,6 +4848,7 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     restored: a.restored + b.restored,
     foldersCreated: a.foldersCreated + b.foldersCreated,
     chunksSent: a.chunksSent + b.chunksSent,
+    reusedChunks: a.reusedChunks + b.reusedChunks,
     bytesSent: a.bytesSent + b.bytesSent,
     unchanged: b.unchanged,
     waiting: b.waiting,
@@ -4253,6 +4929,16 @@ export function validityGateFor(
   if (looksLikeJson(path)) return parsesAsJson;
   if (looksLikeExcalidraw(path)) return drawingGate(base, mine, theirs);
   if (looksLikeMarkupPath(path)) return wellFormedMarkup;
+  if (looksLikeYaml(path)) {
+    // Abstaining where the sides already fail, the way `drawingGate` does.
+    // This gate reads a subset of YAML, so a document shape it gets wrong
+    // would turn every concurrent edit of that one file into a conflict copy
+    // for as long as the file existed, with nothing on screen to say why.
+    // Refusing a merge is only defensible when the unmerged sides pass.
+    return parsesAsYaml(base) && parsesAsYaml(mine) && parsesAsYaml(theirs)
+      ? parsesAsYaml
+      : undefined;
+  }
   return undefined;
 }
 
@@ -4312,6 +4998,33 @@ function fingerprintOf(entry: IndexEntry | undefined): string {
  * memory is the thing that matters.
  */
 const KEEP_SEALED_BELOW = 8 * 1024 * 1024;
+
+/**
+ * Below this, a download does not look at what this device already holds.
+ *
+ * The reuse costs a read and a seal of the local file to save fetching the
+ * parts that have not changed, which is a good trade for an attachment and a
+ * bad one for a note: a note's whole body is a couple of chunks, and the
+ * bookkeeping is most of the work. A mebibyte is where the saving starts to be
+ * worth more than the read.
+ */
+const REUSE_ABOVE = 1024 * 1024;
+
+/**
+ * How many chunk names one repair offer carries.
+ *
+ * A repair used to send one `resend` per file and wait for the answer, so a
+ * vault of ten thousand notes was ten thousand round trips whatever the server
+ * said: at 200 ms each, half an hour of waiting to put back a handful of
+ * bodies, on the connection's serial queue.
+ *
+ * The server refuses a resend naming more than 65536 chunks. Four thousand is
+ * well under that, keeps the request frame to a couple of hundred kilobytes,
+ * and covers most vaults in a handful of round trips. It also bounds what one
+ * failed batch costs: a batch that cannot be sent is reported per file, and
+ * the run carries on with the next.
+ */
+const REPAIR_BATCH_NAMES = 4096;
 
 /** How many chunks are sealed at once when the bodies are not being kept. */
 export const SEAL_WINDOW = 16;

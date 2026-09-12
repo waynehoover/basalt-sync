@@ -35,6 +35,7 @@ function report(over: Partial<SyncReport>): SyncReport {
     needsAttention: [],
     chunksSent: 0,
     bytesSent: 0,
+    reusedChunks: 0,
     ...over,
   };
 }

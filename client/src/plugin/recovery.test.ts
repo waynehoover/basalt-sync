@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import BasaltPlugin from "./main.ts";
-import { App, built, modals, resetStub, type Plugin as StubPlugin } from "./stub.ts";
+import { App, built, modals, notices, resetStub, type Plugin as StubPlugin } from "./stub.ts";
 import { Client, type DeletedList } from "../core/client.ts";
 import { TestServer } from "../core/test-server.ts";
 import { nextTurn, receiveCommitted, within } from "../core/test-async.ts";
@@ -110,31 +110,113 @@ const deleted = (uid: number, path: string): DeletedList["notes"][number] => ({
   restorable: uid - 1,
 });
 
-it("keeps a way back to newer deletions after the last note on an older page is restored", async () => {
+it("keeps newer deletions on screen after one from an older page is restored", async () => {
+  // Pages accumulate rather than replace (R083-17), so there is no route back
+  // to lose: what "Show older" adds sits under what was already there, and the
+  // search field filters all of it. Restoring one row takes that row out and
+  // leaves the rest, without asking the server again.
   const { plugin } = await load();
-  let restored = false;
   const newest = deleted(100, "Newer.md");
   const older = deleted(10, "Older.md");
-  plugin.deletedNotes = async (_limit, before) =>
-    before === undefined
+  let asked = 0;
+  plugin.deletedNotes = async (_limit, before) => {
+    asked++;
+    return before === undefined
       ? { notes: [newest], more: true, oldest: newest.uid }
-      : { notes: restored ? [] : [older], more: false, oldest: older.uid };
-  plugin.recover = async () => {
-    restored = true;
-    return { path: older.path, sent: true };
+      : { notes: [older], more: false, oldest: older.uid };
+  };
+  plugin.recover = async () => ({ path: older.path, sent: true });
+  plugin.commands.find((command) => command.id === "recover-deleted")!.callback!();
+  await nextTurn();
+  const modal = modals.at(-1)!;
+  const older_ = button("Show older")!;
+  built.length = 0;
+  await older_.click();
+  expect(built.map((row) => row.name)).toContain("Older.md");
+  expect(
+    built.map((row) => row.name),
+    "the older page replaced the newer one",
+  ).toContain("Newer.md");
+
+  // By label: a row with more than one restorable sibling also carries a
+  // Choose button for the bulk path, so the first button is not the one.
+  const restore = built
+    .find((row) => row.name === "Older.md")!
+    .buttons.find((b) => b.label === "Restore")!;
+  built.length = 0;
+  await restore.click();
+  const after = built.map((row) => row.name);
+  expect(after).not.toContain("Older.md");
+  expect(after, "restoring one deletion dropped the others").toContain("Newer.md");
+  expect(asked, "the list was refetched, which would discard the loaded pages").toBe(2);
+  modal.close();
+});
+
+it("restores a chosen set together, in one sync", async () => {
+  // Recovering a deleted folder was one press and one whole-vault reconcile
+  // per note (Codex-11). A hundred notes was a hundred of each, on a phone,
+  // one-handed, after something had already gone wrong.
+  const { plugin } = await load();
+  const gone = [deleted(30, "Folder/a.md"), deleted(20, "Folder/b.md"), deleted(10, "Other.md")];
+  plugin.deletedNotes = async () => ({ notes: gone, more: false });
+  const restored: string[] = [];
+  let syncs = 0;
+  plugin.recoverMany = async (versions) => {
+    syncs++;
+    for (const v of versions) restored.push(v.path);
+    return versions.map((v) => ({ path: v.path, sent: true }));
   };
   plugin.commands.find((command) => command.id === "recover-deleted")!.callback!();
   await nextTurn();
-  await button("Show older")!.click();
-  const restore = button("Restore")!;
-  built.length = 0;
   const modal = modals.at(-1)!;
-  await restore.click();
-  expect(button("Newest"), "an empty older page must not hide the route back").toBeDefined();
-  const newestButton = button("Newest")!;
+
+  // Two of the three, chosen by name.
+  for (const name of ["Folder/a.md", "Folder/b.md"]) {
+    await built
+      .find((row) => row.name === name)!
+      .buttons.find((b) => b.label === "Choose")!
+      .click();
+  }
+  const go = button("Restore 2")!;
   built.length = 0;
-  await newestButton.click();
-  expect(built.map((row) => row.name)).toContain("Newer.md");
+  await go.click();
+
+  expect(restored).toEqual(["Folder/a.md", "Folder/b.md"]);
+  expect(syncs, "each note was restored and synced on its own").toBe(1);
+  // The two that came back are gone from the list and the third is not.
+  const after = built.map((row) => row.name);
+  expect(after).not.toContain("Folder/a.md");
+  expect(after).not.toContain("Folder/b.md");
+  expect(after).toContain("Other.md");
+  modal.close();
+});
+
+it("says how many of a chosen set could not be restored", async () => {
+  // All three counts, always. "Restored 40" without "and 2 could not be" is
+  // the comfortable half of the story, and the other half is the one somebody
+  // has to act on.
+  const { plugin } = await load();
+  const gone = [deleted(30, "a.md"), deleted(20, "b.md")];
+  plugin.deletedNotes = async () => ({ notes: gone, more: false });
+  plugin.recoverMany = async (versions) =>
+    versions.map((v) =>
+      v.path === "b.md"
+        ? { path: v.path, sent: false, willRetry: false as const, why: "its history was purged" }
+        : { path: v.path, sent: true },
+    );
+  plugin.commands.find((command) => command.id === "recover-deleted")!.callback!();
+  await nextTurn();
+  const modal = modals.at(-1)!;
+  await button("Choose all shown")!.click();
+  notices.length = 0;
+  await button("Restore 2")!.click();
+
+  const said = notices.map((n) => n.message).join(" ");
+  expect(said).toContain("Restored 1 of 2");
+  expect(said).toContain("1 could not be restored");
+  expect(said).toContain("its history was purged");
+  // The one that failed stays, so it can be tried again.
+  expect(built.map((row) => row.name)).toContain("b.md");
   modal.close();
 });
 

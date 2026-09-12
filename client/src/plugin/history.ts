@@ -1,6 +1,7 @@
 import { diff_match_patch } from "diff-match-patch";
 import { Modal, Notice, type App } from "obsidian";
 
+import { looksLikeText } from "../core/chunk.ts";
 import type { Version } from "../core/client.ts";
 
 /** Where a restore landed, and whether it went any further. */
@@ -56,7 +57,11 @@ export function previewReason(version: Version): string | undefined {
   if (version.deleted)
     return "This version records a deletion. Choose an earlier version to restore.";
   if (version.folder) return "This version is a folder.";
-  if (!/\.(md|txt|csv|json|canvas|css|js|ts|html|xml|yaml|yml|svg)$/i.test(version.path))
+  // The engine's own list, not a second one. These had drifted apart: `.bib`
+  // and `.tex` merged as text and previewed as attachments, and `.base` was an
+  // attachment on both sides (R083-12). A file this device will diff and merge
+  // as text is a file this modal can show.
+  if (!looksLikeText(version.path))
     return "Attachment preview unavailable. Restore a copy to open the complete file.";
   if (version.size > PREVIEW_BYTES)
     return "This version is too large to preview. Restore a copy to open the complete file.";
@@ -79,6 +84,11 @@ export class HistoryModal extends Modal {
   /** Keep only the selected version, including an in-flight download. */
   private preview: { uid: number; text: Promise<string> } | undefined;
   private versions: Version[] = [];
+  /**
+   * The name currently being paged, which is the note's own until paging walks
+   * back through a rename into an earlier one.
+   */
+  private pagingName = "";
   private chosen: Version | undefined;
   private text = "";
   private showDiff = false;
@@ -108,6 +118,7 @@ export class HistoryModal extends Modal {
     private readonly path: string,
   ) {
     super(app);
+    this.pagingName = path;
   }
 
   override onOpen(): void {
@@ -155,16 +166,29 @@ export class HistoryModal extends Modal {
   private async loadPage(): Promise<void> {
     const before = this.versions.length ? this.versions[this.versions.length - 1]!.uid : undefined;
     try {
-      const page = await this.source.history(this.path, {
+      const page = await this.source.history(this.pagingName, {
         limit: PAGE,
         ...(before !== undefined ? { before } : {}),
       });
       if (this.closed) return;
-      // Short of a full page means the server has no more. Asking again
-      // would be a round trip that can only return nothing.
+      // Short of a full page means the server has no more *under this name*.
+      // Asking again would be a round trip that can only return nothing.
       if (page.length < PAGE) this.exhausted = true;
       const moveFocus = this.moreEl.ownerDocument.activeElement === this.moreEl;
       this.versions.push(...page);
+      // A rename does not end a note's history (Codex-06). History matches one
+      // exact sealed path, so a note renamed today used to have a history that
+      // started today, however many months of it the server was still holding
+      // under the old name. The rename is signed with the entry that carries
+      // it, so the older name is authenticated, and paging continues under it
+      // bounded by that version's own uid: a name reused for something else
+      // later cannot be pulled in, because everything older is what is asked
+      // for and everything newer is refused.
+      const oldest = this.versions.at(-1);
+      if (this.exhausted && oldest?.previousPath !== undefined) {
+        this.pagingName = oldest.previousPath;
+        this.exhausted = false;
+      }
       this.renderList();
       if (moveFocus) {
         const target = page[0] ?? this.versions.at(-1);
@@ -250,6 +274,15 @@ export class HistoryModal extends Modal {
         cls: "modal-sidebar-list-item-details",
         text: describe(version, i === 0),
       });
+      // Under the name it had then, when that is not the name it has now. A
+      // version restored from here goes back to its own name, so saying which
+      // one is not decoration.
+      if (version.path !== this.path) {
+        item.createSpan({
+          cls: "modal-sidebar-list-item-details",
+          text: `as ${version.path}`,
+        });
+      }
       item.addEventListener("click", () => void this.choose(version));
       item.addEventListener("keydown", (event) => {
         const next =

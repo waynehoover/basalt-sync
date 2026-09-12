@@ -774,6 +774,49 @@ func (w *Writer) Add(name string, body []byte) error {
 	return nil
 }
 
+// syncDirs flushes every directory the batch wrote into, bounded the same way
+// the bodies are, and returns the first failure after all of them have
+// finished. Waiting for the rest matters: a directory left mid-flush while the
+// caller unwinds is a name whose durability nobody knows.
+func (w *Writer) syncDirs() error {
+	dirs := make([]string, 0, len(w.dirs))
+	for dir := range w.dirs {
+		dirs = append(dirs, dir)
+	}
+	width := Writers
+	if len(dirs) < width {
+		width = len(dirs)
+	}
+	if width == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var first error
+	next := make(chan string)
+	for i := 0; i < width; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for dir := range next {
+				if err := w.store.sync(dir); err != nil {
+					mu.Lock()
+					if first == nil {
+						first = err
+					}
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, dir := range dirs {
+		next <- dir
+	}
+	close(next)
+	wg.Wait()
+	return first
+}
+
 // Close waits for every body and flushes every directory they landed in.
 //
 // Until this returns nil, no chunk in the batch may be treated as stored. The
@@ -786,10 +829,17 @@ func (w *Writer) Close() error {
 	if w.err != nil {
 		return w.err
 	}
-	for dir := range w.dirs {
-		if err := w.store.sync(dir); err != nil {
-			return err
-		}
+	// In parallel, for the reason the bodies are: an fsync is almost entirely
+	// waiting. A batch of 256 uniformly distributed names touches about 162 of
+	// the 256 shards, and flushing those one at a time put the whole batch's
+	// directory latency end to end in front of the acknowledgement, once per
+	// batch, for the length of a first sync.
+	//
+	// Every one of them still completes before this returns, so the barrier is
+	// exactly where it was: the names are durable, together, before `proven`
+	// and before anything above this acknowledges the push.
+	if err := w.syncDirs(); err != nil {
+		return err
 	}
 	// Only here, and only on the way out clean. A batch that failed leaves its
 	// names unproven, so they read as absent and the next put writes them

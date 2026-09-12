@@ -58,6 +58,7 @@ import {
   type Vault as ObsidianVaultApi,
 } from "obsidian";
 
+import { looksLikeText } from "../core/chunk.ts";
 import { plainDigest } from "../core/crypto.ts";
 import {
   DISPLACED_LOG,
@@ -378,7 +379,7 @@ export class ObsidianVault implements Vault {
     configDir: string,
     log: (message: string, ...rest: unknown[]) => void = () => undefined,
     /** A stand-in for Node's fs, for tests. Never set in the plugin. */
-    opts: { fs?: FsyncFs; displacedLog?: string } = {},
+    opts: { fs?: FsyncFs; displacedLog?: string; ignore?: readonly string[] } = {},
   ) {
     this.adapter = vault.adapter;
     this.log = log;
@@ -396,7 +397,11 @@ export class ObsidianVault implements Vault {
     // vault's data key. So the real
     // name is passed in, and it is the one thing added to the rule in
     // core/paths.ts, which already covers every dot-prefixed name.
-    this.ignore = new Set([configFolderName(configDir)]);
+    // Plus whatever this device has been told to leave alone, which is
+    // per-device configuration and goes nowhere near the server (R083-13).
+    // The same shape the CLI's `--ignore` has: one name, matched against every
+    // segment, so `Attachments` skips it wherever it is.
+    this.ignore = new Set([configFolderName(configDir), ...(opts.ignore ?? [])]);
   }
 
   /**
@@ -710,6 +715,25 @@ export class ObsidianVault implements Vault {
   }
 
   /**
+   * Reads a version this vault parked out of sight, past the filter that put
+   * it there (Codex-08).
+   *
+   * `resolve` refuses a dot-prefixed name because nothing under one may be
+   * *synced*: Obsidian does not list it, so a file written there and never
+   * listed is reported deleted. Reading one back is the opposite operation.
+   * The whole reason those bytes are under a hidden name is that this device
+   * could not leave them anywhere Obsidian would show, and a recovery that
+   * cannot read them is the safety net with a hole in it.
+   *
+   * Only for a path the displaced ledger names. Nothing else calls this, and
+   * nothing it reads is written back under the name it came from: the caller
+   * places a visible copy beside the note instead.
+   */
+  async readDisplaced(path: string): Promise<Uint8Array> {
+    return new Uint8Array(await this.adapter.readBinary(normalizePath(path)));
+  }
+
+  /**
    * One path's stat, for the check the engine makes before destroying bytes.
    *
    * Obsidian's adapter answers `null` for a path it has nothing at, and this
@@ -783,19 +807,36 @@ export class ObsidianVault implements Vault {
     const from = this.resolve(path);
     const kept = this.resolve(keepAt);
 
-    const before = await this.readIfThere(path);
-    if (before !== undefined) {
-      const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-      let previous: string | undefined;
-      let next: string | undefined;
+    // Whether this is a text update is decided from the name and from the
+    // bytes that have already been fetched, before anything on disk is read
+    // (R083-18). It used to read the existing file first and ask whether it
+    // decoded, which meant replacing a 50 MiB attachment read it in full to
+    // discover it was not text, on top of the park, the stage, the verify and
+    // the digest. `looksLikeText` is the engine's own list, so the files that
+    // take the in-place path here are the files it treats as text everywhere
+    // else, and that path is the one that keeps an open editor pointed at the
+    // same TFile.
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    let next: string | undefined;
+    if (looksLikeText(path)) {
       try {
-        previous = decoder.decode(before);
         next = decoder.decode(bytes);
       } catch {
         // Invalid UTF-8 must stay bytes; decoding it leniently corrupts it.
       }
-      if (previous !== undefined && next !== undefined) {
-        return this.replaceText(path, from, keepAt, before, previous, next, expect, times);
+    }
+    if (next !== undefined) {
+      const before = await this.readIfThere(path);
+      if (before !== undefined) {
+        let previous: string | undefined;
+        try {
+          previous = decoder.decode(before);
+        } catch {
+          // A text name whose current content is not text. Kept as bytes.
+        }
+        if (previous !== undefined) {
+          return this.replaceText(path, from, keepAt, before, previous, next, expect, times);
+        }
       }
     }
 

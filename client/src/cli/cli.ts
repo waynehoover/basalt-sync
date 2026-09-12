@@ -308,11 +308,20 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // flags are kept for anyone who split it by hand when that was the only way.
   let server = args.server;
   let token = args.token;
+  // The line's own vault name, where it carries one, so `--vault-id` and a
+  // named setup line cannot disagree about which vault is being claimed.
+  let named: string | undefined;
   const setup = await secretFrom(args.rest[0], args, "the setup string");
   if (setup !== undefined) {
     if (server !== undefined || token !== undefined)
       throw new Error("init takes the server's line or --server and --token, not both");
-    ({ url: server, token } = parseSetup(setup));
+    ({ url: server, token, vaultId: named } = parseSetup(setup));
+    if (named !== undefined && args.vaultIdGiven && named !== args.vaultId) {
+      throw new Error(
+        `the setup line names the vault ${named} and --vault-id says ${args.vaultId}; ` +
+          `they have to be the same vault`,
+      );
+    }
   }
   if (!server || !token)
     throw new Error(
@@ -330,7 +339,7 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // not written, not renamed, but readable and decoding to itself.
   const starting: Config = {
     url,
-    vaultId: args.vaultId,
+    vaultId: named ?? args.vaultId,
     device,
     secret,
     // Recorded here rather than left to the flag (I29). A mirror that becomes
@@ -345,7 +354,7 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // This is the only moment it exists anywhere: registering below replaces the
   // root on disk with this device's own credential on purpose, so if this
   // string is not written down now there is no command that can print it again.
-  const recoveryKey = formatPairing({ url, vaultId: args.vaultId, secret });
+  const recoveryKey = formatPairing({ url, vaultId: starting.vaultId, secret });
 
   // Claim the vault and register this device's row now, rather than leaving
   // either to whenever this device first syncs.
@@ -2485,6 +2494,8 @@ export interface Args {
   /** Whether --device was typed, since the default gets a random tail at pairing. */
   deviceGiven: boolean;
   vaultId: string;
+  /** Whether --vault-id was typed, so a setup line naming a vault can differ. */
+  vaultIdGiven: boolean;
   server?: string;
   token?: string;
   json: boolean;
@@ -2568,6 +2579,7 @@ export function parseArgs(argv: readonly string[]): Args {
     device: hostname().split(".")[0] || "device",
     deviceGiven: false,
     vaultId: "default",
+    vaultIdGiven: false,
     json: false,
     watch: false,
     limit: 20,
@@ -2641,6 +2653,7 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--vault-id":
         args.vaultId = value!;
+        args.vaultIdGiven = true;
         break;
       case "--server":
         args.server = value!;

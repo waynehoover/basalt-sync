@@ -1538,11 +1538,7 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 			budgets, s.srv.maxBatchBytes))
 	}
 
-	type prepared struct {
-		entry   store.Entry
-		refusal *wire.Err
-	}
-	items := make([]prepared, len(m.Entries))
+	items := make([]preparedEntry, len(m.Entries))
 
 	// The union, in the order the entries name them, without repeats: two files
 	// sharing a chunk ask for it once, which is the whole of what dedup buys on
@@ -1558,11 +1554,11 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 			// One entry's refusal is one entry's result in the acks, and the
 			// rest of the batch still commits, so it is carried rather than
 			// written. Unlike handlePut, nothing is logged here.
-			items[i] = prepared{entry: e, refusal: refusal}
+			items[i] = preparedEntry{entry: e, refusal: refusal}
 			continue
 		}
 
-		items[i] = prepared{entry: e}
+		items[i] = preparedEntry{entry: e}
 		for _, name := range missing {
 			if _, seen := asked[name]; seen {
 				continue
@@ -1582,20 +1578,126 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 		}
 	}
 
+	results, err := s.commitMany(items, m.Entries)
+	if err != nil {
+		return err
+	}
+	return s.writeJSON(wire.Acks{Res: "acks", ID: s.reqID, Results: results})
+}
+
+// preparedEntry is one entry of a batch after `prepare`: either a store entry
+// ready to commit, or the refusal that stands in its place.
+type preparedEntry struct {
+	entry   store.Entry
+	refusal *wire.Err
+}
+
+// commitMany commits every entry of a batch that prepare did not already
+// refuse, in one transaction (R083-23).
+//
+// One fsync for the batch rather than one per entry, which is what a folder
+// rename or a bulk delete is made of: those batches carry no bodies, so the
+// syncs were the whole cost of them. The per-entry answers are unchanged,
+// because the store rolls back a savepoint for a stale or malformed entry and
+// leaves the rest of the batch committed.
+//
+// The broadcast moves to the end, after the transaction is durable. It used to
+// go out as each entry committed, which meant a peer could be told about entry
+// three of five before entries four and five existed; now nothing is announced
+// that is not on the disk.
+func (s *Session) commitMany(items []preparedEntry, sent []wire.PutEntry) ([]wire.AckResult, error) {
 	results := make([]wire.AckResult, len(items))
+	entries := make([]store.Entry, 0, len(items))
+	bases := make([]int64, 0, len(items))
+	prevBases := make([]int64, 0, len(items))
+	at := make([]int, 0, len(items))
 	for i, item := range items {
 		if item.refusal != nil {
 			results[i] = wire.AckResult{Code: item.refusal.Code, Msg: item.refusal.Msg}
 			continue
 		}
-		uid, refusal := s.commit(item.entry, m.Entries[i].Base, m.Entries[i].PrevBase)
-		if refusal != nil {
-			results[i] = wire.AckResult{Code: refusal.Code, Msg: refusal.Msg}
+		s.noteFutureMTime(item.entry)
+		entries = append(entries, item.entry)
+		bases = append(bases, sent[i].Base)
+		prevBases = append(prevBases, sent[i].PrevBase)
+		at = append(at, i)
+	}
+	if len(entries) == 0 {
+		return results, nil
+	}
+
+	s.srv.commitMu.Lock()
+	defer s.srv.commitMu.Unlock()
+	if err := s.currentCredential(); err != nil {
+		code := wire.CodeInternal
+		if errors.Is(err, errSessionRevoked) {
+			code = wire.CodeAuth
+		}
+		for _, i := range at {
+			results[i] = wire.AckResult{Code: code, Msg: err.Error()}
+		}
+		return results, nil
+	}
+
+	if s.srv.beforeAppend != nil {
+		for k, e := range entries {
+			if err := s.srv.beforeAppend(e); err != nil {
+				// The same answer the per-entry path gave: this is a test hook
+				// standing in for a commit failure, so it refuses this entry
+				// and the batch goes on without it.
+				results[at[k]] = wire.AckResult{
+					Code: wire.CodeInternal,
+					Msg:  "the entry could not be committed: " + err.Error(),
+				}
+				entries[k].Path = ""
+			}
+		}
+	}
+
+	out, err := s.srv.st.AppendMany(s.vaultID, entries, bases, prevBases)
+	if err != nil {
+		s.srv.log.Error("batch commit failed", "vault", s.vaultID, "err", err)
+		for k, i := range at {
+			if results[i].Code == "" && entries[k].Path != "" {
+				results[i] = wire.AckResult{
+					Code: wire.CodeInternal,
+					Msg:  "the entry could not be committed: " + err.Error(),
+				}
+			}
+		}
+		return results, nil
+	}
+
+	// Durable, so now it can be said out loud.
+	for k, r := range out {
+		i := at[k]
+		if results[i].Code != "" {
+			continue // refused by beforeAppend above
+		}
+		if r.Err != nil {
+			code := commitCode(r.Err)
+			if code == "" {
+				s.srv.log.Error("commit failed", "vault", s.vaultID, "err", r.Err)
+				code = wire.CodeInternal
+			} else {
+				s.srv.log.Warn("refused at commit", "vault", s.vaultID,
+					"path", len(entries[k].Path), "code", code, "err", r.Err)
+			}
+			results[i] = wire.AckResult{Code: code, Msg: r.Err.Error()}
 			continue
 		}
-		results[i] = wire.AckResult{UID: uid}
+		e := entries[k]
+		e.UID = r.UID
+		if s.srv.afterAppend != nil {
+			s.srv.afterAppend(r.UID)
+		}
+		s.srv.log.Info("committed", "vault", s.vaultID, "uid", r.UID,
+			"size", e.Size, "chunks", len(e.Chunks),
+			"folder", e.Folder, "deleted", e.Deleted)
+		s.srv.hub.broadcast(s.vaultID, e, s)
+		results[i] = wire.AckResult{UID: r.UID}
 	}
-	return s.writeJSON(wire.Acks{Res: "acks", ID: s.reqID, Results: results})
+	return results, nil
 }
 
 // prepare runs every refusal a put makes before a single body is read, and

@@ -52,6 +52,58 @@ it("returns to an edited open note before preparing the remaining attachments", 
   expect(vault.text("note.md")).toBe("edited while transferring");
 });
 
+it("does not restart the whole pass for every save to the open note", async () => {
+  // The yield breaks out of the ordered walk, and the next round lists the
+  // vault and re-decides every path from the start. Unbounded, one save per
+  // round is one whole re-decision per save, so typing during a first sync on
+  // a phone costs more in re-listing than the sync does (R083-11).
+  server = new TestServer();
+  await server.start();
+  const vault = new MemoryVault();
+  const secret = new Uint8Array(32).fill(57);
+  let listings = 0;
+  const list = vault.list.bind(vault);
+  vault.list = async () => {
+    listings++;
+    return list();
+  };
+  client = new Client({
+    vault,
+    store: new MemoryIndexStore(),
+    url: server.wsUrl,
+    ...(await server.deviceCredentials(secret, await testWrapped(secret))),
+    vaultId: "default",
+    device: "phone",
+    activePath: () => "note.md",
+  });
+  await client.connect();
+  await vault.edit("note.md", "before");
+  for (let i = 0; i < 60; i++)
+    await vault.edit(`background/${String(i).padStart(3, "0")}.md`, `n${i}`);
+
+  // Saved again the instant the engine looks at any background note, which is
+  // what an autosave during a first sync does.
+  let saves = 0;
+  const read = vault.read.bind(vault);
+  vault.read = async (path) => {
+    if (path.startsWith("background/") && saves < 20) {
+      saves++;
+      await vault.edit("note.md", `edit ${saves}`);
+      client.noteChanged("note.md");
+    }
+    return read(path);
+  };
+
+  listings = 0;
+  await client.engine.sync({ coalesceWrites: false });
+  expect(saves, "the test never reached the window it is about").toBeGreaterThan(1);
+  // The property is that this does not scale with the saves. A round per save
+  // was one listing each, up to the eight rounds `sync` allows, which is what
+  // this used to hit; one interruption per sync is a small constant whatever
+  // somebody types.
+  expect(listings, `${listings} whole-vault listings for ${saves} saves`).toBeLessThanOrEqual(3);
+});
+
 it.each(["oversized", "unreadable"] as const)(
   "syncs background notes when the active note is %s and has pending remote work",
   async (failure) => {

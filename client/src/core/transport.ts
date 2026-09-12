@@ -1646,7 +1646,26 @@ export class Transport {
           `server asked for ${name}, which this ${what} does not contain`,
         );
       }
-      const body = await bodyOf(name);
+      let body: Uint8Array;
+      try {
+        body = await bodyOf(name);
+      } catch (err) {
+        // The server has sent `want` and is reading binary frames. It is owed
+        // N bodies and is about to get fewer, and there is no frame that says
+        // "never mind": the next text frame this client sends would arrive
+        // where a body was expected, and the server would end the session over
+        // a protocol violation whose real cause was a file that changed on
+        // this disk. So the connection is ended here, by the side that knows
+        // why, and the caller gets the reason rather than a `protostate` on
+        // whatever it asked for next.
+        this.die(
+          new ConnectionError(
+            `${what} could not produce ${name}, so the connection was ended ` +
+              `rather than left owing the server bodies: ${(err as Error).message}`,
+          ),
+        );
+        throw err;
+      }
       await interleave?.();
       this.send(body);
       bytes += body.length;
@@ -1683,11 +1702,12 @@ export class Transport {
     if (!socket || socket.bufferedAmount === undefined) return;
     let last = socket.bufferedAmount;
     let movedAt = Date.now();
+    let wait = DRAIN_POLL_MS;
     while (socket.bufferedAmount > below) {
       if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
       // Browser WebSocket has no drain event. Poll only while bytes remain;
       // removing this wait would spin or remove the upload's memory bound.
-      await sleep(DRAIN_POLL_MS);
+      await sleep(wait);
       if (interleave) {
         const before = Date.now();
         await interleave();
@@ -1698,11 +1718,14 @@ export class Transport {
       if (now < last) {
         last = now;
         movedAt = Date.now();
+        wait = DRAIN_POLL_MS;
       } else if (Date.now() - movedAt > this.timeoutMs) {
         this.die(
           new ConnectionError(`upload stalled: ${now} bytes unsent for ${this.timeoutMs}ms`),
         );
         throw this.closeReason ?? new ConnectionError("not connected");
+      } else {
+        wait = Math.min(wait * 2, DRAIN_POLL_MAX_MS);
       }
     }
   }
@@ -1875,7 +1898,21 @@ export class Transport {
    * The caller keeps within `maxFetchBytes` and `MAX_FETCH_NAMES`; this
    * refuses a list over the count, which is the one bound it can see whole.
    */
-  async fetch(names: readonly string[], onBytes?: (bytes: number) => void): Promise<Uint8Array[]> {
+  async fetch(
+    names: readonly string[],
+    onBytes?: (bytes: number) => void,
+    /**
+     * Called between bodies, so a saved note can go out while a large
+     * attachment is still arriving.
+     *
+     * Only ever passed for a fetch on the auxiliary wire, for the reason
+     * `put`'s is: whatever this does sends frames, and sending them down the
+     * stream that is mid-fetch would put them between two bodies. On the
+     * second wire the bodies and the interleaved write are on different
+     * sockets and cannot meet.
+     */
+    interleave?: () => Promise<void>,
+  ): Promise<Uint8Array[]> {
     if (names.length === 0) return [];
     if (names.length > MAX_FETCH_NAMES) {
       throw new Error(
@@ -1945,6 +1982,11 @@ export class Transport {
         const next = await Promise.race([this.body(i), aborted]);
         received += next.length;
         notifyTransfer(onBytes, received);
+        // Between bodies, not between fetches. A fetch of one 64 MiB
+        // attachment is a single request, so a yield that only happened
+        // between requests never happened at all, and a note saved during
+        // that download waited out the whole of it.
+        if (interleave) await interleave();
         // Hashed alongside the next body rather than in front of it.
         //
         // The bodies arrive in order and must be read in order, but
@@ -2555,8 +2597,21 @@ function defaultSocketFactory(url: string): SocketLike {
  */
 const UPLOAD_HIGH_WATER = 4 * 1024 * 1024;
 
-/** How often the socket buffer is looked at while an upload drains. */
+/**
+ * How often the socket buffer is looked at while an upload drains, at its
+ * fastest and at its slowest.
+ *
+ * It starts fast, because the wait at the start of each body is short and a
+ * slow first look is latency added to every chunk. It widens while the buffer
+ * is not moving, because a buffer that has not moved in 5 ms will not have
+ * moved in the next 5 ms either: at a fixed 5 ms a 64 MiB attachment woke the
+ * event loop two hundred times a second for the length of the upload, which on
+ * a phone is the radio and the CPU both kept awake to read one number
+ * (R083-22). Every look that finds progress resets it, so the responsiveness
+ * that matters, the moment the buffer clears, is unchanged.
+ */
 const DRAIN_POLL_MS = 5;
+const DRAIN_POLL_MAX_MS = 50;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

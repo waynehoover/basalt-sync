@@ -66,6 +66,58 @@ async function device(): Promise<{ adapter: FakeAdapter; client: Client; source:
   return { adapter, client, source };
 }
 
+/** One version, with only the fields a test cares about filled in. */
+function version(uid: number, path: string, over: Partial<Version> = {}): Version {
+  return {
+    uid,
+    path,
+    size: 4,
+    ctime: 1000,
+    mtime: 1000 + uid,
+    folder: false,
+    deleted: false,
+    device: "a",
+    chunks: 1,
+    contentId: `c${uid}`,
+    ...over,
+  };
+}
+
+it("follows a rename back into the note's earlier history", async () => {
+  // History matches one exact sealed path, so a note renamed today had a
+  // history that started today, however many months of it the server was
+  // still holding under the old name (Codex-06).
+  const asked: { path: string; before?: number }[] = [];
+  const source: HistorySource = {
+    history: async (path, opts) => {
+      asked.push({ path, ...(opts.before !== undefined ? { before: opts.before } : {}) });
+      if (path === "Now.md") {
+        // A short page, so paging is exhausted under this name, and the
+        // oldest of them carries the rename.
+        return [version(30, "Now.md"), version(20, "Now.md", { previousPath: "Then.md" })];
+      }
+      return [version(10, "Then.md")];
+    },
+    contentAt: async () => "text\n",
+    restoreVersion: async () => ({ path: "Now.md", sent: true }),
+    currentText: async () => "text\n",
+  };
+  const modal = new HistoryModal(new App() as never, source, "Now.md");
+  const work = modal as unknown as { load(): Promise<void> };
+  modal.onOpen();
+  await work.load();
+  // Not exhausted, because there is an earlier name to read.
+  await work.load();
+
+  expect(asked[0]).toEqual({ path: "Now.md" });
+  // Bounded by the rename's own version, so a name reused for something else
+  // later cannot be pulled into this note's history.
+  expect(asked.at(-1)).toEqual({ path: "Then.md", before: 20 });
+  const shown = (modal.contentEl as unknown as { allText(): string }).allText();
+  expect(shown, "the earlier name was not labelled").toContain("as Then.md");
+  modal.onClose();
+});
+
 /** Writes a note and syncs, once per revision, so the server holds a history. */
 async function revisions(
   adapter: FakeAdapter,

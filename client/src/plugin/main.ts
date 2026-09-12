@@ -46,6 +46,7 @@ import {
   proveDeviceConnects,
   type ClientOptions,
   type DeletedList,
+  type Deletion,
   type DeviceRow,
   type InviteRow,
   type Version,
@@ -62,7 +63,9 @@ import {
   deviceCredential,
   encodeConfig,
   formatPairing,
+  isIgnorableName,
   isInvite,
+  joinDestination,
   normaliseUrl,
   parseInvite,
   parseSetup,
@@ -73,6 +76,7 @@ import {
 import { rotateVault } from "../core/rotation.ts";
 import { ProtocolError } from "../core/transport.ts";
 import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
+import { firstFreeName } from "../core/paths.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
 import { checkFirstSync, MergeConfirmationRequired } from "./first-sync.ts";
@@ -105,6 +109,34 @@ export type State =
        * show. Nothing in this plugin used to say so at all (R46).
        */
       waiting: number;
+      /**
+       * Files this device has not synced yet and expects to, with a deadline.
+       *
+       * Its own number, not folded into `refused` and not left out (rule 7,
+       * Codex-03). `needsAttention` counts what a person has to act on, and a
+       * file backing off after a failed upload is not that; but it is not
+       * finished either, and the glyph said it was. A vault with a note
+       * retrying showed the same tick as a vault with nothing left to do.
+       */
+      pending?: number | undefined;
+      /**
+       * When the next attempt at `pending` is due, if anything is.
+       *
+       * Because "3 files are waiting" and "3 files are waiting, next try in
+       * four minutes" are different amounts of help, and the second is what
+       * stops somebody power-cycling their phone.
+       */
+      pendingAt?: number | undefined;
+      /**
+       * What is written off and why, and what is being retried, by name.
+       *
+       * Kept on the state rather than only in a notice. A refusal used to be a
+       * sentence on screen for twenty seconds and a number afterwards, and the
+       * guide told people to look in the panel for a reason the panel did not
+       * have (Codex-03).
+       */
+      issues?: readonly { path: string; why: string }[] | undefined;
+      retryingPaths?: readonly string[] | undefined;
       /**
        * Set when this device cannot say what is waiting (RR2).
        *
@@ -155,6 +187,14 @@ export default class BasaltPlugin extends Plugin {
    * made with its old secret. This is that handle.
    */
   private live: Client | undefined;
+  /**
+   * The vault adapter the running client is using, or none.
+   *
+   * The displaced-version ledger lives on it, and getting a stranded note back
+   * has to go through the same adapter that put it there: it is the only thing
+   * that knows the hidden name and the only thing that writes through Obsidian.
+   */
+  private liveVault: ObsidianVault | undefined;
   private state: State = { kind: "unpaired" };
   private statusEl: HTMLElement | undefined;
   private ribbonEl: HTMLElement | undefined;
@@ -505,7 +545,19 @@ export default class BasaltPlugin extends Plugin {
     const detach = this.watchUnload(close);
     try {
       const proceed = await modal.confirm();
-      if (!proceed && current()) void this.togglePause();
+      if (!proceed && current()) {
+        // Said out loud, because the two ways of getting here do not look
+        // alike (R083-15, rule 7). One is a button labelled "Pause sync"; the
+        // other is Escape or the close button, which a person reads as "not
+        // now" and which used to stop sync with nothing on screen to say so.
+        // Whichever it was, this names the state and how to leave it.
+        new Notice(
+          "Sync is paused until you review these changes. " +
+            "Choose Resume sync from the Basalt menu to continue.",
+          10_000,
+        );
+        void this.togglePause();
+      }
       return proceed && current();
     } finally {
       this.syncPrompts.delete(close);
@@ -878,7 +930,11 @@ export default class BasaltPlugin extends Plugin {
     // the engine is told only that a path was kept.
     const vault = new ObsidianVault(this.app.vault, configDir, log, {
       displacedLog: `${this.pluginDir()}/${DISPLACED_LOG}`,
+      ...(config.ignore?.length ? { ignore: config.ignore } : {}),
     });
+    // Also held here, so the recovery surface can read the ledger and put a
+    // hidden version back without a pass having to hand it over (Codex-08).
+    this.liveVault = vault;
     return {
       vault,
       activePath: () => this.app.workspace.getActiveFile()?.path,
@@ -929,8 +985,14 @@ export default class BasaltPlugin extends Plugin {
           // needs-attention list holds, through the one helper, so the glyph,
           // the sentence and the notice cannot start counting different things.
           refused: needsAttention(report),
+          pending: report.retrying,
+          ...(report.nextUploadAt !== undefined ? { pendingAt: report.nextUploadAt } : {}),
           waiting: vault.stranded.length,
           recoveryUnknown: vault.recovery.complete ? undefined : vault.recovery.why,
+          // Kept, so the reason survives the notice that showed it. A refusal
+          // used to exist for twenty seconds and then be a number.
+          issues: report.needsAttention ?? [],
+          retryingPaths: report.retryingPaths ?? [],
         });
         this.announce(report, vault.displaced, vault.recovery);
         void this.activityLog?.flush();
@@ -1144,6 +1206,73 @@ export default class BasaltPlugin extends Plugin {
         throw err;
       }
       if (!stillCurrent()) throw new Error("the pairing changed while saving the server address");
+      this.config = next;
+      this.start();
+    } finally {
+      this.editingConnection = false;
+    }
+  }
+
+  /** The folder and file names this device leaves alone, beyond the dot rule. */
+  get ignoredNames(): readonly string[] {
+    return this.config?.ignore ?? [];
+  }
+
+  /**
+   * Changes what this device skips, and restarts sync under the new list.
+   *
+   * Per device and never sent anywhere (R083-13): a phone can leave a folder
+   * of attachments alone while the desktop keeps it, which is what Obsidian
+   * Sync and LiveSync both offer and what a person with a large media folder
+   * has otherwise no way to ask for here.
+   *
+   * The restart is not decoration. The ignore set is read when the vault
+   * adapter is built, so a list changed under a running client would be a
+   * client listing one set of files and reporting against another.
+   *
+   * Adding a name does not delete anything. What was already synced stays on
+   * the server and on every other device; this device stops listing it, and
+   * the pass counts it as `ignored`, which is out of the exit code and out of
+   * the attention list. Removing a name puts it back in the listing, and the
+   * next pass reconciles it like any other path.
+   */
+  async setIgnoredNames(names: readonly string[]): Promise<void> {
+    if (this.unlinking) throw new Error("This vault is being unlinked.");
+    if (this.editingConnection) throw new Error("Another settings change is in progress.");
+    this.editingConnection = true;
+    try {
+      const config = this.config;
+      if (!config) throw new Error("this vault is not paired yet.");
+      const wanted = [...new Set(names.map((name) => name.trim()))].filter((name) =>
+        isIgnorableName(name),
+      );
+      wanted.sort();
+      if (JSON.stringify(wanted) === JSON.stringify([...(config.ignore ?? [])].sort())) return;
+      const next: DeviceConfig = { ...config, ignore: wanted };
+      const mine = this.generation + 1;
+      await this.quiet();
+      if (this.generation !== mine || this.config !== config) {
+        throw new Error("the pairing changed while saving what this device skips");
+      }
+      try {
+        await this.saveDuringRun(mine, next);
+      } catch (err) {
+        if (mine === this.generation) {
+          this.setState({
+            kind: "stopped",
+            why: `what this device skips could not be saved: ${(err as Error).message}. Reopen Obsidian to reload the saved settings`,
+          });
+        }
+        throw err;
+      }
+      // Again, after the save, the way `changeServerAddress` does. An unlink
+      // started while the save was in flight has already taken the generation,
+      // removed the index and written the config away; starting here would run
+      // a client against a vault that no longer exists while the panel says
+      // this device is unpaired.
+      if (this.unlinking || this.generation !== mine || this.config !== config) {
+        throw new Error("the pairing changed while saving what this device skips");
+      }
       this.config = next;
       this.start();
     } finally {
@@ -1421,16 +1550,31 @@ export default class BasaltPlugin extends Plugin {
    * paired, and the first sign of it was a status bar saying stopped, later
    * (I13). See `registerAsDevice`.
    */
-  async pair(pairingString: string, device: string, mergeConfirmed = false): Promise<void> {
+  async pair(
+    pairingString: string,
+    device: string,
+    mergeConfirmed = false,
+    /**
+     * Names this device will never sync, chosen before it starts (Codex-05).
+     *
+     * Here rather than only in the paired panel because the download starts
+     * the moment pairing finishes: somebody adding a phone to a vault with
+     * several gigabytes of attachments had to race it to the settings screen.
+     * The list is written with the pairing, so the first pass already honours
+     * it and the bytes are never asked for.
+     */
+    ignore: readonly string[] = [],
+  ): Promise<void> {
     await this.onePairing(async () => {
       const name = deviceName(device);
+      const skip = [...new Set(ignore.map((n) => n.trim()))].filter(isIgnorableName).sort();
       const mine = this.generation;
       const invite = isInvite(pairingString) ? parseInvite(pairingString) : undefined;
       const pairing = invite === undefined ? parsePairing(pairingString) : undefined;
       await checkFirstSync(this.app.vault.adapter, this.app.vault.configDir, mergeConfirmed);
       if (mine !== this.generation)
         throw new Error("Pairing was cancelled while checking local files.");
-      if (invite !== undefined) return await this.pairWithInvite(invite, name);
+      if (invite !== undefined) return await this.pairWithInvite(invite, name, skip);
       let registered = false;
       let paired: DeviceConfig;
       try {
@@ -1440,6 +1584,7 @@ export default class BasaltPlugin extends Plugin {
             vaultId: pairing!.vaultId,
             device: name,
             secret: pairing!.secret,
+            ...(skip.length > 0 ? { ignore: skip } : {}),
           },
           (next) => this.saveDuringRun(mine, next),
           {
@@ -1507,7 +1652,11 @@ export default class BasaltPlugin extends Plugin {
    * lands the only copy of the data key on this phone is in memory and the
    * invite that carried it is already spent (rule 4).
    */
-  private async pairWithInvite(invite: Invite, name: string): Promise<void> {
+  private async pairWithInvite(
+    invite: Invite,
+    name: string,
+    ignore: readonly string[] = [],
+  ): Promise<void> {
     // The generation this pairing belongs to, taken before the network (F23).
     //
     // Redeeming is a round trip, and the plugin can be unloaded, unlinked or
@@ -1528,6 +1677,9 @@ export default class BasaltPlugin extends Plugin {
       deviceId: redeemed.deviceId,
       deviceSecret: redeemed.deviceSecret,
       dataKey: redeemed.dataKey,
+      // Written with the pairing, so the first pass already skips them and
+      // nothing is downloaded that this device was never going to keep.
+      ...(ignore.length > 0 ? { ignore } : {}),
     };
     // Refuses once this run has been retired, and is registered where
     // `unlink` waits for it, which is the pair of guarantees the two halves
@@ -1587,6 +1739,8 @@ export default class BasaltPlugin extends Plugin {
     setup: string,
     device: string,
     onKey?: (key: string) => void | Promise<void>,
+    /** Names this device will never sync, chosen before it starts (Codex-05). */
+    ignore: readonly string[] = [],
   ): Promise<string> {
     return this.onePairing(async () => {
       // Captured before anything is awaited (R10). It was taken after the
@@ -1594,13 +1748,25 @@ export default class BasaltPlugin extends Plugin {
       // was invisible to every check that followed and the pairing went on to
       // start a loop for a vault that had been retired.
       const mine = this.generation;
-      const { url, token } = parseSetup(setup);
+      // The vault the line names, or `default` (R083-14). A server started
+      // with `-vault work` prints its name in the line, and until this the
+      // plugin could only ever claim `default`: the documented way to start a
+      // differently named vault from a phone was to install the CLI on
+      // something else first.
+      const { url, token, vaultId = "default" } = parseSetup(setup);
       const secret = generateSecret();
       const name = deviceName(device);
-      const starting: DeviceConfig = { url, vaultId: "default", device: name, secret };
+      const skip = [...new Set(ignore.map((n) => n.trim()))].filter(isIgnorableName).sort();
+      const starting: DeviceConfig = {
+        url,
+        vaultId,
+        device: name,
+        secret,
+        ...(skip.length > 0 ? { ignore: skip } : {}),
+      };
       await this.saveVerified(starting);
       this.config = starting;
-      const recoveryKey = formatPairing({ url, vaultId: "default", secret });
+      const recoveryKey = formatPairing({ url, vaultId, secret });
       // On screen now, and *waited for*, while the root above is still the
       // only thing on disk and nothing has been sent (R02).
       //
@@ -1624,7 +1790,14 @@ export default class BasaltPlugin extends Plugin {
       let registered = false;
       try {
         this.config = await registerAsDevice(
-          { url, vaultId: "default", device: name, secret, bootstrap: token },
+          {
+            url,
+            vaultId,
+            device: name,
+            secret,
+            bootstrap: token,
+            ...(skip.length > 0 ? { ignore: skip } : {}),
+          },
           (next) => this.saveDuringRun(mine, next),
           {
             onRegistered: () => {
@@ -1728,6 +1901,148 @@ export default class BasaltPlugin extends Plugin {
       );
     }
     return this.restoreAndSend(version);
+  }
+
+  /**
+   * Every version this device took off a name and could not put back.
+   *
+   * Read from the live vault's ledger, which is where the record is: the
+   * hidden file is not in Obsidian's index, so nothing else can walk for it.
+   * Incomplete is kept apart from empty, because a log that will not parse and
+   * a vault with nothing stranded look identical from a count (rule 2).
+   */
+  async displacedVersions(): Promise<Inventory> {
+    const vault = this.vaultForRecovery();
+    // The running client's copy has already listed, so its answer is current
+    // and free. Without one the ledger has to be read, and reading it means
+    // listing: recovering a note has to work on a device whose sync is paused
+    // or stopped, which is exactly when somebody reaches for it.
+    if (vault !== this.liveVault) await vault.list();
+    return vault.recovery;
+  }
+
+  /**
+   * An adapter that can reach the displaced ledger, running or not.
+   *
+   * The same one the client uses where there is a client, because it has the
+   * inventory already; a fresh one otherwise, pointed at the same log. Both
+   * write through Obsidian, which is the part that matters.
+   */
+  private vaultForRecovery(): ObsidianVault {
+    if (this.liveVault) return this.liveVault;
+    return new ObsidianVault(this.app.vault, this.app.vault.configDir, undefined, {
+      displacedLog: `${this.pluginDir()}/${DISPLACED_LOG}`,
+    });
+  }
+
+  /**
+   * Puts a hidden version back where Obsidian can see it (Codex-08).
+   *
+   * When preservation cannot place a visible copy it parks the bytes under a
+   * name Obsidian does not list, says so once, and afterwards the panel could
+   * only report that this had happened somewhere. Getting those bytes back
+   * meant a file manager or a terminal, on a device that may have neither, for
+   * what is sometimes the only surviving copy of somebody's note.
+   *
+   * Beside, never over: the visible name is the first free one, so a recovery
+   * cannot displace the thing that displaced it. The hidden copy is left where
+   * it is. Removing it would be the one destructive step in a recovery path,
+   * and there is no version of "it worked" worth taking that risk for; the
+   * ledger keeps naming it until somebody deletes it themselves.
+   */
+  async recoverDisplaced(version: Displaced): Promise<string> {
+    const vault = this.vaultForRecovery();
+    const bytes = await vault.readDisplaced(version.at);
+    const target = await firstFreeName(version.from, (path: string) => vault.exists(path));
+    const now = Date.now();
+    if (!(await vault.create(target, bytes, { mtime: now, ctime: now }))) {
+      throw new Error(`something is already at ${target}`);
+    }
+    await vault.flush?.();
+    // Sent like any other new note, and not waited on: the bytes are visible
+    // and durable now, which is the whole of what was asked for.
+    this.nudge(target);
+    return target;
+  }
+
+  /**
+   * Restores several deletions, and syncs once at the end (Codex-11).
+   *
+   * Recovering a deleted folder was one button per note, and each of those
+   * reconciled the whole vault before the next could start. A hundred notes
+   * was a hundred taps and a hundred passes, on a phone, one-handed, after
+   * something had already gone wrong.
+   *
+   * The two halves stay apart for the reason `restoreAndSend` keeps them
+   * apart: every restore that lands is durable the moment it returns, whatever
+   * the sync afterwards does. So each one is placed first, and the sync is
+   * asked once, and then each path is asked separately whether the server has
+   * it. A restore that could not be placed at all is its own answer and does
+   * not stop the others.
+   */
+  async recoverMany(deletions: readonly Version[]): Promise<Restored[]> {
+    const client = this.client;
+    if (!client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
+    const mine = this.generation;
+
+    const placed: { at: string; failed?: undefined }[] = [];
+    const out: (Restored | undefined)[] = deletions.map(() => undefined);
+    for (let i = 0; i < deletions.length; i++) {
+      const deletion = deletions[i]!;
+      try {
+        const version = await client.findVersion(
+          deletion.path,
+          (v) => v.uid < deletion.uid && !v.deleted && !v.folder,
+        );
+        if (!version) {
+          throw new Error(
+            `the server no longer holds content from before this deletion of ${deletion.path}`,
+          );
+        }
+        const done = await client.restore(version);
+        placed.push({ at: done.path });
+        out[i] = { path: done.path, sent: false, willRetry: true, why: "not sent yet" };
+      } catch (err) {
+        out[i] = {
+          path: deletion.path,
+          sent: false,
+          willRetry: false,
+          why: (err as Error).message,
+        };
+      }
+    }
+    if (placed.length === 0) return out.map((r) => r!);
+
+    // One pass for all of them, which is the whole point.
+    let failure: string | undefined;
+    try {
+      await client.settle({ coalesceWrites: false });
+    } catch (err) {
+      failure =
+        mine !== this.generation ? "this vault is no longer paired" : (err as Error).message;
+    }
+    for (let i = 0; i < out.length; i++) {
+      const done = out[i]!;
+      if (done.willRetry === false) continue; // never placed
+      if (client.engine.serverHasOurs(done.path)) {
+        out[i] = { path: done.path, sent: true };
+      } else if (failure !== undefined) {
+        out[i] = {
+          path: done.path,
+          sent: false,
+          ...(mine !== this.generation ? { willRetry: false } : {}),
+          why: failure,
+        };
+      } else {
+        out[i] = {
+          path: done.path,
+          sent: false,
+          willRetry: true,
+          why: "it has not been acknowledged by the server yet, and will be tried again",
+        };
+      }
+    }
+    return out.map((r) => r!);
   }
 
   /**
@@ -2405,7 +2720,48 @@ export default class BasaltPlugin extends Plugin {
       if (tone) this.ribbonEl.addClass(tone);
       this.ribbonEl.setAttribute("aria-label", `Basalt: ${longStatus(state)}`);
     }
+    this.announceOnAPhone(state);
     for (const listener of this.listeners) listener(state);
+  }
+
+  /** The condition a Notice has already been shown for, so it is shown once. */
+  private toldOnAPhone: "attention" | "offline" | undefined;
+  private lastToldOnAPhone = 0;
+
+  /**
+   * Puts the two states a phone most needs where a phone can see them (R083-16).
+   *
+   * There is no status bar on mobile: `addStatusBarItem` is documented as
+   * unavailable there, so on Android the whole of the state is the ribbon
+   * glyph and an `aria-label` that renders as a tooltip nobody taps. "Some
+   * files need attention" and "not connected" are exactly the two a person
+   * needs to be told rather than to go looking for, and both were invisible
+   * until they opened the panel.
+   *
+   * On the transition, and once. A Notice per pass would be the plugin talking
+   * over the person; a Notice when nothing has changed says nothing. The flag
+   * clears when the condition does, so the next occurrence is announced again.
+   */
+  private announceOnAPhone(state: State): void {
+    if (!Platform.isMobileApp) return;
+    const now =
+      state.kind === "offline"
+        ? "offline"
+        : state.kind === "synced" && (state.refused > 0 || state.waiting > 0)
+          ? "attention"
+          : undefined;
+    if (now === this.toldOnAPhone) return;
+    this.toldOnAPhone = now;
+    if (now === undefined) return;
+    // And not more than once every few minutes. A phone's radio drops and
+    // comes back on its own, and a Notice per drop is a plugin talking over
+    // somebody who is trying to write. The state is on the ribbon either way;
+    // this is the interruption, and an interruption that repeats stops being
+    // read.
+    const at = Date.now();
+    if (at - this.lastToldOnAPhone < PHONE_NOTICE_GAP_MS) return;
+    this.lastToldOnAPhone = at;
+    new Notice(`Basalt: ${longStatus(state)} Tap the Basalt icon for details.`, 10_000);
   }
 
   private readonly listeners = new Set<(state: State) => void>();
@@ -2622,9 +2978,12 @@ function iconFor(state: State): string {
     case "syncing":
       return "refresh-cw";
     case "synced":
-      return state.refused > 0 || state.waiting > 0 || state.recoveryUnknown !== undefined
-        ? "alert-circle"
-        : "cloud-check";
+      if (state.refused > 0 || state.waiting > 0 || state.recoveryUnknown !== undefined) {
+        return "alert-circle";
+      }
+      // Not a tick. Something is still owed and will be tried again, which is
+      // neither "done" nor "somebody has to look at this" (Codex-03).
+      return (state.pending ?? 0) > 0 ? "refresh-cw" : "cloud-check";
     case "offline":
       return "cloud-off";
     case "failed":
@@ -2661,6 +3020,27 @@ function toneFor(state: State): string {
 }
 
 /** The panel's own document, which is where the long form of all of this lives. */
+/**
+ * The shortest gap between two of the Notices a phone gets about its own sync
+ * state.
+ *
+ * There is no status bar on mobile, so a Notice is the only way to say
+ * "offline" or "some files need attention" to somebody who has not opened the
+ * panel. It is also the most intrusive thing this plugin can do, and a radio
+ * that drops and returns every few seconds would otherwise produce one per
+ * drop. Five minutes is long enough that the second one means something.
+ */
+const PHONE_NOTICE_GAP_MS = 5 * 60_000;
+
+/**
+ * How many outstanding paths the panel names before it stops being a message.
+ *
+ * The engine caps its own lists at five for the same reason, and this matches
+ * it: a wall of four hundred identical sentences is not a list somebody reads.
+ * Whatever is not shown is counted and said.
+ */
+const LISTED_IN_PANEL = 5;
+
 const DOCS = "https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md";
 
 /** Native settings groups on current Obsidian; flat rows on older releases. */
@@ -2816,6 +3196,13 @@ class BasaltPanel {
     const primary = settingGroup(contentEl);
     const sync = row(primary, "Sync status");
     const status = sync.descEl;
+    // What is outstanding, by name and with its reason, under the status line.
+    //
+    // These reasons used to exist for the twenty seconds a notice was on
+    // screen and then be a number, while the guide told people to look in the
+    // panel for them (Codex-03). A person who put their phone down during a
+    // sync had no way back to what it had said.
+    const outstanding = contentEl.createDiv("basalt-outstanding");
     status.addClass("basalt-sync-status");
     this.renderDelivery(sync.infoEl);
     status.setAttribute("role", "status");
@@ -2865,6 +3252,7 @@ class BasaltPanel {
     this.watchShape(() => {
       const state = this.plugin.currentState;
       status.setText(longStatus(state));
+      this.renderOutstanding(outstanding, state);
       const busy =
         state.kind === "connecting" || state.kind === "loading" || state.kind === "syncing";
       syncButton
@@ -2933,6 +3321,8 @@ class BasaltPanel {
     manage.createEl("summary", { text: "Manage this vault" });
     const management = settingGroup(manage);
     this.renderThisDeviceName(management);
+    this.renderStranded(management);
+    this.renderIgnored(management);
     this.renderDevices(management);
     row(management, "Recovery key", "Not stored on this device. Keep your saved copy safe.");
 
@@ -3002,6 +3392,53 @@ class BasaltPanel {
     );
 
     docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "Basalt documentation");
+  }
+
+  /**
+   * The paths this device has not synced, with what it says about each.
+   *
+   * Two kinds, kept apart, because they need different things from a person
+   * (rule 7): a written-off path is one somebody has to look at, and a
+   * retrying one is one to leave alone until the deadline. Rebuilt in place on
+   * every state change rather than redrawn as rows, so a panel left open
+   * follows the vault.
+   */
+  private renderOutstanding(host: HTMLElement, state: State): void {
+    host.empty();
+    if (state.kind !== "synced") return;
+    const issues = state.issues ?? [];
+    const retrying = state.retryingPaths ?? [];
+    if (issues.length === 0 && retrying.length === 0) return;
+
+    if (issues.length > 0) {
+      const list = host.createEl("ul", { cls: "basalt-outstanding-list" });
+      for (const issue of issues.slice(0, LISTED_IN_PANEL)) {
+        list.createEl("li", { text: `${issue.path}: ${issue.why}` });
+      }
+      // Said, rather than left to a count that does not add up. The engine
+      // caps its own list, so the panel showing five of forty has to say so.
+      const more = state.refused - Math.min(issues.length, LISTED_IN_PANEL);
+      if (more > 0) {
+        host.createEl("p", {
+          cls: "basalt-advice",
+          text: `And ${more} more not listed here. Sync activity has the full record.`,
+        });
+      }
+    }
+
+    if (retrying.length > 0) {
+      const when =
+        state.pendingAt === undefined
+          ? ""
+          : ` Next attempt ${new Date(state.pendingAt).toLocaleTimeString()}.`;
+      const count = state.pending ?? retrying.length;
+      host.createEl("p", {
+        cls: "basalt-advice",
+        text:
+          `${count} ${count === 1 ? "file is" : "files are"} waiting to be sent again: ` +
+          `${retrying.slice(0, LISTED_IN_PANEL).join(", ")}.${when}`,
+      });
+    }
   }
 
   /** Form fields survive ordinary updates; a different pairing redraws every surface. */
@@ -3377,6 +3814,102 @@ class BasaltPanel {
     );
   }
 
+  /**
+   * What this device skips, and a way to change it (R083-13).
+   *
+   * A list of names with a Remove each, and one field to add another, rather
+   * than a text area of comma-separated anything. The names are somebody's
+   * folders and the failure mode of free text is a typo that silently syncs
+   * the folder they asked to skip; a name that is already on the list is
+   * visible, and one that is not was never accepted.
+   */
+  private renderIgnored(contentEl: HTMLElement): void {
+    const names = this.plugin.ignoredNames;
+    const setting = row(
+      contentEl,
+      "Skip these on this device",
+      names.length === 0
+        ? "Nothing beyond hidden folders and Obsidian's own. This device only; other devices keep syncing them."
+        : `Not synced here: ${names.join(", ")}. This device only; other devices keep syncing them.`,
+    );
+    let field: TextComponent | undefined;
+    setting.addText((t) => {
+      t.setPlaceholder("Attachments");
+      t.inputEl.setAttribute("aria-label", "A folder or file name to skip on this device");
+      field = t;
+    });
+    const change = async (wanted: readonly string[], button: ButtonComponent, was: string) => {
+      button.setDisabled(true).setButtonText("Saving");
+      try {
+        await this.plugin.setIgnoredNames(wanted);
+        this.render();
+      } catch (err) {
+        new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+        button.setDisabled(false).setButtonText(was);
+      }
+    };
+    setting.addButton((b) =>
+      b.setButtonText("Skip").onClick(async () => {
+        const wanted = (field?.getValue() ?? "").trim();
+        if (!isIgnorableName(wanted)) {
+          new Notice("Basalt: give one folder or file name, with no slashes in it.");
+          return;
+        }
+        if (names.includes(wanted)) {
+          new Notice(`Basalt: ${wanted} is already skipped on this device.`);
+          return;
+        }
+        await change([...names, wanted], b, "Skip");
+      }),
+    );
+    for (const name of names) {
+      row(
+        contentEl,
+        name,
+        "Skipped on this device. Removing it syncs it again from the next pass.",
+      ).addButton((b) =>
+        b.setButtonText("Sync it").onClick(async () => {
+          await change(
+            names.filter((other) => other !== name),
+            b,
+            "Sync it",
+          );
+        }),
+      );
+    }
+  }
+
+  /**
+   * A way back to the versions this device could not leave visible (Codex-08).
+   *
+   * The panel said these existed and stopped there, so getting them back meant
+   * a file manager or a terminal, on a phone that has neither, for what is
+   * sometimes the only surviving copy of a note. The row is drawn even when
+   * the inventory is empty *and incomplete*, because "nothing is stranded" and
+   * "I cannot tell you what is stranded" are different answers (rule 2).
+   */
+  private renderStranded(contentEl: HTMLElement): void {
+    // From the state, which the pass already put there, rather than from a
+    // fresh read: the row is drawn on every panel render and the modal is the
+    // thing that goes and looks.
+    const state = this.plugin.currentState;
+    const waiting = state.kind === "synced" ? state.waiting : 0;
+    const unknown = state.kind === "synced" ? state.recoveryUnknown : undefined;
+    if (waiting === 0 && unknown === undefined) return;
+    row(
+      contentEl,
+      "Versions kept out of sight",
+      unknown === undefined
+        ? `${waiting} ${waiting === 1 ? "version is" : "versions are"} under a name Obsidian does not show.`
+        : `Basalt cannot tell what is waiting: ${unknown}`,
+    ).addButton((b) =>
+      b.setButtonText("Look").onClick(() => {
+        this.dismiss();
+        new StrandedModal(this.plugin).open();
+      }),
+    );
+  }
+
   private renderRotate(contentEl: HTMLElement): void {
     const said = later(contentEl, "basalt-advice");
     let keyField: TextComponent | undefined;
@@ -3500,7 +4033,7 @@ class BasaltPanel {
               b.setDisabled(true);
               cancel.setDisabled(true);
               try {
-                await this.pairFromPanel(draft.key, draft.device, true);
+                await this.pairFromPanel(draft.key, draft.device, this.joinSkip, true);
               } finally {
                 b.setDisabled(false);
                 cancel.setDisabled(false);
@@ -3562,6 +4095,15 @@ class BasaltPanel {
     // not a value, so the honest thing to do with the field was leave it
     // alone, and every device ended up named after the app rather than after
     // itself. What is offered is what will be used, and it can be typed over.
+    // What this device will never sync, before it starts (Codex-05).
+    //
+    // Pairing starts the download the moment it finishes, and the exclusion
+    // controls used to exist only in the paired panel: somebody adding a phone
+    // to a vault holding several gigabytes of attachments had to race their
+    // own sync to the settings screen. Asked here, the list is written with
+    // the pairing and the first pass never asks for those bytes.
+    const skipping = () => this.joinSkip;
+
     row(contentEl, "Device name", "Shown in the device list and future sync activity.").addText(
       (t) => {
         t.setPlaceholder("laptop");
@@ -3575,6 +4117,8 @@ class BasaltPanel {
       },
     );
 
+    this.renderJoinSkip(contentEl);
+
     if (this.joining === "invite") {
       let pairingField: TextComponent | undefined;
       row(
@@ -3587,24 +4131,58 @@ class BasaltPanel {
         literalInput(t);
         const key = this.joinDraft?.key ?? this.incomingInvite;
         if (key !== undefined) t.setValue(key);
+        t.onChange(() => showDestination());
         pairingField = t;
       });
 
+      // Where this string goes, before it goes there (R083-05).
+      //
+      // An invite carries the server address and the vault name, and neither
+      // was on screen: a person pressed Pair on a base64 blob, and an invite
+      // arriving through `obsidian://basalt-sync?invite=...` filled the field
+      // in for them. An unpaired vault pointed at a stranger's server uploads
+      // itself to it on the first sync, so the address has to be readable
+      // first and the button stays disabled until it is.
+      const destination = contentEl.createEl("p", { cls: "basalt-advice" });
+      destination.setAttribute("role", "status");
+      let pairButton: ButtonComponent | undefined;
+      const showDestination = () => {
+        const value = pairingField?.getValue().trim() ?? "";
+        let readable = false;
+        if (value === "") {
+          destination.setText("Paste an invite or recovery key to see which vault it joins.");
+        } else {
+          try {
+            const to = joinDestination(value, "join");
+            readable = true;
+            destination.setText(
+              to.vaultId === undefined
+                ? `Joins ${to.url}. Check that this is your server.`
+                : `Joins vault "${to.vaultId}" at ${to.url}. Check that this is your server.`,
+            );
+          } catch (err) {
+            destination.setText(`Cannot read that: ${(err as Error).message}`);
+          }
+        }
+        pairButton?.setDisabled(!readable);
+      };
+
       new Setting(contentEl)
         .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
-        .addButton((b) =>
-          b
-            .setButtonText("Pair")
+        .addButton((b) => {
+          pairButton = b;
+          b.setButtonText("Pair")
             .setCta()
             .onClick(async () => {
               b.setDisabled(true);
               try {
-                await this.pairFromPanel(pairingField?.getValue() ?? "", device());
+                await this.pairFromPanel(pairingField?.getValue() ?? "", device(), skipping());
               } finally {
-                b.setDisabled(false);
+                showDestination();
               }
-            }),
-        );
+            });
+        });
+      showDestination();
     } else {
       let setupField: TextComponent | undefined;
       row(
@@ -3615,13 +4193,38 @@ class BasaltPanel {
         t.setPlaceholder("homelab:3003#K7M2PQR4-...");
         t.inputEl.setAttribute("aria-label", "Setup string");
         literalInput(t, true);
+        t.onChange(() => showDestination());
         setupField = t;
       });
+
+      // The same line, for the same reason (R083-05). A setup line claims a
+      // server for a vault that does not exist yet, so getting the address
+      // wrong here is a vault started somewhere nobody meant.
+      const destination = contentEl.createEl("p", { cls: "basalt-advice" });
+      destination.setAttribute("role", "status");
+      let startButton: ButtonComponent | undefined;
+      const showDestination = () => {
+        const value = setupField?.getValue().trim() ?? "";
+        let readable = false;
+        if (value === "") {
+          destination.setText("Paste the setup line to see which server it claims.");
+        } else {
+          try {
+            const to = joinDestination(value, "first");
+            readable = true;
+            destination.setText(`Starts a vault at ${to.url}. Check that this is your server.`);
+          } catch (err) {
+            destination.setText(`Cannot read that: ${(err as Error).message}`);
+          }
+        }
+        startButton?.setDisabled(!readable);
+      };
+
       new Setting(contentEl)
         .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
-        .addButton((b) =>
-          b
-            .setButtonText("Start a new vault")
+        .addButton((b) => {
+          startButton = b;
+          b.setButtonText("Start a new vault")
             .setCta()
             .onClick(async () => {
               try {
@@ -3637,11 +4240,16 @@ class BasaltPanel {
                 // anybody read the screen. Nothing has been claimed while this
                 // waits, so abandoning it costs nothing: the config still holds the
                 // root, and the panel offers the key again on the next load.
-                await this.plugin.pairFirst(setupField?.getValue() ?? "", device(), async (key) => {
-                  this.freshRecoveryKey = key;
-                  this.render();
-                  await this.writtenDown;
-                });
+                await this.plugin.pairFirst(
+                  setupField?.getValue() ?? "",
+                  device(),
+                  async (key) => {
+                    this.freshRecoveryKey = key;
+                    this.render();
+                    await this.writtenDown;
+                  },
+                  skipping(),
+                );
                 new Notice(
                   "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
                 );
@@ -3650,11 +4258,63 @@ class BasaltPanel {
               } catch (err) {
                 new Notice(`Basalt: ${(err as Error).message}`, 10_000);
               }
-            }),
-        );
+            });
+        });
+      showDestination();
     }
 
     docsLink(host.createEl("p", { cls: "basalt-advice" }), "How pairing works");
+  }
+
+  /**
+   * Names chosen on the pairing screen, before anything is downloaded.
+   *
+   * Held on the panel rather than in the config, because there is no config
+   * yet: this is the answer to "what should this device sync" asked at the one
+   * moment it can still prevent a download rather than undo one.
+   */
+  private joinSkip: string[] = [];
+
+  /**
+   * The skip list, on the pairing screen.
+   *
+   * A field and a row per chosen name, the same shape `renderIgnored` has for
+   * a paired vault, so the control somebody meets at setup is the control they
+   * meet again in the settings.
+   */
+  private renderJoinSkip(contentEl: HTMLElement): void {
+    const setting = row(
+      contentEl,
+      "Skip on this device",
+      this.joinSkip.length === 0
+        ? "Optional. A folder or file name this device should never sync, such as a large attachments folder."
+        : `Not synced here: ${this.joinSkip.join(", ")}. Other devices keep syncing them.`,
+    );
+    let field: TextComponent | undefined;
+    setting.addText((t) => {
+      t.setPlaceholder("Attachments");
+      t.inputEl.setAttribute("aria-label", "A folder or file name to skip on this device");
+      field = t;
+    });
+    setting.addButton((b) =>
+      b.setButtonText("Skip").onClick(() => {
+        const wanted = (field?.getValue() ?? "").trim();
+        if (!isIgnorableName(wanted)) {
+          new Notice("Basalt: give one folder or file name, with no slashes in it.");
+          return;
+        }
+        if (!this.joinSkip.includes(wanted)) this.joinSkip.push(wanted);
+        this.render();
+      }),
+    );
+    for (const name of this.joinSkip) {
+      row(contentEl, name, "Will not be synced to this device.").addButton((b) =>
+        b.setButtonText("Sync it").onClick(() => {
+          this.joinSkip = this.joinSkip.filter((other) => other !== name);
+          this.render();
+        }),
+      );
+    }
   }
 
   /** Which pairing path the panel is showing, or the question if neither. */
@@ -3664,11 +4324,16 @@ class BasaltPanel {
   private confirmMerge = false;
 
   /** Confirmation is a panel step; it never leaves a pairing request waiting. */
-  private async pairFromPanel(key: string, device: string, mergeConfirmed = false): Promise<void> {
+  private async pairFromPanel(
+    key: string,
+    device: string,
+    ignore: readonly string[] = this.joinSkip,
+    mergeConfirmed = false,
+  ): Promise<void> {
     if (this.closed) return;
     this.joinDraft = { key, device };
     try {
-      await this.plugin.pair(key, device, mergeConfirmed);
+      await this.plugin.pair(key, device, mergeConfirmed, ignore);
       this.joinDraft = undefined;
       this.confirmMerge = false;
       this.joining = undefined;
@@ -3884,8 +4549,30 @@ class RecoverModal extends Modal {
   private closed = false;
   private rendering: Promise<void> | undefined;
   private readonly restoring = new Set<number>();
-  /** The oldest uid of the page before this one, or undefined for the newest. */
-  private before: number | undefined;
+  /**
+   * Which deletions are picked out for a bulk restore, by uid.
+   *
+   * A button per row rather than a checkbox, because the stub and Obsidian
+   * both give a button a phone-sized tap target and neither gives a checkbox
+   * one. Recovering a deleted folder was one press and one whole-vault sync
+   * per note (Codex-11).
+   */
+  private readonly picked = new Set<number>();
+  /**
+   * Every deletion fetched so far, newest first.
+   *
+   * Kept rather than replaced, because the filter below has to have something
+   * to filter. "Show older" used to swap one page of fifty for the next, so a
+   * person looking for one name among three hundred deletions read fifty
+   * names, pressed a button, and lost the fifty they had just read (R083-17).
+   */
+  private readonly loaded: Deletion[] = [];
+  /** Whether the server said there are older deletions than the ones held. */
+  private more = false;
+  /** The oldest uid held, which is what asks for the page before it. */
+  private oldest: number | undefined;
+  private query = "";
+  private failure: string | undefined;
 
   constructor(private readonly plugin: BasaltPlugin) {
     super(plugin.app);
@@ -3900,123 +4587,358 @@ class RecoverModal extends Modal {
 
   override onClose(): void {
     this.closed = true;
+    this.listEl = undefined;
     this.contentEl.empty();
   }
 
-  private render(): Promise<void> {
+  /** Fetches the next page, then redraws. Never two fetches at once. */
+  private render(before?: number): Promise<void> {
     if (this.closed) return Promise.resolve();
     if (this.rendering) return this.rendering;
-    this.rendering = this.renderPage().finally(() => {
+    this.rendering = this.fetchPage(before).finally(() => {
       this.rendering = undefined;
     });
     return this.rendering;
   }
 
-  private async renderPage(): Promise<void> {
+  private async fetchPage(before: number | undefined): Promise<void> {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("p", { cls: "basalt-advice", text: "Loading deleted notes…" });
 
     let deleted: DeletedList;
     try {
-      deleted = await this.plugin.deletedNotes(PAGE_SIZE, this.before);
+      deleted = await this.plugin.deletedNotes(PAGE_SIZE, before);
     } catch (err) {
       if (this.closed) return;
-      contentEl.empty();
       // Not an empty list. "There is nothing to recover" and "I could not
       // ask" are different answers and this is the worst place to confuse
       // them.
-      contentEl.createEl("p", {
-        cls: "basalt-advice",
-        text: `Cannot ask the server: ${(err as Error).message}`,
-      });
-      new Setting(contentEl).addButton((button) =>
-        button.setButtonText("Try again").onClick(() => this.render()),
-      );
-      this.renderNewest();
+      this.failure = `Cannot ask the server: ${(err as Error).message}`;
+      this.draw();
       return;
     }
-
     if (this.closed) return;
-    contentEl.empty();
 
-    if (deleted.notes.length === 0) {
-      contentEl.createEl("p", {
-        cls: "basalt-advice",
-        text:
-          this.before === undefined
-            ? "No deleted notes to restore."
-            : "No older deleted notes to restore.",
-      });
-      this.renderNewest();
+    this.failure = undefined;
+    const held = new Set(this.loaded.map((note) => note.uid));
+    for (const note of deleted.notes) if (!held.has(note.uid)) this.loaded.push(note);
+    this.loaded.sort((a, b) => b.uid - a.uid);
+    this.more = deleted.more;
+    // Only from a page that had something in it: an empty answer names no uid
+    // to page from, and taking `undefined` here would ask for the newest page
+    // again on the next press.
+    if (deleted.oldest !== undefined) {
+      this.oldest =
+        this.oldest === undefined ? deleted.oldest : Math.min(this.oldest, deleted.oldest);
+    }
+    this.draw();
+  }
+
+  private draw(): void {
+    if (this.closed) return;
+    const { contentEl } = this;
+    contentEl.empty();
+    this.listEl = undefined;
+
+    if (this.failure !== undefined) {
+      contentEl.createEl("p", { cls: "basalt-advice", text: this.failure });
+      new Setting(contentEl).addButton((button) =>
+        button.setButtonText("Try again").onClick(() => this.render(this.oldest)),
+      );
+      if (this.loaded.length === 0) return;
+    }
+
+    if (this.loaded.length === 0) {
+      contentEl.createEl("p", { cls: "basalt-advice", text: "No deleted notes to restore." });
       return;
     }
 
-    contentEl.createEl("p", { cls: "basalt-advice", text: describeDeleted(deleted) });
-    this.renderNewest();
-    if (deleted.more && deleted.oldest !== undefined) {
+    // The same control the activity log has, for the same reason: the useful
+    // question is "which one was called something like this", and the answer
+    // was a page at a time of unfiltered names.
+    new Setting(contentEl).setName("Deleted notes").addSearch((input) => {
+      input.inputEl.setAttribute("aria-label", "Find a deleted note by filename");
+      input
+        .setPlaceholder("Find a file…")
+        .setValue(this.query)
+        .onChange((value) => {
+          this.query = value;
+          this.list();
+        });
+    });
+
+    // The filter redraws this and only this, so the field it is typed into
+    // survives the keystroke and keeps the caret.
+    this.listEl = contentEl.createDiv("basalt-deleted-list");
+    this.list();
+  }
+
+  private listEl: HTMLElement | undefined;
+  /** Whether a bulk restore is running, so a second press cannot start one. */
+  private bulk = false;
+
+  private list(): void {
+    const listEl = this.listEl;
+    if (this.closed || listEl === undefined) return;
+    listEl.empty();
+
+    const needle = this.query.trim().toLocaleLowerCase();
+    const shown = needle
+      ? this.loaded.filter((note) => note.path.toLocaleLowerCase().includes(needle))
+      : this.loaded;
+
+    listEl.createEl("p", {
+      cls: "basalt-advice",
+      text: describeDeleted({ notes: shown, more: this.more && !needle }),
+    });
+
+    if (this.more && this.oldest !== undefined) {
       // A page, not a bigger ask (F21). This doubled the limit it requested,
       // which stops working at the server's cap: at a thousand deletions the
       // button fetched the same capped page for ever and said nothing. The
-      // cursor is the oldest uid on this page, so the next one starts below
-      // it however many there are.
-      const next = deleted.oldest;
-      row(contentEl, "Show older", "The server has more deletions than are listed here.").addButton(
-        (b) =>
-          b.setButtonText("Show older").onClick(async () => {
-            this.before = next;
-            await this.render();
-          }),
-      );
+      // cursor is the oldest uid held, so the next one starts below it however
+      // many there are.
+      const next = this.oldest;
+      row(
+        listEl,
+        "Show older",
+        needle
+          ? "Only the deletions already loaded are searched. Show older loads more of them."
+          : "The server has more deletions than are listed here.",
+      ).addButton((b) => b.setButtonText("Show older").onClick(() => this.render(next)));
     }
 
-    for (const version of deleted.notes) {
+    if (shown.length === 0) {
+      listEl.createEl("p", {
+        cls: "basalt-advice",
+        text: needle ? "No deleted note matches that." : "No deleted notes to restore.",
+      });
+      return;
+    }
+
+    const restorable = shown.filter((note) => note.restorable > 0);
+    const chosen = restorable.filter((note) => this.picked.has(note.uid));
+    if (restorable.length > 1) {
+      const pick = row(
+        listEl,
+        chosen.length === 0
+          ? "Restore several at once"
+          : `${chosen.length} chosen of ${restorable.length}`,
+        chosen.length === 0
+          ? "Choose notes below, then restore them together in one sync."
+          : "Restored together, into names nothing already occupies.",
+      );
+      pick.addButton((b) =>
+        b
+          .setButtonText(chosen.length === restorable.length ? "Choose none" : "Choose all shown")
+          .onClick(() => {
+            if (chosen.length === restorable.length) {
+              for (const note of restorable) this.picked.delete(note.uid);
+            } else {
+              for (const note of restorable) this.picked.add(note.uid);
+            }
+            this.list();
+          }),
+      );
+      if (chosen.length > 0) {
+        pick.addButton((b) =>
+          b
+            .setButtonText(`Restore ${chosen.length}`)
+            .setCta()
+            .onClick(async () => {
+              if (this.closed || this.bulk) return;
+              this.bulk = true;
+              b.setDisabled(true).setButtonText("Restoring…");
+              try {
+                const done = await this.plugin.recoverMany(chosen);
+                const sent = done.filter((r) => r.sent).length;
+                const kept = done.filter((r) => !r.sent && r.willRetry !== false).length;
+                const lost = done.filter((r) => r.willRetry === false);
+                // All three counts, always. "Restored 40" without "and 2
+                // could not be" is the comfortable half of the story.
+                const parts = [`Restored ${sent + kept} of ${chosen.length}.`];
+                if (kept > 0) parts.push(`${kept} not yet sent to your other devices.`);
+                if (lost.length > 0) {
+                  parts.push(`${lost.length} could not be restored: ${lost[0]!.why}`);
+                }
+                new Notice(`Basalt: ${parts.join(" ")}`, 15_000);
+                for (const note of chosen) {
+                  if (lost.some((r) => r.path === note.path)) continue;
+                  this.picked.delete(note.uid);
+                  const at = this.loaded.findIndex((held) => held.uid === note.uid);
+                  if (at >= 0) this.loaded.splice(at, 1);
+                }
+                this.list();
+              } catch (err) {
+                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+              } finally {
+                this.bulk = false;
+              }
+            }),
+        );
+      }
+    }
+
+    for (const version of shown) {
       const deletedAt = when(version.mtime);
       if (version.restorable === 0) {
         // Purge can retain a deletion after its recoverable content is gone.
         // Follow the server's restorable count, since some history survives
         // purge as evidence of moves or deletions.
-        new Setting(contentEl)
+        new Setting(listEl)
           .setName(version.path)
           .setDesc(
             `Deleted ${deletedAt}. Its history has been purged, so there is nothing to restore.`,
           );
         continue;
       }
-      new Setting(contentEl)
+      const setting = new Setting(listEl)
         .setName(version.path)
-        .setDesc(`Deleted ${deletedAt} on ${version.device}`)
+        .setDesc(`Deleted ${deletedAt} on ${version.device}`);
+      if (restorable.length > 1) {
+        setting.addButton((b) =>
+          b.setButtonText(this.picked.has(version.uid) ? "Chosen" : "Choose").onClick(() => {
+            if (!this.picked.delete(version.uid)) this.picked.add(version.uid);
+            this.list();
+          }),
+        );
+      }
+      setting.addButton((b) =>
+        b
+          .setButtonText("Restore")
+          .setCta()
+          .onClick(async () => {
+            if (this.closed || this.restoring.has(version.uid)) return;
+            this.restoring.add(version.uid);
+            b.setDisabled(true).setButtonText("Restoring…");
+            try {
+              const done = await this.plugin.recover(version);
+              new Notice(describeRestore(version, done), done.sent ? undefined : 10_000);
+              // Restored, so it is no longer a deletion to offer. Dropped
+              // here rather than by refetching, which would throw away every
+              // older page that had been loaded.
+              const at = this.loaded.findIndex((note) => note.uid === version.uid);
+              if (at >= 0) this.loaded.splice(at, 1);
+              this.list();
+            } catch (err) {
+              new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+            } finally {
+              this.restoring.delete(version.uid);
+              b.setDisabled(false).setButtonText("Restore");
+            }
+          }),
+      );
+    }
+  }
+}
+
+/**
+ * The versions this device parked where Obsidian cannot see them.
+ *
+ * A preserving write moves whatever is at a name aside before writing over it,
+ * and where it cannot place the displaced bytes beside the note it parks them
+ * under a hidden name and writes a record. That record was the end of the
+ * story: the panel could say it had happened and nothing could act on it.
+ *
+ * Deliberately one button per row and nothing else. Somebody opening this has
+ * already lost something once.
+ */
+class StrandedModal extends Modal {
+  private closed = false;
+  private readonly working = new Set<string>();
+
+  constructor(private readonly plugin: BasaltPlugin) {
+    super(plugin.app);
+  }
+
+  private inventory: Inventory | undefined;
+
+  override onOpen(): void {
+    this.setTitle("Versions kept out of sight");
+    this.modalEl.addClass("mod-basalt-panel");
+    this.contentEl.addClass("basalt-panel");
+    this.contentEl.createEl("p", { cls: "basalt-advice", text: "Looking…" });
+    void this.load();
+  }
+
+  private async load(): Promise<void> {
+    try {
+      this.inventory = await this.plugin.displacedVersions();
+    } catch (err) {
+      // Rule 2 again, one level up: "I could not look" is not "there is
+      // nothing there", and this is the worst screen to confuse them on.
+      this.inventory = { waiting: [], complete: false, why: (err as Error).message };
+    }
+    this.draw();
+  }
+
+  override onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+
+  private draw(): void {
+    if (this.closed) return;
+    const { contentEl } = this;
+    contentEl.empty();
+    const inventory = this.inventory;
+    if (inventory === undefined) return;
+
+    if (!inventory.complete) {
+      // Never folded into the list. An incomplete inventory reads exactly like
+      // an empty one, and the difference is whether anything is missing.
+      contentEl.createEl("p", {
+        cls: "basalt-advice",
+        text: `This list may be incomplete: ${inventory.why}`,
+      });
+    }
+    if (inventory.waiting.length === 0) {
+      contentEl.createEl("p", {
+        cls: "basalt-advice",
+        text: inventory.complete
+          ? "Nothing is waiting. Every version this device took off a name was put back."
+          : "Nothing is listed, and the record above says why that may not mean nothing is there.",
+      });
+      return;
+    }
+
+    contentEl.createEl("p", {
+      cls: "basalt-advice",
+      text:
+        "These are versions Basalt took off a name and could not put back beside it. " +
+        "Recovering one writes a visible copy next to the note it came from. The hidden " +
+        "copy is left where it is.",
+    });
+
+    for (const version of inventory.waiting) {
+      new Setting(contentEl)
+        .setName(version.from)
+        .setDesc(`Kept ${when(version.when)} at ${version.at}. ${version.why}`)
         .addButton((b) =>
           b
-            .setButtonText("Restore")
+            .setButtonText("Recover a visible copy")
             .setCta()
             .onClick(async () => {
-              if (this.closed || this.restoring.has(version.uid)) return;
-              this.restoring.add(version.uid);
-              b.setDisabled(true).setButtonText("Restoring…");
+              if (this.closed || this.working.has(version.at)) return;
+              this.working.add(version.at);
+              b.setDisabled(true).setButtonText("Recovering…");
               try {
-                const done = await this.plugin.recover(version);
-                new Notice(describeRestore(version, done), done.sent ? undefined : 10_000);
-                await this.render();
+                const at = await this.plugin.recoverDisplaced(version);
+                new Notice(
+                  `Basalt: recovered to ${at}. The hidden copy is still at ${version.at}.`,
+                  15_000,
+                );
+                await this.load();
               } catch (err) {
                 new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+                b.setDisabled(false).setButtonText("Recover a visible copy");
               } finally {
-                this.restoring.delete(version.uid);
-                b.setDisabled(false).setButtonText("Restore");
+                this.working.delete(version.at);
               }
             }),
         );
     }
-  }
-
-  private renderNewest(): void {
-    if (this.before === undefined) return;
-    row(this.contentEl, "Back to the newest", "This is a page further back.").addButton((button) =>
-      button.setButtonText("Newest").onClick(async () => {
-        this.before = undefined;
-        await this.render();
-      }),
-    );
   }
 }
 
