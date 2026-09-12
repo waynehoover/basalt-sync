@@ -25,6 +25,44 @@ relisting unchanged files; namespace changes, uncertain events and periodic
 verification still require full scans. This does not measure cold startup or
 mobile performance. Engine reconciliation still visits the full index.
 
+### What a pass costs at 0.8.4
+
+`bun run bench:pass`, 4,000 notes, bun 1.4.2, Apple M4 Pro, two samples of the
+median of seven. Measured against `dbbe4a4`, the commit before the 0.8.3 review
+round, on the same machine in the same session.
+
+| 4,000-note pass | dbbe4a4 | 0.8.4 |
+|---|---:|---:|
+| Nothing changed | 19.5, 19.6 ms | 20.1, 19.9 ms |
+| One note changed | 52.5, 50.6 ms | 50.1, 52.1 ms |
+| A folder renamed | 545.5, 580.9 ms | 451.8, 458.4 ms |
+| Catching up | 155.6, 154.4 ms | 129.6, 134.5 ms |
+
+The two that moved came from a CPU profile of the same benchmark rather than
+from reading the code, and three changes account for them:
+
+- `prune` walks the whole index twice on every pass and in the ordinary case
+  deletes nothing, so what it cost per record was the whole of what it cost.
+  Destructuring a Map entry allocates a two-element array per record; reading
+  the key and looking the value up does not.
+- `canonical`, which builds the bytes an entry's authenticator is computed
+  over, allocated an array, a mapped copy of it and a joined string per entry.
+  One string built in place produces the same bytes, which
+  `protocol-fixtures.test.ts` holds it to.
+- The refusal check added for R083-04 ran for every path in the vault. A path
+  the vault listed cannot be non-canonical, so it now runs only for names that
+  came from the server.
+
+The first two profiles also showed the cost of the check *before* it was gated,
+and `sendInteractiveEdit` walking the whole index between every body of a
+transfer. Both are fixed; the second is now bounded to one look per 200 ms.
+
+What did not move is the shape: "nothing changed" still scales at about 1.9x
+per doubling, because reconciliation still visits the whole index and `save`
+still repacks every entry for the journal to diff. That is the finding recorded
+in [open work](open-work.md), and it is the only thing left here that is worth
+a large number.
+
 For 10,000 local and 10,000 remote records, detached journal comparisons took
 **7.36 ms**, down from **13.78 ms** (25 samples). Retained comparison state grew
 from about **5.0 MB to 8.8 MB**. The durable journal format and flushing are

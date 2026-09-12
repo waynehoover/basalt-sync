@@ -47,11 +47,18 @@ plus due retries, with derived indexes maintained in place and explicit
 mutations handed to the journal, is the largest recurring saving available.
 
 It is not done because the measurement does not yet justify the risk. An
-unchanged pass at ten thousand notes is 33 ms with a healthy watcher
-([research.md](research.md)), which is not a duration anybody feels, and the
-change is a rewrite of the code that decides what happens to somebody's notes.
-A work set that misses a path is a note that stops syncing and says nothing,
-which is the failure rule 1 and most of the test suite exist to prevent.
+unchanged pass is 33 ms at ten thousand notes with a healthy watcher, and 20 ms
+at four thousand ([research.md](research.md)), which is not a duration anybody
+feels. The change is a rewrite of the code that decides what happens to
+somebody's notes, and a work set that misses a path is a note that stops
+syncing and says nothing, which is the failure rule 1 and most of the test
+suite exist to prevent.
+
+The cheap parts of it are already taken. A CPU profile of that benchmark said
+the cost was concentrated in three places that had nothing to do with the
+architecture, and removing them left the constant lower and the shape
+unchanged: it still scales at about 1.9x per doubling. What remains is the
+architecture, which is this.
 
 **What would change the answer:** Android, at ten thousand and fifty thousand
 notes, from a saved file to verified content on a peer, with listing,

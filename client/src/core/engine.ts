@@ -1438,6 +1438,29 @@ export class Engine {
   }
 
   /**
+   * `refusedInboundPath`, remembered.
+   *
+   * The answer is a pure function of the string, and the pass asks it about
+   * every path in the vault on every pass. Asked directly it is two splits and
+   * two walks of the segments per path, which measured as 4 to 6% of a settled
+   * pass at four thousand notes: the whole cost of a check that says no to
+   * approximately nothing.
+   *
+   * Pruned with the sealed-path cache and against the same sets, so a vault
+   * that churns through names does not accumulate answers about paths nothing
+   * refers to any more.
+   */
+  private refusedName(path: string): string | undefined {
+    const known = this.refusalOf.get(path);
+    if (known !== undefined) return known.why;
+    const why = refusedInboundPath(path);
+    this.refusalOf.set(path, { why });
+    return why;
+  }
+
+  private readonly refusalOf = new Map<string, { why: string | undefined }>();
+
+  /**
    * Asks the server for the current version of every path it refused as stale,
    * and folds the answer into `remote` (R083-01).
    *
@@ -1827,7 +1850,13 @@ export class Engine {
       // the path stays in `pending`, both of which persist, so the refusal
       // and its count survive a restart. Nothing is written and nothing is
       // fetched: there is no local file to compare and no name to write to.
-      const refused = refusedInboundPath(path);
+      // Only for a name the listing did not produce. A path on disk was
+      // listed by the vault, and both adapters apply the dot rule and hand
+      // back names a filesystem filed, so it cannot be one of these; `remote`
+      // is the only place a non-canonical name can come from. Asking about
+      // every path in the vault instead was 1.3 s of samples in a profile of
+      // a settled pass, for a question whose answer is no for all of them.
+      const refused = onDisk.has(path) ? undefined : this.refusedName(path);
       if (refused !== undefined) {
         if (this.refusedInbound.get(path) !== refused) {
           this.log("refused a path from another device", path, refused);
@@ -2163,7 +2192,7 @@ export class Engine {
       return;
     }
 
-    await this.act(path, action, entry, local, remote, report, sealed);
+    await this.act(path, action, entry, local, remote, report, now, sealed);
     this.pending.delete(path);
   }
 
@@ -2284,6 +2313,8 @@ export class Engine {
     local: LocalState | undefined,
     remote: Remote | undefined,
     report: SyncReport,
+    /** The pass's own clock reading, so the hot branches do not take another. */
+    now: number,
     /** What the rehash read and cut, if this file was just scanned. */
     sealed?: Scanned,
   ): Promise<void> {
@@ -2304,9 +2335,9 @@ export class Engine {
             // had before they paired never recorded a sync, and
             // `decideFolder` reads no synctime as "never seen here", so
             // removing it later put it straight back.
-            synced(entry, "", [], remote.uid, this.now());
+            synced(entry, "", [], remote.uid, now);
           } else if (local.hash === remote.hash) {
-            synced(entry, local.hash, entry.chunks, remote.uid, this.now());
+            synced(entry, local.hash, entry.chunks, remote.uid, now);
           }
         }
         return;
@@ -2325,7 +2356,7 @@ export class Engine {
       case "createLocalFolder":
         await this.opts.vault.mkdir(path);
         entry.folder = true;
-        if (remote) synced(entry, "", [], remote.uid, this.now());
+        if (remote) synced(entry, "", [], remote.uid, now);
         report.foldersCreated++;
         return;
 
@@ -2797,6 +2828,8 @@ export class Engine {
   }
 
   private servicingInteractive = false;
+  /** When the interleaved publish last looked, so it does not look per body. */
+  private lastInteractive = 0;
 
   /**
    * Publish an independent small saved note while a bulk transfer yields.
@@ -2814,6 +2847,20 @@ export class Engine {
       this.opts.transport.isClosed
     )
       return;
+    // Not on every body. This runs between the bodies of a transfer, and the
+    // checks below include a walk of every index entry looking for a rename in
+    // flight: a 64 MiB attachment is a few hundred bodies, so on a large vault
+    // with one unsaved note that is a few million comparisons spent deciding
+    // the same thing over and over. The point of the yield is that a save
+    // reaches the server while a person would still call it prompt, and a
+    // fifth of a second is well inside that.
+    //
+    // Wall clock rather than `now()`, because this is about not burning a
+    // phone's CPU in real time rather than about sync's own ordering. The
+    // first opportunity is always taken, so nothing waits that would not have.
+    const at = Date.now();
+    if (at - this.lastInteractive < INTERACTIVE_GAP_MS) return;
+    this.lastInteractive = at;
     const active = this.opts.activePath?.();
     const path =
       active && this.dirty.has(active)
@@ -4676,8 +4723,15 @@ export class Engine {
    * there rather than from here.
    */
   private prune(onDisk: Map<string, unknown>): void {
-    for (const [path, entry] of this.entries) {
+    // Both loops walk the whole index on every pass and in the ordinary case
+    // delete nothing, so what they cost per record is the whole of what they
+    // cost. `for (const [path, x] of map)` allocates a two-element array per
+    // record to destructure, which at four thousand notes a pass made this the
+    // most expensive thing in a settled sync. Reading the key and looking the
+    // value up allocates nothing.
+    for (const path of this.entries.keys()) {
       if (onDisk.has(path)) continue;
+      const entry = this.entries.get(path)!;
       const remote = this.remote.get(path);
       if (remote && !remote.deleted) continue;
       if (entry.synchash === "" && entry.hash === "") this.entries.delete(path);
@@ -4693,8 +4747,8 @@ export class Engine {
     // clauses overlap. That is a fact about the state space rather than
     // about the clauses, and shaving it down to whatever a current test can
     // tell apart would be optimising the predicate against the tests.
-    for (const [path, remote] of this.remote) {
-      if (!remote.deleted) continue;
+    for (const path of this.remote.keys()) {
+      if (!this.remote.get(path)!.deleted) continue;
       if (onDisk.has(path)) continue;
       if (this.entries.has(path)) continue;
       if (this.pending.has(path)) continue;
@@ -4707,6 +4761,21 @@ export class Engine {
       // off path that no longer exists anywhere, and there would be nothing
       // anybody could do about it (R083-04, rule 7).
       this.refusedInbound.delete(path);
+    }
+
+    // The refusal memo, under its own bound rather than the one below: it is
+    // keyed by every path a pass walks, which includes the ones on disk, so a
+    // vault that churns through names would otherwise keep an answer about
+    // each of them for the life of the process.
+    if (this.refusalOf.size > onDisk.size + this.entries.size + this.remote.size) {
+      const live = new Set<string>([
+        ...onDisk.keys(),
+        ...this.entries.keys(),
+        ...this.remote.keys(),
+      ]);
+      for (const path of this.refusalOf.keys()) {
+        if (!live.has(path)) this.refusalOf.delete(path);
+      }
     }
 
     // The sealed-path cache, kept to what the two indexes still name.
@@ -5025,6 +5094,17 @@ const REUSE_ABOVE = 1024 * 1024;
  * the run carries on with the next.
  */
 const REPAIR_BATCH_NAMES = 4096;
+
+/**
+ * The shortest gap between two looks at whether the open note can be published
+ * mid-transfer.
+ *
+ * The look is not free: it walks every index entry for a rename in flight, and
+ * it happens between the bodies of a transfer, which for a large attachment is
+ * hundreds of times. Two hundred milliseconds is invisible to a person saving a
+ * note and turns a per-body cost into a per-fifth-of-a-second one.
+ */
+const INTERACTIVE_GAP_MS = 200;
 
 /** How many chunks are sealed at once when the bodies are not being kept. */
 export const SEAL_WINDOW = 16;
