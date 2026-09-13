@@ -144,6 +144,8 @@ interface Row {
   readonly quiet: Timing;
   readonly oneNote: Timing;
   readonly rename: Timing;
+  /** The same move, with the shell reporting it the way the plugin does. */
+  readonly renameReported: Timing;
   readonly catchUp: Timing;
 }
 
@@ -238,6 +240,31 @@ async function atSize(size: number): Promise<Row> {
       overlays,
     );
 
+    // The same folder rename, with the vault telling the engine it happened.
+    //
+    // This is the difference between the two shells rather than a variant of
+    // the benchmark. Obsidian fires a rename event and the plugin forwards it
+    // to `noteRename`, which carries the entry, its chunk list and its hash to
+    // the new path: nothing is read and nothing is sealed, because the bytes
+    // did not change and sealing is deterministic. The CLI has no such event,
+    // so every moved note looks like a new path with no entry and is read,
+    // chunked and sealed again from scratch.
+    let told = 0;
+    const renameReported = await measure(
+      async () => {
+        const from = `area-5`;
+        const to = `area-5-moved-${told++}`;
+        await movePath(join(a.dir, from), join(a.dir, to)).catch(() => undefined);
+        a.c.engine.noteRename(from, to);
+        await a.c.settle({}, 16);
+        await movePath(join(a.dir, to), join(a.dir, from)).catch(() => undefined);
+        a.c.engine.noteRename(to, from);
+        return await a.c.settle({}, 16);
+      },
+      Math.max(3, Math.floor(REPEATS / 2)),
+      overlays,
+    );
+
     // Catching up: entries arriving from another device, which is the inbound
     // half. A second device writes a fixed number of notes however large the
     // vault is, so a cost that grows with the row is the vault's size showing
@@ -260,7 +287,7 @@ async function atSize(size: number): Promise<Row> {
       overlays,
     );
 
-    return { size, quiet, oneNote, rename, catchUp };
+    return { size, quiet, oneNote, rename, renameReported, catchUp };
   } finally {
     for (const c of clients) c.close();
     await server.stop();
@@ -273,6 +300,7 @@ function table(rows: Row[]): void {
     ["nothing changed", (r) => r.quiet],
     ["one note changed", (r) => r.oneNote],
     ["a folder renamed", (r) => r.rename],
+    ["a folder renamed, reported", (r) => r.renameReported],
     [`catching up`, (r) => r.catchUp],
   ];
   for (const [name, pick] of cols) {

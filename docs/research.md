@@ -52,6 +52,37 @@ not a fifth term, and `compare` is inside `save`.
 **A folder renamed**, 50,000 notes: 6,633 ms, of which decide 2,527 and the
 adapter 1,408. **Catching up**, 50,000 notes: 1,392 ms.
 
+That rename figure is the **CLI's**, and the two shells differ here more than
+anywhere else. Obsidian fires a rename event and the plugin forwards it to
+`noteRename`, which carries the entry and its chunk list to the new path. The
+CLI has no such event, so every moved note is a new path with no entry and is
+read, chunked and sealed again to rediscover a list it was already holding.
+At 10,000 notes, measured the same way:
+
+| a folder renamed | before | after |
+|---|---:|---:|
+| not reported, the CLI's path | 1,178 ms | 1,171 ms |
+| reported, the plugin's path | 1,081 ms | **832 ms** |
+
+The improvement is in `planUpload`: a file whose chunk list the pass did not
+have to recompute does not need reading at all. The names go out from the
+index, and a body is produced only if the server asks for one, checked against
+the name it was promised under. A rename changes no byte, so the server holds
+every chunk and asks for none. Decide falls from 441 ms to 229 ms.
+
+The CLI's row does not move, and cannot on this evidence: without a rename
+event it genuinely does not know the content is the same.
+
+One thing was tried here and reverted, which is worth recording because the
+argument for it was persuasive and wrong. A rename moves an inode's change
+time without touching a byte, so `changeId` differs across a move and defeats
+the carried chunk list; the proposal was to excuse that when the device,
+inode, modification time and size all agree. They can all agree for an
+in-place edit too, if the editor restores the modification time, and then the
+change time is the only witness left. `preservation.stress.ts` failed within
+one run of trying it. That is the R071-03 incident, and the stress suite
+exists for exactly this.
+
 Three things these say, and one they do not.
 
 - **Listing is about half of a quiet pass on a desktop**, and it is almost
