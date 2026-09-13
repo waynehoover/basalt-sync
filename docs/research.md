@@ -25,7 +25,52 @@ relisting unchanged files; namespace changes, uncertain events and periodic
 verification still require full scans. This does not measure cold startup or
 mobile performance. Engine reconciliation still visits the full index.
 
-### What a pass costs at 0.8.4
+#### Where a pass spends its time, at 10,000 and 50,000 notes
+
+`BENCH_SIZES=10000,50000 BENCH_REPEATS=5 bun run bench:pass`, bun 1.4.2, Apple
+M4 Pro, median of five after two warm-ups, at `8521092`. Desktop: a `NodeVault`
+on APFS and a `JsonIndexStore`, both wrapped so the adapter and the journal
+report their own time.
+
+The four phase columns partition a pass. `fs` is an overlay across all four,
+not a fifth term, and `compare` is inside `save`.
+
+**Nothing changed**, the pass that happens most:
+
+| notes | total | list | decide | save | of which compare | fs |
+|---|---:|---:|---:|---:|---:|---:|
+| 10,000 | 50.2 ms | 27.5 | 13.4 | 10.0 | 6.8 | 26.6 |
+| 50,000 | 310.0 ms | 145.2 | 88.2 | 80.1 | 60.0 | 140.6 |
+
+**One note changed:**
+
+| notes | total | list | decide | transfer | save | of which compare |
+|---|---:|---:|---:|---:|---:|---:|
+| 10,000 | 116.4 ms | 54.3 | 28.1 | 11.9 | 21.3 | 13.6 |
+| 50,000 | 638.0 ms | 286.8 | 180.8 | 13.0 | 151.0 | 110.0 |
+
+**A folder renamed**, 50,000 notes: 6,633 ms, of which decide 2,527 and the
+adapter 1,408. **Catching up**, 50,000 notes: 1,392 ms.
+
+Three things these say, and one they do not.
+
+- **Listing is about half of a quiet pass on a desktop**, and it is almost
+  entirely adapter time: 145.2 ms of list against 140.6 ms of filesystem at
+  50,000. That term is a directory walk here and is *not* one in the Obsidian
+  plugin, whose `list()` reads `getAllLoadedFiles()` out of memory. So the
+  desktop split cannot be carried over to a phone, which is the whole reason
+  the Android measurement exists.
+- **Decide plus compare is 40% of a quiet pass at 10,000 and 48% at 50,000.**
+  Growing, and on this runtime still under the half that
+  [open work](open-work.md) set as its threshold.
+- **A single edited note costs 625 ms at 50,000 once transfer is taken out.**
+  That is over the 200 ms half of the same threshold by a wide margin, on a
+  laptop.
+- What they do not say is anything about a phone. Both halves of the threshold
+  are written against Android numbers, and the term that dominates here is the
+  one most likely to behave differently there.
+
+## What a pass costs at 0.8.4
 
 `bun run bench:pass`, 4,000 notes, bun 1.4.2, Apple M4 Pro, two samples of the
 median of seven. Measured against `dbbe4a4`, the commit before the 0.8.3 review
