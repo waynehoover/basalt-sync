@@ -41,9 +41,12 @@ import { join } from "node:path";
 import { cpus } from "node:os";
 
 import { Client } from "./src/core/client.ts";
+import type { PassPhases, SyncReport } from "./src/core/engine.ts";
 import { testWrapped } from "./src/core/test-keys.ts";
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
+import { noteBody, pathFor } from "./bench-corpus.ts";
 import { JsonIndexStore, NodeVault } from "./src/cli/vault.ts";
+import { timedVault } from "./src/core/vault.ts";
 
 /** Vault sizes. Doubling, so the ratio between rows is the growth rate. */
 const SIZES = (process.env["BENCH_SIZES"] ?? "500,1000,2000,4000").split(",").map(Number);
@@ -52,25 +55,6 @@ const SIZES = (process.env["BENCH_SIZES"] ?? "500,1000,2000,4000").split(",").ma
 const REPEATS = Number(process.env["BENCH_REPEATS"] ?? 7);
 
 const enc = new TextEncoder();
-
-/**
- * Notes that look like notes. Length varies, because a vault of identical
- * files would let anything that caches by content look better than it is.
- */
-function noteBody(i: number): string {
-  const lines = 8 + (i % 23);
-  const out: string[] = [`# Note ${i}`, ""];
-  for (let n = 0; n < lines; n++) {
-    out.push(`Paragraph ${n} of note ${i}, with enough words in it to be a sentence.`);
-  }
-  return out.join("\n") + "\n";
-}
-
-function pathFor(i: number): string {
-  // Several folders deep and spread across them, because a flat directory is
-  // the one shape a real vault never is, and folder entries are their own work.
-  return join(`area-${i % 11}`, `topic-${i % 7}`, `note-${String(i).padStart(5, "0")}.md`);
-}
 
 async function buildVault(dir: string, count: number): Promise<void> {
   const made = new Set<string>();
@@ -88,6 +72,15 @@ async function buildVault(dir: string, count: number): Promise<void> {
 interface Timing {
   readonly median: number;
   readonly heapKb: number;
+  /** Median of each phase across the same samples, in milliseconds. */
+  readonly phases?: Record<string, number>;
+}
+
+/** The median of one phase across the samples that reported it. */
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)]!;
 }
 
 /**
@@ -97,22 +90,52 @@ interface Timing {
  * reports the collector's schedule as if it were the cost of the work. The
  * warm-up is because the first call through any of this is compiling it.
  */
-async function measure(pass: () => Promise<void>, repeats = REPEATS): Promise<Timing> {
+async function measure(
+  pass: () => Promise<SyncReport | void>,
+  repeats = REPEATS,
+  /** Reset before each sample and read after it, for the two overlays. */
+  overlays?: { reset(): void; read(): { fsMs: number; compareMs: number } },
+): Promise<Timing> {
   await pass();
   await pass();
   const times: number[] = [];
+  const seen: PassPhases[] = [];
+  const fs: number[] = [];
+  const compare: number[] = [];
   const before = process.memoryUsage().heapUsed;
   let peak = before;
   for (let i = 0; i < repeats; i++) {
+    overlays?.reset();
     const t = performance.now();
-    await pass();
+    const report = await pass();
     times.push(performance.now() - t);
+    if (report && report.phases) seen.push(report.phases);
+    if (overlays) {
+      const got = overlays.read();
+      fs.push(got.fsMs);
+      compare.push(got.compareMs);
+    }
     peak = Math.max(peak, process.memoryUsage().heapUsed);
   }
   times.sort((a, b) => a - b);
+  // Median per phase across the same samples, not a breakdown of the median
+  // pass: one sample's collection pause should not be attributed to whichever
+  // phase happened to hold it in a different sample.
+  const phases =
+    seen.length === 0
+      ? undefined
+      : {
+          list: medianOf(seen.map((p) => p.listMs)),
+          decide: medianOf(seen.map((p) => p.decideMs)),
+          transfer: medianOf(seen.map((p) => p.transferMs)),
+          save: medianOf(seen.map((p) => p.saveMs)),
+          journalCompare: medianOf(compare),
+          fs: medianOf(fs),
+        };
   return {
     median: times[Math.floor(times.length / 2)]!,
     heapKb: Math.max(0, Math.round((peak - before) / 1024)),
+    ...(phases ? { phases } : {}),
   };
 }
 
@@ -132,18 +155,34 @@ async function atSize(size: number): Promise<Row> {
   const dirs: string[] = [];
   const clients: Client[] = [];
 
+  // Filled by the wrappers below, read by `measure`, cleared per sample. The
+  // adapter overlay and the journal's own split do not travel in the report,
+  // because they belong to the store and the vault rather than to the engine.
+  const filesystemMs: Record<string, { ms: number; calls: number }> = {};
+  let journalCompareMs = 0;
+
   const device = async (name: string): Promise<{ c: Client; dir: string }> => {
     const dir = await mkdtemp(join(tmpdir(), `basalt-pass-${name}-`));
     dirs.push(dir);
     const c = new Client({
-      vault: new NodeVault(dir),
-      store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
+      // Wrapped exactly as the plugin wraps its own, so the desktop rows and
+      // the Android rows are measuring the same things under the same names.
+      vault: timedVault(new NodeVault(dir), filesystemMs),
+      store: new JsonIndexStore(join(dir, ".basalt", "index.json"), {
+        onSave: (cost) => {
+          journalCompareMs += cost.compareMs;
+        },
+      }),
       url: server.wsUrl,
       ...(await server.deviceCredentials(secret, wrapped, name)),
       vaultId: "default",
       device: name,
       timeoutMs: 120_000,
       coalesceWrites: false,
+      // The same breakdown the Android runs collect, so the two can be held
+      // against each other. See docs/open-work.md for what the comparison is
+      // meant to settle.
+      timing: true,
     });
     clients.push(c);
     await c.connect();
@@ -156,18 +195,31 @@ async function atSize(size: number): Promise<Row> {
     await a.c.settle({}, 64);
 
     // Nothing changed. The pass that happens most and should cost least.
-    const quiet = await measure(async () => {
-      await a.c.sync();
-    });
+    const overlays = {
+      reset: () => {
+        for (const op of Object.keys(filesystemMs)) delete filesystemMs[op];
+        journalCompareMs = 0;
+      },
+      read: () => ({
+        fsMs: Object.values(filesystemMs).reduce((sum, op) => sum + op.ms, 0),
+        compareMs: journalCompareMs,
+      }),
+    };
+
+    const quiet = await measure(async () => await a.c.sync(), REPEATS, overlays);
 
     // One note, rewritten each time so the pass has exactly one thing to do.
     let n = 0;
-    const oneNote = await measure(async () => {
-      const rel = pathFor(n++ % size);
-      const body = await readFile(join(a.dir, rel), "utf8");
-      await writeFile(join(a.dir, rel), body + `edit ${n}\n`);
-      await a.c.settle({}, 8);
-    });
+    const oneNote = await measure(
+      async () => {
+        const rel = pathFor(n++ % size);
+        const body = await readFile(join(a.dir, rel), "utf8");
+        await writeFile(join(a.dir, rel), body + `edit ${n}\n`);
+        return await a.c.settle({}, 8);
+      },
+      REPEATS,
+      overlays,
+    );
 
     // A folder moved. Every note under it changes path at once, which is the
     // shape that makes identity tracking and the index delta work hardest, and
@@ -180,9 +232,10 @@ async function atSize(size: number): Promise<Row> {
         await movePath(from, to).catch(() => undefined);
         await a.c.settle({}, 16);
         await movePath(to, from).catch(() => undefined);
-        await a.c.settle({}, 16);
+        return await a.c.settle({}, 16);
       },
       Math.max(3, Math.floor(REPEATS / 2)),
+      overlays,
     );
 
     // Catching up: entries arriving from another device, which is the inbound
@@ -201,9 +254,10 @@ async function atSize(size: number): Promise<Row> {
           await writeFile(join(b.dir, "incoming", `from-b-${tag}-${i}.md`), noteBody(i));
         }
         await b.c.settle({}, 16);
-        await a.c.settle({}, 16);
+        return await a.c.settle({}, 16);
       },
       Math.max(3, Math.floor(REPEATS / 2)),
+      overlays,
     );
 
     return { size, quiet, oneNote, rename, catchUp };
@@ -234,6 +288,33 @@ function table(rows: Row[]): void {
         `    ${String(r.size).padStart(7)} ${t.median.toFixed(1).padStart(9)} ${ratio.padStart(8)}  ${String(t.heapKb).padStart(6)} KiB`,
       );
       prev = t.median;
+    }
+    // The breakdown under the totals, for the terms the rewrite in
+    // docs/open-work.md would remove. `fs` is an overlay across the other
+    // four, not a fifth column, so it does not add into the total.
+    //
+    // The four phase columns are per pass, summed across the rounds of one
+    // `sync`. The two overlay columns are per *sample*, and a sample of every
+    // workload except the quiet one is a whole `settle`, which is several
+    // syncs. So on those rows `compare` and `fs` cover more passes than the
+    // phases do and can exceed the phase they sit inside. The quiet row, which
+    // is one `sync` and is the row the threshold in docs/open-work.md is
+    // written against, is consistent.
+    if (rows.some((r) => pick(r).phases)) {
+      console.log(
+        `    ${"notes".padStart(7)} ${"list".padStart(8)} ${"decide".padStart(8)} ${"transfer".padStart(8)} ${"save".padStart(8)} ${"of which".padStart(9)} ${"fs".padStart(8)}`,
+      );
+      console.log(
+        `    ${"".padStart(7)} ${"per pass".padStart(35)} ${"compare".padStart(18)} ${"per sample".padStart(8)}`,
+      );
+      for (const r of rows) {
+        const p = pick(r).phases;
+        if (!p) continue;
+        const n = (v: number | undefined) => (v ?? 0).toFixed(1).padStart(8);
+        console.log(
+          `    ${String(r.size).padStart(7)} ${n(p["list"])} ${n(p["decide"])} ${n(p["transfer"])} ${n(p["save"])} ${n(p["journalCompare"]).padStart(9)} ${n(p["fs"])}`,
+        );
+      }
     }
   }
   console.log(`

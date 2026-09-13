@@ -94,6 +94,13 @@ export interface ClientOptions {
   readonly timeoutMs?: number;
   /** Whether to hold back a file written moments ago. See EngineOptions. */
   readonly coalesceWrites?: boolean;
+  /**
+   * Ask each pass to report where it spent its time (`SyncReport.phases`).
+   *
+   * Off everywhere that ships. See `EngineOptions.timing` and
+   * docs/open-work.md for the question the numbers exist to settle.
+   */
+  readonly timing?: boolean;
   /** Whether two edits to one note may be merged. Default true (I30). */
   readonly merge?: boolean;
   /** Whether this device may send anything to the server. Default false (I29). */
@@ -245,6 +252,7 @@ export class Client {
       deviceId: opts.deviceId,
       token: opts.token,
       ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
+      ...(opts.timing !== undefined ? { timing: opts.timing } : {}),
       ...(opts.merge !== undefined ? { merge: opts.merge } : {}),
       ...(opts.readOnly !== undefined ? { readOnly: opts.readOnly } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
