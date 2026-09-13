@@ -49,7 +49,6 @@ import { join } from "node:path";
 import { cpus } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createInterface } from "node:readline/promises";
 
 import { Client } from "./src/core/client.ts";
 import { testWrapped } from "./src/core/test-keys.ts";
@@ -116,12 +115,6 @@ async function phoneFacts(): Promise<Record<string, string>> {
 async function inForeground(): Promise<boolean> {
   return /mCurrentFocus.*md\.obsidian/.test(await adb("shell", "dumpsys", "window"));
 }
-
-const ask = async (question: string): Promise<void> => {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  await rl.question(`\n  ${question}\n  Press enter when done. `);
-  rl.close();
-};
 
 /** One line per measured pass, as the plugin wrote it. */
 interface PassLine {
@@ -246,15 +239,16 @@ async function atSize(size: number): Promise<void> {
     await adb("shell", "touch", TIMING_LOG);
 
     const invite = await peer.invite();
-    console.log(`\n  server: ${endpoint}`);
-    console.log(`  invite: ${invite.invite}`);
-    await ask(
-      `Open Obsidian on the phone, choose "Open folder as vault" and pick ${VAULT}.\n` +
-        `  Turn off Restricted mode, confirm Basalt Sync is enabled, then pair it\n` +
-        `  with the invite above, pointing it at ${endpoint}.`,
-    );
-
-    console.log("  waiting for the phone to catch up...");
+    console.log("\n  ---- do this on the phone ----");
+    console.log(`  1. Obsidian, vault switcher, "Open folder as vault", pick ${VAULT}`);
+    console.log("     (it exists now: this step is why it did not before)");
+    console.log("  2. Settings, Community plugins, turn off Restricted mode");
+    console.log("  3. Basalt, Paste an invite, and paste this:");
+    console.log(`\n     ${invite.invite}\n`);
+    console.log(`     It must say it joins ${endpoint}. If it names anything else, stop.`);
+    console.log("  4. Leave Obsidian open, in the foreground, screen on");
+    console.log("  ------------------------------\n");
+    console.log("  waiting for the phone to pair, then to catch up...");
     await waitFor("the phone to appear online", async () => {
       const rows = await peer.devices();
       return rows.devices.some((d) => d.name !== "peer" && d.online);
