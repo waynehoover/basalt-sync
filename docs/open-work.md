@@ -35,6 +35,33 @@ single-buffer assembly and the windowed sealing landed, so the number the
 64 MiB default rests on is no longer true. Measure peak resident on a phone for
 one large attachment first.
 
+## The index snapshot may be the wrong shape at 50,000 notes
+
+Not a decision yet, a hypothesis the Android measurement was built to test, and
+written down before the numbers arrive so it cannot be invented afterwards.
+
+`DEFAULT_POLICY` in
+[index-journal-store.ts](../client/src/core/index-journal-store.ts) rewrites the
+whole index snapshot after 1,000 appended records. Its own comment says why
+that cap was chosen over the proportional one: at 10,000 notes it "holds the
+log at 380 KiB and replay at 12 ms whatever the vault weighs".
+
+Both of those are load-time costs. Neither is the cost of the write. The
+snapshot grows with the vault, and a live vault of 3,796 notes has a 3.1 MB
+index, so 50,000 notes is roughly 40 MB. The proportional bound
+(`fractionOfSnapshot`) scales with the snapshot and would let the log grow
+instead; the record cap fires first at that size and pays a 40 MB write more
+often, through Obsidian's adapter, on the single thread the editor runs on.
+
+So the suspicion is that the cap was tuned where the snapshot was 5 MiB and
+makes the wrong trade where it is 40 MB. If the measurement bears that out, the
+fix is a policy that weighs the write it is about to do, which is a much
+smaller change than the work set below and would want doing first.
+
+The instrumentation reports `kind` and `bytes` per save for exactly this
+reason: an append and a snapshot are the same call from the outside and nothing
+distinguished them.
+
 ## A pass still re-decides the whole vault
 
 Every pass rebuilds the combined path set, sorts it, visits every path and
@@ -46,13 +73,25 @@ Driving reconciliation from a work set instead, dirty paths plus incoming paths
 plus due retries, with derived indexes maintained in place and explicit
 mutations handed to the journal, is the largest recurring saving available.
 
-It is not done because the measurement does not yet justify the risk. An
-unchanged pass is 33 ms at ten thousand notes with a healthy watcher, and 20 ms
-at four thousand ([research.md](research.md)), which is not a duration anybody
-feels. The change is a rewrite of the code that decides what happens to
+It is not done because the measurement does not yet justify the risk. The two
+figures in [research.md](research.md) are 33 ms for an unchanged pass at ten
+thousand notes with a healthy watcher, and 20 ms at four thousand. Neither is a
+duration anybody feels.
+
+They are **not two points on one curve**, and an earlier version of this
+paragraph implied they were. The first is Node on a CLI vault at `aba03b4`; the
+second is bun on the `bench-pass` harness at `f7f3512`. `bench-pass.ts` says in
+its own header that these numbers move by 20x between JavaScriptCore and V8, so
+a scaling claim drawn across the two would be an artefact of the runtime. The
+1.9x per doubling quoted below comes from one harness on one runtime and is the
+only scaling figure here worth anything. The change is a rewrite of the code that decides what happens to
 somebody's notes, and a work set that misses a path is a note that stops
-syncing and says nothing, which is the failure rule 1 and most of the test
-suite exist to prevent.
+syncing while every status says the vault is fine. That is the
+"do not lose a note" rule in [CLAUDE.md](../CLAUDE.md) and rule 7 in
+[the design](design.md#the-durability-rules), which says a status describes the
+vault rather than the filter. It is not rule 1, which an earlier version of
+this cited: rule 1 is about acknowledging only after a write is durable, and it
+is not what this would break.
 
 The cheap parts of it are already taken. A CPU profile of that benchmark said
 the cost was concentrated in three places that had nothing to do with the
@@ -62,6 +101,23 @@ architecture, which is this.
 
 **What would change the answer:** Android, at ten thousand and fifty thousand
 notes, from a saved file to verified content on a peer, with listing,
-reconciliation, journal comparison and filesystem time separated. If
-reconciliation dominates there, it is worth doing. Until then it is a rewrite
-justified by an estimate.
+reconciliation, journal comparison and filesystem time separated.
+
+The threshold is written down here **before** the measurement is taken, because
+"reconciliation dominates" decided afterwards is a sentence that can be argued
+into either answer. Both of these must hold at fifty thousand notes:
+
+- decide plus journal comparison is more than half of a quiet pass on the phone, and
+- a save pass, with transfer time subtracted, takes longer than 200 ms.
+
+Either one alone is not enough. A large share of a pass nobody waits on is not
+worth this risk, and a slow pass whose time is somewhere else would not be
+fixed by this change.
+
+The evidence for the first is the **quiet ticker passes**, not the save passes.
+A phone has one JavaScript thread, so Obsidian's own reaction to a save runs
+interleaved with Basalt's and lands inside whichever phase holds the event
+loop; a save pass therefore cannot say whose time it was. A quiet pass has
+Basalt alone on the thread. If the quiet-pass shares and the desktop shares
+disagree, that disagreement goes in [research.md](research.md) and this rewrite
+does not start on the strength of it.

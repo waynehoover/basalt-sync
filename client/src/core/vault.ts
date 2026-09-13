@@ -793,3 +793,100 @@ export function parents(path: string): string[] {
   }
   return out;
 }
+
+/**
+ * A vault that reports how long it spent inside the adapter, by operation.
+ *
+ * An overlay rather than a phase. Filesystem time cuts across listing,
+ * deciding, transferring and saving, so reporting it as a fifth term would
+ * double-count; reporting it per operation says which call is expensive
+ * without pretending it belongs to one part of a pass.
+ *
+ * This exists for one question. On a desktop the adapter is Node's `fs`; on
+ * Android it is Obsidian's `DataAdapter` over a Capacitor bridge onto a
+ * FUSE-backed mount, and the per-call cost is not the same animal. Whether
+ * that difference matters is exactly what docs/open-work.md is waiting on, and
+ * a guess about it would not settle anything.
+ *
+ * Results and failures pass through untouched, and the timing is recorded for
+ * a rejection as well as a return: an operation that took two seconds and then
+ * threw still took two seconds. `watch` is not wrapped, because it is a
+ * subscription rather than an operation and its duration means nothing.
+ *
+ * Synchronous members (`ambiguous`, `canonical`, `sameFile`) are forwarded
+ * rather than timed: they read state the adapter already has, and wrapping them
+ * would cost more than it measured. The index store is not here at all, because
+ * it is its own interface with its own hook (`JournalStoreOptions.onSave`).
+ */
+export function timedVault(
+  inner: Vault,
+  into: Record<string, { ms: number; calls: number }>,
+): Vault {
+  const time = <T>(op: string, run: () => Promise<T>): Promise<T> => {
+    const at = performance.now();
+    const done = (): void => {
+      const seen = (into[op] ??= { ms: 0, calls: 0 });
+      seen.ms += performance.now() - at;
+      seen.calls++;
+    };
+    return run().then(
+      (value) => {
+        done();
+        return value;
+      },
+      (err: unknown) => {
+        done();
+        throw err;
+      },
+    );
+  };
+
+  // Written out rather than built from a proxy. A proxy would forward
+  // everything including the optional members, and the engine decides what an
+  // adapter can do by asking whether the method is there: a proxy that answers
+  // every name would tell it every vault can stream.
+  const out: Vault = {
+    list: (options) => time("list", () => inner.list(options)),
+    read: (path) => time("read", () => inner.read(path)),
+    stat: (path) => time("stat", () => inner.stat(path)),
+    write: (path, bytes, times) => time("write", () => inner.write(path, bytes, times)),
+    remove: (path) => time("remove", () => inner.remove(path)),
+    mkdir: (path) => time("mkdir", () => inner.mkdir(path)),
+    exists: (path) => time("exists", () => inner.exists(path)),
+    ...(inner.watch ? { watch: inner.watch.bind(inner) } : {}),
+    ...(inner.ambiguous ? { ambiguous: inner.ambiguous.bind(inner) } : {}),
+    ...(inner.canonical ? { canonical: inner.canonical.bind(inner) } : {}),
+    ...(inner.sameFile ? { sameFile: inner.sameFile.bind(inner) } : {}),
+    ...(inner.flush ? { flush: () => time("flush", () => inner.flush!()) } : {}),
+    ...(inner.create
+      ? { create: (path, bytes, times) => time("create", () => inner.create!(path, bytes, times)) }
+      : {}),
+    ...(inner.replace
+      ? {
+          replace: (path, expect, bytes, times, keepAt) =>
+            time("replace", () => inner.replace!(path, expect, bytes, times, keepAt)),
+        }
+      : {}),
+    ...(inner.removeExpecting
+      ? {
+          removeExpecting: (path, expect, keepAt) =>
+            time("removeExpecting", () => inner.removeExpecting!(path, expect, keepAt)),
+        }
+      : {}),
+    ...(inner.readRange
+      ? {
+          readRange: (path, start, end) =>
+            time("readRange", () => inner.readRange!(path, start, end)),
+        }
+      : {}),
+    ...(inner.readBlocks
+      ? {
+          // Timed as one span over the whole stream, because that is the thing
+          // a caller waits for. Per-block timing would measure how fast the
+          // consumer asked.
+          readBlocks: (path, blockSize) => inner.readBlocks!(path, blockSize),
+        }
+      : {}),
+  };
+  return out;
+}

@@ -13,3 +13,6 @@ client/release/
 
 # Locally built server binary
 /server/basaltd
+
+# Relay working files, not part of the project.
+tmp/

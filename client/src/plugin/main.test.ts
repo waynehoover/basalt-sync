@@ -1623,6 +1623,33 @@ describe("the panel, which is a modal and a settings tab", () => {
   });
 });
 
+describe("measuring where a pass spent its time", () => {
+  it("writes nothing at all unless the log file is already there", async () => {
+    // The file's existence is the whole switch. A plugin that wrote timings
+    // because it could would be a permanent cost for a question asked once
+    // (docs/open-work.md).
+    const { plugin, app } = await load();
+    await plugin.syncNow();
+    expect(
+      app.vault.adapter.text(".obsidian/plugins/basalt-sync/pass-timings.ndjson"),
+      "a measurement nobody asked for",
+    ).toBeUndefined();
+  });
+
+  it("records the first event of a batch, not the last", async () => {
+    // Several saves coalesce into one pass. The last would understate what
+    // somebody waited, and an average would describe nobody.
+    const { plugin } = await load();
+    plugin.measuringFrom = undefined;
+    const nudge = (plugin as unknown as { nudge(path?: string): void }).nudge.bind(plugin);
+    nudge("a.md");
+    const first = plugin.measuringFrom;
+    expect(first, "the first event was not marked").toBeDefined();
+    nudge("b.md");
+    expect(plugin.measuringFrom, "a later event moved the mark").toBe(first);
+  });
+});
+
 describe("a version kept where Obsidian cannot see it", () => {
   it("can be recovered from the panel, without disturbing the hidden copy", async () => {
     // Preservation parks bytes under a hidden name when it cannot place them

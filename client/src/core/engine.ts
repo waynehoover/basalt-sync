@@ -407,6 +407,15 @@ export interface EngineOptions {
   /** Keep the main wire available while a large upload sends its bodies. */
   readonly withUploadTransport?: <T>(work: (transport: Transport) => Promise<T>) => Promise<T>;
   readonly releaseUploadTransport?: () => void;
+  /**
+   * Measure where a pass spends its time, and put it in the report.
+   *
+   * Off everywhere that ships. When off, the marks below are a single boolean
+   * test at each boundary: no clock reading, no allocation, no record. That is
+   * checked rather than asserted, by running `bench:pass` with it off against
+   * the commit before it existed.
+   */
+  readonly timing?: boolean;
   readonly device: string;
   readonly vaultId: string;
   /** This device's row in the vault's device list. */
@@ -662,6 +671,21 @@ export interface SyncReport {
    * second, so a renderer can always say how many are not shown.
    */
   needsAttention: { path: string; why: string }[];
+  /**
+   * Where a pass spent its wall time, when this device was asked to measure.
+   *
+   * Absent unless `timing` is on, which it is not in any shipped
+   * configuration: the numbers exist to settle whether reconciliation visiting
+   * the whole index is worth rewriting (see docs/open-work.md), and a question
+   * asked once does not deserve a permanent cost.
+   *
+   * Wall time, not CPU time, and on a phone that distinction is the whole
+   * story: Obsidian runs on the same single JavaScript thread, so a phase that
+   * held the event loop while Obsidian reacted to a save is charged for it.
+   * That is why the quiet ticker passes are the evidence and the save passes
+   * are not.
+   */
+  phases?: PassPhases | undefined;
   /** Chunk bodies actually sent, and their size. The measure that matters. */
   chunksSent: number;
   bytesSent: number;
@@ -674,6 +698,34 @@ export interface SyncReport {
    * what changed is how much of somebody's connection it took.
    */
   reusedChunks: number;
+}
+
+/**
+ * The four terms a pass divides into, in milliseconds, plus how many rounds it
+ * took.
+ *
+ * They partition the pass and are meant to be added up: `list` is the vault
+ * listing and the restored-path recheck, `decide` is everything from the first
+ * observation to the end of the ordered walk with transfer time taken out,
+ * `transfer` is every fill, flush and delete application wherever they happen,
+ * and `save` is the prune, the vault flush and the index write.
+ *
+ * `journalCompare` is inside `save` rather than beside it, and is reported
+ * separately because it is the term the rewrite in docs/open-work.md would
+ * remove. `filesystem` is an overlay, not a fifth term: it cuts across all
+ * four, and on Android it is the one most likely to differ from a desktop.
+ */
+export interface PassPhases {
+  listMs: number;
+  decideMs: number;
+  transferMs: number;
+  saveMs: number;
+  /** Inside `saveMs`: the journal's own record-by-record comparison. */
+  journalCompareMs: number;
+  /** Across all four: time awaited inside the vault adapter, by operation. */
+  filesystemMs: Record<string, { ms: number; calls: number }>;
+  /** How many rounds `sync` ran, since `again` can repeat a pass. */
+  rounds: number;
 }
 
 /**
@@ -770,6 +822,49 @@ function noteSkipped(report: SyncReport, path: string): void {
 function noteRetrying(report: SyncReport, path: string): void {
   report.retrying++;
   report.retryingPaths.push(path);
+}
+
+/**
+ * Two passes' phases, added.
+ *
+ * The filesystem overlay adds per operation, so a run that read in two rounds
+ * reports one call count and one total for reads rather than two rows nobody
+ * can add up.
+ */
+function addPhases(a?: PassPhases, b?: PassPhases): PassPhases {
+  const left = a ?? blankPhases();
+  const right = b ?? blankPhases();
+  const filesystemMs: Record<string, { ms: number; calls: number }> = {};
+  for (const side of [left.filesystemMs, right.filesystemMs]) {
+    for (const [op, seen] of Object.entries(side)) {
+      const into = (filesystemMs[op] ??= { ms: 0, calls: 0 });
+      into.ms += seen.ms;
+      into.calls += seen.calls;
+    }
+  }
+  return {
+    listMs: left.listMs + right.listMs,
+    decideMs: left.decideMs + right.decideMs,
+    transferMs: left.transferMs + right.transferMs,
+    saveMs: left.saveMs + right.saveMs,
+    journalCompareMs: left.journalCompareMs + right.journalCompareMs,
+    filesystemMs,
+    // Not summed: `a` is the accumulated report and `b` is one more round.
+    rounds: (a === undefined ? 0 : left.rounds) + right.rounds,
+  };
+}
+
+/** A fresh set of phase totals, all zero. */
+function blankPhases(): PassPhases {
+  return {
+    listMs: 0,
+    decideMs: 0,
+    transferMs: 0,
+    saveMs: 0,
+    journalCompareMs: 0,
+    filesystemMs: {},
+    rounds: 1,
+  };
 }
 
 function emptyReport(): SyncReport {
@@ -1671,6 +1766,17 @@ export class Engine {
 
   private async pass(opts: SyncOptions = {}): Promise<SyncReport> {
     const report = emptyReport();
+    // One closure per pass, captured once. `phases` stays undefined when
+    // timing is off, and `into` returns immediately, so the cost of carrying
+    // this is one property read and one comparison per boundary.
+    const phases = this.opts.timing ? blankPhases() : undefined;
+    let mark = phases === undefined ? 0 : performance.now();
+    const into = (term: "listMs" | "decideMs" | "transferMs" | "saveMs"): void => {
+      if (phases === undefined) return;
+      const at = performance.now();
+      phases[term] += at - mark;
+      mark = at;
+    };
     const now = this.now();
     const coalesce = opts.coalesceWrites ?? this.coalesce;
 
@@ -1722,6 +1828,7 @@ export class Engine {
         omittedRefusals.set(path, err);
       }
     }
+    into("listMs");
     await this.confirmWork(stats);
     const dirty = new Set(this.dirty);
     this.dirty.clear();
@@ -1877,8 +1984,10 @@ export class Engine {
         // Publish the current note before background notes, and all notes
         // before attachments. A slow file must not hold an interactive edit
         // in an unflushed batch. Every batch retains the same safety checks.
+        into("decideMs");
         await this.fill(report);
         await this.flush(report);
+        into("transferMs");
       }
       previousPriority = priority;
       if (omittedRefusals.has(path)) {
@@ -1976,10 +2085,12 @@ export class Engine {
     // fill forgot every file written by an earlier one, so a case-only rename
     // arriving in a pass with more than a batch of downloads deleted the file
     // it had just written. The reset after the deletes is the one that counts.
+    into("decideMs");
     await this.fill(report);
     await this.applyDeletes(report);
     this.wroteThisPass = [];
     await this.flush(report);
+    into("transferMs");
 
     this.opts.onProgress?.(undefined);
     // The ones the walk cannot reach, which is the empty path and anything
@@ -2000,6 +2111,7 @@ export class Engine {
     // moment the file in its way is gone.
     this.blocked = nowBlocked;
 
+    into("decideMs");
     this.prune(onDisk);
     // Before the index, always. The index names notes, so it must not be
     // durable ahead of them; a vault that defers any part of a write makes it
@@ -2038,6 +2150,10 @@ export class Engine {
       report.appliedCursor = this.cursor;
     }
     report.needsAttention = this.attentionList(report);
+    if (phases !== undefined) {
+      into("saveMs");
+      report.phases = phases;
+    }
     return report;
   }
 
@@ -4918,6 +5034,10 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     foldersCreated: a.foldersCreated + b.foldersCreated,
     chunksSent: a.chunksSent + b.chunksSent,
     reusedChunks: a.reusedChunks + b.reusedChunks,
+    // Summed, not replaced. `sync` runs a pass again while `again` is set, and
+    // the question these answer is what the whole sync cost, so two rounds of
+    // 20 ms is 40 ms and two rounds.
+    ...(a.phases || b.phases ? { phases: addPhases(a.phases, b.phases) } : {}),
     bytesSent: a.bytesSent + b.bytesSent,
     unchanged: b.unchanged,
     waiting: b.waiting,

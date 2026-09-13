@@ -168,6 +168,33 @@ interface SnapshotFile {
 export interface JournalStoreOptions {
   readonly policy?: SnapshotPolicy;
   readonly log?: (message: string, ...rest: unknown[]) => void;
+  /**
+   * Told what each save cost, when this device was asked to measure.
+   *
+   * The comparison and the write are reported apart because they scale
+   * differently and only one of them is what the work set in
+   * docs/open-work.md would remove. `deltaFrom` deep-compares every entry and
+   * every remote record on every pass, settled or not, which is how a settled
+   * pass learns it has nothing to write. The write is occasional and, when it
+   * is a snapshot, large.
+   *
+   * Off everywhere that ships. An exception thrown here must not reach the
+   * save, so it is called inside a `try`.
+   */
+  readonly onSave?: (cost: JournalSaveCost) => void;
+}
+
+/** What one index save cost, split the way the two halves scale. */
+export interface JournalSaveCost {
+  /** `deltaFrom` alone: the record-by-record comparison. */
+  readonly compareMs: number;
+  /** Writing, which is zero when there was nothing to write. */
+  readonly writeMs: number;
+  /** Bytes handed to the adapter, so a snapshot's size is visible. */
+  readonly bytes: number;
+  readonly kind: "unchanged" | "append" | "snapshot";
+  /** Records in the log after this save, against the policy's cap. */
+  readonly records: number;
 }
 
 export class JournalIndexStore implements IndexStore {
@@ -193,8 +220,11 @@ export class JournalIndexStore implements IndexStore {
    */
   private mustSnapshot = false;
 
+  private readonly opts: JournalStoreOptions;
+
   constructor(files: JournalFiles, opts: JournalStoreOptions = {}) {
     this.files = files;
+    this.opts = opts;
     this.policy = opts.policy ?? DEFAULT_POLICY;
     this.say = opts.log ?? (() => undefined);
   }
@@ -313,6 +343,23 @@ export class JournalIndexStore implements IndexStore {
   }
 
   async save(state: StoredState): Promise<void> {
+    const watch = this.opts.onSave;
+    const started = watch === undefined ? 0 : performance.now();
+    let comparedAt = started;
+    const tell = (kind: JournalSaveCost["kind"], bytes: number): void => {
+      if (watch === undefined) return;
+      try {
+        watch({
+          compareMs: comparedAt - started,
+          writeMs: performance.now() - comparedAt,
+          bytes,
+          kind,
+          records: this.records,
+        });
+      } catch {
+        // A measurement that throws must not be able to stop an index save.
+      }
+    };
     const stamps = await this.files.stamps();
     const foreign = this.foreignWrite(stamps);
 
@@ -320,12 +367,17 @@ export class JournalIndexStore implements IndexStore {
     // write nothing at all. Today's whole-file store learned this twice.
     if (this.saved !== undefined && foreign === undefined) {
       const { delta, shape } = deltaFrom(this.saved, state);
-      if (delta === undefined) return;
+      if (watch !== undefined) comparedAt = performance.now();
+      if (delta === undefined) {
+        tell("unchanged", 0);
+        return;
+      }
       if (
         !this.mustSnapshot &&
         !wantsSnapshot(stamps.log?.size ?? 0, this.snapshotBytes, this.records + 1, this.policy)
       ) {
-        await this.append(delta, shape, stamps.log?.size ?? 0);
+        const line = await this.append(delta, shape, stamps.log?.size ?? 0);
+        tell("append", line);
         return;
       }
     }
@@ -343,7 +395,7 @@ export class JournalIndexStore implements IndexStore {
           "overwriting each other.",
       );
     }
-    await this.snapshot(state);
+    tell("snapshot", await this.snapshot(state));
   }
 
   /** Which file moved under this session, or undefined while both are ours. */
@@ -354,7 +406,7 @@ export class JournalIndexStore implements IndexStore {
     return undefined;
   }
 
-  private async append(delta: JournalDelta, shape: SavedShape, before: number): Promise<void> {
+  private async append(delta: JournalDelta, shape: SavedShape, before: number): Promise<number> {
     const line = encodeRecord(this.seq + 1, delta);
     await this.files.appendLog(line);
     // Rule 4: the call returning is not the outcome. A short append is a
@@ -372,6 +424,7 @@ export class JournalIndexStore implements IndexStore {
     this.records++;
     this.saved = shape;
     this.left = stamps;
+    return byteLength(line);
   }
 
   /**
@@ -380,7 +433,7 @@ export class JournalIndexStore implements IndexStore {
    * Truncating first would leave a window where the records are gone and the
    * snapshot that replaces them is not yet durable.
    */
-  private async snapshot(state: StoredState): Promise<void> {
+  private async snapshot(state: StoredState): Promise<number> {
     const text = JSON.stringify({ ...state, seq: this.seq });
     try {
       await this.files.writeSnapshot(text);
@@ -391,6 +444,7 @@ export class JournalIndexStore implements IndexStore {
       // Only after both are durable. Recording it first would have the next
       // save skip a write that a failed one still owes.
       this.saved = shapeOf(state);
+      return byteLength(text);
     } catch (err) {
       // A snapshot that failed still owes a snapshot. Without this the next
       // pass would append a record beside a file that may be half written,

@@ -78,6 +78,8 @@ import { ProtocolError } from "../core/transport.ts";
 import { DISPLACED_LOG, type Displaced, type Inventory } from "../core/displaced.ts";
 import { firstFreeName } from "../core/paths.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
+import { timedVault } from "../core/vault.ts";
+import type { JournalSaveCost, JournalStoreOptions } from "../core/index-journal-store.ts";
 import { INVITE_ACTION, inviteQrImage } from "./invite-qr.ts";
 import { checkFirstSync, MergeConfirmationRequired } from "./first-sync.ts";
 
@@ -187,6 +189,11 @@ export default class BasaltPlugin extends Plugin {
    * made with its old secret. This is that handle.
    */
   private live: Client | undefined;
+  /**
+   * When the first file event of the current batch arrived, while a run is
+   * being measured. Undefined between passes. See `timingLog`.
+   */
+  measuringFrom: number | undefined;
   /**
    * The vault adapter the running client is using, or none.
    *
@@ -932,13 +939,28 @@ export default class BasaltPlugin extends Plugin {
       displacedLog: `${this.pluginDir()}/${DISPLACED_LOG}`,
       ...(config.ignore?.length ? { ignore: config.ignore } : {}),
     });
+    // Whether this run is being measured, asked once. See `timingLog`.
+    const timingLog = this.timingLog();
+    const measuring = await this.app.vault.adapter.exists(timingLog).catch(() => false);
+    const filesystemMs: Record<string, { ms: number; calls: number }> = {};
+    let journal: JournalSaveCost | undefined;
+
     // Also held here, so the recovery surface can read the ledger and put a
     // hidden version back without a pass having to hand it over (Codex-08).
     this.liveVault = vault;
     return {
-      vault,
+      vault: measuring ? timedVault(vault, filesystemMs) : vault,
+      ...(measuring ? { timing: true } : {}),
       activePath: () => this.app.workspace.getActiveFile()?.path,
-      store: this.indexStore(),
+      store: this.indexStore(
+        measuring
+          ? {
+              onSave: (cost) => {
+                journal = cost;
+              },
+            }
+          : {},
+      ),
       // Which key authenticates and what the vault is bound to, worked out in
       // core so that both shells cannot answer it differently.
       ...(await credentialsFor(config)),
@@ -976,6 +998,32 @@ export default class BasaltPlugin extends Plugin {
       // after any of the others.
       onPass: (report) => {
         if (!current()) return;
+        // Appended after the state below, and deliberately not awaited: the
+        // write is one more filesystem call and charging it to the pass it
+        // describes would be the measurement measuring itself.
+        if (measuring && report.phases) {
+          const line = {
+            at: Date.now(),
+            waitedMs:
+              this.measuringFrom === undefined ? null : performance.now() - this.measuringFrom,
+            ...report.phases,
+            filesystemMs,
+            journal: journal ?? null,
+            unchanged: report.unchanged,
+            uploaded: report.uploaded,
+            downloaded: report.downloaded,
+            merged: report.merged,
+            conflicted: report.conflicted,
+            chunksSent: report.chunksSent,
+            reusedChunks: report.reusedChunks,
+          };
+          this.measuringFrom = undefined;
+          journal = undefined;
+          for (const op of Object.keys(filesystemMs)) delete filesystemMs[op];
+          void this.app.vault.adapter
+            .append(timingLog, `${JSON.stringify(line)}\n`)
+            .catch(() => undefined);
+        }
         this.working(undefined);
         this.setState({
           kind: "synced",
@@ -1048,8 +1096,23 @@ export default class BasaltPlugin extends Plugin {
    * an index that synced would sync to itself and be overwritten by every
    * other device in turn.
    */
-  private indexStore(): ObsidianIndexStore {
-    return new ObsidianIndexStore(this.app.vault.adapter, `${this.pluginDir()}/index.json`);
+  private indexStore(opts: JournalStoreOptions = {}): ObsidianIndexStore {
+    return new ObsidianIndexStore(this.app.vault.adapter, `${this.pluginDir()}/index.json`, opts);
+  }
+
+  /**
+   * Where a measured run writes its lines, and the switch that turns one on.
+   *
+   * The file's existence is the switch. Creating it is `adb push` of an empty
+   * file, reading it is `adb pull`, and turning it off is deleting it. There
+   * is no setting and no `data.json` key: a key would have to survive the
+   * read-back `saveVerified` does, and a settings row would be a permanent
+   * surface for a question asked once (docs/open-work.md).
+   *
+   * Costs one `exists` per client start when absent, and nothing after that.
+   */
+  private timingLog(): string {
+    return `${this.pluginDir()}/pass-timings.ndjson`;
   }
 
   /** Where Obsidian keeps this plugin's settings, for a message that names it. */
@@ -1069,6 +1132,10 @@ export default class BasaltPlugin extends Plugin {
    * pass per event and spend the copy re-scanning.
    */
   private nudge(path?: string): void {
+    // The first event of a batch, which is the one somebody was waiting on.
+    // Several saves coalesce into one pass, so the last would understate the
+    // wait and an average would describe nobody.
+    if (this.measuringFrom === undefined) this.measuringFrom = performance.now();
     if (path !== undefined) this.client?.noteChanged(path);
     // Bound the wait from the first event. Resetting on every event let a
     // busy vault postpone syncing indefinitely until the fallback poll.
