@@ -55,7 +55,7 @@ import { Client } from "./src/core/client.ts";
 import { testWrapped } from "./src/core/test-keys.ts";
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "./src/cli/vault.ts";
-import { noteBody, pathFor } from "./bench-corpus.ts";
+import { corpusPaths, noteBody, pathFor } from "./bench-corpus.ts";
 
 const run = promisify(execFile);
 
@@ -210,6 +210,10 @@ async function atSize(size: number): Promise<void> {
     console.log("  uploading to the disposable server...");
     await peer.settle({}, 256);
 
+    // The folders the corpus actually used, so the archive names them rather
+    // than sweeping in the peer's `.basalt` index alongside the notes.
+    const corpusFolders = [...new Set(corpusPaths(size).map((p) => p.split("/")[0]!))];
+
     // The phone gets the same bytes locally rather than downloading them, so
     // pairing finds both sides identical and nothing transfers. Written while
     // Obsidian is stopped, which is the one moment a vault has no watcher
@@ -217,10 +221,22 @@ async function atSize(size: number): Promise<void> {
     console.log("  seeding the phone (Obsidian stopped)...");
     await adb("shell", "am", "force-stop", "md.obsidian");
     await adb("shell", "mkdir", "-p", PLUGIN_DIR);
-    await adb("push", join(peerDir, "area-0"), `${VAULT_DIR}/`).catch(() => "");
-    for (let folder = 0; folder < 11; folder++) {
-      await adb("push", join(peerDir, `area-${folder}`), `${VAULT_DIR}/`);
-    }
+
+    // One archive, extracted on the device. `adb push` of a directory is one
+    // round trip per file, and fifty thousand of those is the seeding step
+    // taking longer than everything it exists to set up. The phone has
+    // toybox tar, so the transfer becomes one file and the unpacking happens
+    // where the files land.
+    const archive = join(peerDir, "..", `bench-corpus-${size}.tar`);
+    await run("tar", ["-cf", archive, "-C", peerDir, ...corpusFolders], {
+      maxBuffer: 1024 * 1024 * 1024,
+    });
+    const tarAt = performance.now();
+    await adb("push", archive, `${VAULT_DIR}/corpus.tar`);
+    await adb("shell", "tar", "-xf", `${VAULT_DIR}/corpus.tar`, "-C", VAULT_DIR);
+    await adb("shell", "rm", "-f", `${VAULT_DIR}/corpus.tar`);
+    await rm(archive, { force: true });
+    console.log(`    seeded in ${((performance.now() - tarAt) / 1000).toFixed(1)} s`);
     await adb("push", "dist/plugin/main.js", `${PLUGIN_DIR}/main.js`);
     await adb("push", "dist/plugin/manifest.json", `${PLUGIN_DIR}/manifest.json`);
     await adb("push", "dist/plugin/styles.css", `${PLUGIN_DIR}/styles.css`);

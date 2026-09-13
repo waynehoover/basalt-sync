@@ -3272,6 +3272,39 @@ export class Engine {
   }
 
   private async planUpload(entry: IndexEntry, path: string, fresh?: Scanned): Promise<UploadPlan> {
+    // A file whose chunk list is already right does not need reading at all.
+    //
+    // The names have to be known before the put goes out, because the server
+    // answers with the subset it wants. When the pass did not rehash this
+    // path, the index's names *are* the names: `needsRehash` said the bytes on
+    // disk are the bytes these describe, and that is the same evidence every
+    // other decision in the pass is made from.
+    //
+    // This is what a rename costs. Moving a folder changes no byte of any note
+    // under it, so the server already holds every chunk and wants none of
+    // them, and the old shape read, cut and sealed all of them anyway to
+    // rediscover a list it was holding. The bodies are produced only if the
+    // server asks, and then they are checked against the name they were
+    // promised under, so a file that changed between the scan and the ask is
+    // refused rather than sent as something it is not.
+    if (fresh === undefined && entry.chunks.length > 0 && entry.hash !== "") {
+      const names = [...entry.chunks];
+      let made: UploadPlan | undefined;
+      return {
+        names,
+        bodyOf: async (name) => {
+          if (made === undefined) {
+            const scan = await this.rehash(entry, path);
+            if (scan.names.length !== names.length || scan.names.some((n, i) => n !== names[i])) {
+              throw new Error(`${path} changed while it was being sent, so it was not sent`);
+            }
+            made = await this.planUpload(entry, path, scan);
+          }
+          return made.bodyOf(name);
+        },
+      };
+    }
+
     // The scan that decided this file changed already read it, cut it and
     // sealed it. Doing that again was the single largest cost of sending a
     // large attachment: a 64 MiB file was read twice, chunked twice and
