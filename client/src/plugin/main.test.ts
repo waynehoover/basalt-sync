@@ -194,27 +194,16 @@ async function settles(work: Promise<unknown>, what: string, ms = 5_000): Promis
  * and the only thing a short deadline buys is this.
  */
 /**
- * Opens the panel and takes one of the two pairing paths.
+ * Opens the panel on the pairing form.
  *
- * The unpaired panel asks which device this is before it draws a form, so a
- * test that reaches straight for "Setup string" finds nothing. This is the
- * click a person makes, in one place, because twenty tests should not each
- * spell out the same two lines.
+ * There is one form and one field now, and which of the three strings it holds
+ * is read from the string. So this is only the open, and the `path` argument
+ * survives because the callers read better for saying which kind they are
+ * about to paste, not because the panel is told.
  */
-function choosePairing(plugin: Testable, path: "invite" | "first"): void {
+function choosePairing(plugin: Testable, _path: "invite" | "first"): void {
   built.length = 0;
   plugin.commands.find((c) => c.id === "show-status")!.callback!();
-  const label = path === "invite" ? "Paste an invite" : "Use a setup line";
-  const choice = built.find((s) => s.buttons.some((b) => b.label === label));
-  if (!choice) throw new Error(`the panel offers no ${label}: ${built.map((s) => s.name)}`);
-  const button = choice.buttons.find((b) => b.label === label)!;
-  // Cleared before the press, not after: the press re-renders the same panel,
-  // so what lands in `built` is the form. Opening the panel again would not
-  // do, because `joining` belongs to the panel and a second modal is a second
-  // panel, which starts at the question again. That is right for a person and
-  // it silently undid the choice here.
-  built.length = 0;
-  void button.click();
 }
 
 const synced = (p: Testable, ms?: number) =>
@@ -640,7 +629,7 @@ describe("pairing instructions", () => {
     await fresh();
     const { plugin } = await load();
     choosePairing(plugin, "invite");
-    const key = built.find((s) => s.name === "Invite or recovery key")!;
+    const key = built.find((s) => s.name === "Invite or setup line")!;
     expect(key.desc).toMatch(/invite from a paired device/);
     expect(key.desc).toMatch(/saved recovery key/);
     expect(key.nameEl.children).toEqual([]);
@@ -1318,59 +1307,50 @@ describe("the panel, which is a modal and a settings tab", () => {
     expect(tab.containerEl.children).toEqual([]);
   }, 300_000);
 
-  it("asks which device this is before it asks for anything else", async () => {
-    // It used to draw both forms at once: a name, an invite and Pair, then "Or
-    // start a new vault", a setup string and Start a new vault. Everything
-    // needed was there and nothing said which half was yours, which is what
-    // was reported from a phone. So the question comes first, and it is a
-    // question about the device rather than about the protocol.
+  it("asks for one string and works out the rest from it", async () => {
+    // Two designs failed here before this one. Both forms at once was the
+    // first: a name, an invite and Pair, then "Or start a new vault", a setup
+    // string and Start a new vault. Everything needed was there and nothing
+    // said which half was yours, reported from a phone.
+    //
+    // Asking first fixed that and cost a whole screen whose only content was
+    // the question. An invite starts basalt3i_, a recovery key basalt3_, and a
+    // setup line is neither, so the string answers it and nobody has to.
     const { plugin } = await load();
     plugin.commands.find((c) => c.id === "show-status")!.callback!();
 
     const asked = built.map((s) => s.name);
-    expect(asked).toContain("Join an existing vault");
-    expect(asked).toContain("Set up a new vault");
-    // And no fields yet, because a field belongs to one of the two answers.
-    expect(asked).not.toContain("Invite or recovery key");
-    expect(asked).not.toContain("Setup string");
+    // The form, immediately, with no question in front of it.
+    expect(asked).toContain("Invite or setup line");
+    expect(asked).not.toContain("Join an existing vault");
+    expect(asked).not.toContain("Set up a new vault");
 
-    // The line that decides the choice is a description and not a `?`. That was
-    // the whole defect: on a phone there is no hover, so the guidance was not
-    // reachable at all and the labels were on their own. Read off the rows
-    // rather than out of `allText`, because the fake keeps a description as a
-    // property where Obsidian renders it into the row.
-    const desc = (name: string) => built.find((s) => s.name === name)?.desc ?? "";
-    expect(desc("Join an existing vault")).toMatch(/Use an invite from another device/);
-    expect(desc("Set up a new vault")).toMatch(/setup string from your server/);
-    // And nothing that decides the choice is hidden behind a mark.
-    for (const name of ["Join an existing vault", "Set up a new vault"]) {
-      const mark = built.find((s) => s.name === name)!.nameEl.children;
-      expect(
-        mark.filter((c) => c.cls === "basalt-help"),
-        `${name} hides its reason`,
-      ).toEqual([]);
-    }
+    // What to paste is a description and not a `?`. That was the original
+    // defect: on a phone there is no hover, so guidance behind a mark is not
+    // reachable at all. Read off the row rather than out of `allText`, because
+    // the fake keeps a description as a property.
+    const row = built.find((s) => s.name === "Invite or setup line")!;
+    // All three shapes the one field takes, so nobody holding a recovery key
+    // has to guess whether this is the place for it.
+    expect(row.desc).toMatch(/invite from a paired device/i);
+    expect(row.desc).toMatch(/recovery key/i);
+    expect(row.desc).toMatch(/setup line from your server/i);
+    expect(row.nameEl.children.filter((c) => c.cls === "basalt-help")).toEqual([]);
 
-    // Then one path, and only that path's fields.
-    choosePairing(plugin, "invite");
-    const joining = built.map((s) => s.name);
-    expect(joining).toContain("Invite or recovery key");
-    expect(joining).toContain("Device name");
-    expect(joining).not.toContain("Setup string");
-
-    choosePairing(plugin, "first");
-    const starting = built.map((s) => s.name);
-    expect(starting).toContain("Setup string");
-    expect(starting).toContain("Device name");
-    expect(starting).not.toContain("Invite or recovery key");
     // One field holding the line the server printed, rather than a Server and
     // a Token to split it into by hand.
-    expect(starting).not.toContain("Server");
-    expect(starting).not.toContain("Token");
+    expect(asked).not.toContain("Server");
+    expect(asked).not.toContain("Token");
+
+    // The two things with working answers are present but not in the way. They
+    // are still on this screen: the skip list has to be answerable before the
+    // download starts, not after it (Codex-05).
+    expect(asked).toContain("Device name");
+    expect(asked).toContain("Skip on this device");
 
     // No options anywhere in it. docs/design.md refuses a settings
     // screen, and this is the thing that would quietly become one.
-    expect(starting.filter((n) => n.toLowerCase().includes("enable"))).toEqual([]);
+    expect(asked.filter((n) => n.toLowerCase().includes("enable"))).toEqual([]);
   });
 
   it("pairs from what was typed into it", async () => {
@@ -1383,7 +1363,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     choosePairing(second.plugin, "invite");
 
     built.find((s) => s.name === "Device name")!.texts[0]!.type("desktop");
-    built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(pairing);
+    built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(pairing);
     await built
       .find((s) => s.buttons.some((b) => b.label === "Pair"))!
       .buttons.find((b) => b.label === "Pair")!
@@ -1550,7 +1530,7 @@ describe("the panel, which is a modal and a settings tab", () => {
     const { plugin } = await load();
     choosePairing(plugin, "invite");
     built
-      .find((s) => s.name === "Invite or recovery key")!
+      .find((s) => s.name === "Invite or setup line")!
       .texts[0]!.type("this is not a pairing string");
     notices.length = 0;
     const pair = built
@@ -1581,7 +1561,7 @@ describe("the panel, which is a modal and a settings tab", () => {
       carried = ignore;
     };
     built
-      .find((s) => s.name === "Invite or recovery key")!
+      .find((s) => s.name === "Invite or setup line")!
       .texts[0]!.type(
         formatInvite({
           url: "wss://homelab.example.ts.net",
@@ -1601,7 +1581,7 @@ describe("the panel, which is a modal and a settings tab", () => {
   it("names the vault and server an invite would join, before pairing", async () => {
     const { plugin } = await load();
     choosePairing(plugin, "invite");
-    const field = built.find((s) => s.name === "Invite or recovery key")!.texts[0]!;
+    const field = built.find((s) => s.name === "Invite or setup line")!.texts[0]!;
     const pair = () =>
       built
         .find((s) => s.buttons.some((b) => b.label === "Pair"))!
@@ -3748,7 +3728,7 @@ describe("adding a device from the panel", () => {
       if (source === "QR") second.plugin.protocolHandlers.get(INVITE_ACTION)!({ invite });
       else choosePairing(second.plugin, "invite");
       expect(built.find((s) => s.name === "First sync")).toBeUndefined();
-      const keyField = built.find((s) => s.name === "Invite or recovery key")!.texts[0]!;
+      const keyField = built.find((s) => s.name === "Invite or setup line")!.texts[0]!;
       if (source !== "QR") keyField.type(pairingValue);
       built.find((s) => s.name === "Device name")!.texts[0]!.type("Phone");
       const pair = built.flatMap((s) => s.buttons).find((b) => b.label === "Pair")!;
@@ -3762,7 +3742,7 @@ describe("adding a device from the panel", () => {
       const cancel = built.flatMap((s) => s.buttons).find((b) => b.label === "Cancel")!;
       built.length = 0;
       await cancel.click();
-      expect(built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.getValue()).toBe(
+      expect(built.find((s) => s.name === "Invite or setup line")!.texts[0]!.getValue()).toBe(
         pairingValue,
       );
       expect(built.find((s) => s.name === "Device name")!.texts[0]!.getValue()).toBe("Phone");
@@ -3901,9 +3881,7 @@ describe("adding a device from the panel", () => {
     expect(second.plugin.paired).toBe(false);
     expect(second.plugin.savedData).toBe(null);
     expect((await first.plugin.devices()).devices).toHaveLength(1);
-    expect(built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.getValue()).toBe(
-      invite,
-    );
+    expect(built.find((s) => s.name === "Invite or setup line")!.texts[0]!.getValue()).toBe(invite);
     built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
     await built
       .find((s) => s.buttons.some((b) => b.label === "Pair"))!
@@ -4030,7 +4008,7 @@ describe("adding a device from the panel", () => {
     const second = await load();
     choosePairing(second.plugin, "invite");
     built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
-    built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(key);
+    built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(key);
     await built
       .find((s) => s.buttons.some((b) => b.label === "Pair"))!
       .buttons.find((b) => b.label === "Pair")!
@@ -4086,7 +4064,7 @@ describe("adding a device from the panel", () => {
     await fresh();
     const { plugin } = await load();
     choosePairing(plugin, "first");
-    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(server.setup);
     built.find((s) => s.name === "Device name")!.texts[0]!.type("laptop");
     // Not awaited yet. The pairing now holds the vault's claim until somebody
     // says they have the key (R02), so awaiting the click here would wait for
@@ -4172,7 +4150,7 @@ describe("adding a device from the panel", () => {
     const { plugin } = await load();
 
     choosePairing(plugin, "first");
-    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(server.setup);
     const starting = built
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
       .buttons.find((b) => b.label === "Start a new vault")!
@@ -4212,7 +4190,7 @@ describe("adding a device from the panel", () => {
       built.some((s) => s.buttons.some((b) => b.label === "I have written it down")),
     );
     expect(
-      built.some((s) => s.name === "Setup string"),
+      built.some((s) => s.name === "Invite or setup line"),
       "there is no way to try again: the panel offers no pairing form",
     ).toBe(true);
     await built
@@ -4222,7 +4200,7 @@ describe("adding a device from the panel", () => {
 
     // And starting over actually works, rather than being refused.
     choosePairing(plugin, "first");
-    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(server.setup);
     const start = built
       .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
       .buttons.find((b) => b.label === "Start a new vault")!;
@@ -4309,7 +4287,7 @@ describe("what the panel knows and used to keep to itself", () => {
       const suggested = nameField().getValue();
       expect(suggested).toMatch(/^mac-[0-9a-f]{4}$/);
 
-      built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+      built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(server.setup);
       // The pairing holds until the key is acknowledged (R02), so the
       // acknowledgement comes before the await.
       const starting = built

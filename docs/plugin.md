@@ -40,14 +40,15 @@ changes the protocol, upgrade the server before its clients.
 
 ### Start your first device
 
-1. Choose **Use a setup line** for the first device, then give it a recognizable
-   name, such as `laptop`.
-2. Paste the server's setup string into
-   **Setup string**. With TLS configured, it looks like
-   `wss://homelab.example.ts.net#TOKEN`.
-3. Press **Start a new vault**, save the recovery key under **Write this down**,
+1. Paste the server's setup string into **Invite or setup line**. With TLS
+   configured, it looks like `wss://homelab.example.ts.net#TOKEN`. Basalt reads
+   it and says which server it will start the vault on; check that address.
+2. Press **Start a new vault**, save the recovery key under **Write this down**,
    then press **I have written it down**.
-4. Wait for sync to finish before adding another device.
+3. Wait for sync to finish before adding another device.
+
+To name this device something other than the suggestion, open **More options**
+first.
 
 Keep the recovery key somewhere safe and separate from your devices. It is how
 you regain access if every device is lost; Basalt cannot reissue it. Use an
@@ -61,10 +62,8 @@ join it with an invite.
 
 1. On a paired device, open **Add another device → Create invite**.
 2. On your phone, install and enable Basalt, then scan the QR code. Or copy the
-   pairing code and press **Paste an invite** under **Join an existing vault**
-   on the new device.
-3. Choose a device name and press **Pair**. If you copied the invite, paste it
-   into **Invite or recovery key** first.
+   pairing code and paste it into **Invite or setup line** on the new device.
+3. Check the vault and server named under the field, then press **Pair**.
 4. If this vault already contains files, Basalt asks you to confirm combining
    them with your synced vault. An older copy can bring back files moved or
    deleted elsewhere. **Cancel** leaves your files and invite untouched.

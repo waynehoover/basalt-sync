@@ -408,12 +408,13 @@ export async function walkPanelStates(
   const nobody = await load();
   loaded.push(nobody);
   openPanel(nobody);
-  shots.push(shotOfOpenPanel("unpaired", "A fresh install, before anything is paired."));
-  await built
-    .flatMap((s) => s.buttons)
-    .find((b) => b.label === "Paste an invite")!
-    .click();
-  shots.push(shotOfOpenPanel("join", "Joining uses the same pairing form for every vault."));
+  shots.push(
+    shotOfOpenPanel(
+      "unpaired",
+      "A fresh install. One field takes an invite, a recovery key or a setup line, " +
+        "and the line under it says where that string goes.",
+    ),
+  );
   closePanel();
 
   // A config that cannot be read. Deliberately shows no pairing form: pairing
@@ -437,11 +438,7 @@ export async function walkPanelStates(
 
   nobody.app.vault.adapter.seed("local.md", "An existing local note\n");
   openPanel(nobody);
-  await built
-    .flatMap((s) => s.buttons)
-    .find((b) => b.label === "Paste an invite")!
-    .click();
-  built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(recoveryKey);
+  built.find((s) => s.name === "Invite or setup line")!.texts[0]!.type(recoveryKey);
   await built
     .flatMap((s) => s.buttons)
     .find((b) => b.label === "Pair")!

@@ -203,8 +203,10 @@ documented Basalt CLI command that writes the plugin's pairing state. Do not
 manufacture `data.json`, copy another device's credentials, or run the headless
 client against the plugin's vault as a shortcut.
 
-**First device, unclaimed server:** choose **Use a setup line**, enter a device
-name and the secure setup string, then press **Start a new vault**. The panel
+**First device, unclaimed server:** paste the secure setup string into **Invite
+or setup line** and press **Start a new vault**. The panel names the server it
+will claim; check it before pressing. A device name is suggested and can be
+changed under **More options**. The panel
 shows the recovery key under **Write this down**. Help the user save it in the
 chosen private location. Press **I have written it down** only after the user
 has saved it, or after verifying a save to a destination they designated for
@@ -218,8 +220,9 @@ For a fresh copy, create a new empty Obsidian vault and preserve the old vault
 separately; do not clear it automatically. Sync runs both ways after pairing.
 
 On a paired device, choose **Add another device → Create
-invite**. On the new device, choose **Paste an invite**, supply a device name and
-the invite, then press **Pair**. Invites expire after ten minutes by default and
+invite**. On the new device, paste the invite into **Invite or setup line** and
+press **Pair**. The same field takes a recovery key. Check the vault and server
+named under it first. Invites expire after ten minutes by default and
 work once. Create one per device. A recovery key is the fallback when no paired
 device remains, not the routine handoff.
 
