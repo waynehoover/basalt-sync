@@ -732,11 +732,24 @@ func serveInBackground(t *testing.T, dir string) func() {
 		done <- run(ctx, []string{"serve", "-data", dir, "-addr", "127.0.0.1:0"}, out)
 	}()
 
+	// Waited for by the line it prints once it is serving, not by its lock.
+	//
+	// The lock this used to watch is the *server* lock, and serve takes that
+	// one first and the shared *data* lock second. Purge is held off by the
+	// data lock, so watching the server lock released the test into the window
+	// between the two: purge took the data lock exclusively, ran, and the
+	// server then failed to start behind it. That is a sound refusal from a
+	// sound lock, reported as this test failing, and it took a machine busy
+	// with a benchmark to widen the window enough to see once.
+	//
+	// "listening on" is printed after both locks and after the store opens, so
+	// a server that has said it is serving is holding everything this helper's
+	// callers assume it holds.
 	deadline := time.Now().Add(15 * time.Second)
-	for dirlock.Holder(dir, dirlock.Server) == "" {
+	for !strings.Contains(out.String(), "listening on") {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("the server never took its lock:\n%s", out.String())
+			t.Fatalf("the server never started serving:\n%s", out.String())
 		}
 		select {
 		case err := <-done:
