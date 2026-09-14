@@ -1426,7 +1426,6 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
       hooks.onConnecting?.(client);
       await client.connect();
       reachedTheServer = true;
-      backoff.success();
       // Asked again here, not only at the top of the loop. A shell that
       // said stop during the handshake has nothing else to say it with,
       // and a settle on a vault somebody has just unlinked is exactly the
@@ -1438,6 +1437,20 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
       // `onSynced` never had the settle run at all: an optional call skips
       // its arguments, and the first sync waited for the ticker.
       const report = await client.settle();
+      // Only here, because connecting is not progress.
+      //
+      // This used to reset the moment the handshake finished, which is the
+      // same as saying a server that answers is a server that works. For a
+      // day my own server answered every time and then refused the first
+      // batch and closed the socket, so the loop reconnected, was refused,
+      // reset the backoff to zero, and came back three seconds later. Twenty
+      // two thousand times, at a five minute ceiling it never once reached.
+      //
+      // Settling is the smallest thing that means the session was worth
+      // having: this device reconciled against the server and neither refused
+      // the other. A drop after that is a network, and the next attempt should
+      // be quick. A drop before it repeats, and the wait should grow.
+      backoff.success();
       hooks.onSynced?.(report, client.serverCursor);
       cause = await client.runUntilClosed();
     } catch (err) {

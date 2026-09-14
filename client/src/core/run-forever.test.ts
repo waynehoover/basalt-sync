@@ -14,6 +14,7 @@ import { Client, runForever, type ClientOptions } from "./client.ts";
 import { testWrapped } from "./test-keys.ts";
 import type { SyncReport } from "./engine.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
+import { ConnectionError } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(21);
@@ -88,6 +89,18 @@ async function connected(name: string, vault = new MemoryVault()): Promise<Clien
   open.push(c);
   await c.connect();
   return c;
+}
+
+/**
+ * A vault that dies the way a refused batch does: the connection goes, after
+ * the handshake and before the pass finishes.
+ */
+class DyingVault extends MemoryVault {
+  listed = 0;
+  override async list(): Promise<never> {
+    this.listed++;
+    throw new ConnectionError("received close frame: status = StatusNoStatusRcvd");
+  }
 }
 
 /** A vault whose writes wait until the test says go. */
@@ -305,6 +318,40 @@ describe("what the loop does with a refusal (I2)", () => {
     ).toBe(5_000);
     expect(retryWait(new Error("dropped"), 2_500)).toBe(2_500);
   });
+
+  it("stops hammering a server that answers and then refuses everything", async () => {
+    server = new TestServer();
+    await server.start();
+    const warm = await connected("warm", new MemoryVault());
+    await warm.close();
+
+    // For a day a real server accepted every handshake and then refused the
+    // first batch and closed the socket. The loop reset its backoff the
+    // instant the handshake finished, so it came back three seconds later,
+    // twenty two thousand times, and never once reached the five minute
+    // ceiling the backoff has. Connecting is not progress; settling is.
+    const vault = new DyingVault();
+    let running = true;
+    const waits: number[] = [];
+    const loop = runForever(await options("a", vault), {
+      onDisconnected: (_cause, delay) => void waits.push(delay),
+      keepGoing: () => running,
+      // The clock, so the test does not sit through the waits it is checking.
+      sleep: async () => {},
+    });
+    loops.push(loop);
+    await until("several refused sessions", () => waits.length >= 5, 30_000);
+    running = false;
+    await loop;
+
+    // Growing, not flat. Backoff jitters, so what is asserted is the trend:
+    // by the fifth refusal the wait is well past the first one.
+    const first = waits[0] ?? 0;
+    const fifth = waits[4] ?? 0;
+    expect(first).toBeLessThan(10_000);
+    expect(fifth).toBeGreaterThan(first * 3);
+    expect(vault.listed).toBeGreaterThanOrEqual(5);
+  }, 60_000);
 
   it("comes back after the server restarts, rather than stopping", async () => {
     server = new TestServer();
