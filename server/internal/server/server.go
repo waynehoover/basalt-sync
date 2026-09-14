@@ -316,6 +316,10 @@ type Server struct {
 	// commit, which no test can arrange honestly on a working disk, so that the
 	// session's answer to that fault can be pinned (S27).
 	beforeAppend func(e store.Entry) error
+	// failBatch makes the batched commit report a failure without attempting
+	// one, so the per-entry fallback can be exercised. Nil in every non-test
+	// build, like beforeAppend above.
+	failBatch error
 
 	// afterAppend runs between assigning a uid and announcing it, and is nil in
 	// every non-test build.
