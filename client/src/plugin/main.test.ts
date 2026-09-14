@@ -38,6 +38,7 @@ import { Engine, type SyncReport } from "../core/engine.ts";
 import { Client, redeemInvite } from "../core/client.ts";
 import { ObsidianIndexStore } from "./vault.ts";
 import {
+  DEFAULT_VAULT,
   INVITE_ID_LENGTH,
   INVITE_KEY_LENGTH,
   formatInvite,
@@ -1600,6 +1601,24 @@ describe("the panel, which is a modal and a settings tab", () => {
     expect(shown).toContain("their-vault");
     expect(shown).toContain("wss://someone-elses.example.org");
     expect(pair().disabled).toBe(false);
+
+    // A vault nobody named is not named back. "default" is the value assumed
+    // when a string carries none, and the server leaves it out of a setup line
+    // for the same reason: it is a default, not a choice, and quoting it here
+    // reads as a placeholder that leaked into the one line somebody is meant
+    // to check the server address on.
+    field.type(
+      formatInvite({
+        url: "wss://homelab.example.ts.net",
+        vaultId: DEFAULT_VAULT,
+        id: new Uint8Array(INVITE_ID_LENGTH).fill(7),
+        key: new Uint8Array(INVITE_KEY_LENGTH).fill(9),
+      }),
+    );
+    const plain = modals.at(-1)!.contentEl.allText();
+    expect(plain).toContain("wss://homelab.example.ts.net");
+    expect(plain).not.toContain("default");
+    expect(pair().disabled, "still perfectly joinable").toBe(false);
   });
 });
 
