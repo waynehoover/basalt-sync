@@ -59,6 +59,17 @@ import {
  */
 export const PAIRING_PREFIX = "basalt3_";
 
+/**
+ * The vault every string means when it does not name one.
+ *
+ * The server has the same constant and leaves it out of a setup line on
+ * purpose: a line for this vault is byte for byte what it always was. It is a
+ * default rather than a name, so nothing should read it back to somebody as
+ * though they had chosen it. A screen that says `vault "default"` is showing
+ * an implementation detail in the place a person looks for confirmation.
+ */
+export const DEFAULT_VAULT = "default";
+
 /** Marks a single-use invite, which is not a pairing string and does not carry the root. */
 export const INVITE_PREFIX = "basalt3i_";
 

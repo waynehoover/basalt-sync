@@ -59,6 +59,7 @@ import { describeDelivery } from "../core/delivery.ts";
 import { generateSecret } from "../core/crypto.ts";
 import { REJOIN_ADVICE, type RepairReport, type SyncReport } from "../core/engine.ts";
 import {
+  DEFAULT_VAULT,
   INVITE_PREFIX,
   PAIRING_PREFIX,
   decodeConfig,
@@ -1824,7 +1825,7 @@ export default class BasaltPlugin extends Plugin {
       // plugin could only ever claim `default`: the documented way to start a
       // differently named vault from a phone was to install the CLI on
       // something else first.
-      const { url, token, vaultId = "default" } = parseSetup(setup);
+      const { url, token, vaultId = DEFAULT_VAULT } = parseSetup(setup);
       const secret = generateSecret();
       const name = deviceName(device);
       const skip = [...new Set(ignore.map((n) => n.trim()))].filter(isIgnorableName).sort();
@@ -4171,10 +4172,15 @@ class BasaltPanel {
           if (kind === "first") {
             destination.setText(`Starts a new vault at ${to.url}. Check that this is your server.`);
           } else {
+            // The vault is named only when somebody named it. Almost every
+            // invite carries "default", which is the value assumed when a
+            // string carries none, so naming it back reads as a placeholder
+            // that leaked rather than as the confirmation this line is for.
+            const named = to.vaultId !== undefined && to.vaultId !== DEFAULT_VAULT;
             destination.setText(
-              to.vaultId === undefined
-                ? `Joins ${to.url}. Check that this is your server.`
-                : `Joins vault "${to.vaultId}" at ${to.url}. Check that this is your server.`,
+              named
+                ? `Joins vault "${to.vaultId}" at ${to.url}. Check that this is your server.`
+                : `Joins ${to.url}. Check that this is your server.`,
             );
           }
         } catch (err) {
