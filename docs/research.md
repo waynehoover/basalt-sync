@@ -220,12 +220,28 @@ Unicode normalisation, and neither gets cheaper on a phone.
 median of seven. Measured against `dbbe4a4`, the commit before the 0.8.3 review
 round, on the same machine in the same session.
 
-| 4,000-note pass | dbbe4a4 | 0.8.4 |
-|---|---:|---:|
-| Nothing changed | 19.5, 19.6 ms | 20.1, 19.9 ms |
-| One note changed | 52.5, 50.6 ms | 50.1, 52.1 ms |
-| A folder renamed | 545.5, 580.9 ms | 451.8, 458.4 ms |
-| Catching up | 155.6, 154.4 ms | 129.6, 134.5 ms |
+| 4,000-note pass | dbbe4a4 | 0.8.4 | 0.8.6 |
+|---|---:|---:|---:|
+| Nothing changed | 19.5, 19.6 ms | 20.1, 19.9 ms | 18.4 ms |
+| One note changed | 52.5, 50.6 ms | 50.1, 52.1 ms | 49.2 ms |
+| A folder renamed | 545.5, 580.9 ms | 451.8, 458.4 ms | 424.0 ms |
+| Catching up | 155.6, 154.4 ms | 129.6, 134.5 ms | 121.8 ms |
+
+The 0.8.6 column was taken to answer whether the two fixes after 0.8.4 cost
+anything. They do not: every row is at or below 0.8.4, by margins inside the
+few percent this benchmark moves between runs, and it is one sample against
+two. Read it as no regression rather than as an improvement.
+
+Neither fix is in this benchmark's path, which is why that is the expected
+answer and not a reassuring one. The client change moves when a backoff
+resets, and a benchmark that never loses its connection never reaches it. The
+server changes are not measured here at all: `bench-pass` times the engine.
+For those, `bun run bench:sync` at loopback, 20 ms and 100 ms delivered 2,000
+of 2,000 files with none wrong, none missing and none refused, in 21 round
+trips for the upload. That is a correctness result. The batched commit's cost
+is one `fsync` per batch, and the fallback's is one per entry, which is the
+trade being made deliberately in the case where the alternative is refusing
+the write.
 
 The two that moved came from a CPU profile of the same benchmark rather than
 from reading the code, and three changes account for them:
