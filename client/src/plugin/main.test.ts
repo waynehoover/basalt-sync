@@ -4400,10 +4400,15 @@ describe("what the panel knows and used to keep to itself", () => {
     });
     expect(on).toContain("Protocol 4, basaltd 0.3.4.");
     // The scheme is the whole of what is known about the hop, and wss is the
-    // only thing that says something terminated TLS in front. It is the `?`
-    // that says so now, because which server answered is what the line is for.
-    expect(connectionDetail({ url: "wss://homelab.tailnet.ts.net" })).toContain("TLS in front");
-    expect(connectionDetail({ url: "ws://192.168.1.20:3003" })).toContain("No TLS in front");
+    // only thing that says something terminated TLS in front.
+    //
+    // One line, and nothing at all when the hop is protected. This used to
+    // spend three sentences on what encryption covers and where to read more,
+    // in a panel whose last row is a link to that guide.
+    expect(connectionDetail({ url: "wss://homelab.tailnet.ts.net" })).toBe("");
+    expect(connectionDetail({ url: "ws://192.168.1.20:3003" })).toBe(
+      "This connection is not encrypted.",
+    );
   });
 });
 

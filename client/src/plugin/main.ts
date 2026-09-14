@@ -5093,16 +5093,19 @@ export function describeConnection(at: Connection): string {
 }
 
 /**
- * What the line above cannot carry: whether the hop is protected, and what
- * that does and does not cover.
+ * Whether the connection is protected, in one line.
  *
- * The panel shows this in connection details for an unprotected hop.
+ * Shown in the connection details, which is a place somebody has gone looking
+ * for a fact rather than for an explanation. It used to spend three sentences
+ * here on what encryption does and does not cover and where to read more,
+ * which is a lecture attached to a status line; the guide is one tap away
+ * under the documentation link at the bottom of the same panel.
+ *
+ * Nothing is hidden by shortening it. "Not encrypted" is the actionable half
+ * and it is still the first thing said.
  */
 export function connectionDetail(at: Connection): string {
-  return at.url.startsWith("wss://")
-    ? "TLS in front of this hop, so the credential and the note sizes are covered too."
-    : "No TLS in front of this hop. Notes stay sealed either way; the credential and the " +
-        "note sizes are not. docs/server.md has the two arrangements that fix it.";
+  return at.url.startsWith("wss://") ? "" : "This connection is not encrypted.";
 }
 
 /** A fragment placed where a sentence starts. A leading digit is left alone. */
