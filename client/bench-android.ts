@@ -65,8 +65,10 @@ const PLUGIN_DIR = `${VAULT_DIR}/.obsidian/plugins/basalt-sync`;
 const TIMING_LOG = `${PLUGIN_DIR}/pass-timings.ndjson`;
 const SIZES = (process.env["BENCH_SIZES"] ?? "10000").split(",").map(Number);
 const SAMPLES = Number(process.env["BENCH_SAMPLES"] ?? 15);
-/** Loopback port on the phone, forwarded to the disposable server here. */
-const PHONE_PORT = Number(process.env["BENCH_PHONE_PORT"] ?? 3999);
+/** How long the first sync is given before anything is measured. */
+const SETTLE_MS = Number(process.env["BENCH_SETTLE_MS"] ?? 150_000);
+/** How long quiet passes are gathered for. The ticker fires every 30 s. */
+const COLLECT_MS = Number(process.env["BENCH_COLLECT_MS"] ?? 210_000);
 
 /**
  * Names this must never appear to operate on.
@@ -109,6 +111,20 @@ async function phoneFacts(): Promise<Record<string, string>> {
     battery: line(await one("shell", "dumpsys", "battery"), "level"),
     thermal: line(await one("shell", "dumpsys", "thermalservice"), "Thermal Status"),
   };
+}
+
+/** Brings Obsidian forward without writing anything. */
+async function wakeObsidian(): Promise<void> {
+  await adb(
+    "shell",
+    "am",
+    "start",
+    "-a",
+    "android.intent.action.VIEW",
+    "-d",
+    `'obsidian://open?vault=${encodeURIComponent(VAULT)}'`,
+  ).catch(() => "");
+  await new Promise((r) => setTimeout(r, 3000));
 }
 
 /** Whether Obsidian is the focused window, which is when Android lets it work. */
@@ -172,8 +188,14 @@ async function atSize(size: number): Promise<void> {
 
   // The phone reaches this machine over its own loopback, forwarded by adb.
   // Nothing is published on the network and the live server is never named.
-  await adb("reverse", `tcp:${PHONE_PORT}`, `tcp:${port}`);
-  const endpoint = `ws://127.0.0.1:${PHONE_PORT}`;
+  //
+  // The *same* port number on both sides, which matters more than it looks:
+  // an invite carries the server's own URL, and the phone has to resolve that
+  // URL unchanged. Forwarding phone:3999 to mac:65267 hands the phone an
+  // invite naming 65267, a port nothing on the phone is listening on, and the
+  // pairing fails for a reason that looks like anything but this.
+  await adb("reverse", `tcp:${port}`, `tcp:${port}`);
+  const endpoint = `ws://127.0.0.1:${port}`;
 
   const peer = new Client({
     vault: new NodeVault(peerDir),
@@ -237,8 +259,21 @@ async function atSize(size: number): Promise<void> {
     await writeFile(enabled, JSON.stringify(["basalt-sync"]));
     await adb("push", enabled, `${VAULT_DIR}/.obsidian/community-plugins.json`);
     await adb("shell", "touch", TIMING_LOG);
+    // Unpaired, every run. The server this seeds against is disposable, so a
+    // pairing left from a previous run names a port nothing is listening on,
+    // and the phone sits retrying a dead address instead of offering the
+    // invite screen. The index goes with it: it describes a vault on a server
+    // that no longer exists.
+    for (const stale of ["data.json", "index.json", "index.log"]) {
+      await adb("shell", "rm", "-f", `${PLUGIN_DIR}/${stale}`);
+    }
 
-    const invite = await peer.invite();
+    // An hour, not the ten-minute default. What this is waiting for is a
+    // person picking up a phone, and an invite that expires while they do
+    // fails as "could not connect", which reads like a broken endpoint rather
+    // than a stopwatch. The server caps this if it disagrees.
+    const invite = await peer.invite(60 * 60_000);
+    const until = new Date(invite.expiresAt).toLocaleTimeString();
     console.log("\n  ---- do this on the phone ----");
     console.log(`  1. Obsidian, vault switcher, "Open folder as vault", pick ${VAULT}`);
     console.log("     (it exists now: this step is why it did not before)");
@@ -247,43 +282,49 @@ async function atSize(size: number): Promise<void> {
     console.log(`\n     ${invite.invite}\n`);
     console.log(`     It must say it joins ${endpoint}. If it names anything else, stop.`);
     console.log("  4. Leave Obsidian open, in the foreground, screen on");
+    console.log(`\n  This invite is good until ${until}.`);
     console.log("  ------------------------------\n");
     console.log("  waiting for the phone to pair, then to catch up...");
-    await waitFor("the phone to appear online", async () => {
-      const rows = await peer.devices();
-      return rows.devices.some((d) => d.name !== "peer" && d.online);
-    });
+    // Generous, because what it is waiting for is a person with a phone.
+    await waitFor(
+      "the phone to appear online",
+      async () => {
+        const rows = await peer.devices();
+        return rows.devices.some((d) => d.name !== "peer" && d.online);
+      },
+      30 * 60_000,
+    );
 
     // Settled, and seen to be settled, before anything is timed. Obsidian
-    // indexes the whole vault on open and that runs on the same thread.
+    // Settled first, and only then measured. Obsidian indexes the whole vault
+    // on open and the first pass reconciles every file against the server,
+    // which at 500 notes was 22 seconds: a real cost, and not a quiet pass.
+    // Letting it finish and *then* clearing the log keeps it out of the
+    // sample rather than sitting in the middle of it.
+    console.log("  letting the first sync finish...");
+    await new Promise((r) => setTimeout(r, SETTLE_MS));
     await adb("shell", "rm", "-f", TIMING_LOG);
     await adb("shell", "touch", TIMING_LOG);
-    console.log("  letting it settle, then collecting quiet passes...");
-    await new Promise((r) => setTimeout(r, 120_000));
-
-    const quiet = (await readTimings()).filter((l) => l.unchanged > 0 && l.uploaded === 0);
-    console.log(`\n  quiet passes collected: ${quiet.length}`);
-    if (quiet.length > 0) {
-      const total = (l: PassLine) => l.listMs + l.decideMs + l.transferMs + l.saveMs;
-      const share = median(quiet.map((l) => (l.decideMs + l.journalCompareMs) / total(l)));
-      console.log(`    total     p50 ${median(quiet.map(total)).toFixed(1)} ms`);
-      console.log(`    list      p50 ${median(quiet.map((l) => l.listMs)).toFixed(1)} ms`);
-      console.log(`    decide    p50 ${median(quiet.map((l) => l.decideMs)).toFixed(1)} ms`);
-      console.log(`    save      p50 ${median(quiet.map((l) => l.saveMs)).toFixed(1)} ms`);
-      console.log(
-        `    compare   p50 ${median(quiet.map((l) => l.journalCompareMs)).toFixed(1)} ms`,
-      );
-      console.log(`    decide+compare share: ${(share * 100).toFixed(1)}%  (threshold 50%)`);
-    }
+    // Obsidian in front, or there are no passes to collect.
+    //
+    // Android suspends a backgrounded WebView, and Basalt's own guide says
+    // sync runs on Android only while Obsidian is open in the foreground. A
+    // collection window with the phone on a home screen gathers nothing at
+    // all, which is what two runs did. `obsidian://open` brings it forward and
+    // writes nothing, so it costs the measurement nothing either.
+    await wakeObsidian();
+    console.log(`  collecting quiet passes for ${(COLLECT_MS / 1000).toFixed(0)} s...`);
+    await new Promise((r) => setTimeout(r, COLLECT_MS));
 
     // The end-to-end figure, on this machine's clock at both ends.
     console.log(`\n  ${SAMPLES} saved edits, phone to verified bytes here...`);
     const totals: number[] = [];
     for (let i = 0; i < SAMPLES; i++) {
-      if (!(await inForeground())) {
-        console.log("    skipped: Obsidian was not in the foreground");
-        continue;
-      }
+      // Brought forward rather than skipped. The URI below launches Obsidian
+      // anyway, so refusing to send it because Obsidian was not already in
+      // front skipped every sample of the first run and measured nothing.
+      // What matters is that it was in front *while the pass ran*, which is
+      // checked after.
       const nonce = `bench-${Date.now()}-${i}`;
       const rel = pathFor(i % size);
       const uri =
@@ -291,13 +332,27 @@ async function atSize(size: number): Promise<void> {
         `&file=${encodeURIComponent(rel.replace(/\.md$/, ""))}` +
         `&content=${encodeURIComponent(nonce)}&overwrite&silent`;
       const at = performance.now();
-      await adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri);
+      // Quoted for the phone's shell, which is a second shell.
+      //
+      // `adb shell` joins its arguments and hands the string to `sh` on the
+      // device, so an unquoted `&` in the URI is a shell operator there: the
+      // last run split `...&overwrite&silent` into three commands and failed
+      // with "silent: inaccessible or not found". This is CLAUDE.md's rule
+      // about never inlining a payload into a shell argument, and the second
+      // shell is the one that is easy to forget.
+      await adb("shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", `'${uri}'`);
       await waitFor(`sample ${i + 1} to arrive`, async () => {
         const here = await readFileMaybe(join(peerDir, rel));
         return here !== undefined && here.includes(nonce);
       });
-      totals.push(performance.now() - at);
-      console.log(`    ${i + 1}/${SAMPLES}: ${totals.at(-1)!.toFixed(0)} ms`);
+      const took = performance.now() - at;
+      const front = await inForeground();
+      if (!front) {
+        console.log(`    ${i + 1}/${SAMPLES}: ${took.toFixed(0)} ms (discarded, not in front)`);
+        continue;
+      }
+      totals.push(took);
+      console.log(`    ${i + 1}/${SAMPLES}: ${took.toFixed(0)} ms`);
     }
     if (totals.length > 0) {
       console.log(
@@ -305,8 +360,43 @@ async function atSize(size: number): Promise<void> {
           `p95 ${percentile(totals, 95).toFixed(0)} ms, over ${totals.length} samples`,
       );
     }
+
+    // The whole log, read once at the end, rather than a snapshot taken in
+    // the middle. A quiet pass is a quiet pass whenever it happened, and the
+    // ones that follow each timed save are as good as the ones in the
+    // collection window; reading only the window threw half the evidence away.
+    const all = await readTimings();
+    await writeFile(`bench-android-${size}.ndjson`, all.map((l) => JSON.stringify(l)).join("\n"));
+    // The first pass after pairing reconciles every file against the server
+    // and is not a quiet pass by any reading: at 500 notes it was 22 seconds.
+    const quiet = all
+      .filter((l) => l.unchanged > 0 && l.uploaded === 0 && l.downloaded === 0)
+      .slice(1);
+    console.log(`\n  quiet passes: ${quiet.length} (raw log in bench-android-${size}.ndjson)`);
+    if (quiet.length > 0) {
+      const total = (l: PassLine) => l.listMs + l.decideMs + l.transferMs + l.saveMs;
+      // From the journal's own record. `phases.journalCompareMs` is the
+      // engine's field, and the engine cannot see inside the store, so it is
+      // always zero; the number is the one the store reported.
+      const compareOf = (l: PassLine) => l.journal?.compareMs ?? 0;
+      const share = median(quiet.map((l) => (l.decideMs + compareOf(l)) / total(l)));
+      console.log(`    total     p50 ${median(quiet.map(total)).toFixed(1)} ms`);
+      console.log(`    list      p50 ${median(quiet.map((l) => l.listMs)).toFixed(1)} ms`);
+      console.log(`    decide    p50 ${median(quiet.map((l) => l.decideMs)).toFixed(1)} ms`);
+      console.log(`    save      p50 ${median(quiet.map((l) => l.saveMs)).toFixed(1)} ms`);
+      console.log(`    compare   p50 ${median(quiet.map(compareOf)).toFixed(1)} ms`);
+      console.log(`    decide+compare share: ${(share * 100).toFixed(1)}%  (threshold 50%)`);
+      const snaps = all.filter((l) => l.journal?.kind === "snapshot");
+      if (snaps.length > 0) {
+        const bytes = Math.max(...snaps.map((l) => l.journal?.bytes ?? 0));
+        const wrote = Math.max(...snaps.map((l) => l.journal?.writeMs ?? 0));
+        console.log(
+          `    index snapshot: ${(bytes / 1024).toFixed(0)} KiB in ${wrote.toFixed(0)} ms`,
+        );
+      }
+    }
   } finally {
-    await adb("reverse", "--remove", `tcp:${PHONE_PORT}`).catch(() => "");
+    await adb("reverse", "--remove", `tcp:${port}`).catch(() => "");
     await peer.close().catch(() => undefined);
     await server.cleanup().catch(() => undefined);
     await rm(peerDir, { recursive: true, force: true });
@@ -341,7 +431,15 @@ async function main(): Promise<void> {
   console.log(`  sizes: ${SIZES.join(", ")}, ${SAMPLES} samples each`);
 
   await serverBinary();
-  for (const size of SIZES) await atSize(size);
+  // The screen off is Obsidian suspended, and a suspended Obsidian runs no
+  // passes: the last run collected one quiet pass in three and a half minutes
+  // of trying, because the phone had gone to sleep. Restored at the end.
+  await adb("shell", "svc", "power", "stayon", "usb").catch(() => "");
+  try {
+    for (const size of SIZES) await atSize(size);
+  } finally {
+    await adb("shell", "svc", "power", "stayon", "false").catch(() => "");
+  }
 }
 
 await main();

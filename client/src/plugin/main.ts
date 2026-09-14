@@ -1017,12 +1017,14 @@ export default class BasaltPlugin extends Plugin {
             chunksSent: report.chunksSent,
             reusedChunks: report.reusedChunks,
           };
+          // Serialised before the collectors are cleared, not after. `line`
+          // holds a reference to `filesystemMs` rather than a copy, so
+          // emptying it first produced a line that always said `{}`.
+          const text = `${JSON.stringify(line)}\n`;
           this.measuringFrom = undefined;
           journal = undefined;
           for (const op of Object.keys(filesystemMs)) delete filesystemMs[op];
-          void this.app.vault.adapter
-            .append(timingLog, `${JSON.stringify(line)}\n`)
-            .catch(() => undefined);
+          void this.app.vault.adapter.append(timingLog, text).catch(() => undefined);
         }
         this.working(undefined);
         this.setState({

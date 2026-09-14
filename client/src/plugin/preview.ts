@@ -48,14 +48,34 @@ export class SyncPreviewModal extends Modal {
           .setName(LABELS[key as PreviewAction])
           .setDesc(`${count.toLocaleString()} ${count === 1 ? "file" : "files"}`);
     }
-    const details = this.contentEl.createEl("details");
-    details.createEl("summary", { text: "File details" });
+    // Only when there is something behind it.
+    //
+    // This used to be drawn whatever the preview said, and its contents are
+    // the files that are *not* already matching. Pairing a device to a vault
+    // it already holds a copy of therefore offered a "File details" chevron
+    // that opened onto an empty box: the one moment somebody most wants to
+    // know what is about to happen to their notes, answered with nothing at
+    // all. Reported from a phone doing exactly that.
     const changes = this.preview.files.filter((file) => file.action !== "unchanged");
-    const list = details.createDiv("basalt-activity-list");
-    for (const file of changes.slice(0, 200))
-      new Setting(list).setName(file.path).setDesc(LABELS[file.action]);
-    if (changes.length > 200)
-      list.createEl("p", { text: `Showing 200 of ${changes.length.toLocaleString()} changes.` });
+    if (changes.length === 0) {
+      this.contentEl.createEl("p", {
+        cls: "basalt-advice",
+        text:
+          this.preview.files.length === 0
+            ? "There is nothing here and nothing on the server yet."
+            : "Nothing to do: every file here already matches the server.",
+      });
+    } else {
+      const details = this.contentEl.createEl("details");
+      details.createEl("summary", {
+        text: `File details (${changes.length.toLocaleString()})`,
+      });
+      const list = details.createDiv("basalt-activity-list");
+      for (const file of changes.slice(0, 200))
+        new Setting(list).setName(file.path).setDesc(LABELS[file.action]);
+      if (changes.length > 200)
+        list.createEl("p", { text: `Showing 200 of ${changes.length.toLocaleString()} changes.` });
+    }
     if (this.answer)
       new Setting(this.contentEl)
         .addButton((button) => button.setButtonText("Pause sync").onClick(() => this.close()))
