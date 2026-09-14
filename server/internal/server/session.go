@@ -1654,18 +1654,38 @@ func (s *Session) commitMany(items []preparedEntry, sent []wire.PutEntry) ([]wir
 		}
 	}
 
-	out, err := s.srv.st.AppendMany(s.vaultID, entries, bases, prevBases)
+	var out []store.ManyResult
+	var err error
+	if s.srv.failBatch != nil {
+		err = s.srv.failBatch
+	} else {
+		out, err = s.srv.st.AppendMany(s.vaultID, entries, bases, prevBases)
+	}
 	if err != nil {
-		s.srv.log.Error("batch commit failed", "vault", s.vaultID, "err", err)
-		for k, i := range at {
-			if results[i].Code == "" && entries[k].Path != "" {
-				results[i] = wire.AckResult{
-					Code: wire.CodeInternal,
-					Msg:  "the entry could not be committed: " + err.Error(),
-				}
+		// One transaction per batch is an optimisation, and an optimisation
+		// that can stop a vault syncing is worse than the fsyncs it saves.
+		//
+		// The batched commit arrived in 0.8.4 and inside a day was failing on a
+		// real vault with "disk I/O error (6410)" on every batch a device sent:
+		// it connected, its batch was refused, the session ended, and it tried
+		// again three seconds later, twenty-two thousand times in a day.
+		// Nothing was lost, because nothing was acknowledged, and nothing
+		// synced either. The server said the same line each time and never
+		// tried the path that had worked for every release before it.
+		//
+		// So it falls back to that path: one entry at a time, one fsync each,
+		// available whenever the batch is not. A vault that syncs slowly is a
+		// working vault; this is the difference.
+		s.srv.log.Warn("batch commit failed, committing one at a time",
+			"vault", s.vaultID, "entries", len(entries), "err", err)
+		out = make([]store.ManyResult, len(entries))
+		for k, e := range entries {
+			if e.Path == "" {
+				continue // refused by beforeAppend above
 			}
+			uid, single := s.srv.st.AppendCurrent(s.vaultID, e, bases[k], prevBases[k])
+			out[k] = store.ManyResult{UID: uid, Err: single}
 		}
-		return results, nil
 	}
 
 	// Durable, so now it can be said out loud.

@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
@@ -292,5 +294,51 @@ func TestACommitRefusalDoesNotTakeTheBatchWithIt(t *testing.T) {
 	cl.recvInto("pong", &wire.Pong{})
 	if got := r.mustStats().Files; got != 3 {
 		t.Fatalf("the vault holds %d files, want 3", got)
+	}
+}
+
+// A batch that cannot commit as one transaction still commits.
+//
+// The batched commit is an optimisation over committing entries one at a time,
+// and an optimisation that can stop a vault syncing is worse than the fsyncs
+// it saves. Within a day of shipping it, a real vault was refusing every batch
+// a device sent and reconnecting to try again three seconds later, twenty-two
+// thousand times, because nothing fell back to the path that had always
+// worked.
+func TestBatchFallsBackToOneAtATime(t *testing.T) {
+	r := newRig(t)
+	c := r.dial("a")
+	c.hello(0)
+
+	entries := make([]wire.PutEntry, 0, 4)
+	bodies := map[string]string{}
+	for i := 0; i < 4; i++ {
+		entry, made := entryFor(fmt.Sprintf("note-%d.md", i), fmt.Sprintf("body %d", i))
+		entries = append(entries, entry)
+		for name, body := range made {
+			bodies[name] = body
+		}
+	}
+
+	r.srv.failBatch = errors.New("disk I/O error (6410)")
+	acks := c.putMany(entries, bodies)
+
+	if len(acks.Results) != len(entries) {
+		t.Fatalf("%d results for %d entries", len(acks.Results), len(entries))
+	}
+	for i, ack := range acks.Results {
+		if ack.Code != "" {
+			t.Fatalf("entry %d refused despite the fallback: %s %s", i, ack.Code, ack.Msg)
+		}
+		if ack.UID == 0 {
+			t.Fatalf("entry %d acknowledged with no uid", i)
+		}
+	}
+
+	// And the notes are on the server, which is the only thing that matters.
+	for i := range entries {
+		if head := c.head(fmt.Sprintf("note-%d.md", i)); head == 0 {
+			t.Errorf("note-%d.md was acknowledged and is not there", i)
+		}
 	}
 }

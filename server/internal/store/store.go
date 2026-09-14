@@ -284,6 +284,24 @@ const (
 const schema = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+-- Statement journals in memory, because this server is built to run with a
+-- read-only root filesystem and nothing else needs a scratch file.
+--
+-- SQLite writes a statement journal when a statement inside a transaction may
+-- have to be rolled back on its own, which is exactly what a SAVEPOINT is for,
+-- and it puts that journal in a temp directory. The shipped container mounts
+-- only /data and sets read_only, so there is no temp directory to have: the
+-- batched commit added in 0.8.4 asked for one and got
+-- SQLITE_IOERR_GETTEMPPATH (6410) on every batch large enough to need it,
+-- twenty-two thousand times in a day on the author's own server before anyone
+-- noticed, because a single put never takes that path and a failed batch just
+-- looks like a client retrying.
+--
+-- MEMORY is the right answer here rather than a workaround: these
+-- transactions hold one batch of entries, the size of which the protocol
+-- already bounds, so the journal they would spill is small and the disk it
+-- would spill to is one this server is deliberately not given.
+PRAGMA temp_store = MEMORY;
 
 CREATE TABLE IF NOT EXISTS vaults (
   vault_id   TEXT    PRIMARY KEY,

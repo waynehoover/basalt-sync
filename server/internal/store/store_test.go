@@ -1734,3 +1734,54 @@ func TestAppendManySeesItsOwnEarlierEntries(t *testing.T) {
 		t.Errorf("the second entry did not see the first: %+v", out[1])
 	}
 }
+
+// A batch must commit on a server with nowhere to put a temp file.
+//
+// The shipped container mounts only /data and sets read_only, and SQLite wants
+// a temp directory for the statement journal a SAVEPOINT implies. AppendMany
+// therefore failed with SQLITE_IOERR_GETTEMPPATH on every batch large enough
+// to need one, which on a real vault was twenty-two thousand failures in a day:
+// a single put never takes that path, and a refused batch looks from the
+// outside exactly like a client retrying.
+//
+// TMPDIR is emptied and SQLITE_TMPDIR pointed at somewhere that does not exist,
+// which is as close to that container as a test on a writable disk can get.
+func TestAppendManyWithNoTempDirectory(t *testing.T) {
+	// After the store is open, because the harness needs a real temp directory
+	// to make one and SQLite consults these when it wants a scratch file rather
+	// than when it connects.
+	h := newTestStore(t)
+	t.Setenv("SQLITE_TMPDIR", "/nonexistent-basalt-temp")
+	t.Setenv("TMPDIR", "/nonexistent-basalt-temp")
+
+	// Enough entries, each with a chunk, that the statement journal is worth
+	// writing. One or two never reached the failure.
+	entries := make([]Entry, 0, 24)
+	bases := make([]int64, 0, 24)
+	prevBases := make([]int64, 0, 24)
+	for i := 0; i < 24; i++ {
+		entries = append(entries, h.entryFor(t, fmt.Sprintf("batch-%02d.md", i), fmt.Sprintf("body %d", i)))
+		bases = append(bases, 0)
+		prevBases = append(prevBases, 0)
+	}
+
+	out, err := h.AppendMany("v1", entries, bases, prevBases)
+	if err != nil {
+		t.Fatalf("a batch could not commit without a temp directory: %v", err)
+	}
+	for i, r := range out {
+		if r.Err != nil {
+			t.Fatalf("entry %d refused: %v", i, r.Err)
+		}
+		if r.UID == 0 {
+			t.Fatalf("entry %d committed with no uid", i)
+		}
+	}
+	// And the notes are really there, which is the point of the whole thing.
+	for i := range entries {
+		uid, _, err := pathHead(h.db, "v1", fmt.Sprintf("batch-%02d.md", i))
+		if err != nil || uid == 0 {
+			t.Errorf("batch-%02d.md did not commit: uid %d, err %v", i, uid, err)
+		}
+	}
+}
