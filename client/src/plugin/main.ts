@@ -59,6 +59,8 @@ import { describeDelivery } from "../core/delivery.ts";
 import { generateSecret } from "../core/crypto.ts";
 import { REJOIN_ADVICE, type RepairReport, type SyncReport } from "../core/engine.ts";
 import {
+  INVITE_PREFIX,
+  PAIRING_PREFIX,
   decodeConfig,
   deviceCredential,
   encodeConfig,
@@ -3182,7 +3184,6 @@ class BasaltPanel {
     private readonly incomingInvite?: string,
   ) {
     this.unwatchUnload = plugin.watchUnload(() => this.teardown());
-    if (incomingInvite !== undefined) this.joining = "invite";
   }
 
   teardown(): void {
@@ -4051,26 +4052,30 @@ class BasaltPanel {
   }
 
   /**
-   * Which device this is, and then the one form that answers it.
+   * One field, because the string already says which kind it is.
    *
-   * This used to be both forms at once: a device name, an invite field and
-   * *Pair*, then "Or start a new vault", a setup string and *Start a new
-   * vault*. Everything needed was on the screen and the screen did not say
-   * which half was yours. Reported from a phone as not knowing which path to
-   * take, and it was worse there than on a desktop for two reasons: the lines
-   * that disambiguated the two were on the `?` marks, which did nothing
-   * without a hover, and "Only for the first device" was one small line doing
-   * all the work.
+   * This screen has been rebuilt twice and both times for the same reason. It
+   * began as both forms at once: a device name, an invite field and *Pair*,
+   * then "Or start a new vault", a setup string and *Start a new vault*.
+   * Everything needed was on screen and nothing said which half was yours.
    *
-   * So the choice comes first and is a question about the device rather than
-   * about the protocol: has this vault got Basalt on it somewhere else, or is
-   * this the first one. Then only that path's fields are drawn. The guidance
-   * that decides the choice is visible text and not a `?`, because a line
-   * somebody needs in order to choose is content rather than detail.
+   * The fix then was to ask first, so a choice came before a form. That did
+   * remove the ambiguity, and it bought it with a screen whose only content
+   * was a question. Reported as too much for what it does, and it is: a person
+   * with an invite in their clipboard has already made the choice the screen
+   * is asking them to make.
    *
-   * `joining` is panel state and not plugin state: closing the panel and
-   * opening it again starts at the question, which is right, because somebody
-   * who left is somebody who was not sure.
+   * An invite starts `basalt3i_`, a recovery key starts `basalt3_`, and a
+   * setup line is neither; `parseSetup` has always refused the other two by
+   * name. So the string is self-describing and the question was never
+   * necessary. One field takes all three, the line under it says what pressing
+   * the button will do and to which server, and the button says it too.
+   *
+   * The two things somebody might still want are behind *More options*, with
+   * working defaults in place: a device name suggested from the platform, and
+   * the skip list, which stays on this screen rather than moving to the paired
+   * panel because pairing starts the download immediately and a phone joining
+   * a vault of attachments has to be able to say no before that (Codex-05).
    */
   private renderPairing(host: HTMLElement): void {
     if (this.confirmMerge && this.joinDraft) {
@@ -4111,52 +4116,102 @@ class BasaltPanel {
         );
       return;
     }
+
     new Setting(host).setName("Set up sync").setHeading();
     const contentEl = settingGroup(host);
-    if (this.joining === undefined) {
-      const joinRow = new Setting(contentEl)
-        .setName("Join an existing vault")
-        .setDesc("Use an invite from another device, or your saved recovery key.")
-        .addButton((b) =>
-          b
-            .setButtonText("Paste an invite")
-            .setCta()
-            .onClick(() => {
-              this.joining = "invite";
-              this.render();
-            }),
+
+    let pairingField: TextComponent | undefined;
+    row(
+      contentEl,
+      "Invite or setup line",
+      "Paste an invite from a paired device, or your saved recovery key. If this is the " +
+        "first device on this vault, paste the setup line from your server instead.",
+    ).addText((t) => {
+      t.setPlaceholder("basalt3i_...");
+      t.inputEl.setAttribute("aria-label", "Invite or setup line");
+      literalInput(t, true);
+      const key = this.joinDraft?.key ?? this.incomingInvite;
+      if (key !== undefined) t.setValue(key);
+      t.onChange(() => showDestination());
+      pairingField = t;
+    });
+
+    // Where this string goes, before it goes there (R083-05).
+    //
+    // An invite carries the server address and the vault name, and neither was
+    // on screen: a person pressed Pair on a base64 blob, and an invite arriving
+    // through `obsidian://basalt-sync?invite=...` filled the field in for them.
+    // An unpaired vault pointed at a stranger's server uploads itself to it on
+    // the first sync, so the address has to be readable first and the button
+    // stays disabled until it is. A setup line claims a server for a vault that
+    // does not exist yet, so getting that address wrong is a vault started
+    // somewhere nobody meant; the same line answers both.
+    const destination = contentEl.createEl("p", { cls: "basalt-advice" });
+    destination.setAttribute("role", "status");
+    let goButton: ButtonComponent | undefined;
+
+    /** Which of the three this is, from the string alone. */
+    const kindOf = (value: string): "join" | "first" =>
+      value.startsWith(INVITE_PREFIX) || value.startsWith(PAIRING_PREFIX) ? "join" : "first";
+
+    const showDestination = () => {
+      const value = pairingField?.getValue().trim() ?? "";
+      let readable = false;
+      let starting = false;
+      if (value === "") {
+        destination.setText(
+          "Paste an invite from another device, or your server's setup line, to see where it goes.",
         );
+      } else {
+        const kind = kindOf(value);
+        starting = kind === "first";
+        try {
+          const to = joinDestination(value, kind);
+          readable = true;
+          if (kind === "first") {
+            destination.setText(`Starts a new vault at ${to.url}. Check that this is your server.`);
+          } else {
+            destination.setText(
+              to.vaultId === undefined
+                ? `Joins ${to.url}. Check that this is your server.`
+                : `Joins vault "${to.vaultId}" at ${to.url}. Check that this is your server.`,
+            );
+          }
+        } catch (err) {
+          // Named shapes, not the parser's complaint.
+          //
+          // With one field a string that is none of the three reaches whichever
+          // parser its shape guessed, and that parser answers as though the
+          // guess were established: paste a typo and `parseSetup` explains what
+          // is wrong with a setup line, which is not what you were holding. So
+          // an unrecognised string is answered by the field, and only a string
+          // that named its own kind and then failed gets the parser's reason.
+          destination.setText(
+            starting && !value.includes("#")
+              ? "Cannot read that. An invite starts basalt3i_, a recovery key starts " +
+                  `${PAIRING_PREFIX}, and a setup line looks like homelab:3003#TOKEN.`
+              : `Cannot read that: ${(err as Error).message}`,
+          );
+        }
+      }
+      // The label follows the string, so the button says what it will do
+      // rather than what this screen is for. Before anything readable is
+      // there it reads Pair, because every device after the first joins and
+      // only one ever starts.
+      goButton?.setButtonText(readable && starting ? "Start a new vault" : "Pair");
+      goButton?.setDisabled(!readable);
+    };
 
-      const firstRow = new Setting(contentEl)
-        .setName("Set up a new vault")
-        .setDesc(
-          "Use the setup string from your server. Other devices can join later with an invite.",
-        )
-        .addButton((b) =>
-          // Not "Start a new vault", which is what the button at the end of
-          // that path says. Two buttons with one label is a screen where the
-          // second press is a guess, and it made the tests ambiguous too.
-          b.setButtonText("Use a setup line").onClick(() => {
-            this.joining = "first";
-            this.render();
-          }),
-        );
+    // More options, collapsed, because both have answers that work.
+    //
+    // A device name is suggested from the platform and is only ever a label in
+    // the device list. A skip list is empty for almost everybody. Neither is a
+    // decision most people have to make, and a screen that asks anyway is a
+    // screen that says all four of these matter equally.
+    const more = contentEl.createEl("details", { cls: "basalt-more-options" });
+    more.createEl("summary", { text: "More options" });
+    const moreEl = settingGroup(more);
 
-      // Obsidian top-aligns a row's control, which is right when the row is one
-      // line. These two carry the sentence somebody chooses by, so the button
-      // ends up pinned to the top of a card with two lines of text beside it
-      // and dead space underneath. Measured before changing: the row is 85px of
-      // 16px padding plus 52px of content, so the padding was never the
-      // problem and centring the control is the whole fix.
-      for (const r of [joinRow, firstRow]) r.settingEl.addClass("basalt-choice");
-
-      docsLink(host.createEl("p", { cls: "basalt-advice" }), "How pairing works");
-      return;
-    }
-
-    // The fields are read when a button is pressed rather than tracked
-    // through input events. One less thing between what was typed and what
-    // is used, and it is what makes this reachable from a test.
     let deviceField: TextComponent | undefined;
     const device = () => deviceField?.getValue() ?? "";
 
@@ -4164,173 +4219,66 @@ class BasaltPanel {
     // not a value, so the honest thing to do with the field was leave it
     // alone, and every device ended up named after the app rather than after
     // itself. What is offered is what will be used, and it can be typed over.
-    // What this device will never sync, before it starts (Codex-05).
-    //
-    // Pairing starts the download the moment it finishes, and the exclusion
-    // controls used to exist only in the paired panel: somebody adding a phone
-    // to a vault holding several gigabytes of attachments had to race their
-    // own sync to the settings screen. Asked here, the list is written with
-    // the pairing and the first pass never asks for those bytes.
-    const skipping = () => this.joinSkip;
-
-    row(contentEl, "Device name", "Shown in the device list and future sync activity.").addText(
+    row(moreEl, "Device name", "Shown in the device list and future sync activity.").addText(
       (t) => {
         t.setPlaceholder("laptop");
         t.inputEl.setAttribute("aria-label", "Device name");
-        t.setValue(
-          this.joining === "invite"
-            ? (this.joinDraft?.device ?? suggestedDeviceName())
-            : suggestedDeviceName(),
-        );
+        t.setValue(this.joinDraft?.device ?? suggestedDeviceName());
         deviceField = t;
       },
     );
 
-    this.renderJoinSkip(contentEl);
+    this.renderJoinSkip(moreEl);
+    const skipping = () => this.joinSkip;
 
-    if (this.joining === "invite") {
-      let pairingField: TextComponent | undefined;
-      row(
-        contentEl,
-        "Invite or recovery key",
-        "Paste an invite from a paired device, or use your saved recovery key.",
-      ).addText((t) => {
-        t.setPlaceholder("basalt3i_...");
-        t.inputEl.setAttribute("aria-label", "Invite or recovery key");
-        literalInput(t);
-        const key = this.joinDraft?.key ?? this.incomingInvite;
-        if (key !== undefined) t.setValue(key);
-        t.onChange(() => showDestination());
-        pairingField = t;
-      });
-
-      // Where this string goes, before it goes there (R083-05).
-      //
-      // An invite carries the server address and the vault name, and neither
-      // was on screen: a person pressed Pair on a base64 blob, and an invite
-      // arriving through `obsidian://basalt-sync?invite=...` filled the field
-      // in for them. An unpaired vault pointed at a stranger's server uploads
-      // itself to it on the first sync, so the address has to be readable
-      // first and the button stays disabled until it is.
-      const destination = contentEl.createEl("p", { cls: "basalt-advice" });
-      destination.setAttribute("role", "status");
-      let pairButton: ButtonComponent | undefined;
-      const showDestination = () => {
-        const value = pairingField?.getValue().trim() ?? "";
-        let readable = false;
-        if (value === "") {
-          destination.setText("Paste an invite or recovery key to see which vault it joins.");
-        } else {
-          try {
-            const to = joinDestination(value, "join");
-            readable = true;
-            destination.setText(
-              to.vaultId === undefined
-                ? `Joins ${to.url}. Check that this is your server.`
-                : `Joins vault "${to.vaultId}" at ${to.url}. Check that this is your server.`,
-            );
-          } catch (err) {
-            destination.setText(`Cannot read that: ${(err as Error).message}`);
+    new Setting(contentEl).addButton((b) => {
+      goButton = b;
+      b.setButtonText("Pair")
+        .setCta()
+        .onClick(async () => {
+          const value = pairingField?.getValue() ?? "";
+          if (kindOf(value.trim()) === "join") {
+            b.setDisabled(true);
+            try {
+              await this.pairFromPanel(value, device(), skipping());
+            } finally {
+              showDestination();
+            }
+            return;
           }
-        }
-        pairButton?.setDisabled(!readable);
-      };
-
-      new Setting(contentEl)
-        .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
-        .addButton((b) => {
-          pairButton = b;
-          b.setButtonText("Pair")
-            .setCta()
-            .onClick(async () => {
-              b.setDisabled(true);
-              try {
-                await this.pairFromPanel(pairingField?.getValue() ?? "", device(), skipping());
-              } finally {
-                showDestination();
-              }
-            });
-        });
-      showDestination();
-    } else {
-      let setupField: TextComponent | undefined;
-      row(
-        contentEl,
-        "Setup string",
-        "Paste your server's setup string, including its secure address.",
-      ).addText((t) => {
-        t.setPlaceholder("homelab:3003#K7M2PQR4-...");
-        t.inputEl.setAttribute("aria-label", "Setup string");
-        literalInput(t, true);
-        t.onChange(() => showDestination());
-        setupField = t;
-      });
-
-      // The same line, for the same reason (R083-05). A setup line claims a
-      // server for a vault that does not exist yet, so getting the address
-      // wrong here is a vault started somewhere nobody meant.
-      const destination = contentEl.createEl("p", { cls: "basalt-advice" });
-      destination.setAttribute("role", "status");
-      let startButton: ButtonComponent | undefined;
-      const showDestination = () => {
-        const value = setupField?.getValue().trim() ?? "";
-        let readable = false;
-        if (value === "") {
-          destination.setText("Paste the setup line to see which server it claims.");
-        } else {
           try {
-            const to = joinDestination(value, "first");
-            readable = true;
-            destination.setText(`Starts a vault at ${to.url}. Check that this is your server.`);
-          } catch (err) {
-            destination.setText(`Cannot read that: ${(err as Error).message}`);
-          }
-        }
-        startButton?.setDisabled(!readable);
-      };
-
-      new Setting(contentEl)
-        .addButton((b) => b.setButtonText("Back").onClick(() => this.chooseAgain()))
-        .addButton((b) => {
-          startButton = b;
-          b.setButtonText("Start a new vault")
-            .setCta()
-            .onClick(async () => {
-              try {
-                // Rendered the moment the key exists, which is before the vault is
-                // claimed and long before the registration replaces the root on
-                // disk (F02), and the pairing *waits here* until somebody says they
-                // have it (R02).
-                //
-                // Showing it and carrying on was not a handoff. Registration
-                // replaces the root with this device's own credential, so a reload
-                // or a closed panel in between took the only copy of a key nothing
-                // can reissue, and returning from a callback is not evidence that
-                // anybody read the screen. Nothing has been claimed while this
-                // waits, so abandoning it costs nothing: the config still holds the
-                // root, and the panel offers the key again on the next load.
-                await this.plugin.pairFirst(
-                  setupField?.getValue() ?? "",
-                  device(),
-                  async (key) => {
-                    this.freshRecoveryKey = key;
-                    this.render();
-                    await this.writtenDown;
-                  },
-                  skipping(),
-                );
-                new Notice(
-                  "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
-                );
-                this.joining = undefined;
+            // Rendered the moment the key exists, which is before the vault is
+            // claimed and long before the registration replaces the root on
+            // disk (F02), and the pairing *waits here* until somebody says they
+            // have it (R02).
+            //
+            // Showing it and carrying on was not a handoff. Registration
+            // replaces the root with this device's own credential, so a reload
+            // or a closed panel in between took the only copy of a key nothing
+            // can reissue, and returning from a callback is not evidence that
+            // anybody read the screen. Nothing has been claimed while this
+            // waits, so abandoning it costs nothing: the config still holds the
+            // root, and the panel offers the key again on the next load.
+            await this.plugin.pairFirst(
+              value,
+              device(),
+              async (key) => {
+                this.freshRecoveryKey = key;
                 this.render();
-              } catch (err) {
-                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
-              }
-            });
+                await this.writtenDown;
+              },
+              skipping(),
+            );
+            new Notice(
+              "Vault started. Basalt is connecting. Write down the recovery key shown in this panel.",
+            );
+            this.render();
+          } catch (err) {
+            new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+          }
         });
-      showDestination();
-    }
+    });
+    showDestination();
 
     docsLink(host.createEl("p", { cls: "basalt-advice" }), "How pairing works");
   }
@@ -4386,9 +4334,6 @@ class BasaltPanel {
     }
   }
 
-  /** Which pairing path the panel is showing, or the question if neither. */
-  private joining: "invite" | "first" | undefined;
-
   private joinDraft: { key: string; device: string } | undefined;
   private confirmMerge = false;
 
@@ -4405,7 +4350,6 @@ class BasaltPanel {
       await this.plugin.pair(key, device, mergeConfirmed, ignore);
       this.joinDraft = undefined;
       this.confirmMerge = false;
-      this.joining = undefined;
       new Notice("Paired. Basalt is connecting.");
       this.render();
     } catch (err) {
@@ -4417,21 +4361,6 @@ class BasaltPanel {
         new Notice(`Basalt: ${(err as Error).message}`, 10_000);
       }
     }
-  }
-
-  /**
-   * Back to the question, because a choice that cannot be unmade is one
-   * somebody has to be sure about before they know anything.
-   *
-   * On the same row as the action rather than a row of its own: two lone
-   * right-aligned buttons on two lines is what that looked like, which a
-   * screenshot said and no test could.
-   */
-  private chooseAgain(): void {
-    this.joining = undefined;
-    this.joinDraft = undefined;
-    this.confirmMerge = false;
-    this.render();
   }
 
   /** The recovery key of a vault this panel just started, shown once. */

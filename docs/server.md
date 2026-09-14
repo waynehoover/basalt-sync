@@ -145,7 +145,7 @@ wss://homelab.example.ts.net#TOKEN
 ```
 
 1. [Install the plugin](plugin.md#install) on your first device.
-2. Open Basalt, choose **Use a setup line**, paste the setup string, and press
+2. Open Basalt, paste the setup string into **Invite or setup line**, and press
    **Start a new vault**.
 3. Save the recovery key somewhere safe and separate, then press
    **I have written it down**.

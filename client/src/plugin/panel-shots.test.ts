@@ -67,7 +67,6 @@ afterAll(async () => {
 /** Every state the walk is expected to reach, in the order it reaches them. */
 const EXPECTED = [
   "unpaired",
-  "join",
   "config-unreadable",
   "join-confirm",
   "paired",
@@ -125,19 +124,17 @@ describe("the panel walk", () => {
     }
   });
 
-  it("asks a device with nothing which it is, and asks a broken one nothing", () => {
-    // The question, not a form. Both paths are named and neither field is
-    // drawn until one of them is chosen, because a screen holding both said
-    // nothing about which half was yours.
-    expect(of("unpaired")).toContain("Join an existing vault");
-    expect(of("unpaired")).toContain("Set up a new vault");
-    expect(of("unpaired")).toContain("Paste an invite");
-    expect(of("unpaired")).toContain("Use a setup line");
-    // And no fields yet: a field belongs to one of the two answers.
-    expect(of("unpaired")).not.toContain("Setup string");
-    expect(of("unpaired")).not.toContain("Invite or recovery key");
-    expect(prose("join")).not.toContain("First sync");
-    expect(prose("join")).toContain("Invite or recovery key");
+  it("gives a device with nothing one field, and a broken one none", () => {
+    // The form, immediately. This screen used to ask which kind of device this
+    // was before drawing anything, and the string being pasted already answers
+    // that, so the question was a screen for nothing.
+    expect(of("unpaired")).toContain("Invite or setup line");
+    expect(of("unpaired")).not.toContain("Join an existing vault");
+    expect(of("unpaired")).not.toContain("Set up a new vault");
+    expect(of("unpaired")).not.toContain("Use a setup line");
+    // The defaults are present and out of the way.
+    expect(of("unpaired")).toContain("More options");
+    expect(of("unpaired")).not.toContain("First sync");
     expect(prose("join-confirm")).toContain("Confirm merge");
     expect(prose("join-confirm")).toContain(
       "Files moved or deleted on another device may reappear",

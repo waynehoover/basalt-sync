@@ -57,19 +57,17 @@ it("updates an already open setup panel when another surface finishes pairing, w
   const plugin = await load();
   const tab = plugin.settingTabs[0]!;
   tab.display();
-  await button(tab.containerEl, "Paste an invite").click();
-  const field = rows(tab.containerEl).find((row) => row.name === "Invite or recovery key")!
-    .texts[0]!;
+  const field = rows(tab.containerEl).find((row) => row.name === "Invite or setup line")!.texts[0]!;
   field.type("a draft invite");
   state(plugin, { kind: "unpaired" });
-  expect(rows(tab.containerEl).find((row) => row.name === "Invite or recovery key")!.texts[0]).toBe(
+  expect(rows(tab.containerEl).find((row) => row.name === "Invite or setup line")!.texts[0]).toBe(
     field,
   );
   expect(field.getValue()).toBe("a draft invite");
   pair(plugin);
   state(plugin, { kind: "synced", summary: "Up to date", at: 1, refused: 0, waiting: 0 });
   expect(rows(tab.containerEl).map((row) => row.name)).toContain("Sync status");
-  expect(rows(tab.containerEl).map((row) => row.name)).not.toContain("Invite or recovery key");
+  expect(rows(tab.containerEl).map((row) => row.name)).not.toContain("Invite or setup line");
   tab.hide();
   expect((plugin as unknown as { listeners: Set<unknown> }).listeners.size).toBe(0);
 });
@@ -78,21 +76,17 @@ it("gives pairing inputs accessible names matching the visible labels", async ()
   const plugin = await load();
   const tab = plugin.settingTabs[0]!;
   tab.display();
-  await button(tab.containerEl, "Paste an invite").click();
-  for (const name of ["Device name", "Invite or recovery key"]) {
+  // One form, so both fields are here at once. "Device name" lives inside the
+  // collapsed More options, and a label inside a closed `details` is still a
+  // label: a screen reader reaches it by opening the disclosure, and it has to
+  // say the same thing there as it does on screen.
+  for (const name of ["Device name", "Invite or setup line"]) {
     expect(
       rows(tab.containerEl)
         .find((row) => row.name === name)!
         .texts[0]!.inputEl.getAttribute("aria-label"),
     ).toBe(name);
   }
-  await button(tab.containerEl, "Back").click();
-  await button(tab.containerEl, "Use a setup line").click();
-  expect(
-    rows(tab.containerEl)
-      .find((row) => row.name === "Setup string")!
-      .texts[0]!.inputEl.getAttribute("aria-label"),
-  ).toBe("Setup string");
   tab.hide();
 });
 
