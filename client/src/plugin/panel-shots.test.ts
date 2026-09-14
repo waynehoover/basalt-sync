@@ -271,9 +271,12 @@ describe("the panel walk", () => {
     // The recovery key is written down, and is not how a device is added.
     expect(prose("paired")).toMatch(/Not stored on this device/);
     expect(prose("fresh-recovery-key")).toMatch(/only way back if every device is lost/);
-    // And what a hop with nothing in front of it costs.
-    expect(prose("paired")).toMatch(/No TLS in front of this hop/);
-    expect(prose("paired")).toMatch(/credential and the note sizes are not/);
+    // And what a hop with nothing in front of it costs. Shortened once, and
+    // the wording is not the point: what may not go is that the notes are
+    // sealed anyway and the credential is not, which is the half somebody has
+    // to act on.
+    expect(prose("paired")).toMatch(/notes are still sealed, the device credential is not/);
+    expect(prose("paired")).toMatch(/the device credential is not/);
   });
 
   /**
