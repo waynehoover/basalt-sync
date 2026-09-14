@@ -160,6 +160,30 @@ Two figures were reported from this phone before these were fixed, 66% and
 had settled, the second from a single sample. Only the 38.1% above comes from
 settled passes with the overlay working.
 
+### Ten thousand notes on the phone was attempted and not obtained
+
+The figure the threshold is written against is fifty thousand. Ten thousand was
+the step toward it and it did not produce a number, so nothing here revises the
+share above.
+
+Seeding the phone with ten thousand notes took **543 seconds** over `adb push`
+of a tar, before Basalt was involved at all. The phone then had every file on
+disk and had to hash and reconcile them against the server on its first pass.
+After **thirty minutes** it had not finished and the harness gave up.
+
+That is not a measurement of Basalt, because the run is confounded: the phone
+entered `mWakefulness=Dozing` partway through, and a dozing phone is not
+syncing. The harness now holds the screen on and brings Obsidian forward, but
+the run was not repeated. What can be said is narrow: nothing establishes that
+a phone completes a first reconcile of ten thousand notes in a usable time, and
+the first pass at five hundred notes took 22.5 seconds, which extrapolates to
+about seven and a half minutes at ten thousand if it is linear. Whether it is
+linear is exactly what was not shown.
+
+So [open work](open-work.md) keeps its threshold unresolved. The decision it
+gates is still waiting on a phone number at fifty thousand notes, and the
+honest state is that this project has one Android data point, at five hundred.
+
 ### Listing is the biggest term, and half of it was avoidable
 
 The phase breakdown put listing at 47% of a quiet pass on a desktop at 50,000

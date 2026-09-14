@@ -121,3 +121,13 @@ loop; a save pass therefore cannot say whose time it was. A quiet pass has
 Basalt alone on the thread. If the quiet-pass shares and the desktop shares
 disagree, that disagreement goes in [research.md](research.md) and this rewrite
 does not start on the strength of it.
+
+**Where the measurement got to.** The harness exists, it works, and it has
+produced one Android data point: five hundred notes, where decide plus
+comparison is 38.1% of a quiet pass, below the threshold but at a size nobody
+claimed was decisive. Ten thousand was attempted and did not finish; the run is
+written up in [research.md](research.md#ten-thousand-notes-on-the-phone-was-attempted-and-not-obtained)
+along with why it cannot be read as a result. Fifty thousand has not been tried.
+
+So this stays declined, and the reason is unchanged rather than strengthened:
+there is still no phone number at the size the threshold names.

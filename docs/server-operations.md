@@ -220,6 +220,7 @@ just to make a refusal disappear.
 | A device stays behind | Check its connection and status; compare the positions shown on devices. |
 | Unrecognized device or invite | Review the device list and revoke or cancel it. |
 | Service repeatedly fails | Read `journalctl -u basalt`. After fixing the cause, use `systemctl reset-failed basalt` if required. |
+| `batch commit failed` in the log | The server refused a device's work and the device will keep retrying. On 0.8.4 this could repeat forever; 0.8.5 falls back to committing one entry at a time and logs `batch commit failed, committing one at a time` instead. Either line means something is wrong with the store: check disk space and permissions on the data directory. |
 
 Use `basaltd stats -json` for storage automation. Check `reclaimComplete` before
 using the reclaim estimates; a partial scan cannot give a reliable total.
