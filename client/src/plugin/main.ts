@@ -5095,17 +5095,25 @@ export function describeConnection(at: Connection): string {
 /**
  * Whether the connection is protected, in one line.
  *
- * Shown in the connection details, which is a place somebody has gone looking
- * for a fact rather than for an explanation. It used to spend three sentences
- * here on what encryption does and does not cover and where to read more,
- * which is a lecture attached to a status line; the guide is one tap away
- * under the documentation link at the bottom of the same panel.
+ * Shown in the connection details, which is somewhere somebody has gone
+ * looking for a fact rather than for an explanation. It used to spend three
+ * sentences here on what encryption covers and where to read more, in a panel
+ * whose last row is a link to that guide.
  *
- * Nothing is hidden by shortening it. "Not encrypted" is the actionable half
- * and it is still the first thing said.
+ * Shorter, not smaller. `panel-shots.test.ts` guards this line as one of four
+ * things "paid for in incidents", and it is right to: the fact worth having is
+ * not that TLS is missing, it is that the notes are sealed anyway and the
+ * credential is not. Cutting to "this connection is not encrypted" reads as
+ * though the notes were exposed, which is both wrong and more alarming than
+ * the truth. So the clause stays and the lecture goes.
+ *
+ * Nothing at all when the hop is protected: explaining TLS to somebody who
+ * already has it is the same lecture with a happier ending.
  */
 export function connectionDetail(at: Connection): string {
-  return at.url.startsWith("wss://") ? "" : "This connection is not encrypted.";
+  return at.url.startsWith("wss://")
+    ? ""
+    : "No TLS on this hop: your notes are still sealed, the device credential is not.";
 }
 
 /** A fragment placed where a sentence starts. A leading digit is left alone. */

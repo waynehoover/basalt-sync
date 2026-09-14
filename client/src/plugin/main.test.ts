@@ -4381,8 +4381,8 @@ describe("what the panel knows and used to keep to itself", () => {
     expect(shown).toContain(`Protocol ${PROTO}, basaltd ${to.server!.version}.`);
     expect(shown).not.toContain("Not connected");
     // An unencrypted connection shows its warning in the server details.
-    expect(panelText()).toMatch(/No TLS in front of this hop/);
-    expect(panelText()).toMatch(/credential and the note sizes are not/);
+    expect(panelText()).toMatch(/notes are still sealed, the device credential is not/);
+    expect(panelText()).toMatch(/the device credential is not/);
   }, 300_000);
 
   it("says the protocol and the build are unknown rather than leaving a gap", () => {
@@ -4406,8 +4406,8 @@ describe("what the panel knows and used to keep to itself", () => {
     // spend three sentences on what encryption covers and where to read more,
     // in a panel whose last row is a link to that guide.
     expect(connectionDetail({ url: "wss://homelab.tailnet.ts.net" })).toBe("");
-    expect(connectionDetail({ url: "ws://192.168.1.20:3003" })).toBe(
-      "This connection is not encrypted.",
+    expect(connectionDetail({ url: "ws://192.168.1.20:3003" })).toMatch(
+      /notes are still sealed, the device credential is not/,
     );
   });
 });
