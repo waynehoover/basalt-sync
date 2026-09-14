@@ -101,6 +101,65 @@ Three things these say, and one they do not.
   are written against Android numbers, and the term that dominates here is the
   one most likely to behave differently there.
 
+### First Android numbers, at 500 notes
+
+`bun run bench:android`, Pixel 9 Pro XL, Android 17, Obsidian 1.13.8, plugin
+built at `2b3d611` with pass timing on. A disposable `basaltd` on a laptop,
+reached over `adb reverse` on the phone's own loopback; the live server was
+never involved. A separate `Bench` vault, seeded with the same corpus
+`bench-pass` uses, so these files and the desktop rows above are byte for byte
+the same notes.
+
+Five hundred notes is a shakeout, not the measurement. It is recorded because
+it is the first Android data this project has, and because getting it exposed
+five defects in the harness that would have quietly corrupted a larger run.
+
+| 500 notes, quiet pass | ms |
+|---|---:|
+| total | 33.5 |
+| list | 17.8 |
+| decide | 6.6 |
+| save | 7.0 |
+| of which journal compare | 5.2 |
+
+decide plus compare is **38.1%** of a quiet pass. The threshold in
+[open work](open-work.md) is half, at fifty thousand notes; on the desktop the
+share grew from 40% at ten thousand to 48% at fifty thousand, so the figure
+that decides anything is still unmeasured.
+
+Save to verified content on a peer, over five samples: **p50 368 ms, p95
+791 ms**. Both timestamps are taken on the laptop, and a sample completes only
+when a fresh read of the peer's own file matches the exact bytes; a pass
+report or an applied cursor does not end it.
+
+The first pass after pairing, which reconciles every file against the server,
+took **22.5 seconds** at five hundred notes. It is excluded from the quiet
+figures above and is its own cost.
+
+**What went wrong getting these, because it bears on how much to trust them.**
+Every defect was in reading the measurements, not in taking them:
+
+- The line held a reference to the filesystem collector and cleared it before
+  serialising, so every `filesystemMs` was `{}`.
+- The harness read the compare time from the engine's field, which is always
+  zero because the engine cannot see inside the store. The number was in the
+  journal's own record throughout.
+- Each timed sample checked that Obsidian was in the foreground *before*
+  sending the URI that brings Obsidian to the foreground, so every sample of
+  one run was skipped.
+- The `&` in that URI reached the phone's shell unquoted and split the command
+  into three. `adb shell` is a second shell, which is the case CLAUDE.md's rule
+  about inlining payloads exists for.
+- The collection window read the log after three and a half minutes in which
+  the phone had been asleep. Android suspends a backgrounded WebView and
+  Basalt does not sync there, so the window gathered nothing. The harness now
+  brings Obsidian forward first and reads the whole log at the end.
+
+Two figures were reported from this phone before these were fixed, 66% and
+29%, and neither is sound: the first came from passes taken before the vault
+had settled, the second from a single sample. Only the 38.1% above comes from
+settled passes with the overlay working.
+
 ## What a pass costs at 0.8.4
 
 `bun run bench:pass`, 4,000 notes, bun 1.4.2, Apple M4 Pro, two samples of the
