@@ -538,7 +538,7 @@ export class ObsidianVault implements Vault {
     for (const item of items) {
       const raw = trimLeadingSlash(item.path);
       if (raw === "" || raw === "/") continue; // the vault root itself
-      const path = normalizePath(raw);
+      const path = this.normalOf(raw);
       if (this.ignored(path)) continue;
       const group = byPath.get(path);
       if (group) group.push({ raw, item });
@@ -547,6 +547,24 @@ export class ObsidianVault implements Vault {
 
     const out: FileStat[] = [];
     for (const [path, group] of byPath) {
+      // The single-spelling case does not build anything.
+      //
+      // Every path used to get a Set, a mapped array and a sort to find out
+      // whether two names in the index claim it. Two do for approximately no
+      // paths in any real vault, and this runs for all of them on every pass:
+      // listing is about half of a quiet pass on both a laptop and a phone,
+      // and this was a measurable part of it.
+      if (group.length === 1) {
+        const { raw, item } = group[0]!;
+        if (path !== raw) this.actualName.set(path, raw);
+        const only = statOf(item);
+        out.push(
+          only === undefined
+            ? { path, folder: true, mtime: 0, ctime: 0, size: 0 }
+            : { path, folder: false, mtime: only.mtime, ctime: only.ctime, size: only.size },
+        );
+        continue;
+      }
       const spellings = [...new Set(group.map((g) => g.raw))].sort();
       if (spellings.length > 1) {
         // Left out of the listing and reported separately, never silently
@@ -582,6 +600,9 @@ export class ObsidianVault implements Vault {
     // ledger only, unlike the headless client: Obsidian's index does not list
     // a hidden folder, so there is nothing here to walk for and the record is
     // the whole answer.
+    // Kept to roughly what the vault holds. See `normalOf`.
+    if (this.normalised.size > items.length * 2) this.normalised.clear();
+
     const inventory = await this.ledger.inventory();
     this.displaced = inventory.waiting;
     this.recovery = inventory;
@@ -709,6 +730,29 @@ export class ObsidianVault implements Vault {
   private ignored(path: string): boolean {
     return isNeverSynced(path, this.ignore);
   }
+
+  /**
+   * `normalizePath`, remembered.
+   *
+   * It is a pure function of the string and it is asked about every file in
+   * the vault on every pass, and it normalises to NFC, which is not cheap.
+   * The same few thousand names are asked about over and over, so the answer
+   * is kept.
+   *
+   * Bounded against the listing that is being built: a vault that churns
+   * through names would otherwise keep an answer for each of them for the
+   * life of the process. Nothing here can go stale, because nothing about a
+   * string changes.
+   */
+  private normalOf(raw: string): string {
+    const known = this.normalised.get(raw);
+    if (known !== undefined) return known;
+    const path = normalizePath(raw);
+    this.normalised.set(raw, path);
+    return path;
+  }
+
+  private readonly normalised = new Map<string, string>();
 
   async read(path: string): Promise<Uint8Array> {
     return new Uint8Array(await this.adapter.readBinary(this.resolve(path)));

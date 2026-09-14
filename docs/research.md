@@ -160,6 +160,36 @@ Two figures were reported from this phone before these were fixed, 66% and
 had settled, the second from a single sample. Only the 38.1% above comes from
 settled passes with the overlay working.
 
+### Listing is the biggest term, and half of it was avoidable
+
+The phase breakdown put listing at 47% of a quiet pass on a desktop at 50,000
+notes and 53% on a phone at 500. That was not the expected answer: the
+proposal in [open work](open-work.md) attacks reconciliation, which is the
+second biggest.
+
+The plugin's `list()` reads Obsidian's own index rather than walking a
+directory, so its cost is per item and can be measured without a phone.
+`BENCH_LIST=1 bunx vitest run src/plugin/list-bench.test.ts`, bun 1.4.2,
+Apple M4 Pro, median of nine after two warm-ups, against a `FakeVaultIndex`:
+
+| plugin `list()` | before | after |
+|---|---:|---:|
+| 10,000 notes | 7.8 ms | 6.7 ms |
+| 50,000 notes | 37.9 ms | 21.1 ms |
+
+Two changes, both of which leave the output identical:
+
+- Every path was given a `Set`, a mapped array and a sort, to decide whether
+  two names in the index claimed it. Two claim approximately none of them in
+  any real vault, and the single-spelling case now allocates nothing.
+- `normalizePath` normalises to NFC and was called for every file on every
+  pass. It is a pure function of the string and the same names recur, so the
+  answer is kept, bounded against the listing it serves.
+
+This is a laptop's JavaScript engine, not a phone's, so the absolute figures
+do not transfer. The proportion should: the work removed is allocation and
+Unicode normalisation, and neither gets cheaper on a phone.
+
 ## What a pass costs at 0.8.4
 
 `bun run bench:pass`, 4,000 notes, bun 1.4.2, Apple M4 Pro, two samples of the

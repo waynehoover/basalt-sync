@@ -65,8 +65,8 @@ const PLUGIN_DIR = `${VAULT_DIR}/.obsidian/plugins/basalt-sync`;
 const TIMING_LOG = `${PLUGIN_DIR}/pass-timings.ndjson`;
 const SIZES = (process.env["BENCH_SIZES"] ?? "10000").split(",").map(Number);
 const SAMPLES = Number(process.env["BENCH_SAMPLES"] ?? 15);
-/** How long the first sync is given before anything is measured. */
-const SETTLE_MS = Number(process.env["BENCH_SETTLE_MS"] ?? 150_000);
+/** How long the first sync is allowed before this gives up on it. */
+const SETTLE_MS = Number(process.env["BENCH_SETTLE_MS"] ?? 30 * 60_000);
 /** How long quiet passes are gathered for. The ticker fires every 30 s. */
 const COLLECT_MS = Number(process.env["BENCH_COLLECT_MS"] ?? 210_000);
 
@@ -301,8 +301,23 @@ async function atSize(size: number): Promise<void> {
     // which at 500 notes was 22 seconds: a real cost, and not a quiet pass.
     // Letting it finish and *then* clearing the log keeps it out of the
     // sample rather than sitting in the middle of it.
-    console.log("  letting the first sync finish...");
-    await new Promise((r) => setTimeout(r, SETTLE_MS));
+    // Waited for, not timed out. The first pass reconciles every file against
+    // the server and took 22.5 seconds at five hundred notes, so any fixed
+    // sleep is a guess that is far too long at one size and far too short at
+    // the next. The phone reports the cursor it has applied, and that reaching
+    // the server's is the thing "settled" actually means.
+    console.log("  letting the first sync finish (waiting for the phone to catch up)...");
+    const settleFrom = performance.now();
+    await waitFor(
+      "the phone to apply everything the server has",
+      async () => {
+        const rows = await peer.devices();
+        const phone = rows.devices.find((d) => d.name !== "peer");
+        return phone !== undefined && (phone.applied ?? -1) >= peer.serverCursor;
+      },
+      SETTLE_MS,
+    );
+    console.log(`    first sync done in ${((performance.now() - settleFrom) / 1000).toFixed(0)} s`);
     await adb("shell", "rm", "-f", TIMING_LOG);
     await adb("shell", "touch", TIMING_LOG);
     // Obsidian in front, or there are no passes to collect.
