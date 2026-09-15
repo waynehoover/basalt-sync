@@ -115,6 +115,70 @@ it("edits two daily tasks over stdio while keeping unrelated bytes and the backu
   expect(await readFile(join(phone, edited.beforeImage), "utf8")).toBe(original);
 }, 30000);
 
+it("resolves case aliases over stdio only when the filesystem does", async () => {
+  const { dir } = await paired();
+  await mkdir(join(dir, "work"));
+  await writeFile(join(dir, "work/note.md"), "keep the existing note");
+  const foldsCase = await readFile(join(dir, "Work/note.md")).then(
+    () => true,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return false;
+    },
+  );
+  const { client } = await host(dir);
+  await ready(client);
+  const read = await tool(client, "read_note", { path: "Work/note.md" });
+  if (foldsCase) {
+    expect(read).toMatchObject({ path: "work/note.md", content: "keep the existing note" });
+  } else {
+    expect.soft(read.error?.code).toBe("not_found_local");
+  }
+  const created = await tool(client, "create_note", {
+    path: "Work/new.md",
+    content: "new note in the requested folder",
+  });
+  expect(created.applied).toBe(true);
+  expect(created.path).toBe(foldsCase ? "work/new.md" : "Work/new.md");
+  expect(await readFile(join(dir, "Work/new.md"), "utf8")).toBe("new note in the requested folder");
+  if (!foldsCase)
+    await expect(readFile(join(dir, "work/new.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await readFile(join(dir, "work/note.md"), "utf8")).toBe("keep the existing note");
+});
+
+it("reads and edits both case-distinct notes over stdio without touching the other", async (ctx) => {
+  const { dir } = await paired();
+  await writeFile(join(dir, "Foo.md"), "upper note original");
+  try {
+    await writeFile(join(dir, "foo.md"), "lower note original", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    ctx.skip();
+  }
+  const { client } = await host(dir);
+  await ready(client);
+  const listed = await tool(client, "list_notes");
+  expect(listed.ambiguousCount).toBe(0);
+  expect(listed.entries.map((entry: { path: string }) => entry.path)).toEqual(["Foo.md", "foo.md"]);
+  for (const [path, original] of [
+    ["Foo.md", "upper note original"],
+    ["foo.md", "lower note original"],
+  ] as const) {
+    const read = await tool(client, "read_note", { path });
+    expect(read.content).toBe(original);
+    const edited = await tool(client, "edit_note", {
+      path,
+      base: read.base,
+      edits: [{ old: "original", new: "edited" }],
+    });
+    expect(edited.applied).toBe(true);
+    expect(await readFile(join(dir, edited.beforeImage), "utf8")).toBe(original);
+    expect(await readFile(join(dir, path), "utf8")).toBe(original.replace("original", "edited"));
+    if (path === "Foo.md")
+      expect(await readFile(join(dir, "foo.md"), "utf8")).toBe("lower note original");
+  }
+});
+
 it("initializes and reads 5000 notes while the sync handshake is stalled, with bounded pages and eight concurrent calls", async () => {
   const { dir } = await paired();
   const accepted = deferred<void>();

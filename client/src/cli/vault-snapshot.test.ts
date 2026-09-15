@@ -97,6 +97,7 @@ describe("a model-addressable snapshot", () => {
   });
 
   it.each([
+    ["Private", "private"],
     ["ς", "Σ"],
     ["ſ", "s"],
     ["ﬀ", "ff"],
@@ -104,6 +105,7 @@ describe("a model-addressable snapshot", () => {
   ])("conservatively excludes %s physically filed as %s", async (configured, actual) => {
     await note(`${actual}/note.md`, "excluded on a folding filesystem");
     const vault = new NodeVault(root, { configDir: configured });
+    await vault.probeCase();
     const before = await inventory();
     await expect(vault.readSnapshot(`${actual}/note.md`, 1024)).rejects.toThrow(/excluded/);
     await expect(vault.checkPath(`${actual}/new.md`, { allowMissing: true })).rejects.toThrow(
