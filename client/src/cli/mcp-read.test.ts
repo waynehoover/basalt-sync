@@ -23,6 +23,9 @@ vi.mock("node:fs/promises", async (original) => {
 let root: string;
 let reader: McpReader;
 const enc = new TextEncoder();
+// APFS cannot hold both Unicode spellings. This seam leaves real files and
+// real enumeration in place while allowing the same collision on macOS.
+const normalForm = (name: string): string => name.normalize("NFC").replaceAll("~", "");
 beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), "basalt-mcp-read-")));
   reader = new McpReader(new NodeVault(root, { observeOnly: true }));
@@ -288,4 +291,86 @@ it("allows inspecting a text drawing without authorizing its mutation", async ()
   const drawing = "---\nexcalidraw-plugin: parsed\n---\n# Drawing\n";
   await put("sketch.excalidraw.md", drawing);
   expect((await reader.read({ path: "sketch.excalidraw.md" })).content).toBe(drawing);
+});
+
+it("reports ambiguous notes omitted by the inventory as an incomplete search", async () => {
+  reader = new McpReader(new NodeVault(root, { observeOnly: true, normalForm }));
+  await put("cafe.md", "needle in the first spelling");
+  await put("cafe~.md", "needle in the second spelling");
+  expect((await reader.list({})).ambiguousCount).toBe(1);
+  const result = await reader.search({ query: "needle" });
+  expect(result).toMatchObject({
+    matches: [],
+    scanned: 0,
+    complete: false,
+    nextCursor: null,
+    skipped: { count: 1, items: [{ path: "cafe.md", why: "ambiguous_path" }], truncated: false },
+  });
+  expect(await readFile(join(root, "cafe.md"), "utf8")).toBe("needle in the first spelling");
+  expect(await readFile(join(root, "cafe~.md"), "utf8")).toBe("needle in the second spelling");
+});
+it.each(["folder", "folder.pdf", "folder (MCP backup 20260915T120000Z abcdef0123456789).md"])(
+  "reports an ambiguous subtree even when its name %s resembles an omitted file",
+  async (folder) => {
+    reader = new McpReader(new NodeVault(root, { observeOnly: true, normalForm }));
+    await put(`${folder}/note.md`, "needle in the first folder");
+    await put(`${folder}~/note.md`, "needle in the second folder");
+    const result = await reader.search({ query: "needle" });
+    expect(result).toMatchObject({
+      matches: [],
+      scanned: 0,
+      complete: false,
+      nextCursor: null,
+      skipped: { count: 1, items: [{ path: folder, why: "ambiguous_path" }] },
+    });
+  },
+);
+it("keeps ambiguity outside the search folder and excluded paths out of coverage", async () => {
+  reader = new McpReader(
+    new NodeVault(root, { observeOnly: true, normalForm, configDir: "Private" }),
+  );
+  await put("Daily/note.md", "needle");
+  await put("Daily/note (MCP backup 20260915T120000Z abcdef0123456789).md", "needle in backup");
+  await put("Daily/Private/secret.md", "needle in excluded state");
+  await put("Daily/Private/secret~.md", "needle in excluded state");
+  await put("Dailyish/cafe.md", "needle outside the folder");
+  await put("Dailyish/cafe~.md", "needle outside the folder");
+  const result = await reader.search({ query: "needle", folder: "Daily" });
+  expect(result.matches.map((row) => row.path)).toEqual(["Daily/note.md"]);
+  expect(result.skipped.count).toBe(0);
+  expect(result.omitted.backups).toBe(1);
+  expect(result.complete).toBe(true);
+});
+it("keeps an ambiguous omission visible on every continuation page", async () => {
+  reader = new McpReader(new NodeVault(root, { observeOnly: true, normalForm }));
+  await put("a.md", "unsearchable needle");
+  await put("a~.md", "another unsearchable needle");
+  await put("z.md", "needle needle");
+  const first = await reader.search({ query: "needle", limit: 1 });
+  expect(first.nextCursor).not.toBeNull();
+  expect(first.matches[0]?.column).toBe(1);
+  expect(first.skipped.count).toBe(1);
+  const last = await reader.search({ query: "needle", limit: 1, cursor: first.nextCursor! });
+  expect(last.matches[0]?.column).toBe(8);
+  expect(last.nextCursor).toBeNull();
+  expect(last.complete).toBe(false);
+  expect(last.skipped).toMatchObject({
+    count: 1,
+    items: [{ path: "a.md", why: "ambiguous_path" }],
+  });
+});
+it("bounds ambiguity samples while retaining the total alongside failed reads", async () => {
+  reader = new McpReader(new NodeVault(root, { observeOnly: true, normalForm }));
+  for (let i = 0; i < 21; i++) {
+    await put(`note-${i}.md`, "needle in the first spelling");
+    await put(`note-${i}~.md`, "needle in the second spelling");
+  }
+  await writeFile(join(root, "bad.md"), Buffer.from([0xff]));
+  const result = await reader.search({ query: "needle" });
+  expect(result.skipped.count).toBe(22);
+  expect(result.skipped.items).toHaveLength(20);
+  expect(result.skipped.items.every((entry) => entry.why === "ambiguous_path")).toBe(true);
+  expect(result.skipped.truncated).toBe(true);
+  expect(result.complete).toBe(false);
+  expect(result.scanned).toBe(1);
 });

@@ -185,6 +185,16 @@ export class McpReader {
       })
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
+  private ambiguous(folder: string) {
+    return this.vault.ambiguous().filter((entry) => {
+      try {
+        this.vault.assertPathPolicy(entry.path);
+      } catch {
+        return false;
+      }
+      return inFolder(entry.path, folder);
+    });
+  }
   read(input: ReadNoteInput, signal?: AbortSignal) {
     return this.run(async () => {
       noteFormat(input.path);
@@ -246,14 +256,7 @@ export class McpReader {
         entries.push(entry);
         used += size;
       }
-      const ambiguous = this.vault.ambiguous().filter((entry) => {
-        try {
-          this.vault.assertPathPolicy(entry.path);
-        } catch {
-          return false;
-        }
-        return inFolder(entry.path, folder);
-      });
+      const ambiguous = this.ambiguous(folder);
       const last = entries.at(-1);
       return {
         entries,
@@ -321,6 +324,15 @@ export class McpReader {
       }[] = [];
       const skipped: { count: number; items: { path: string; why: string }[]; truncated: boolean } =
         { count: 0, items: [], truncated: false };
+      const skip = (path: string, why: string): void => {
+        skipped.count++;
+        if (skipped.items.length < 20) skipped.items.push({ path: clip(path), why });
+        else skipped.truncated = true;
+      };
+      // The inventory omits ambiguous paths, including whole subtrees. A
+      // suffix cannot prove they held only attachments or backups. Report
+      // them on every page so the last page cannot silently claim coverage.
+      for (const entry of this.ambiguous(folder)) skip(entry.path, "ambiguous_path");
       let scanned = 0;
       let scannedBytes = 0;
       let outputBytes = 0;
@@ -340,10 +352,7 @@ export class McpReader {
           source = noteText(snapshot.bytes);
           scannedBytes += snapshot.size;
         } catch (error) {
-          skipped.count++;
-          if (skipped.items.length < 20)
-            skipped.items.push({ path: clip(file.path), why: noteFailure(error).code });
-          else skipped.truncated = true;
+          skip(file.path, noteFailure(error).code);
           last = { path: file.path, line: Number.MAX_SAFE_INTEGER, column: 0 };
           continue;
         }
