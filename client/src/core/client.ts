@@ -172,6 +172,25 @@ export interface ClientOptions {
  */
 export const SYNC_EVENT_DELAY_MS = 0;
 
+export interface LocalMutationContext {
+  readonly vault: Vault;
+  changed(path: string): void;
+}
+
+export interface LocalMutationControl {
+  readonly signal?: AbortSignal;
+  readonly waitMs?: number;
+}
+
+export class LocalMutationError extends Error {
+  constructor(
+    readonly code: "busy" | "cancelled" | "read_only" | "not_ready" | "stopping",
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 /** One connection, from hello to close. */
 export class Client {
   readonly engine: Engine;
@@ -364,6 +383,123 @@ export class Client {
     return next;
   }
 
+  private initiallySettled = false;
+  private pendingMutations = 0;
+  private readonly cancelMutations = new Set<() => void>();
+
+  get writeReady(): boolean {
+    return (
+      this.initiallySettled &&
+      this.limits !== undefined &&
+      !this.closing &&
+      !this.endedWith &&
+      !this.transport.isClosed &&
+      !this.opts.inspect &&
+      !this.opts.readOnly
+    );
+  }
+
+  /**
+   * An agent's base must be checked after the pass ahead of it finishes. An
+   * offline callback also races the old client's drain during reconnect, so
+   * only a settled connection may admit work.
+   */
+  mutateLocal<T>(
+    work: (context: LocalMutationContext) => Promise<T>,
+    control: LocalMutationControl = {},
+  ): Promise<T> {
+    const waitMs = control.waitMs ?? 5000;
+    if (
+      !Number.isSafeInteger(waitMs) ||
+      waitMs < 0 ||
+      waitMs > 5000 ||
+      this.pendingMutations >= 16
+    ) {
+      return Promise.reject(new LocalMutationError("busy", "the local mutation queue is full"));
+    }
+    this.pendingMutations++;
+    const deadline = Date.now() + waitMs;
+    const touched = new Set<string>();
+    let started = false;
+    let expired: LocalMutationError | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let yes!: (value: T) => void;
+    let no!: (error: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+      yes = resolve;
+      no = reject;
+    });
+    const dispose = (): void => {
+      clearTimeout(timer);
+      control.signal?.removeEventListener("abort", cancelled);
+      this.cancelMutations.delete(stopped);
+    };
+    const expire = (error: LocalMutationError): void => {
+      if (started || expired) return;
+      expired = error;
+      dispose();
+      no(error);
+    };
+    const cancelled = (): void =>
+      expire(new LocalMutationError("cancelled", "cancelled before the local write started"));
+    const stopped = (): void =>
+      expire(new LocalMutationError("stopping", "the client is stopping"));
+    this.cancelMutations.add(stopped);
+    control.signal?.addEventListener("abort", cancelled, { once: true });
+    if (control.signal?.aborted) cancelled();
+    if (!expired)
+      timer = setTimeout(
+        () =>
+          expire(
+            new LocalMutationError(
+              "busy",
+              "the local write did not start before its queue deadline",
+            ),
+          ),
+        waitMs,
+      );
+
+    const slot = this.serial(async () => {
+      if (expired) throw expired;
+      if (this.closing) throw new LocalMutationError("stopping", "the client is stopping");
+      if (this.opts.inspect || this.opts.readOnly)
+        throw new LocalMutationError("read_only", "this client does not permit local agent writes");
+      if (!this.writeReady)
+        throw new LocalMutationError(
+          "not_ready",
+          "wait for the initial sync and a live connection before editing",
+        );
+      if (control.signal?.aborted)
+        throw new LocalMutationError("cancelled", "cancelled before the local write started");
+      if (Date.now() >= deadline)
+        throw new LocalMutationError(
+          "busy",
+          "the local write did not start before its queue deadline",
+        );
+      started = true;
+      dispose();
+      try {
+        return await work({
+          vault: this.opts.vault,
+          changed: (path) => {
+            touched.add(path);
+          },
+        });
+      } finally {
+        for (const path of touched) this.noteChanged(path);
+      }
+    });
+    // Expiry answers promptly but keeps its admission until the skipped slot
+    // drains. Otherwise a stalled upload can accumulate unlimited dead jobs.
+    void slot.then(yes, no).finally(() => {
+      dispose();
+      this.pendingMutations--;
+      if (touched.size > 0 && !this.closing && !this.endedWith && !this.transport.isClosed)
+        void this.sync();
+    });
+    return result;
+  }
+
   /**
    * The newest uid the server is known to hold: what `ready` announced at
    * hello, raised by every batch since, because a batch is the server
@@ -483,6 +619,7 @@ export class Client {
       pass = await this.pass(opts);
       total = combinePasses(total, pass);
     }
+    this.initiallySettled = true;
     return total;
   }
 
@@ -1189,6 +1326,7 @@ export class Client {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const cancel of this.cancelMutations) cancel();
     this.clearUploadTimer();
     // Or a pass fires against a closed transport after the caller has
     // finished with this client, which in a test is a leak and in a plugin
