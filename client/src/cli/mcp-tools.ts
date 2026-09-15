@@ -1,6 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { LocalMutationError, type Client } from "../core/client.ts";
+import { McpHistory, type PreviewInput } from "./mcp-history.ts";
 import { type McpReader } from "./mcp-read.ts";
 import {
   INPUT_BYTES,
@@ -9,6 +10,8 @@ import {
   NoteError,
   mutateNote,
   noteFailure,
+  noteFormat,
+  noteText,
   type NoteMutation,
 } from "./mcp-notes.ts";
 import { TrackedMcpServer, MCP_REPLY_BYTES } from "./mcp-protocol.ts";
@@ -24,10 +27,12 @@ const text = (bytes: number) =>
     );
 const path = text(4096).min(1);
 const base = z.string().regex(/^[a-f0-9]{64}$/u);
+const uid = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const limit = (max: number) => z.number().int().min(1).max(max);
 const readSchema = z
   .object({
     path,
+    uid: uid.optional(),
     startLine: limit(Number.MAX_SAFE_INTEGER).optional(),
     maxLines: limit(1000).optional(),
     base: base.optional(),
@@ -74,6 +79,23 @@ const editSchema = z
 const appendSchema = z.object({ path, base, text: text(INPUT_BYTES).min(1) }).strict();
 const createSchema = z.object({ path, content: text(NOTE_BYTES) }).strict();
 
+const historySchema = z
+  .object({ path, before: uid.optional(), limit: limit(100).optional() })
+  .strict();
+const deletedSchema = z.object({ before: uid.optional(), limit: limit(200).optional() }).strict();
+const restoreSchema = z.object({ path, uid, to: path }).strict();
+const statusSchema = z
+  .object({
+    preview: z.boolean().optional(),
+    after: text(8192).optional(),
+    limit: limit(500).optional(),
+  })
+  .strict()
+  .refine(
+    (input) => input.preview || (input.after === undefined && input.limit === undefined),
+    "after and limit require preview:true",
+  );
+
 export interface McpSession {
   readonly mode: "read-only" | "writable";
   readonly reader: McpReader;
@@ -107,6 +129,7 @@ export function toolFailure(error: unknown): { code: string; message: string } {
 
 export function createTools(session: McpSession, version: string) {
   const server = new TrackedMcpServer({ name: "basalt", version });
+  const history = new McpHistory(session.reader, () => session.client());
   const pending = new Set<Promise<CallToolResult>>();
   function call(work: () => Promise<object>): Promise<CallToolResult> {
     const running = (async () => {
@@ -146,13 +169,15 @@ export function createTools(session: McpSession, version: string) {
     "read_note",
     {
       description:
-        "Read a local note page and its complete SHA-256 base. Pin base when reading later pages.",
+        "Read a local or authenticated historical note page with its complete SHA-256 base. Pin base for later pages; a historical base is not a current-version assertion.",
       inputSchema: readSchema,
       annotations: readAnnotations,
     },
     (input, ctx) =>
       call(async () => ({
-        ...(await session.reader.read(input, ctx.mcpReq.signal)),
+        ...(input.uid === undefined
+          ? await session.reader.read(input, ctx.mcpReq.signal)
+          : await history.read({ ...input, uid: input.uid }, ctx.mcpReq.signal)),
         connection: session.summary(),
       })),
   );
@@ -175,18 +200,55 @@ export function createTools(session: McpSession, version: string) {
     {
       description:
         "Observe connection, readiness, last sync pass and recoverable versions. This is not an upload receipt.",
-      inputSchema: z.object({}).strict(),
+      inputSchema: statusSchema,
       annotations: readAnnotations,
     },
-    () => call(() => session.status()),
+    (input, ctx) =>
+      call(async () => {
+        const status = await session.status();
+        if (!input.preview) return status;
+        try {
+          return {
+            ...status,
+            preview: await history.preview(input as PreviewInput, ctx.mcpReq.signal),
+          };
+        } catch (error) {
+          return { ...status, previewError: toolFailure(error) };
+        }
+      }),
   );
 
-  async function mutation(request: NoteMutation, signal: AbortSignal): Promise<object> {
+  server.registerTool(
+    "note_history",
+    {
+      description:
+        "List authenticated versions of one note, newest first. Device names are reported labels, not proof of authorship.",
+      inputSchema: historySchema,
+      annotations: readAnnotations,
+    },
+    (input, ctx) => call(() => history.history(input, ctx.mcpReq.signal)),
+  );
+  server.registerTool(
+    "deleted_notes",
+    {
+      description:
+        "List deleted notes still known to the server. Zero restorable versions means no content remains. Follow nextBefore even when policy filters a page.",
+      inputSchema: deletedSchema,
+      annotations: readAnnotations,
+    },
+    (input, ctx) => call(() => history.deleted(input, ctx.mcpReq.signal)),
+  );
+
+  async function mutation(
+    request: NoteMutation,
+    signal: AbortSignal,
+    captured?: Client,
+  ): Promise<object> {
     let admitted = false;
     try {
       if (session.mode !== "writable")
         throw new NoteError("read_only", "this process cannot change notes");
-      const client = session.client();
+      const client = captured ?? session.client();
       if (!client?.writeReady)
         throw new NoteError(
           "not_ready",
@@ -244,7 +306,7 @@ export function createTools(session: McpSession, version: string) {
         description:
           "Append exact text to an existing note with its required base, preserving a before-image. No separator is added. On uncertain outcome, inspect before retrying.",
         inputSchema: appendSchema,
-        annotations,
+        annotations: { ...annotations, destructiveHint: false },
       },
       (input, ctx) => call(() => mutation({ kind: "append", ...input }, ctx.mcpReq.signal)),
     );
@@ -254,11 +316,66 @@ export function createTools(session: McpSession, version: string) {
         description:
           "Create a new Markdown or text note only at an unoccupied path. Never replaces a note.",
         inputSchema: createSchema,
-        annotations,
+        annotations: { ...annotations, destructiveHint: false },
       },
       (input, ctx) => call(() => mutation({ kind: "create", ...input }, ctx.mcpReq.signal)),
     );
   }
+  if (session.mode === "writable") {
+    server.registerTool(
+      "restore_note",
+      {
+        description:
+          "Restore a previously inspected server version to a distinct, explicitly chosen free path. Never overwrites or invents a second destination on retry.",
+        inputSchema: restoreSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      (input, ctx) =>
+        call(async () => {
+          try {
+            if (session.mode !== "writable" || session.stopping())
+              throw new NoteError("read_only", "this process cannot restore notes");
+            const client = session.client();
+            if (!client?.writeReady)
+              throw new NoteError(
+                "not_ready",
+                "wait for a settled live connection before restoring",
+              );
+            noteFormat(input.to, true);
+            const source = await history.path(input.path, ctx.mcpReq.signal);
+            const destination = await session.reader.run(
+              () => session.reader.vault.checkPath(input.to, { allowMissing: true }),
+              ctx.mcpReq.signal,
+            );
+            if (
+              session.reader.vault.canonical(source) ===
+              session.reader.vault.canonical(destination.path)
+            )
+              throw new NoteError(
+                "same_destination",
+                "restore to a different path so the original stays available",
+              );
+            if (destination.exists)
+              throw new NoteError("exists", "the restore destination is already occupied");
+            const content = await history.content(source, input.uid, ctx.mcpReq.signal, client);
+            const result = await mutation(
+              { kind: "create", path: destination.path, content: noteText(content.bytes) },
+              ctx.mcpReq.signal,
+              client,
+            );
+            return { ...result, restoredFrom: { path: content.path, uid: content.version.uid } };
+          } catch (error) {
+            return { path: input.to, applied: false, preserved: [], error: toolFailure(error) };
+          }
+        }),
+    );
+  }
+
   return {
     server,
     async drain() {

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -228,7 +228,9 @@ it("omits every mutation in persisted read-only mode and refuses invalid schemas
   await saveConfig(dir, { ...config, readOnly: true });
   const { client } = await host(dir);
   expect((await client.listTools()).tools.map((row) => row.name).sort()).toEqual([
+    "deleted_notes",
     "list_notes",
+    "note_history",
     "read_note",
     "search_notes",
     "sync_status",
@@ -264,3 +266,81 @@ it("serves a cancelled search without losing the next request", async () => {
   await expect(request).rejects.toThrow();
   expect((await tool(client, "read_note", { path: "note.md" })).content).toBe("a local note\n");
 });
+
+it("reads old versions and restores deleted notes to explicit destinations across restart and another device", async () => {
+  const { dir, key } = await paired();
+  const original =
+    "\ufeff---\r\ntitle: Before\r\n---\r\nOriginal [[link]] and unique historical marker.\r\n";
+  await writeFile(join(dir, "daily.md"), original);
+  expect((await cli("sync", "--dir", dir)).code).toBe(0);
+  await writeFile(join(dir, "daily.md"), "latest daily version\n");
+  expect((await cli("sync", "--dir", dir)).code).toBe(0);
+  const firstHost = await host(dir);
+  await ready(firstHost.client);
+  const latest = await tool(firstHost.client, "note_history", { path: "daily.md", limit: 1 });
+  expect(latest.versions).toHaveLength(1);
+  expect(latest.nextBefore).toBeTypeOf("number");
+  const old = await tool(firstHost.client, "note_history", {
+    path: "daily.md",
+    before: latest.nextBefore,
+    limit: 1,
+  });
+  expect(old.nextBefore).toBeNull();
+  const uid = old.versions[0].uid;
+  const historical = await tool(firstHost.client, "read_note", { path: "daily.md", uid });
+  expect(historical).toMatchObject({ source: "history", uid, content: original });
+  const restored = await tool(firstHost.client, "restore_note", {
+    path: "daily.md",
+    uid,
+    to: "Recovered/daily.md",
+  });
+  expect(restored).toMatchObject({
+    applied: true,
+    durable: true,
+    restoredFrom: { path: "daily.md", uid },
+  });
+  expect(
+    await tool(firstHost.client, "restore_note", {
+      path: "daily.md",
+      uid,
+      to: "Recovered/daily.md",
+    }),
+  ).toMatchObject({ applied: false, error: { code: "exists" } });
+  expect((await tool(firstHost.client, "read_note", { path: "daily.md" })).content).toBe(
+    "latest daily version\n",
+  );
+  expect((await tool(firstHost.client, "read_note", { path: "Recovered/daily.md" })).content).toBe(
+    original,
+  );
+  const preview = await tool(firstHost.client, "sync_status", { preview: true, limit: 1 });
+  expect(preview.preview).toMatchObject({ estimated: true });
+  expect(preview.preview.files).toHaveLength(1);
+  await firstHost.close();
+  hosts.splice(hosts.indexOf(firstHost), 1);
+  await rm(join(dir, "daily.md"));
+  expect((await cli("sync", "--dir", dir)).code).toBe(0);
+  const secondHost = await host(dir);
+  await ready(secondHost.client);
+  const deleted = await tool(secondHost.client, "deleted_notes");
+  expect(deleted.notes.some((note: { path: string }) => note.path === "daily.md")).toBe(true);
+  expect((await tool(secondHost.client, "read_note", { path: "daily.md", uid })).content).toBe(
+    original,
+  );
+  expect(
+    (
+      await tool(secondHost.client, "restore_note", {
+        path: "daily.md",
+        uid,
+        to: "Recovered/from-deleted.md",
+      })
+    ).applied,
+  ).toBe(true);
+  await secondHost.close();
+  hosts.splice(hosts.indexOf(secondHost), 1);
+  expect((await cli("sync", "--dir", dir)).code).toBe(0);
+  const fresh = await directory();
+  expect((await cli("pair", key, "--dir", fresh, "--device", "fresh-reader")).code).toBe(0);
+  expect((await cli("sync", "--dir", fresh)).code).toBe(0);
+  expect(await readFile(join(fresh, "Recovered/daily.md"), "utf8")).toBe(original);
+  expect(await readFile(join(fresh, "Recovered/from-deleted.md"), "utf8")).toBe(original);
+}, 30000);

@@ -85,7 +85,8 @@ export async function cmdMcp(args: Args, io: Console, version: string): Promise<
     mode: opts.readOnly ? "read-only" : "writable",
     reader,
     writer,
-    client: () => current,
+    client: () =>
+      state === "ready" && current && !current.transport.isClosed ? current : undefined,
     stopping: () => stopping,
     changed: () => {
       localGeneration++;

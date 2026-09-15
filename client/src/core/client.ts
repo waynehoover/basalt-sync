@@ -48,7 +48,7 @@ import {
   type SocketLike,
   type WireEntry,
 } from "./transport.ts";
-import { MemoryIndexStore, type IndexStore, type Vault } from "./vault.ts";
+import { MemoryIndexStore, type FileStat, type IndexStore, type Vault } from "./vault.ts";
 import { validateStoredState } from "./stored-state.ts";
 import {
   authToken,
@@ -1035,8 +1035,10 @@ export class Client {
     return this.serial(() => this.engine.contentOf(version.uid, version.contentId, version.size));
   }
 
-  preview(): Promise<SyncPreview> {
-    return this.serial(() => this.engine.preview());
+  // MCP supplies an observing scan because the writer's list can reap staging
+  // and normalize disk spellings, even when the caller only asks for a preview.
+  preview(stats?: FileStat[]): Promise<SyncPreview> {
+    return this.serial(() => this.engine.preview(stats));
   }
 
   reviewConflict(pair: ConflictPair): Promise<ConflictReview> {
