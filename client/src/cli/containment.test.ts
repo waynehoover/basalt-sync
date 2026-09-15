@@ -87,6 +87,53 @@ describe("a staging directory that leaves the vault", () => {
   });
 });
 
+describe("a note path that leaves the vault", () => {
+  /**
+   * Reading followed the same rule as writing, eventually.
+   *
+   * `absolute` is lexical: it refuses `../` and the excluded names, and it
+   * cannot see a symlink, so every write calls `insideForReal` after it and
+   * `read` did not. That was defensible while the only caller was the engine,
+   * which reads paths its own `list` produced and `list` does not follow
+   * links. It stops being defensible the moment a path arrives from somewhere
+   * that is not this device: `basalt mcp` hands an agent's path straight to
+   * the adapter, and a read primitive that follows a link out of the vault is
+   * a read primitive for the whole filesystem.
+   *
+   * The leaf and the ancestor are both tested because they fail differently:
+   * a link in the middle of a path is the one a lexical check is most likely
+   * to be thought to have covered.
+   */
+  it("is refused by read, whether the link is the leaf or an ancestor", async () => {
+    const base = await mkdtemp(join(tmpdir(), "basalt-contain-read-"));
+    dirs.push(base);
+    const vault = join(base, "vault");
+    const elsewhere = join(base, "elsewhere");
+    await mkdir(vault, { recursive: true });
+    await mkdir(elsewhere, { recursive: true });
+    await writeFile(join(elsewhere, "secret.md"), "not yours\n");
+    await symlink(join(elsewhere, "secret.md"), join(vault, "leaf.md"));
+    await symlink(elsewhere, join(vault, "ancestor"));
+
+    const v = new NodeVault(vault);
+    await expect(v.read("leaf.md")).rejects.toThrow(/leaves the vault/);
+    await expect(v.read("ancestor/secret.md")).rejects.toThrow(/leaves the vault/);
+  });
+
+  it("still reads an ordinary note, and one under a real folder", async () => {
+    const base = await mkdtemp(join(tmpdir(), "basalt-contain-read-ok-"));
+    dirs.push(base);
+    const vault = join(base, "vault");
+    await mkdir(join(vault, "folder"), { recursive: true });
+    await writeFile(join(vault, "note.md"), "mine\n");
+    await writeFile(join(vault, "folder", "deep.md"), "also mine\n");
+
+    const v = new NodeVault(vault);
+    expect(new TextDecoder().decode(await v.read("note.md"))).toBe("mine\n");
+    expect(new TextDecoder().decode(await v.read("folder/deep.md"))).toBe("also mine\n");
+  });
+});
+
 describe("an ordinary vault", () => {
   it("is not refused by any of it", async () => {
     const base = await mkdtemp(join(tmpdir(), "basalt-contain-ok-"));

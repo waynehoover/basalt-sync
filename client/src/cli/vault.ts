@@ -629,6 +629,35 @@ export class NodeVault implements Vault {
   }
 
   /**
+   * The same check, once per directory rather than once per note.
+   *
+   * `refuseOutsideVault` resolves the containing directory, so asking it per
+   * read asks the same question of the same few directories thousands of
+   * times: measured at about 20 microseconds each, which is 80 ms of realpath
+   * on a four thousand note catch-up and buys nothing after the first answer.
+   *
+   * Only reads use this. A write creates the thing it is naming, so the
+   * directory it lands in may have appeared since, and the writes keep asking
+   * every time.
+   *
+   * What is not cached is the leaf, which `O_NOFOLLOW` settles at the moment
+   * of opening and cannot be stale. So a directory replaced by a link is
+   * caught the first time this vault reads through it, and a *note* replaced
+   * by a link is caught every time. The gap left is a directory swapped after
+   * this process has already read through it, which is outside the threat
+   * model here: ordinary local storage and an owner who is not attacking
+   * themselves.
+   */
+  private async readableDir(full: string): Promise<void> {
+    const dir = dirname(full);
+    if (this.checkedDirs.has(dir)) return;
+    await this.insideForReal(full);
+    this.checkedDirs.add(dir);
+  }
+
+  private readonly checkedDirs = new Set<string>();
+
+  /**
    * Turns a vault-relative path into an absolute one, refusing to escape.
    *
    * Paths arrive from the server, sealed by another device, and a client that
@@ -1377,8 +1406,52 @@ export class NodeVault implements Vault {
     return listed;
   }
 
+  /**
+   * One note's bytes, from inside the vault and from a real file.
+   *
+   * `absolute` is lexical. It refuses `../` and the excluded names and it
+   * cannot see a link, which is why every write follows it with
+   * `insideForReal`. Reading did not, and that was defensible while the only
+   * caller was the engine: it reads paths its own `list` produced, and `list`
+   * does not follow links. It stops being defensible as soon as a path
+   * arrives from somewhere that is not this device, and `basalt mcp` hands an
+   * agent's path straight to the adapter.
+   *
+   * Two different holes, so two different answers. An ancestor that is a link
+   * is `insideForReal`, the check the writes already make. The leaf is not:
+   * `refuseOutsideVault` resolves `dirname`, so a link sitting exactly where
+   * the note should be goes straight through it.
+   *
+   * The leaf is refused rather than resolved, because resolving it is not
+   * enough either. A link inside the vault pointing at `.basalt/config.json`
+   * resolves to a path under the root, so a containment test would pass it
+   * and hand over the device credential. `list` omits links and `stat`
+   * lstats deliberately, so a link is already not a note anywhere else here;
+   * this only makes reading agree.
+   *
+   * `O_NOFOLLOW` rather than an `lstat` first, so there is no instant between
+   * deciding and opening for the path to become a link.
+   */
   async read(path: string): Promise<Uint8Array> {
-    return new Uint8Array(await readFile(await this.absolute(path)));
+    const full = await this.absolute(path);
+    await this.readableDir(full);
+    let handle;
+    try {
+      handle = await open(full, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (err) {
+      // ELOOP is what both kernels raise for a link under O_NOFOLLOW. macOS
+      // has also been seen to answer EMLINK, which means nothing else here.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ELOOP" || code === "EMLINK") {
+        throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
+      }
+      throw err;
+    }
+    try {
+      return new Uint8Array(await handle.readFile());
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
