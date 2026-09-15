@@ -188,9 +188,12 @@ observations, not a frozen inventory; rerun if a concurrent edit matters.
 Search bounds content scanning to 512 candidate files and approximately 8 MiB
 per call (the final file can exceed that work budget). It still walks the full
 inventory. A page can have no matches and still have `nextCursor`.
-Inspect `skipped` and `complete`; no matches does not
-prove absence from unreadable notes. Deleted pages may be empty after filtering
-and still have `nextBefore`. A historical lookup stops after 5000 versions with
+Inspect `skipped` and `complete`; no matches does not prove absence from
+unreadable notes or ambiguous paths. Ambiguous paths in the requested folder
+appear in `skipped` with `why: "ambiguous_path"` on every page and keep
+`complete:false`. Counts include blocked paths, which can represent entire
+unexamined folders, and samples are limited to 20 paths. Deleted pages may be
+empty after filtering and still have `nextBefore`. A historical lookup stops after 5000 versions with
 `lookup_incomplete`, which does not establish absence. Purged, missing and
 unverifiable content cannot be restored.
 

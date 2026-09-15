@@ -408,3 +408,26 @@ it("reads old versions and restores deleted notes to explicit destinations acros
   expect(await readFile(join(fresh, "Recovered/daily.md"), "utf8")).toBe(original);
   expect(await readFile(join(fresh, "Recovered/from-deleted.md"), "utf8")).toBe(original);
 }, 30000);
+it("reports real Unicode spelling collisions as an incomplete stdio search", async (ctx) => {
+  const { dir } = await paired();
+  await writeFile(join(dir, "café.md"), "needle in the first spelling");
+  try {
+    await writeFile(join(dir, "cafe\u0301.md"), "needle in the second spelling", { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    ctx.skip();
+  }
+  const { client } = await host(dir, ["--read-only"]);
+  const listed = await tool(client, "list_notes");
+  expect(listed.ambiguousCount).toBe(1);
+  const searched = await tool(client, "search_notes", { query: "needle" });
+  expect(searched).toMatchObject({
+    matches: [],
+    scanned: 0,
+    complete: false,
+    nextCursor: null,
+    skipped: { count: 1, items: [{ path: "café.md", why: "ambiguous_path" }], truncated: false },
+  });
+  expect(await readFile(join(dir, "café.md"), "utf8")).toBe("needle in the first spelling");
+  expect(await readFile(join(dir, "cafe\u0301.md"), "utf8")).toBe("needle in the second spelling");
+});
