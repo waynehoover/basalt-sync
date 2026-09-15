@@ -58,9 +58,12 @@ Before pushing, run the complete local gate from the repository root:
 bash scripts/check.sh
 ```
 
-Exit 0 means all checks applicable to this machine passed. A skipped check is
-not a pass. Platform-specific checks may run only in CI; inspect CI for the
-exact commit before releasing. A local pass does not establish CI success.
+Exit 0 means all checks applicable to this machine passed. Exit 1 is failure;
+exit 2 means checks could not run and is incomplete. A skipped check is not a
+pass. If Docker is unavailable, start your Docker engine (`orb start` for OrbStack
+on macOS) and rerun the gate. Platform-specific checks may run only in CI;
+inspect CI for the exact commit before releasing. A local pass does not
+establish CI success.
 
 For a bug fix, demonstrate that its regression test fails without the fix and
 passes with it. Test preservation of the actual edited bytes, not just agreement
@@ -78,6 +81,73 @@ Measure interactive sync separately from bulk transfers with
 `cd client && bun run bench:cadence`. It checks exact contents after new notes,
 rapid edits, and incoming updates, using the production timers and a local test
 server. Its in-memory adapters do not measure a phone's filesystem or network.
+
+## MCP verification
+
+The stdio implementation uses the pinned official MCP SDK 2.0.0. Protocol tests
+exercise its legacy `2025-11-25` and modern `2026-07-28` modes, cancellation and
+framing. The usable workflow is also tested through an official client talking
+to a freshly built CLI child and the real Go server:
+
+```bash
+cd client
+bun run test src/cli/mcp.test.ts src/cli/mcp-bin.test.ts src/cli/mcp-protocol.test.ts src/cli/mcp-artifact.test.ts
+bun run stress src/stress/mcp.stress.ts
+```
+
+The workflow finds a daily note, changes two exact task lines, compares unrelated
+BOM/CRLF/frontmatter/link bytes, reads the before-image, and checks both copies
+on a separately paired device. History tests inspect and restore an older version
+to a free destination and read it again after restart and from a fresh device.
+All files live in temporary directories. Tests never require a real user's vault.
+
+Process tests cover EOF, SIGTERM and broken stdout during admitted writes,
+incoming sync, stalled handshake and reconnect sleep. They hold a filesystem
+seam while another process tries the same canonical vault root and require it
+to remain locked until the first process drains. Output backpressure is tested
+with a paused real pipe. Malformed envelope shutdown has a regression for a
+paused stdin descriptor that previously kept the process alive after draining.
+
+`mcp-artifact.test.ts` builds the actual production configuration, copies only
+`basalt.mjs` into an empty installation and removes its build inputs before
+launch. On macOS, sandbox-exec also denies the child access to the repository.
+The test initializes, lists, reads and edits with the official client, verifies
+the backup, and checks the plugin bundle for MCP SDK leakage. The npm tarball
+gate repeats the read/edit/backup workflow against the installed package.
+Dependencies missing from setup fail these tests rather than skipping them.
+
+The MCP stress suite submits writes through tool handlers and uses independent
+phone-equivalent clients plus a freshly paired reader. It checks actual retained
+content after disjoint/overlapping edits, append versus replace, deletion,
+rename, offline catch-up, stale put/putmany and a lost accepted upload reply.
+The remote author exits after uploading so its disk cannot rescue a lost branch.
+Tests also interrupt restore before its reply and disconnect the server during
+an already admitted edit.
+
+The explicit crash matrix reaches each boundary before SIGKILL:
+
+| Seam | Boundary |
+|---|---|
+| `cli/mcp:backupVerified` | Backup bytes verified, before the transaction's directory flush. |
+| `cli/mcp:backupDurable` | Before-image flushed, before rechecking and replacing the source. |
+| `cli/vault:replace.staged` | Replacement staged, before parking the original. |
+| `cli/vault:replace.nameFree` | Original parked, before publishing the replacement. |
+| `cli/mcp:published` | Replacement published, before final verification and flush. |
+| `cli/mcp:durable` | Local result flushed, before sending the tool response. |
+
+After each kill, fresh observing objects read retained content before the first
+network pass; a new process then acquires the lock and a fresh device downloads
+the preserved branches. Removing before-image creation makes the post-publication
+kill test lose the preexisting branch. Removing shutdown drains makes the
+held-write lock test admit a competing process too early. These are preservation
+assertions, not just convergence or successful exit checks.
+
+Production artifacts have been exercised on macOS with Node 22.23.2 and 24.21.0.
+Node 20.20.2 could initialize and read locally but lacked the global WebSocket
+needed for sync; it is not supported. Process kills do not simulate power loss.
+Flush-failure injection complements them, and native Linux filesystem/systemd
+checks still require CI. These tests do not establish real phone-app acceptance
+or network MCP access. This release has no HTTP listener.
 
 ## Plugin testing
 

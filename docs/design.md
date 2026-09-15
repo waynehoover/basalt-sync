@@ -88,6 +88,31 @@ whole-file fallback can also exceed an older phone's memory on large attachments
 The 64 MiB default was informed by desktop measurements, not a measured bound
 for every phone.
 
+## Agent edits in the headless client
+
+The stdio MCP process is a local author on its own paired directory. Its writes
+run in the owning client's serial queue alongside sync, and its vault lock
+remains held until admitted work drains. Offline inspection is allowed; a new
+mutation requires a settled live writable client. Read-only launch omits mutation
+tools while still allowing incoming synchronization.
+
+A matching content base proves which bytes an edit starts from, not whether a
+model's replacement preserves their meaning. MCP therefore exposes exact unique
+old-to-new edits and exact append, with no whole-file writer. Before changing an
+existing note it creates an independent visible before-image, reads and compares
+its bytes, and flushes it. Failure stops before touching the original. Backups
+remain ordinary synced files, immutable through MCP. Creation and restore publish
+only to absent destinations; restore requires an authenticated version belonging
+to the requested path and an explicit different destination.
+
+Success distinguishes a verified, flushed local result from server delivery.
+Cancellation or connection loss cannot roll back an admitted write; unknown
+outcomes require inspection before retry. Checked access refuses existing child
+symlinks and ambiguous names. This is not isolation from a hostile local OS user
+continually swapping directories or editing open descriptors. The supported
+storage and cooperating-owner assumptions still apply, and a host receiving
+notes has access to their plaintext.
+
 ## Fast, because it sends less
 
 Files are divided into content-defined chunks, compressed, then encrypted.
