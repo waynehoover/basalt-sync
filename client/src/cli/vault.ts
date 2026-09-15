@@ -771,8 +771,10 @@ export class NodeVault implements Vault {
       }
       parents.push({ full, info });
       const part = parts[i]!;
+      // Folding every lookup made Work/new.md land in work/ on Linux and
+      // refused exact reads when Foo.md and foo.md both existed.
       const names = (await readdir(full)).filter(
-        (name) => foldPath(this.normal(name)) === foldPath(part),
+        (name) => this.canonical(name) === this.canonical(part),
       );
       if (names.length > 1) {
         throw new CheckedPathError("ambiguous_path", "the path has ambiguous spellings on disk");
