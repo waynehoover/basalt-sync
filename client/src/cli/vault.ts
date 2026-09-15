@@ -709,19 +709,8 @@ export class NodeVault implements Vault {
 
   private readonly checkedDirs = new Set<string>();
 
-  /**
-   * An agent can name a file no scan has seen. The ordinary read's cached
-   * directory check accepted an alias into .basalt, including after a folder
-   * changed to a link. Ask each segment afresh before following it, and keep
-   * this lookup out of the engine's spelling caches.
-   */
-  private async checkedLocation(
-    path: string,
-    {
-      allowMissing = false,
-      kind = "file",
-    }: { allowMissing?: boolean; kind?: "file" | "directory" } = {},
-  ): Promise<CheckedLocation> {
+  /** Listing already inspected the disk; apply the same exclusions to its names. */
+  assertPathPolicy(path: string, kind: "file" | "directory" = "file"): void {
     if (
       typeof path !== "string" ||
       /[\\\0]/u.test(path) ||
@@ -739,6 +728,23 @@ export class NodeVault implements Vault {
     if (parts.some((part) => part.startsWith(".") || ignored.has(foldedExclusion(part)))) {
       throw new CheckedPathError("excluded_path", "the path is excluded from this vault");
     }
+  }
+
+  /**
+   * An agent can name a file no scan has seen. The ordinary read's cached
+   * directory check accepted an alias into .basalt, including after a folder
+   * changed to a link. Ask each segment afresh before following it, and keep
+   * this lookup out of the engine's spelling caches.
+   */
+  private async checkedLocation(
+    path: string,
+    {
+      allowMissing = false,
+      kind = "file",
+    }: { allowMissing?: boolean; kind?: "file" | "directory" } = {},
+  ): Promise<CheckedLocation> {
+    this.assertPathPolicy(path, kind);
+    const parts = path === "" ? [] : path.split("/");
     let full = await (this.realRootOnce ??= realpath(this.root));
     let info: BigIntStats | undefined = await lstat(full, { bigint: true });
     const parents: { full: string; info: BigIntStats }[] = [];
@@ -1395,14 +1401,17 @@ export class NodeVault implements Vault {
    * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
    * 2.6x worse than the default 4.
    */
-  async list(options: { forceFull?: boolean } = {}): Promise<FileStat[]> {
+  async list(options: { forceFull?: boolean; checked?: boolean } = {}): Promise<FileStat[]> {
+    if (options.checked && !this.observeOnly) {
+      throw new Error("checked inventory requires an observe-only vault");
+    }
     // Neither of the two writes a scan normally makes happens in observe-only
     // mode (R12): reaping a crashed run's temporaries, and re-spelling names.
     // The pass over staging still runs, because counting what it will not
     // remove is a read and is the only thing that tells anybody a preserved
     // version is sitting there (R35); the removal half is what it skips.
     const stagingUnknown = await this.reapStaleTemps();
-    const listed = await this.listFiles(options.forceFull === true);
+    const listed = await this.listFiles(options.forceFull === true, options.checked === true);
 
     // Recovery remains an authoritative inventory on every pass, including
     // passes whose visible files came from the watcher-backed listing.
@@ -1426,7 +1435,7 @@ export class NodeVault implements Vault {
     return listed;
   }
 
-  private async listFiles(forceFull: boolean): Promise<FileStat[]> {
+  private async listFiles(forceFull: boolean, checked = false): Promise<FileStat[]> {
     if (
       !forceFull &&
       !this.observeOnly &&
@@ -1481,7 +1490,24 @@ export class NodeVault implements Vault {
     // One gate for the whole scan, not one per directory, which is what makes
     // the bound hold however deep the tree goes (I06).
     const gate = limiter(SCAN_CONCURRENCY);
+    const together = async <T>(work: readonly T[]): Promise<Awaited<T>[]> => {
+      if (!checked) return Promise.all(work);
+      // A failed child walk used to leave its siblings updating the reader's
+      // caches after the next queued request had started using them.
+      const results = await Promise.allSettled(work);
+      for (const result of results) if (result.status === "rejected") throw result.reason;
+      return results.map((result) => (result as PromiseFulfilledResult<Awaited<T>>).value);
+    };
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
+      const before = checked ? await lstat(dir, { bigint: true }) : undefined;
+      const checkDirectory = async (): Promise<void> => {
+        if (!before) return;
+        const now = await lstat(dir, { bigint: true });
+        if (!before.isDirectory() || !now.isDirectory() || !sameSnapshot(before, now)) {
+          throw new CheckedPathError("changed_during_read", "a directory changed during inventory");
+        }
+      };
+      await checkDirectory();
       let items;
       try {
         items = await readdir(dir, { withFileTypes: true });
@@ -1491,6 +1517,9 @@ export class NodeVault implements Vault {
         // empty would report every file in it as deleted.
         throw new Error(`cannot read ${dir}: ${(err as Error).message}`);
       }
+      // A saved Dirent described a folder that had already become a link.
+      // MCP then listed outside note titles through that stale type check.
+      await checkDirectory();
 
       // Symlinks and anything else are left alone: following one would
       // sync a file that is not in the vault, and copying it as a link
@@ -1535,7 +1564,19 @@ export class NodeVault implements Vault {
             !this.neverSynced(prefix ? `${prefix}/${name}` : name) &&
             !isTemporary(item.name, join(dir, item.name)) &&
             (item.isDirectory() || item.isFile()),
-        );
+        )
+        .filter(({ item, name }) => {
+          if (!checked) return true;
+          try {
+            this.assertPathPolicy(
+              prefix ? `${prefix}/${name}` : name,
+              item.isDirectory() ? "directory" : "file",
+            );
+            return true;
+          } catch {
+            return false;
+          }
+        });
 
       // A disk that keeps the two spellings apart can hold both, and then
       // there is no right answer to which one syncs.
@@ -1610,31 +1651,46 @@ export class NodeVault implements Vault {
       // time, was measured and cost nearly three times the wall clock on 2,880
       // files: correct, and not worth it when the descriptors were never the
       // recursion's to exhaust.
-      const stats = await Promise.all(
+      const stats = await together(
         kept.map(({ item, disk }) =>
-          item.isFile()
+          checked || item.isFile()
             ? gate(() =>
-                stat(join(dir, disk)).catch((err: NodeJS.ErrnoException) => {
-                  if (err.code === "ENOENT") return undefined;
-                  throw err;
-                }),
+                (checked ? lstat(join(dir, disk)) : stat(join(dir, disk))).catch(
+                  (err: NodeJS.ErrnoException) => {
+                    if (err.code === "ENOENT") return undefined;
+                    throw err;
+                  },
+                ),
               )
             : undefined,
         ),
       );
-      const children = await Promise.all(
-        kept.map(({ item, name, disk }) =>
-          item.isDirectory()
+      if (checked) {
+        for (let i = 0; i < kept.length; i++) {
+          const info = stats[i];
+          if (info && (kept[i]!.item.isDirectory() ? !info.isDirectory() : !info.isFile())) {
+            throw new CheckedPathError(
+              "changed_during_read",
+              "a file type changed during inventory",
+            );
+          }
+        }
+      }
+      const children = await together(
+        kept.map(({ item, name, disk }, i) =>
+          item.isDirectory() && (!checked || stats[i] !== undefined)
             ? walk(join(dir, disk), prefix ? `${prefix}/${name}` : name)
             : undefined,
         ),
       );
+      await checkDirectory();
 
       const out: FileStat[] = [];
       for (let k = 0; k < kept.length; k++) {
         const { item, name } = kept[k]!;
         const path = prefix ? `${prefix}/${name}` : name;
         if (item.isDirectory()) {
+          if (checked && stats[k] === undefined) continue;
           out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
           out.push(...children[k]!);
         } else {
@@ -1656,7 +1712,8 @@ export class NodeVault implements Vault {
       }
       return out;
     };
-    const listed = await walk(this.root, "");
+    const scanRoot = checked ? await (this.realRootOnce ??= realpath(this.root)) : this.root;
+    const listed = await walk(scanRoot, "");
     if (
       !this.observeOnly &&
       this.listingWatchers.size > 0 &&

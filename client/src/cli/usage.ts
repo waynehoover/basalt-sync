@@ -46,6 +46,8 @@ function refuseExtras(args: Args): void {
 
 export function validateUsage(args: Args): void {
   refuseExtras(args);
+  if (args.command === "mcp" && args.json)
+    throw new Error("mcp uses the MCP protocol on stdout; --json is not supported");
   const forCommands: Record<string, string[]> = {
     "--before": ["history", "deleted"],
     "--limit": ["history", "deleted"],
@@ -62,8 +64,8 @@ export function validateUsage(args: Args): void {
     "--vault-id": ["init"],
     "--key-file": ["init", "pair", "rotate"],
     "--key-out": ["init", "rotate"],
-    "--no-merge": ["sync", "restore", "preview"],
-    "--read-only": ["init", "pair", "sync", "restore", "preview"],
+    "--no-merge": ["sync", "restore", "preview", "mcp"],
+    "--read-only": ["init", "pair", "sync", "restore", "preview", "mcp"],
   };
   for (const flag of args.provided ?? []) {
     const allowed = forCommands[flag];

@@ -1,3 +1,5 @@
+import { cmdMcp } from "./mcp.ts";
+import { clientOptions } from "./client-options.ts";
 import { validateUsage } from "./usage.ts";
 import { previewCounts } from "../core/preview.ts";
 /**
@@ -33,7 +35,6 @@ import {
   Registrar,
   adviseAfterRegistering,
   attentionLines,
-  credentialsFor,
   didSomething,
   needsAttention,
   rebaseCursors,
@@ -42,7 +43,6 @@ import {
   registerAsDevice,
   runForever,
   whatTheDiskHolds,
-  type ClientOptions,
   type DeviceRow,
   type InviteRow,
   type JoiningVault,
@@ -113,6 +113,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
                                             recovery key
   basalt sync                               sync once and exit
   basalt sync --watch                       sync, then keep syncing
+  basalt mcp                                serve notes to a local MCP host over stdio
   basalt status                             what this device thinks the state is
   basalt preview                            show planned sync changes without writing notes
   basalt devices                            every device that may reach this vault
@@ -171,6 +172,9 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
     return 2;
   }
 
+  // stdout belongs to MCP even when startup or usage fails.
+  if (args.command === "mcp") io = { out: io.err, err: io.err };
+
   if (args.version) {
     io.out(args.json ? JSON.stringify({ ok: true, version: VERSION }) : VERSION);
     return 0;
@@ -216,6 +220,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         throw new Error(NO_RECOVERY_KEY);
       case "rebase":
         return await locked(args, () => cmdRebase(args, io));
+      case "mcp":
+        return await locked(args, () => cmdMcp(args, io, VERSION));
       case "sync":
         return await locked(args, () => cmdSync(args, io));
       case "status":
@@ -2293,63 +2299,6 @@ async function open(
   return client;
 }
 
-async function clientOptions(
-  config: Config,
-  args: Args,
-  io?: Console,
-  observeOnly = false,
-): Promise<ClientOptions> {
-  const vault = new NodeVault(args.dir, {
-    configDir: args.configDir,
-    alsoIgnore: args.ignore,
-    // Inspection suppresses automatic sync and the scan's own mutations.
-    // Preview lists files, so transport-only inspection would still compact
-    // the recovery ledger and normalize names beside a running writer.
-    observeOnly,
-  });
-  // Once, here, before anything canonicalises a path. Until the probe has run
-  // `canonical` folds case, which is the safe default and the wrong answer on
-  // Linux: two files that differ only in case are one file as far as the alias
-  // check is concerned, both are refused, and every sync exits 1 over a pair
-  // the disk is perfectly happy with. The probe existed and nothing called it.
-  await vault.probeCase();
-  return {
-    vault,
-    store: new JsonIndexStore(indexPath(args.dir)),
-    // Which key authenticates and what the vault is bound to, worked out in
-    // core so that both shells cannot answer it differently.
-    ...(await credentialsFor(config)),
-    timeoutMs: args.timeout,
-    // A one-shot sync does not defer a file to a next pass it will never
-    // run. A watching one does, because there is one.
-    coalesceWrites: args.watch,
-    // Both of these are off by their absence rather than by a default, so a
-    // config that predates them behaves exactly as it did (I29, I30).
-    ...(args.merge ? {} : { merge: false }),
-    // The config wins over the flag, and there is no flag that turns it back
-    // on. A mirror that becomes writable when a cron line loses an argument is
-    // not a mirror, and the whole value of this is that the capability is
-    // absent rather than merely unused.
-    ...(args.readOnly || config.readOnly === true ? { readOnly: true } : {}),
-    // Only while watching. A one-shot sync prints its report at the end and
-    // a line per path on the way would bury it; a client that stays running
-    // has nothing else to say between passes.
-    ...(args.watch && io
-      ? {
-          onProgress: (path?: string) => {
-            if (path !== undefined) io.err(`  ... ${path}`);
-          },
-        }
-      : {}),
-    ...(args.verbose && io
-      ? {
-          log: (m: string, ...rest: unknown[]) =>
-            io.err(`  ${m} ${rest.map(brief).join(" ")}`.trimEnd()),
-        }
-      : {}),
-  };
-}
-
 export function renderReport(
   r: SyncReport,
   args: Args,
@@ -2818,8 +2767,4 @@ function bytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-function brief(v: unknown): string {
-  return typeof v === "string" ? v : JSON.stringify(v);
 }
