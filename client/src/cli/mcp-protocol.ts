@@ -252,6 +252,9 @@ export function startStdio(
       input.removeListener("error", fail);
       await raw.close();
       checked.destroy();
+      // A schema error can pause stdin inside its own data callback. After
+      // draining, that paused descriptor still keeps the process alive.
+      input.destroy();
       transport.onclose?.();
     },
   };

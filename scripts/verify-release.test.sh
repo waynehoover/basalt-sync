@@ -146,14 +146,24 @@ done
 
 # Packing and installation are real here; only the tiny CLI's version differs.
 package_root="$scratch/package"
-mkdir -p "$package_root/scripts" "$package_root/client/dist"
+mkdir -p "$package_root/scripts" "$package_root/client/dist" "$package_root/client/src/cli"
 cp "$root/scripts/pack-check.sh" "$package_root/scripts/"
+# This fixture tests exact version comparison with a deliberately tiny CLI.
+# The real MCP workflow runs in pack-check and mcp-artifact.test.ts; record
+# delegation here so a metadata fixture need not imitate the protocol.
+cat > "$package_root/client/src/cli/mcp-artifact.run.ts" <<'BASALT_PACK_FIXTURE'
+import { access } from "node:fs/promises";
+if (process.argv.length !== 4) throw new Error("missing artifact or Node executable");
+await access(process.argv[2]);
+await access(process.argv[3]);
+console.info("packed MCP fixture invoked");
+BASALT_PACK_FIXTURE
 printf '{"name":"basalt-sync","version":"1.2.3","files":["dist/basalt.mjs"],"bin":{"basalt":"dist/basalt.mjs"}}\n' > "$package_root/client/package.json"
 for actual in 1.2.3 1.2.30; do
   printf '#!/usr/bin/env node\nconsole.log(process.argv.includes("--version") ? "%s" : "basalt sync basalt pair --version");\n' "$actual" > "$package_root/client/dist/basalt.mjs"
   result=0
   PATH="$package_path" bash "$package_root/scripts/pack-check.sh" > "$scratch/output" 2>&1 || result=$?
-  if { [ "$actual" = 1.2.3 ] && [ "$result" -eq 0 ]; } || { [ "$actual" != 1.2.3 ] && [ "$result" -eq 1 ]; }; then
+  if { [ "$actual" = 1.2.3 ] && [ "$result" -eq 0 ] && grep -qF 'packed MCP fixture invoked' "$scratch/output"; } || { [ "$actual" != 1.2.3 ] && [ "$result" -eq 1 ]; }; then
     echo "ok: packed CLI version check for $actual"
   else
     echo "FAIL: packed CLI check accepted/refused the wrong version $actual (exit $result)"

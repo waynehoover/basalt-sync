@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { conflictCopyPath } from "../core/merge.ts";
 import { firstFreeName, splitName } from "../core/paths.ts";
+import { composite, seam } from "../core/seam.ts";
 import { CheckedPathError, PreservationError, type NodeVault } from "./vault.ts";
 
 export const NOTE_BYTES = 1024 * 1024;
@@ -8,6 +9,13 @@ export const EDIT_BYTES = 8 * 1024;
 export const INPUT_BYTES = 64 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+export const midNoteMutation = composite({
+  backupVerified: seam("cli/mcp:backupVerified"),
+  backupDurable: seam("cli/mcp:backupDurable"),
+  published: seam("cli/mcp:published"),
+  durable: seam("cli/mcp:durable"),
+});
 
 export type NoteMutation =
   | { kind: "edit"; path: string; base: string; edits: readonly { old: string; new: string }[] }
@@ -196,6 +204,7 @@ export async function mutateNote(
         continue;
       }
       await verify(path, bytes);
+      if (kind === "backup") await midNoteMutation.backupVerified(result.path);
       await vault.flush();
       return path;
     }
@@ -245,6 +254,7 @@ export async function mutateNote(
       const backup = await saveSibling(before.bytes, "backup");
       result.beforeImage = backup;
       result.preserved = result.preserved.filter((path) => path !== backup);
+      await midNoteMutation.backupDurable(result.path);
       const again = await vault.readSnapshot(result.path, NOTE_BYTES);
       if (again.base !== before.base)
         throw new NoteError(
@@ -287,10 +297,12 @@ export async function mutateNote(
         };
       }
     }
+    await midNoteMutation.published(result.path);
     await verify(result.path, proposed);
     result.applied = true;
     await vault.flush();
     result.durable = true;
+    await midNoteMutation.durable(result.path);
     result.bytesAfter = proposed.length;
     result.base = noteDigest(proposed);
     if (raced)
