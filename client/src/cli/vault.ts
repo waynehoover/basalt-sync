@@ -138,6 +138,16 @@ export class CheckedPathError extends Error {
   }
 }
 
+/** A failed publication can still have moved an independent local version. */
+export class PreservationError extends Error {
+  constructor(
+    error: unknown,
+    readonly preserved: readonly string[],
+  ) {
+    super(error instanceof Error ? error.message : "file preservation failed", { cause: error });
+  }
+}
+
 interface CheckedLocation {
   readonly path: string;
   readonly full: string;
@@ -835,7 +845,11 @@ export class NodeVault implements Vault {
   }
 
   /** A bounded snapshot is not a promise that a local editor cannot save again. */
-  async readSnapshot(path: string, maxBytes: number): Promise<NoteSnapshot> {
+  async readSnapshot(
+    path: string,
+    maxBytes: number,
+    { flush = false }: { flush?: boolean } = {},
+  ): Promise<NoteSnapshot> {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) {
       throw new CheckedPathError(
         "invalid_limit",
@@ -888,6 +902,10 @@ export class NodeVault implements Vault {
         size += bytesRead;
       }
       if (size > maxBytes) tooLarge();
+      // Directory fsync alone did not make an unexpected editor save durable
+      // when MCP preserved it during replacement. Flush this checked descriptor
+      // before the final identity checks, only when a transaction requests it.
+      if (flush) await handle.sync();
       const after = await handle.stat({ bigint: true });
       if (!sameSnapshot(opened, after) || BigInt(size) !== after.size) changed();
       await recheck();
@@ -1916,6 +1934,10 @@ export class NodeVault implements Vault {
     let staged = join(this.staging, `replace.${randomBytes(8).toString("hex")}`);
     // Named out here so the `finally` can say it is no longer this call's.
     const parked = `${full}.${PARKED_MARK}${randomBytes(4).toString("hex")}`;
+    let retained: string | undefined;
+    let failed = false;
+    const failure = (error: unknown): unknown =>
+      retained === undefined ? error : new PreservationError(error, [retained]);
     try {
       // Durable before anything is moved: a crash after the rename below must
       // not leave the path empty and the new content only in memory.
@@ -1970,6 +1992,7 @@ export class NodeVault implements Vault {
       await midReplace.staged(path);
       try {
         await rename(full, parked);
+        retained = relative(this.root, parked);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         // Nothing there, which is the ordinary first download and also a
@@ -2001,6 +2024,7 @@ export class NodeVault implements Vault {
           // has nothing to do with a conflict.
           if (moved && !(await this.putBack(parked, full))) {
             const at = await claimPreserved(parked, kept).catch(() => parked);
+            retained = relative(this.root, at);
             // Where `claimPreserved` also failed, the version is at a parked
             // name nothing lists and only this record says which note it is.
             if (at === parked) {
@@ -2015,6 +2039,7 @@ export class NodeVault implements Vault {
                 `version could not be put back; it is at ${relative(this.root, at)}`,
             );
           }
+          retained = undefined;
           throw err;
         }
       }
@@ -2035,6 +2060,7 @@ export class NodeVault implements Vault {
         const digest = await digestOf(parked).catch(() => undefined);
         if (digest !== undefined && digest === expect.contentId) {
           await rm(parked, { force: true });
+          retained = undefined;
           return { landed: true };
         }
       }
@@ -2047,6 +2073,7 @@ export class NodeVault implements Vault {
       let at: string;
       try {
         at = await claimPreserved(parked, kept);
+        retained = relative(this.root, at);
       } catch (err) {
         // The displaced version has nowhere to go: the conflict name and every
         // sibling of it are taken, or that directory cannot be written. The
@@ -2063,6 +2090,9 @@ export class NodeVault implements Vault {
       this.dirty(at, had);
       this.unflushed.add(dirname(at));
       return { keptAt: relative(this.root, at), landed };
+    } catch (error) {
+      failed = true;
+      throw failure(error);
     } finally {
       // Only the staged copy, and only ever the staged copy. `link` leaves it
       // behind by design, so there is always one to remove. The preserved
@@ -2071,10 +2101,16 @@ export class NodeVault implements Vault {
       // take the original with it (R18). The parked original is not removed
       // here either, for the same reason: every path above either puts it
       // somewhere or names it in the error.
-      await rm(staged, { force: true });
-      // And it stops being this process's business, so a later scan reports it
-      // if it is still there.
-      liveTemps.delete(parked);
+      try {
+        await rm(staged, { force: true });
+      } catch (error) {
+        // The publication failure already names its retained version. A
+        // second cleanup error must not replace that recovery information.
+        if (!failed) throw failure(error);
+      } finally {
+        // Cleanup failure must not hide a stranded version from the next scan.
+        liveTemps.delete(parked);
+      }
     }
   }
 
