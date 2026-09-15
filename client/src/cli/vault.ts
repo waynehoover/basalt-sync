@@ -8,7 +8,7 @@
  * question about *whether* to is answered a layer up.
  */
 
-import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
+import { constants, watch as fsWatch, type BigIntStats, type FSWatcher } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import {
   access,
@@ -119,6 +119,48 @@ const NEVER_SYNC = new Set(["node_modules"]);
 export const DEFAULT_CONFIG_DIR = ".obsidian";
 
 export { configFolderName };
+
+export interface NoteSnapshot {
+  readonly path: string;
+  readonly bytes: Uint8Array;
+  readonly base: string;
+  readonly size: number;
+  readonly mtime: number;
+  readonly ctime: number;
+}
+
+export class CheckedPathError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+interface CheckedLocation {
+  readonly path: string;
+  readonly full: string;
+  readonly info: BigIntStats | undefined;
+  readonly parents: readonly { full: string; info: BigIntStats }[];
+}
+
+function sameIdentity(a: BigIntStats, b: BigIntStats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
+}
+
+function sameSnapshot(a: BigIntStats, b: BigIntStats): boolean {
+  return (
+    sameIdentity(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+  );
+}
+
+// The excluded folder may not exist yet, so inode checks alone can authorize
+// its creation through an APFS alias. Fold expansions conservatively here;
+// existing names are also compared using the filesystem's own identity.
+function foldedExclusion(name: string): string {
+  return name.toLowerCase().toUpperCase().normalize("NFC");
+}
 
 export interface NodeVaultOptions {
   /** Extra names to leave alone, at any depth. */
@@ -656,6 +698,212 @@ export class NodeVault implements Vault {
   }
 
   private readonly checkedDirs = new Set<string>();
+
+  /**
+   * An agent can name a file no scan has seen. The ordinary read's cached
+   * directory check accepted an alias into .basalt, including after a folder
+   * changed to a link. Ask each segment afresh before following it, and keep
+   * this lookup out of the engine's spelling caches.
+   */
+  private async checkedLocation(
+    path: string,
+    {
+      allowMissing = false,
+      kind = "file",
+    }: { allowMissing?: boolean; kind?: "file" | "directory" } = {},
+  ): Promise<CheckedLocation> {
+    if (
+      typeof path !== "string" ||
+      /[\\\0]/u.test(path) ||
+      /\p{Surrogate}/u.test(path) ||
+      /^[A-Za-z]:/u.test(path) ||
+      Buffer.byteLength(path) > 4096 ||
+      path !== this.normalPath(path) ||
+      (path !== "" && path.split("/").some((part) => !part || part === "." || part === "..")) ||
+      (path === "" && kind !== "directory")
+    ) {
+      throw new CheckedPathError("invalid_path", "expected a canonical vault-relative path");
+    }
+    const parts = path === "" ? [] : path.split("/");
+    const ignored = new Set([...this.ignore].map(foldedExclusion));
+    if (parts.some((part) => part.startsWith(".") || ignored.has(foldedExclusion(part)))) {
+      throw new CheckedPathError("excluded_path", "the path is excluded from this vault");
+    }
+    let full = await (this.realRootOnce ??= realpath(this.root));
+    let info: BigIntStats | undefined = await lstat(full, { bigint: true });
+    const parents: { full: string; info: BigIntStats }[] = [];
+    const canonical: string[] = [];
+    const checkParents = async (): Promise<void> => {
+      // A second walk can itself cross a link installed during its readdir.
+      // Inspect the names again after that walk, not only its saved stats.
+      for (const parent of parents) {
+        const now = await lstat(parent.full, { bigint: true });
+        if (!now.isDirectory() || !sameSnapshot(parent.info, now)) {
+          throw new CheckedPathError(
+            "changed_during_read",
+            "a path ancestor changed while checking it",
+          );
+        }
+      }
+    };
+    for (let i = 0; i < parts.length; i++) {
+      if (!info.isDirectory()) {
+        throw new CheckedPathError(
+          "not_regular_file",
+          "a path ancestor is not a regular directory",
+        );
+      }
+      parents.push({ full, info });
+      const part = parts[i]!;
+      const names = (await readdir(full)).filter(
+        (name) => foldPath(this.normal(name)) === foldPath(part),
+      );
+      if (names.length > 1) {
+        throw new CheckedPathError("ambiguous_path", "the path has ambiguous spellings on disk");
+      }
+      const name = names[0] ?? part;
+      canonical.push(this.normal(name));
+      const parent = full;
+      full = join(full, name);
+      try {
+        info = await lstat(full, { bigint: true });
+      } catch (err) {
+        if (!allowMissing || (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        const rest = parts.slice(i + 1);
+        await checkParents();
+        return {
+          path: [...canonical, ...rest].join("/"),
+          full: join(full, ...rest),
+          info: undefined,
+          parents,
+        };
+      }
+      // APFS resolves aliases that lowercasing does not, such as sigma's
+      // final form and sharp-s. Do not let a spelling absent from readdir
+      // become a route into an excluded folder through lstat's lookup.
+      if (names.length === 0) {
+        throw new CheckedPathError("ambiguous_path", "the path uses an unlisted filesystem alias");
+      }
+      if (info.isSymbolicLink()) {
+        throw new CheckedPathError("symlink", "refusing a path through a link");
+      }
+      for (const excluded of this.ignore) {
+        if (excluded !== basename(excluded)) continue;
+        const alias = await lstat(join(parent, excluded), { bigint: true }).catch(
+          (err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return undefined;
+            throw err;
+          },
+        );
+        if (alias !== undefined && sameIdentity(alias, info)) {
+          throw new CheckedPathError(
+            "excluded_path",
+            "the path aliases an excluded name in this vault",
+          );
+        }
+      }
+    }
+    if (kind === "file" ? !info.isFile() : !info.isDirectory()) {
+      throw new CheckedPathError("not_regular_file", `the path is not a regular ${kind}`);
+    }
+    await checkParents();
+    return { path: canonical.join("/"), full, info, parents };
+  }
+
+  /** Refresh the writer's spellings only after policy accepts the destination. */
+  async checkPath(
+    path: string,
+    options: { allowMissing?: boolean; kind?: "file" | "directory" } = {},
+  ): Promise<{ path: string; exists: boolean }> {
+    const location = await this.checkedLocation(path, options);
+    // A missing leaf ends the walk early. A folder swapped during readdir
+    // otherwise authorizes create through a new alias into excluded state.
+    const again = await this.checkedLocation(path, options);
+    if (
+      location.full !== again.full ||
+      location.parents.length !== again.parents.length ||
+      location.parents.some((parent, i) => !sameIdentity(parent.info, again.parents[i]!.info)) ||
+      (location.info === undefined
+        ? again.info !== undefined
+        : again.info === undefined || !sameSnapshot(location.info, again.info))
+    ) {
+      throw new CheckedPathError("changed_during_read", "the path changed while checking it");
+    }
+    this.diskName.clear();
+    this.spellingsKnown.clear();
+    return { path: location.path, exists: location.info !== undefined };
+  }
+
+  /** A bounded snapshot is not a promise that a local editor cannot save again. */
+  async readSnapshot(path: string, maxBytes: number): Promise<NoteSnapshot> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) {
+      throw new CheckedPathError(
+        "invalid_limit",
+        "snapshot byte limit must be between 1 and 1048576",
+      );
+    }
+    const before = await this.checkedLocation(path);
+    const tooLarge = (): never => {
+      throw new CheckedPathError("note_too_large", "the note is too large for this read");
+    };
+    const changed = (): never => {
+      throw new CheckedPathError(
+        "changed_during_read",
+        "the note changed during the read; read it again",
+      );
+    };
+    if (before.info!.size > BigInt(maxBytes)) tooLarge();
+    let handle;
+    try {
+      // NONBLOCK also makes an injected FIFO refuse instead of waiting for a writer.
+      handle = await open(
+        before.full,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+    } catch (err) {
+      if (["ELOOP", "EMLINK"].includes((err as NodeJS.ErrnoException).code ?? "")) {
+        throw new CheckedPathError("symlink", "refusing a path through a link");
+      }
+      throw err;
+    }
+    try {
+      const opened = await handle.stat({ bigint: true });
+      if (!opened.isFile() || !sameSnapshot(before.info!, opened)) changed();
+      const recheck = async (): Promise<void> => {
+        const now = await this.checkedLocation(path);
+        if (
+          now.full !== before.full ||
+          !sameSnapshot(opened, now.info!) ||
+          now.parents.length !== before.parents.length ||
+          now.parents.some((parent, i) => !sameIdentity(parent.info, before.parents[i]!.info))
+        )
+          changed();
+      };
+      await recheck();
+      const buffer = Buffer.alloc(maxBytes + 1);
+      let size = 0;
+      while (size < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, size, buffer.length - size, size);
+        if (bytesRead === 0) break;
+        size += bytesRead;
+      }
+      if (size > maxBytes) tooLarge();
+      const after = await handle.stat({ bigint: true });
+      if (!sameSnapshot(opened, after) || BigInt(size) !== after.size) changed();
+      await recheck();
+      const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, size);
+      return {
+        path: before.path,
+        bytes,
+        base: createHash("sha256").update(bytes).digest("hex"),
+        size,
+        mtime: Number(opened.mtimeNs) / 1e6,
+        ctime: Number(opened.birthtimeNs) / 1e6,
+      };
+    } finally {
+      await handle.close();
+    }
+  }
 
   /**
    * Turns a vault-relative path into an absolute one, refusing to escape.
