@@ -71,7 +71,11 @@ export function backupOf(path: string): string | undefined {
 }
 
 export function noteFormat(path: string, mutable = false): void {
-  if (typeof path !== "string" || !/\.(md|txt)$/iu.test(path) || /\.excalidraw\.md$/iu.test(path)) {
+  if (
+    typeof path !== "string" ||
+    !/\.(md|txt)$/iu.test(path) ||
+    (mutable && /\.excalidraw\.md$/iu.test(path))
+  ) {
     throw new NoteError(
       "unsupported_format",
       "agent notes must be Markdown or plain text, excluding drawings",
