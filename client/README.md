@@ -58,6 +58,7 @@ Commands use the current directory unless you pass `--dir DIR`.
 |---|---|
 | `basalt sync` | Sync once and exit. |
 | `basalt sync --watch` | Keep syncing and reconnect after temporary outages. |
+| `basalt mcp` | Expose this paired directory to one local MCP host over stdio. |
 | `basalt status` | Check connection, local changes, and recovery issues. |
 | `basalt invite` | Add another device with a single-use invite. |
 | `basalt devices` | List devices and outstanding invites. |
@@ -69,6 +70,82 @@ Commands use the current directory unless you pass `--dir DIR`.
 
 The [command reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md)
 covers all flags, device revocation, rotation, repair, and server recovery.
+
+## Connect a local agent
+
+`basalt mcp` lets a local MCP host read notes and make exact edits while Basalt
+syncs its own headless copy. The host and any model service it uses can receive
+plaintext note content. Choose a host you trust with those notes.
+
+First create an invite on an existing device and pair a **separate directory**:
+
+```bash
+mkdir -p /absolute/path/to/agent-vault
+basalt pair --dir /absolute/path/to/agent-vault --key-file /private/path/invite.txt
+```
+
+For an inspection-only host, add `--read-only` at pairing or launch. A saved
+read-only pairing cannot be made writable by omitting the flag. Never point the
+CLI at the local vault already being synced by the Obsidian plugin.
+
+Configure the host to launch Node with an absolute executable path, the absolute
+installed `basalt.mjs` path, and `--dir`. For a host using `mcpServers` JSON:
+
+```json
+{
+  "mcpServers": {
+    "basalt": {
+      "command": "/absolute/path/to/node",
+      "args": [
+        "/absolute/path/to/basalt-sync/dist/basalt.mjs",
+        "mcp",
+        "--dir",
+        "/absolute/path/to/agent-vault"
+      ]
+    }
+  }
+}
+```
+
+Replace all paths with your installation's paths. `command -v node` locates Node;
+for a global npm installation, `npm root -g` locates the directory containing
+`basalt-sync/dist/basalt.mjs`. Use Node 22 or newer. Node 22 and 24 have been
+exercised with the production MCP artifact. Hosts may use a different outer
+configuration format; the executable and argument array stay the same.
+
+The host owns this long-running process. Stop `sync --watch` first, and configure
+one host process per directory. MCP holds the vault lock and handles ongoing
+sync itself. Stdout is reserved for protocol messages; do not add `--json` or
+`--watch`. EOF, SIGINT and SIGTERM drain admitted writes before releasing the
+lock. A host that force-kills its child can interrupt that drain; inspect any
+unknown outcome.
+
+Start with `sync_status`, `list_notes` and `read_note`. Initialization and local
+reads work during connection setup or outages. They can be stale; a missing local
+file may simply be waiting to download. Edits require `writeReady:true` after
+initial sync. History and restore need a server connection.
+
+To change a note, read it and supply its returned `base` with exact `{old,new}`
+spans to `edit_note`. Each old span must be unique; all spans are validated
+against the same original and published as one replacement. `append_note` also
+requires a base and adds exactly the supplied text, including only the newlines
+you supply. `create_note` and `restore_note` require free destination paths.
+UTF-8 Markdown and plain text are supported up to 1 MiB; drawings and attachments
+cannot be mutated. There is no whole-file writer.
+
+Every edit or append that changes a note preserves a verified, flushed
+before-image. Read the returned `beforeImage` to inspect it, or list with
+`includeBackups:true` to find older copies. Backups sync as ordinary notes and
+MCP cannot alter or delete them.
+`applied:true` and `durable:true` describe the local commit, not delivery to the
+server or another device. Errors may report an applied change or preserved paths.
+After `stale`, a timeout or a lost response, reread and reconsider before retrying.
+
+Follow continuation fields to read later pages. `--read-only` omits every mutation
+tool but still downloads remote edits. The
+[MCP reference and recovery example](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md#mcp-over-stdio)
+cover exact limits, partial results and restoring an inspected version to a new
+path. This release supports local stdio hosts only.
 
 ## A mirror, and turning merging off
 
@@ -119,7 +196,8 @@ attention even when other transfers succeed.
 
 ## Automation and output
 
-Use `--json` for structured output. Exit **0** means the command succeeded,
+Use `--json` for structured command output, except with `mcp`, which uses its
+own protocol. Exit **0** means the command succeeded,
 **1** means a failure or unresolved issue, and **2** means invalid arguments.
 For sync, `outcome` explains the result and the counters describe the work.
 

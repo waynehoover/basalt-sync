@@ -290,6 +290,28 @@ an invite through `--key-file` or standard input. Do not run it in a vault the
 plugin is already syncing. Read-only mode is local behavior, not a server access
 restriction.
 
+## Optional: a local MCP host
+
+When the user wants an agent to work with their notes, pair a dedicated headless
+directory first, using a separate invite. Do not use the plugin's live vault or
+copy its credentials. Configure the host with the absolute Node 22+ executable,
+absolute `basalt.mjs` path and `mcp --dir /absolute/path/to/agent-vault`, following
+the [CLI host example](client/README.md#connect-a-local-agent). One host owns the
+directory's lock and sync loop; stop any existing watcher first. Use `--read-only`
+when edits are outside the authorized scope. It omits mutations while incoming
+sync still changes the local copy. Stdio is the only transport in this release.
+
+Verify initialization and local reads, then wait for `sync_status.writeReady`
+before an authorized edit. Supply the base from `read_note` and exact unique
+old-to-new spans; append adds only the supplied text, with no automatic newline.
+Read the before-image and compare unrelated bytes afterward. Follow pagination
+and inspect skipped or incomplete results. Local `applied`/`durable` fields do
+not prove delivery; read the change and backup from another device if delivery
+is part of the task. On a lost response or stale base, reread and reconsider,
+never blindly retry with a fresh base. Follow the
+[recovery example](docs/cli-reference.md#inspect-and-recover) to inspect a backup
+or server version and recover it to a new path. Keep recovery copies for the owner.
+
 ## Working from development source
 
 This source tree, the Compose image, and released 0.8.x clients use protocol 7.
