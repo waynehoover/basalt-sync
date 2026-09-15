@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "./cli.ts";
 
-export async function buildMcp(dir: string): Promise<string> {
+export async function buildMcp(dir: string, entry = "./bin.ts"): Promise<string> {
   const bundle = join(dir, "basalt.mjs");
   await build({
-    entryPoints: [fileURLToPath(new URL("./bin.ts", import.meta.url))],
+    entryPoints: [fileURLToPath(new URL(entry, import.meta.url))],
     outfile: bundle,
     platform: "node",
     target: "node22",

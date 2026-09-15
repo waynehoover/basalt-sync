@@ -83,4 +83,8 @@ for listed in "basalt sync" "basalt pair" "--version"; do
   }
 done
 
+echo "==> using MCP from the packed artifact under node"
+bun run "$root/client/src/cli/mcp-artifact.run.ts" \
+  "$work/elsewhere/node_modules/basalt-sync/dist/basalt.mjs" "$(command -v node)"
+
 echo "==> the packed CLI installs and runs"
