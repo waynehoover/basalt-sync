@@ -19,7 +19,8 @@ for the installed version's usage.
 | `uninvite ID` | Cancel an outstanding invite. |
 | `rotate KEY` | Replace the recovery key; keep history and existing devices. |
 | `sync [--watch]` | Sync once, or keep syncing. |
-| `mcp` | Serve notes to one local MCP host over stdio while syncing. |
+| `mcp [--listen [ADDR]]` | Serve notes over stdio or authenticated HTTP while syncing. |
+| `mcp-token [--revoke]` | Issue, rotate, or revoke this directory's HTTP MCP credential. |
 | `preview` | Show planned changes without writing notes; `--json` includes paths and counts. |
 | `status` | Check connection, local state, and recovery issues. |
 | `history PATH [--before UID]` | Page through versions, newest first. |
@@ -40,8 +41,12 @@ for the installed version's usage.
 | `--device NAME` | Device label at pairing; default is hostname plus a random suffix. |
 | `--vault-id ID` | Vault name for `init`; default `default`. |
 | `--server URL --token TOKEN` | Alternative to the combined setup string for `init`. |
-| `--json` | Structured command output, except `mcp`, which owns stdout for its protocol. |
+| `--json` | Structured command output; invalid for `mcp` and `mcp-token`. |
 | `--timeout MS` | Server wait; default `30000`. |
+| `--listen [ADDR]` | `mcp` over HTTP; default `127.0.0.1:3010`. Requires an issued MCP credential. |
+| `--writable` | Enable HTTP mutation tools; requires `--listen` and a writable device. |
+| `--allow-origin ORIGIN` | Allow an exact HTTP origin; repeatable, requires `--listen`. |
+| `--revoke` | `mcp-token` only: remove the credential without restarting the service. |
 | `--read-only` | Hold back local sync changes; persisted by `init` and `pair`. For `mcp`, also omit mutation tools. |
 | `--no-merge` | Keep conflicting versions separately for this invocation. |
 | `--config-dir NAME` | Obsidian configuration folder; default `.obsidian`. |
@@ -52,7 +57,7 @@ for the installed version's usage.
 | `--limit N` | `history`: default 20; `deleted`: default all. |
 | `--before UID` | Earlier page for `history` or `deleted`. |
 | `--key-file PATH` | Read a setup string, invite, or recovery key from a private file. |
-| `--key-out PATH` | Also save a generated recovery key in a new file with mode `0600`. |
+| `--key-out PATH` | Save a generated key in a new `0600` file. For `mcp-token`, this suppresses the token on stdout and must be outside the vault. |
 | `--recovery-key KEY` | Use the recovery key for `devices`, `revoke`, or `uninvite`. |
 | `--allow-last` | Permit revoking the final device; requires the recovery key. |
 | `--force` | `unlock` only: clear a holder recorded on another machine after verifying it stopped. |
@@ -60,8 +65,9 @@ for the installed version's usage.
 | `--` | End options; remaining arguments are literal values. |
 
 For `init`, `pair`, and `rotate`, use `-` as the secret argument to read standard
-input. `--key-out` refuses to overwrite an existing file and does not suppress
-the key printed to normal output.
+input. `--key-out` refuses to overwrite an existing file. For recovery-key
+generation it also prints the key; for `mcp-token` it prints only the credential
+id and output path.
 
 ## Device access
 
@@ -147,9 +153,9 @@ releasing it. An admitted edit can finish after cancellation or disconnection;
 inspect the note if its response was lost.
 
 Stdout contains only MCP messages; diagnostics and verbose logs go to stderr.
-`--json`, `--watch`, `--verify` and `--listen` are invalid for this command.
+`--json`, `--watch` and `--verify` are invalid for this command.
 `--read-only`, `--no-merge`, `--timeout`, `--config-dir` and `--ignore` apply.
-This release provides stdio only.
+`--listen` selects the separate [HTTP transport](#mcp-over-http).
 
 ### Tools and bounds
 
@@ -261,6 +267,81 @@ restore response, read that destination before retrying; `exists` does not
 create a second recovery copy. A deleted note follows the same path: discover it
 with `deleted_notes`, inspect `note_history` and `read_note(uid)`, then restore
 to a free name. `restorable:0` means no content remains available.
+
+## MCP over HTTP
+
+Use the same separately paired headless directory, tools and preservation rules
+as stdio. Issue a credential before starting the listener:
+
+```bash
+basalt mcp-token --dir /srv/vault --key-out /private/path/basalt-mcp.key
+basalt mcp --dir /srv/vault --listen 127.0.0.1:3010
+```
+
+The output file's parent must exist and the file must be new, private and outside
+the vault, including through directory aliases. Without `--key-out`, issuance
+prints the 43-character token once to stdout. The directory stores only its
+SHA-256 hash, short id and issue time in `.basalt/mcp-token.json` at mode `0600`.
+That state never syncs and cannot be read by MCP. The token is independent of
+the device secret, data key and recovery key. It grants access to this one
+process's tools; it cannot authenticate to `basaltd`.
+
+Every request to `/mcp`, including loopback requests, needs
+`Authorization: Bearer TOKEN`. Configure the token in the client's authentication
+field. This is static bearer authentication, without OAuth discovery or a login
+flow. A client requiring OAuth needs a separate integration. There is no
+credential-management tool or unauthenticated health endpoint.
+
+HTTP starts with read-only tools. Add `--writable` to enable the four mutation
+tools. It cannot override a saved read-only pairing or `--read-only`; those
+combinations exit 2. HTTP's default only restricts MCP tools: ordinary sync
+still uploads local changes on a writable device. `--read-only` also restricts
+ordinary sync uploads.
+
+`--listen` alone selects `127.0.0.1:3010`; `--listen :3010` also means loopback.
+Use an IP literal or `localhost`, with brackets for IPv6, such as `[::1]:3010`.
+Wildcard addresses are refused. A named non-loopback interface prints a warning
+because the listener carries plaintext notes and credentials. Put TLS in front
+of it for network use; see the [service and Tailscale example](../client/README.md#connect-over-http).
+
+A request carrying `Origin` is refused unless that exact canonical HTTP or HTTPS
+origin was supplied with `--allow-origin`, for example `https://app.example.com`.
+Paths, trailing slashes and wildcard origins are invalid. No origins are allowed
+by default. Forwarded headers supply bounded log metadata only and grant no access.
+Wrong or absent credentials return 401; an unreadable or malformed credential
+returns 503. Refusals contain no vault details. Other paths return empty 404;
+unsupported methods return empty 405.
+
+Rotate by running `mcp-token` again, using a new output filename if exporting:
+
+```bash
+basalt mcp-token --dir /srv/vault --key-out /private/path/basalt-mcp-next.key
+basalt mcp-token --dir /srv/vault --revoke
+```
+
+These commands work while the service holds the vault lock. Each request reads
+the current hash. Observing rotation or revocation cancels old-key work still
+waiting to start and ends old sessions. An already admitted note transaction
+finishes and preserves its before-image. Old tokens receive 401; legacy clients
+initialize a new session with the new token. Revocation leaves the listener
+refusing requests until a new credential is issued. It also prevents a new
+listener from starting.
+
+The pinned SDK supports legacy `2025-11-25` sessions and sessionless `2026-07-28`
+requests. Legacy sessions expire after 30 minutes idle, with at most 16 sessions,
+8 requests and one GET stream per session. Both modes share a 32-request process
+cap and the same reader and mutation queues. Overflow returns 429 with
+`Retry-After`, or a tool-level `busy` refusal. Bodies are limited to 8 MiB before
+parsing; headers time out after 10 seconds and request bodies after 30 seconds.
+Tool responses are bounded to 1 MiB. GET streams have no write timeout.
+Cancellation or an interrupted request ends its legacy session; reconnect and
+inspect any uncertain mutation before deciding whether to retry.
+
+HTTP ignores stdin EOF and keeps stdout empty. SIGINT and SIGTERM close admission,
+cancel queued work and drain admitted transactions before releasing the shared
+vault lock. One process serves all clients and handles ongoing sync. The proxy
+stand-in and real child have been tested locally; actual Tailscale and phone-client
+acceptance remain unverified.
 
 ## Files and locking
 

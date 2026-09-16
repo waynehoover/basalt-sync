@@ -114,7 +114,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
                                             recovery key
   basalt sync                               sync once and exit
   basalt sync --watch                       sync, then keep syncing
-  basalt mcp                                serve notes to a local MCP host over stdio
+  basalt mcp                                serve notes over stdio, or HTTP with --listen
   basalt mcp-token                          issue or rotate the HTTP MCP credential
   basalt status                             what this device thinks the state is
   basalt preview                            show planned sync changes without writing notes
@@ -137,6 +137,10 @@ Options
   --vault-id ID    which vault on the server (default: default)
   --json           machine-readable output
   --timeout MS     how long to wait on the server (default: 30000)
+  --listen [ADDR]  mcp over HTTP (default: 127.0.0.1:3010); requires an mcp-token credential
+  --writable       allow HTTP MCP mutations; requires --listen and a writable device
+  --allow-origin O allow this exact HTTP origin; repeatable, requires --listen
+  --revoke         mcp-token only: revoke HTTP access without restarting the service
   --allow-last     revoke the last device, leaving the vault reachable only by its recovery key.
                    Needs --recovery-key: it is the one revocation a device cannot undo
   --no-merge       never combine two edits to one note; keep both versions instead. Merging is the
@@ -158,7 +162,9 @@ Options
   --before UID     for history or deleted: the page before this version
   --verify         for sync: read every file to verify the content cache
   --key-file PATH  read the recovery key, invite or setup string from a file
-  --key-out PATH   also write a newly generated recovery key here, readable only by you
+  --key-out PATH   save a generated key in a new private file
+                   mcp-token: outside the vault, prints only the id and path
+                   recovery keys: also printed to stdout
   --config-dir DIR Obsidian's config folder, if it is not .obsidian
   --ignore NAME    a folder or file name never to sync, at any depth, repeatable; local to this
                    device. A path another device syncs and this one ignores is reported as

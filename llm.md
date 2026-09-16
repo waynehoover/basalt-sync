@@ -290,7 +290,7 @@ an invite through `--key-file` or standard input. Do not run it in a vault the
 plugin is already syncing. Read-only mode is local behavior, not a server access
 restriction.
 
-## Optional: a local MCP host
+## Optional: an MCP host
 
 When the user wants an agent to work with their notes, pair a dedicated headless
 directory first, using a separate invite. Do not use the plugin's live vault or
@@ -299,7 +299,7 @@ absolute `basalt.mjs` path and `mcp --dir /absolute/path/to/agent-vault`, follow
 the [CLI host example](client/README.md#connect-a-local-agent). One host owns the
 directory's lock and sync loop; stop any existing watcher first. Use `--read-only`
 when edits are outside the authorized scope. It omits mutations while incoming
-sync still changes the local copy. Stdio is the only transport in this release.
+sync still changes the local copy.
 
 Verify initialization and local reads, then wait for `sync_status.writeReady`
 before an authorized edit. Supply the base from `read_note` and exact unique
@@ -311,6 +311,19 @@ is part of the task. On a lost response or stale base, reread and reconsider,
 never blindly retry with a fresh base. Follow the
 [recovery example](docs/cli-reference.md#inspect-and-recover) to inspect a backup
 or server version and recover it to a new path. Keep recovery copies for the owner.
+
+For authorized HTTP access, follow the [service and proxy runbook](client/README.md#connect-over-http):
+issue `basalt mcp-token --dir DIR --key-out /private/path/new-mcp.key` outside the
+vault, run `basalt mcp --dir DIR --listen 127.0.0.1:3010`, and enable `--writable`
+only if edits are authorized and the device is writable. Put the token in the
+client's bearer-auth configuration, never in a note or model prompt. Tailscale
+Serve can publish the loopback listener; its TLS terminator sees plaintext notes.
+Every request still needs the token. Rotation uses `mcp-token` again; revocation
+uses `mcp-token --revoke`. Old-key queued work is cancelled when the change is
+observed, while admitted edits finish. The client must support a static bearer
+and reach the endpoint; OAuth is outside this release. Real Tailscale, Collie
+and phone acceptance remain unverified. If the phone just prompts an agent on
+the Mac, configure the Mac's MCP client and use stdio when it supports it.
 
 ## Working from development source
 

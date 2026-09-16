@@ -230,6 +230,9 @@ vaults, and a server web interface. Obsidian configuration sync is also absent:
 settings and workspace files have different ownership and failure consequences
 from notes, and the configuration folder contains device credentials.
 
+The HTTP MCP endpoint is an agent transport on a paired device, outside the
+excluded server web interface scope.
+
 Notes and ordinary attachments are the target. Large media libraries, arbitrary
 filesystem layouts, and untrusted collaborators require a different product
 scope. These are scope decisions, not claims that alternatives cannot solve them.
@@ -314,17 +317,22 @@ a collision between distinct plaintexts would reuse a GCM nonce. The birthday
 scale is about 2^48 distinct inputs, a probabilistic bound rather than an
 impossibility. Do not present deterministic sealing as revealing no information.
 
-## Three credentials, and who holds which
+## Four credentials, and who holds which
 
 | Credential/key | Held by | Purpose |
 |---|---|---|
 | Recovery key/root secret | Owner's separate recovery copy; transiently during setup/rotation | Register devices, rotate the root, administer device access. |
 | Device secret | That device | Connect, sync, list/revoke devices, issue/cancel invites. |
 | Data key | Every paired device | Encrypt, decrypt, and authenticate vault content. |
+| MCP bearer token | Owner and configured MCP client; serving device stores only its hash | Authenticate to one device's HTTP MCP endpoint in its launch mode. |
 
 A paired device does not normally retain the root. An incomplete initialization
 can retain it until device registration finishes, so an error must preserve and
 explain that recovery state.
+
+The MCP token is independently random, not derived from another vault key.
+Its hash lives in unsynced `.basalt` state. Rotating or revoking it does not
+change device registration, recovery access or encryption keys.
 
 ## What a device can do to another device
 
