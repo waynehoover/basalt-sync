@@ -2209,13 +2209,18 @@ export class NodeVault implements Vault {
     this.invalidateListing();
     const full = await this.absolute(path);
     await this.insideForReal(full);
-    if ((await lstat(full).catch(() => undefined)) === undefined) {
+    const present = await lstat(full).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return undefined;
+      throw err;
+    });
+    if (present === undefined) {
       // Nothing there. Two devices deleting one file produces this routinely;
       // `remove` says the same by doing nothing. Asked with `lstat` and not by
       // hashing: hashing to find out whether a file exists reads a 256 MiB
       // attachment to learn what one syscall knows, and calls a file that
       // cannot be read a file that is gone.
-      await this.remove(path);
+      // A second, unconditional remove used to trash a save arriving after
+      // this missing-path observation, bypassing the expected digest.
       return { landed: true };
     }
 
@@ -2284,15 +2289,18 @@ export class NodeVault implements Vault {
       // should find it. `putBack` refuses an occupied name, so a file that
       // arrived while this was deciding keeps it.
       if (await this.putBack(aside, full)) throw err;
-      await this.noteDisplaced(
-        aside,
-        full,
-        `${path} was taken off its name to be identified and could not be put back`,
-      );
-      throw new Error(
-        `${path} was taken off its name to be identified and could not be put back ` +
-          `(${(err as Error).message}); it is at ${relative(this.root, aside)}`,
-      );
+      try {
+        await this.noteDisplaced(
+          aside,
+          full,
+          `${path} was taken off its name to be identified and could not be put back`,
+        );
+      } catch (ledgerError) {
+        throw new PreservationError(ledgerError, [relative(this.root, aside)]);
+      }
+      // MCP redacts filesystem error text. A recovery path only named in
+      // that text disappeared from its deletion response despite surviving.
+      throw new PreservationError(err, [relative(this.root, aside)]);
     } finally {
       // It stops being this call's business either way, so a later scan
       // reports it if it is still there.

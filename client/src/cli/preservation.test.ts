@@ -27,11 +27,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { basename, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   NodeVault,
+  PreservationError,
   STALE_TEMP_MS,
   TEMP_MARK,
   midPreserve,
@@ -41,9 +42,16 @@ import {
 } from "./vault.ts";
 import { plainDigest } from "../core/crypto.ts";
 
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, lstat: vi.fn(actual.lstat) };
+});
+
 const dirs: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   midPreserve.beforeClaim = async () => {};
+  midTrash.parked = async () => {};
   while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
 });
 
@@ -55,6 +63,56 @@ async function vault(): Promise<{ dir: string; v: NodeVault }> {
 
 const enc = new TextEncoder();
 const expecting = (id: string) => ({ contentId: id, idOf: plainDigest });
+
+it.each(["EIO", "ENOENT"])("does not turn a %s stat into an unchecked removal", async (code) => {
+  const { dir, v } = await vault();
+  const path = join(dir, "note.md");
+  await writeFile(path, "newer unsent editor save");
+  const realStat = vi.mocked(lstat).getMockImplementation()!;
+  let injected = false;
+  vi.mocked(lstat).mockImplementation(async (...args) => {
+    if (!injected && String(args[0]) === path) {
+      injected = true;
+      throw Object.assign(new Error("stat failed"), { code });
+    }
+    return realStat(...args);
+  });
+  const result = await v
+    .removeExpecting("note.md", expecting("old base"), "kept.md")
+    .catch((error: unknown) => error);
+  expect(injected).toBe(true);
+  expect(await readFile(path, "utf8")).toBe("newer unsent editor save");
+  if (code === "EIO") expect(result).toBeInstanceOf(Error);
+});
+
+it("names a stranded editor save when deletion cannot preserve it or put it back", async () => {
+  const { dir, v } = await vault();
+  await writeFile(join(dir, "note.md"), "approved original");
+  const before = await v.readSnapshot("note.md", 1024);
+  await v.create("before.md", before.bytes, { mtime: Date.now(), ctime: Date.now() });
+  expect((await v.readSnapshot("before.md", 1024, { flush: true })).bytes).toEqual(before.bytes);
+  await v.flush();
+  await writeFile(join(dir, "note.md"), "first unsent editor save");
+  let parked = "";
+  midTrash.parked = async (at) => {
+    parked = basename(at);
+    await writeFile(join(dir, "note.md"), "second unsent editor save");
+  };
+  midPreserve.beforeClaim = async () => {
+    throw new Error("preservation claim failed");
+  };
+  const error = await v
+    .removeExpecting("note.md", expecting(before.base), "kept.md")
+    .catch((error: unknown) => error);
+  expect(await readFile(join(dir, "before.md"), "utf8")).toBe("approved original");
+  expect(await readFile(join(dir, parked), "utf8")).toBe("first unsent editor save");
+  expect(await readFile(join(dir, "note.md"), "utf8")).toBe("second unsent editor save");
+  const fresh = new NodeVault(dir, { observeOnly: true });
+  await fresh.list();
+  expect(fresh.displaced.map((entry) => entry.at)).toContain(parked);
+  expect(error).toBeInstanceOf(PreservationError);
+  expect((error as PreservationError).preserved).toContain(parked);
+});
 
 describe("a write that displaces something unexpected", () => {
   it("leaves it at a real path, and says which", async () => {
