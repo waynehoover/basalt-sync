@@ -233,7 +233,10 @@ export async function openHttp(
   }
   async function close() {
     const clientsClosed = await Promise.allSettled(clients.map((client) => client.close()));
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    // A shutdown test may already have sent SIGTERM. Sending it again raced
+    // the child's removal of its handler and turned a clean drain into a kill.
+    if (!child.killed && child.exitCode === null && child.signalCode === null)
+      child.kill("SIGTERM");
     try {
       const [code, signal] = await within(closed, "HTTP child shutdown", 15000);
       const failed = clientsClosed.find((result) => result.status === "rejected");
