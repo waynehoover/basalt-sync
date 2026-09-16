@@ -60,6 +60,44 @@ is not a system for sharing notes with people you do not trust. The CLI's
 read-only mode controls that client's sync behavior; it is not a restricted
 server credential.
 
+## HTTP access for an agent
+
+`basalt mcp --listen` exposes readable notes from a paired device. The MCP client
+and any model service it uses can receive plaintext note content. Whoever
+terminates the HTTPS connection can see that content and the bearer credential.
+This differs from the sync relay, which receives encrypted notes.
+
+Keep the listener on loopback and put a trusted TLS proxy in front of it.
+[Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) terminates
+TLS on the serving machine and restricts reachability to the tailnet and its
+network policy. The MCP bearer remains mandatory. A **Cloudflare Tunnel exposes
+plaintext notes to Cloudflare's TLS termination**. If you choose that arrangement,
+put an identity check such as Cloudflare Access in front of it and keep MCP's
+own bearer check. Forwarded identity or IP headers never authenticate to Basalt.
+
+Generate the separate random credential with `basalt mcp-token`. Keep it in the
+client's authentication configuration, outside the notes it can read. With
+`--key-out`, the CLI creates a new private file outside the vault and prints
+only its id and path. The server stores a SHA-256 hash in unsynced `.basalt`
+state. A missing credential refuses access, as does an unreadable or malformed
+record. There is no auth bypass, OAuth server, multi-user account system or
+per-tool token scope.
+
+HTTP exposes read-only tools by default; `--writable` explicitly enables the
+existing guarded mutations on a writable device. This launch policy applies
+to every client using its one credential. It does not restrict the serving
+device's own sync credential or prevent incoming sync from changing files.
+
+Rerun `mcp-token` to rotate, or use `mcp-token --revoke` to revoke without stopping
+the service. Once a request observes the change, old sessions end and queued
+old-key operations are cancelled. An admitted edit still finishes its preservation
+transaction. Rotation cannot retract notes already received by a client or model.
+Read any uncertain result before trying another edit.
+
+The [service example](../client/README.md#connect-over-http) describes the intended
+Tailscale arrangement. Real Tailscale, Cloudflare and phone-client acceptance
+have not been exercised for this release.
+
 ## Backups still matter
 
 Keep a backup of your readable local notes as well as the server's encrypted

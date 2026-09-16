@@ -58,7 +58,8 @@ Commands use the current directory unless you pass `--dir DIR`.
 |---|---|
 | `basalt sync` | Sync once and exit. |
 | `basalt sync --watch` | Keep syncing and reconnect after temporary outages. |
-| `basalt mcp` | Expose this paired directory to one local MCP host over stdio. |
+| `basalt mcp` | Expose this paired directory over stdio, or HTTP with `--listen`. |
+| `basalt mcp-token` | Issue or rotate the HTTP MCP credential; `--revoke` revokes it. |
 | `basalt status` | Check connection, local changes, and recovery issues. |
 | `basalt invite` | Add another device with a single-use invite. |
 | `basalt devices` | List devices and outstanding invites. |
@@ -145,7 +146,95 @@ Follow continuation fields to read later pages. `--read-only` omits every mutati
 tool but still downloads remote edits. The
 [MCP reference and recovery example](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md#mcp-over-stdio)
 cover exact limits, partial results and restoring an inspected version to a new
-path. This release supports local stdio hosts only.
+path.
+
+## Connect over HTTP
+
+For an agent running on the same machine, stdio can use the configuration above.
+HTTP lets multiple clients share one running process. Use the same separately
+paired headless directory and stop its existing watcher first. Issue the HTTP
+credential, exporting it outside the vault to a new private file:
+
+```bash
+basalt mcp-token --dir /srv/vault --key-out /private/path/basalt-mcp.key
+basalt mcp --dir /srv/vault --listen 127.0.0.1:3010
+```
+
+The output directory must already exist. Without `--key-out`, the command prints
+the token once. With it, only the credential id and file path are printed.
+Every HTTP request needs `Authorization: Bearer TOKEN`, including requests on
+loopback. The token is separate from your recovery key and device credential.
+HTTP has read-only tools by default; add `--writable` only when the agent should
+edit notes. A saved read-only pairing cannot be overridden. This default limits
+MCP tools, while ordinary sync still uploads on a writable device.
+
+On Linux, a service can own this directory. For example, save the following as
+`/etc/systemd/system/basalt-mcp.service`, adjusting the account, Node executable,
+installed artifact and vault paths:
+
+```ini
+[Unit]
+Description=Basalt MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=basalt
+ExecStart=/usr/local/bin/node /usr/local/lib/node_modules/basalt-sync/dist/basalt.mjs mcp --dir /srv/vault --listen 127.0.0.1:3010
+Restart=on-failure
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The service account must own the paired directory and its credential state.
+Use `command -v node` and `npm root -g` to locate your installation. Then enable
+the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now basalt-mcp
+```
+
+SIGTERM drains admitted edits before releasing the vault lock. If the service
+manager force-kills the process after its shutdown allowance, inspect uncertain
+outcomes and recovery copies. HTTP ignores stdin EOF and writes diagnostics only
+to stderr. Systemd acceptance of this example remains untested locally on macOS.
+
+On the same machine, publish the loopback listener through Tailscale Serve:
+
+```bash
+tailscale serve --bg --https=8443 3010
+```
+
+Replace `host.ts.net` with the machine's full Tailscale DNS name. Enter
+`https://host.ts.net:8443/mcp` in the MCP client and put the token in its bearer
+token/API-key field, or configure the exact `Authorization` header above. The
+client must support that header and have a network path into your tailnet.
+This static-key service does not provide OAuth discovery or a browser login.
+If your phone only sends prompts to an agent on your Mac, the Mac is the MCP
+client and can use local stdio instead.
+
+Rotate without restarting the service, then update each client:
+
+```bash
+basalt mcp-token --dir /srv/vault --key-out /private/path/basalt-mcp-next.key
+```
+
+Use a new export filename; existing files are never overwritten. Old keys fail
+their next request, and old sessions end when the new credential is observed.
+Queued old-key operations are cancelled; admitted edits finish. Revoking uses
+`basalt mcp-token --dir /srv/vault --revoke`. Issuing another credential restores
+access. The stored hash cannot recover a lost token.
+
+The [HTTP reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md#mcp-over-http)
+covers origins, limits and reconnect behavior. TLS terminators receive plaintext
+notes; read the [Cloudflare and proxy warning](https://github.com/waynehoover/basalt-sync/blob/main/docs/security.md#http-access-for-an-agent)
+before choosing another proxy. A loopback proxy stand-in was tested. **Real
+Tailscale routing, Cloudflare Tunnel, Collie and phone-client access remain
+unverified**, including phone lockout and re-entry after token rotation.
 
 ## A mirror, and turning merging off
 
@@ -196,8 +285,10 @@ attention even when other transfers succeed.
 
 ## Automation and output
 
-Use `--json` for structured command output, except with `mcp`, which uses its
-own protocol. Exit **0** means the command succeeded,
+Use `--json` for structured command output. `mcp` and `mcp-token` refuse this flag.
+MCP stdout is protocol-only for stdio and empty for HTTP; `mcp-token` prints
+the token once, or the id and path when exporting.
+Exit **0** means the command succeeded,
 **1** means a failure or unresolved issue, and **2** means invalid arguments.
 For sync, `outcome` explains the result and the counters describe the work.
 
@@ -219,8 +310,9 @@ basalt pair - --read-only < /private/path/invite.txt
 basalt rotate --key-file /private/path/recovery.txt --key-out /private/path/new-recovery.txt
 ```
 
-`--key-out` creates a new private file and refuses to overwrite one. The key is
-also printed, so protect command output and logs.
+`--key-out` creates a new private file and refuses to overwrite one. Recovery
+keys are also printed, so protect command output and logs. For `mcp-token`,
+exporting suppresses the token on stdout.
 
 ## Files and local state
 

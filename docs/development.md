@@ -84,7 +84,7 @@ server. Its in-memory adapters do not measure a phone's filesystem or network.
 
 ## MCP verification
 
-The stdio implementation uses the pinned official MCP SDK 2.0.0. Protocol tests
+The stdio and HTTP implementations use the pinned official MCP SDK 2.0.0. Protocol tests
 exercise its legacy `2025-11-25` and modern `2026-07-28` modes, cancellation and
 framing. The usable workflow is also tested through an official client talking
 to a freshly built CLI child and the real Go server:
@@ -92,6 +92,7 @@ to a freshly built CLI child and the real Go server:
 ```bash
 cd client
 bun run test src/cli/mcp.test.ts src/cli/mcp-bin.test.ts src/cli/mcp-protocol.test.ts src/cli/mcp-artifact.test.ts
+bun run test src/cli/mcp-token.test.ts src/cli/mcp-token-auth.test.ts src/cli/mcp-http.test.ts src/cli/mcp-http-process.test.ts src/cli/mcp-http-concurrency.test.ts
 bun run stress src/stress/mcp.stress.ts
 ```
 
@@ -100,6 +101,34 @@ BOM/CRLF/frontmatter/link bytes, reads the before-image, and checks both copies
 on a separately paired device. History tests inspect and restore an older version
 to a free destination and read it again after restart and from a fresh device.
 All files live in temporary directories. Tests never require a real user's vault.
+The daily-note workflow runs through both legacy and modern official HTTP clients
+talking to a CLI child, including exact before-image and second-device checks.
+
+HTTP concurrency tests use one actual sync Client and writing NodeVault shared
+by all clients. They cover same-base contention, disjoint edits, retries behind
+a held append, 17 competing mutations, disconnect, DELETE and idle expiry during
+an admitted write. Rotation and revocation tests hold one admitted write and
+four queued writes, then prove that observing an old-token 401 cancels queued
+work without losing the admitted edit. One thousand real CLI rotations under
+an authentication loop must never expose a missing or torn credential record.
+
+The SDK's `2026-07-28` HTTP path is sessionless; legacy `2025-11-25` uses sessions.
+Twenty legacy initialization attempts yield 16 usable sessions and four prompt
+refusals. Twenty modern readers compete with a phone-equivalent publishing 200
+notes. Reads may honestly return `busy` or `changed_during_read`, and searches
+report skipped changing files. Successful stable-folder results match sequential
+queries; a fresh observer matches the final converged 231-file inventory.
+The tests keep those bounded refusals instead of widening the existing queues.
+
+Legacy cancellation ends its session because SDK 2.0 retains cancelled routing
+state until the transport is collected. Tests check reconnection and actual
+callback drain, including cancellation of old-key work in both protocol modes.
+Authorization, origin, body, request, session and response limits run on real
+ports. An unreadable credential returns 503 with no tool dispatch; its real
+permission test explicitly skips when root bypasses that filesystem refusal.
+Named-interface binding is exercised when a non-loopback IPv4 interface exists;
+otherwise only that environment-dependent probe skips. Loopback remains required.
+Both probes ran on the development Mac.
 
 Process tests cover EOF, SIGTERM and broken stdout during admitted writes,
 incoming sync, stalled handshake and reconnect sleep. They hold a filesystem
@@ -111,9 +140,9 @@ paused stdin descriptor that previously kept the process alive after draining.
 `mcp-artifact.test.ts` builds the actual production configuration, copies only
 `basalt.mjs` into an empty installation and removes its build inputs before
 launch. On macOS, sandbox-exec also denies the child access to the repository.
-The test initializes, lists, reads and edits with the official client, verifies
-the backup, and checks the plugin bundle for MCP SDK leakage. The npm tarball
-gate repeats the read/edit/backup workflow against the installed package.
+The test initializes, lists, reads and edits over both transports with the official
+client, verifies the backup, and checks the plugin bundle for MCP SDK leakage.
+The npm tarball gate repeats both read/edit/backup workflows against the installed package.
 Dependencies missing from setup fail these tests rather than skipping them.
 
 The MCP stress suite submits writes through tool handlers and uses independent
@@ -124,7 +153,13 @@ The remote author exits after uploading so its disk cannot rescue a lost branch.
 Tests also interrupt restore before its reply and disconnect the server during
 an already admitted edit.
 
-The explicit crash matrix reaches each boundary before SIGKILL:
+The HTTP stress driver repeats the phone races through real ports. Three official
+clients share one writer; all three submit distinct create requests after the
+intercepted phone race, and a fresh device must retain their markers as well as
+the original and independent remote branches. Simultaneous competing HTTP edits
+are covered separately by the concurrency tests above.
+
+The explicit crash matrix reaches each boundary before SIGKILL on both stdio and HTTP:
 
 | Seam | Boundary |
 |---|---|
@@ -141,13 +176,41 @@ the preserved branches. Removing before-image creation makes the post-publicatio
 kill test lose the preexisting branch. Removing shutdown drains makes the
 held-write lock test admit a competing process too early. These are preservation
 assertions, not just convergence or successful exit checks.
+HTTP restart also requires the unchanged credential to authenticate. All six
+HTTP seams additionally exercise dropped TCP plus SIGTERM: the lock remains held
+until the admitted edit finishes, and the exact before-image remains readable.
 
 Production artifacts have been exercised on macOS with Node 22.23.2 and 24.21.0.
+Recorded on 2026-09-15 on an Apple M4 Pro with 48 GiB RAM and local storage:
+the HTTP CLI is 1,088,247 bytes, 49,471 bytes above the step 5 artifact
+(1,038,776), or 49,171 bytes above the final stdio artifact (1,039,076).
+The plugin remains 298,846 bytes, unchanged by HTTP and free of SDK imports.
+
+| Runtime | Step 5 stdio initialization | Current HTTP initialization | Difference |
+|---|---:|---:|---:|
+| Node 22.23.2 | 93.0 ms | 120.7 ms | +27.7 ms |
+| Node 24.21.0 | 101.4 ms | 109.8 ms | +8.4 ms |
+
+Current stdio samples were 96.0 ms and 268.5 ms respectively. These are individual
+observations from separate runs with different concurrent load and probe setup,
+not controlled performance comparisons or latency guarantees. Each current
+artifact workflow also verified an exact edit and before-image while denied
+access to repository sources and dependencies.
+
 Node 20.20.2 could initialize and read locally but lacked the global WebSocket
 needed for sync; it is not supported. Process kills do not simulate power loss.
 Flush-failure injection complements them, and native Linux filesystem/systemd
-checks still require CI. These tests do not establish real phone-app acceptance
-or network MCP access. This release has no HTTP listener.
+checks still require CI. The HTTP reverse-proxy stand-in rewrites Host and adds
+forwarded headers while preserving mandatory bearer authentication. It exercises
+forwarding, not external TLS, tailnet reachability or proxy identity enforcement.
+
+Real Tailscale Serve, Cloudflare Tunnel, Collie and phone-client acceptance have
+not been exercised. They cannot be established by the CI stand-in. Manual
+acceptance must publish a running listener through the actual proxy, ask the
+daily-note questions from the intended phone client, then rotate the credential
+and prove access fails until the new token is entered. That arrangement remains
+untested for this release; phone access is unverified. If the chosen MCP client
+requires OAuth instead of a static bearer, scope that separately.
 
 ## Plugin testing
 
