@@ -111,3 +111,84 @@ it.each([false, true])(
   },
   30000,
 );
+
+it.each([false, true])(
+  "previews and applies tag, move, directory and delete workflows through the built transport, HTTP=%s",
+  async (http) => {
+    const { dir, key, client } = await start(http);
+    expect(await tool(client, "create_directory", { path: "Projects" })).toMatchObject({
+      applied: true,
+      durable: true,
+    });
+    for (const [path, content] of [
+      ["Projects/A.md", "UNSENT original\n#old\n"],
+      ["Index.md", "[[Projects/A|label]]\n"],
+    ])
+      expect(await tool(client, "create_note", { path, content })).toMatchObject({
+        applied: true,
+        durable: true,
+      });
+    const addArgs = { paths: ["Projects/A.md"], tags: ["added"], location: "frontmatter" };
+    const add = await tool(client, "add_tags", addArgs);
+    expect(add).toMatchObject({ phase: "preview", applied: false });
+    expect(await tool(client, "add_tags", { ...addArgs, changes: add.changes })).toMatchObject({
+      complete: true,
+    });
+    const renameArgs = { oldTag: "old", newTag: "new" };
+    const rename = await tool(client, "rename_tag", renameArgs);
+    expect(
+      await tool(client, "rename_tag", { ...renameArgs, changes: rename.changes }),
+    ).toMatchObject({ complete: true });
+    const removeArgs = { paths: ["Projects/A.md"], patterns: ["add*"] };
+    const remove = await tool(client, "remove_tags", removeArgs);
+    expect(
+      await tool(client, "remove_tags", { ...removeArgs, changes: remove.changes }),
+    ).toMatchObject({ complete: true });
+    const manageArgs = {
+      paths: ["Projects/A.md"],
+      operation: "add",
+      tags: ["managed"],
+      location: "content",
+    };
+    const manage = await tool(client, "manage_tags", manageArgs);
+    expect(
+      await tool(client, "manage_tags", { ...manageArgs, changes: manage.changes }),
+    ).toMatchObject({ complete: true });
+    const moveArgs = { path: "Projects/A.md", to: "Archive/A.md" };
+    const move = await tool(client, "move_note", moveArgs);
+    expect(await tool(client, "move_note", { ...moveArgs, changes: move.changes })).toMatchObject({
+      complete: true,
+    });
+    expect((await tool(client, "read_note", { path: "Index.md" })).content).toBe(
+      "[[Archive/A|label]]\n",
+    );
+    const read = await tool(client, "read_note", { path: "Archive/A.md" });
+    expect(read.content).toContain("UNSENT original");
+    expect(read.content).toContain("#new");
+    expect(read.content).toContain("#managed");
+    const deletion = await tool(client, "delete_note", { path: "Archive/A.md" });
+    const deleted = await tool(client, "delete_note", {
+      path: "Archive/A.md",
+      changes: deletion.changes,
+    });
+    expect(deleted).toMatchObject({ complete: true });
+    const beforeImage = deleted.results.find(
+      (row: { path: string }) => row.path === "Archive/A.md",
+    ).beforeImage;
+    expect((await tool(client, "read_note", { path: beforeImage })).content).toBe(read.content);
+    expect(await readFile(join(dir, beforeImage), "utf8")).toBe(read.content);
+    await waitFor(
+      client,
+      (status) =>
+        !status.localWritesSincePass && !status.engine.syncing && status.engine.pending === 0,
+    );
+    const phone = await directory();
+    expect((await cli("pair", key, "--dir", phone, "--device", "phone")).code).toBe(0);
+    const synced = await cli("sync", "--dir", phone);
+    expect(synced.code, synced.err).toBe(0);
+    expect(await readFile(join(phone, beforeImage), "utf8")).toBe(read.content);
+    expect(await readFile(join(phone, "Index.md"), "utf8")).toBe("[[Archive/A|label]]\n");
+    expect(await readFile(join(phone, "Archive/A.md")).catch(() => null)).toBeNull();
+  },
+  30000,
+);

@@ -1,13 +1,8 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { isMap, isScalar, isSeq, parseDocument, type Node as YamlNode } from "yaml";
-import { inputText, NOTE_BYTES, NoteError } from "./mcp-notes.ts";
+import { NoteError, sourceEdit, applySourceEdits, type SourceEdit } from "./mcp-notes.ts";
+export { sourceEdit, applySourceEdits, type SourceEdit } from "./mcp-notes.ts";
 
-export interface SourceEdit {
-  start: number;
-  end: number;
-  old: string;
-  text: string;
-}
 export interface TagOccurrence {
   tag: string;
   start: number;
@@ -24,36 +19,6 @@ export interface TagChange {
   includeChildren?: boolean | undefined;
   position?: "start" | "end" | undefined;
   normalization?: "preserve" | "lowercase" | "kebab" | undefined;
-}
-
-export function sourceEdit(source: string, start: number, end: number, text: string): SourceEdit {
-  return { start, end, old: source.slice(start, end), text };
-}
-
-export function applySourceEdits(source: string, edits: readonly SourceEdit[]): string {
-  let at = 0;
-  const out: string[] = [];
-  for (const edit of [...edits].sort((a, b) => a.start - b.start || a.end - b.end)) {
-    if (
-      !Number.isSafeInteger(edit.start) ||
-      !Number.isSafeInteger(edit.end) ||
-      edit.start < at ||
-      edit.end < edit.start ||
-      edit.end > source.length ||
-      source.slice(edit.start, edit.end) !== edit.old
-    ) {
-      throw new NoteError(
-        "invalid_edits",
-        "source edits overlap or differ from the inspected bytes",
-      );
-    }
-    out.push(source.slice(at, edit.start), edit.text);
-    at = edit.end;
-  }
-  out.push(source.slice(at));
-  const result = out.join("");
-  inputText(result, NOTE_BYTES);
-  return result;
 }
 
 export function validateTag(input: string): string {
