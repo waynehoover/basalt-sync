@@ -769,3 +769,32 @@ the server uses `modernc.org/sqlite` and `github.com/coder/websocket`. Exact
 versions live in the package manifests and lockfiles. Changes that affect sealed
 bytes or merge output need compatibility tests, even when the replacement API
 looks equivalent.
+
+The namespace expansion uses a preview containing exact source spans and required
+bases. Applying recomputes the semantic operation and accepts only the same plan.
+All before-images are verified and flushed before any original is changed. Batch
+results retain per-file outcomes when a later operation fails; rollback could
+replace a concurrent editor save, so it is not used.
+
+Moves deliberately use a verified exclusive copy, approved backlink changes and
+recoverable source deletion, in that order. They do not call `noteRename` inside
+`mutateLocal`, which would wait on the same serial queue. They also do not claim
+crash-stable rename lineage: the engine's in-memory rename hint is persisted only
+by a later sync pass. Destination history starts at its new path.
+
+Independent review caught destination parsing errors in links containing code
+labels, nested images and character references. The implementation now consumes
+micromark destination token offsets and raw fragment boundaries rather than
+searching for a decoded URL in a whole link. Regression tests preserve labels,
+titles, aliases, encoded fragments, BOM/CRLF, relative outbound links and unrelated
+prose. The micromark and decode-string dependencies are pinned directly because
+these CLI paths import them directly.
+
+The same review reproduced two deletion adapter failures: an unreadable or
+missing `lstat` could fall through to an unconditional remove, and a stranded
+editor save's path appeared only in error text that MCP redacts. Missing paths
+now return without a second removal, other stat errors propagate, and retained
+paths travel in `PreservationError`. Actual process stress tests kill moves,
+deletes and tag batches before replies, restart them, sync a fresh device and
+assert the original bytes remain discoverable. Concurrent phone-edit cases check
+retained content after the remote author disconnects.

@@ -16,6 +16,13 @@ import {
 } from "./mcp-notes.ts";
 import { TrackedMcpServer, MCP_REPLY_BYTES } from "./mcp-protocol.ts";
 import type { NodeVault } from "./vault.ts";
+import {
+  applyOperation,
+  previewOperation,
+  createDirectory,
+  type PlannedChange,
+  type VaultOperation,
+} from "./mcp-operations.ts";
 
 const text = (bytes: number) =>
   z
@@ -80,6 +87,76 @@ const editSchema = z
   );
 const appendSchema = z.object({ path, base, text: text(INPUT_BYTES).min(1) }).strict();
 const createSchema = z.object({ path, content: text(NOTE_BYTES) }).strict();
+
+const plannedChanges = z
+  .array(
+    z
+      .object({
+        path,
+        base,
+        action: z.enum(["edit", "move", "delete"]),
+        to: path.optional(),
+        edits: z
+          .array(
+            z
+              .object({
+                start: z.number().int().min(0).max(NOTE_BYTES),
+                end: z.number().int().min(0).max(NOTE_BYTES),
+                old: text(INPUT_BYTES),
+                text: text(INPUT_BYTES),
+              })
+              .strict(),
+          )
+          .max(4096),
+      })
+      .strict(),
+  )
+  .max(32);
+const tagFields = {
+  paths: z.array(path).min(1).max(32),
+  location: z.enum(["frontmatter", "content", "both"]).optional(),
+  changes: plannedChanges.optional(),
+};
+const addFields = {
+  ...tagFields,
+  tags: z.array(text(200).min(1)).min(1).max(100),
+  position: z.enum(["start", "end"]).optional(),
+  normalization: z.enum(["preserve", "lowercase", "kebab"]).optional(),
+};
+const removeFields = {
+  ...tagFields,
+  tags: z.array(text(200).min(1)).min(1).max(100).optional(),
+  patterns: z.array(text(200).min(1)).min(1).max(100).optional(),
+  includeChildren: z.boolean().optional(),
+};
+const addTagsSchema = z.object(addFields).strict();
+const removeTagsSchema = z.object(removeFields).strict();
+const manageTagsSchema = z.discriminatedUnion("operation", [
+  z.object({ ...addFields, operation: z.literal("add") }).strict(),
+  z.object({ ...removeFields, operation: z.literal("remove") }).strict(),
+]);
+const renameTagSchema = z
+  .object({
+    oldTag: text(200).min(1),
+    newTag: text(200).min(1),
+    folder: text(4096).optional(),
+    includeChildren: z.boolean().optional(),
+    location: z.enum(["frontmatter", "content", "both"]).optional(),
+    changes: plannedChanges.optional(),
+  })
+  .strict();
+const moveSchema = z
+  .object({
+    path,
+    to: path,
+    updateLinks: z.boolean().optional(),
+    changes: plannedChanges.optional(),
+  })
+  .strict();
+const deleteSchema = z
+  .object({ path, markBroken: z.boolean().optional(), changes: plannedChanges.optional() })
+  .strict();
+const directorySchema = z.object({ path }).strict();
 
 const historySchema = z
   .object({ path, before: uid.optional(), limit: limit(100).optional() })
@@ -241,9 +318,10 @@ export function createTools(session: McpSession, version: string) {
     (input, ctx) => call(() => history.deleted(input, ctx.mcpReq.signal)),
   );
 
-  async function mutation(
-    request: NoteMutation,
+  async function localWork(
+    path: string,
     signal: AbortSignal,
+    work: (changed: (path: string) => void) => Promise<object>,
     captured?: Client,
   ): Promise<object> {
     let admitted = false;
@@ -262,7 +340,7 @@ export function createTools(session: McpSession, version: string) {
             throw new NoteError("stopping", "this process cannot admit a mutation");
           admitted = true;
           let invalidated = false;
-          const result = await mutateNote(session.writer, request, (path) => {
+          const result = await work((path) => {
             if (!invalidated) {
               session.changed();
               invalidated = true;
@@ -275,7 +353,7 @@ export function createTools(session: McpSession, version: string) {
       );
     } catch (error) {
       return {
-        path: request.path,
+        path,
         applied: admitted ? "unknown" : false,
         ...(admitted ? { durable: "unknown" } : {}),
         preserved: [],
@@ -285,6 +363,32 @@ export function createTools(session: McpSession, version: string) {
     }
   }
 
+  async function mutation(
+    request: NoteMutation,
+    signal: AbortSignal,
+    captured?: Client,
+  ): Promise<object> {
+    return localWork(
+      request.path,
+      signal,
+      (changed) => mutateNote(session.writer, request, changed),
+      captured,
+    );
+  }
+  async function operation(
+    request: VaultOperation,
+    changes: readonly PlannedChange[] | undefined,
+    signal: AbortSignal,
+  ): Promise<object> {
+    if (changes === undefined)
+      return session.reader.run(() => previewOperation(session.reader.vault, request), signal);
+    return localWork(request.kind === "tags" ? "" : request.path, signal, (changed) =>
+      session.reader.run(() =>
+        applyOperation(session.writer, session.reader.vault, request, changes, changed),
+      ),
+    );
+  }
+
   if (session.mode === "writable") {
     const annotations = {
       readOnlyHint: false,
@@ -292,6 +396,125 @@ export function createTools(session: McpSession, version: string) {
       idempotentHint: false,
       openWorldHint: false,
     };
+    const previewDescription =
+      " Without changes, returns a read-only preview. To apply, resubmit every exact change and required base. Preserves all originals first; partial results and ambiguous links require inspection.";
+    server.registerTool(
+      "add_tags",
+      {
+        description:
+          "Add tags to selected notes, preserving unrelated frontmatter and prose." +
+          previewDescription,
+        inputSchema: addTagsSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { paths, changes, ...change } = input;
+          return operation(
+            { kind: "tags", paths, change: { operation: "add", ...change } },
+            changes,
+            ctx.mcpReq.signal,
+          );
+        }),
+    );
+    server.registerTool(
+      "remove_tags",
+      {
+        description:
+          "Remove exact, nested or wildcard-selected tags from selected notes." +
+          previewDescription,
+        inputSchema: removeTagsSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { paths, changes, ...change } = input;
+          return operation(
+            { kind: "tags", paths, change: { operation: "remove", ...change } },
+            changes,
+            ctx.mcpReq.signal,
+          );
+        }),
+    );
+    server.registerTool(
+      "manage_tags",
+      {
+        description:
+          "Add or remove tags using the same exact-span workflow as add_tags and remove_tags." +
+          previewDescription,
+        inputSchema: manageTagsSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { paths, changes, ...change } = input;
+          return operation({ kind: "tags", paths, change }, changes, ctx.mcpReq.signal);
+        }),
+    );
+    server.registerTool(
+      "rename_tag",
+      {
+        description:
+          "Rename a tag across the vault or a selected folder. Recovery copies are immutable and omitted." +
+          previewDescription,
+        inputSchema: renameTagSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { folder, changes, ...change } = input;
+          return operation(
+            { kind: "tags", folder, change: { operation: "rename", ...change } },
+            changes,
+            ctx.mcpReq.signal,
+          );
+        }),
+    );
+    server.registerTool(
+      "move_note",
+      {
+        description:
+          "Move a note to a free path, maintaining relative outbound links and optionally updating unambiguous backlinks. Verified copy, backlink edits, then recoverable source deletion. Destination history starts at the new path." +
+          previewDescription,
+        inputSchema: moveSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { changes, ...request } = input;
+          return operation({ kind: "move", ...request }, changes, ctx.mcpReq.signal);
+        }),
+    );
+    server.registerTool(
+      "delete_note",
+      {
+        description:
+          "Recoverably delete a note after a verified before-image. Backlinks stay unchanged unless markBroken requests visible strike-through markers. No permanent deletion." +
+          previewDescription,
+        inputSchema: deleteSchema,
+        annotations,
+      },
+      (input, ctx) =>
+        call(() => {
+          const { changes, ...request } = input;
+          return operation({ kind: "delete", ...request }, changes, ctx.mcpReq.signal);
+        }),
+    );
+    server.registerTool(
+      "create_directory",
+      {
+        description:
+          "Create and flush a checked vault-relative directory. Existing directories are a no-op; occupied file paths are refused.",
+        inputSchema: directorySchema,
+        annotations: { ...annotations, destructiveHint: false },
+      },
+      (input, ctx) =>
+        call(() =>
+          localWork(input.path, ctx.mcpReq.signal, (changed) =>
+            createDirectory(session.writer, input.path, changed),
+          ),
+        ),
+    );
     server.registerTool(
       "edit_note",
       {

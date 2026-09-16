@@ -177,12 +177,19 @@ resolve to its canonical local directory.
 | `append_note` | Required `path`, current `base`, and nonempty `text` (max 64 KiB). Appends exactly those bytes to an existing note. Include any wanted newline yourself. |
 | `prepend_note` | Same arguments as append. Inserts exact text at the start, after an existing UTF-8 BOM. Include any wanted newline yourself. Preserves a verified before-image and refuses stale retries. |
 | `create_note` | Required `path` and `content` (max 1 MiB). Exclusively creates a note at a free path. |
+| `create_directory` | Required `path`. Creates and flushes a checked directory; an existing directory is a no-op. |
+| `add_tags` | `paths` and `tags`, optional `location` (`frontmatter`, `content`, `both`), `position` (`start`, `end`) and `normalization` (`preserve`, `lowercase`, `kebab`). Returns an exact preview unless `changes` is supplied. |
+| `remove_tags` | `paths`, exact `tags` and/or single-`*` wildcard `patterns`, optional `includeChildren` and `location`. Uses the same preview/apply workflow. |
+| `manage_tags` | The add/remove fields plus `operation: "add"` or `"remove"`. |
+| `rename_tag` | `oldTag`, `newTag`, optional `folder`, `includeChildren` and `location`. Scans the selected scope, omitting immutable recovery copies. |
+| `move_note` | `path`, free destination `to`, optional `updateLinks` (default true). Previews the move and exact link edits; maintains relative outbound links even when incoming backlink updates are disabled. |
+| `delete_note` | `path`, optional `markBroken` (default false). Previews recoverable deletion and optional backlink strike-through edits. |
 | `restore_note` | Required source `path`, inspected version `uid`, and distinct explicit destination `to`. Exclusively creates that destination; an occupied path gives `exists`. Repeating a request never invents another filename. |
 
 Content reads and searches accept UTF-8 `.md` and `.txt` notes up to 1 MiB.
 Mutations also require those formats and refuse `.excalidraw.md` drawings and
 MCP backup/recovery names. Attachments can be listed but not read or changed.
-There is no whole-file replacement, deletion, rename or backup-cleanup tool.
+There is no whole-file replacement, permanent deletion or backup-cleanup tool.
 
 Every read page is at most 64 KiB. A single line larger than that gives
 `line_too_large`; reducing `maxLines` cannot split it. Follow `nextLine` with
@@ -209,7 +216,8 @@ unverifiable content cannot be restored.
 Initialization does not wait for initial sync. Local read/list/search and basic
 status remain available while connecting or offline, and may reflect an older
 local copy. A missing local path gives `not_found_local`, not proof of deletion
-from the server. History and preview require a settled server connection.
+from the server. History and sync preview require a settled server connection.
+Tag and namespace previews inspect local files and can run while offline.
 Mutations require `writeReady:true`; a queued mutation waits at most five seconds
 to start and otherwise returns `busy`. An admitted mutation finishes in the
 owning sync client's serial queue even if its connection subsequently drops.
@@ -218,7 +226,7 @@ owning sync client's serial queue even if its connection subsequently drops.
 tools. It still permits incoming sync to change local files. It is a local
 process policy, not a restricted server credential.
 
-Before an edit, append or prepend changes existing bytes, it creates a visible sibling,
+Before any mutation changes or removes existing bytes, it creates a visible sibling,
 reads it back, compares every byte and flushes it. Failure stops the edit before
 touching the original. Creation and restore have no before-image because their
 destinations must be absent. An unchanged edit returns `noop:true` without a write.
@@ -242,6 +250,45 @@ the base or repeat an append. `localWritesSincePass` says whether a pass scanned
 since the local commit; zero does not prove server delivery. Inspect the last
 pass, pending work and recovery state, and read from a second device when
 delivery matters.
+
+### Tag, move and delete previews
+
+Call the tool without `changes` to inspect its plan. The result has `phase:
+"preview"`, `applied:false`, and a `changes` array. Each row contains the note's
+complete base, its action and exact source edits. Offsets count JavaScript UTF-16
+code units; `old` and `text` carry the actual removed and inserted text.
+
+To apply, resubmit the same tool arguments with the complete returned `changes`
+array. Basalt recomputes the operation and refuses `plan_changed` if an affected
+note, base or edit differs, including a new affected note. Inspect a new preview
+and reconsider before retrying. Never replace bases automatically.
+
+Tag edits preserve unrelated YAML and body bytes. They ignore code, comments and
+link destinations. Add defaults to frontmatter; remove and rename default to both
+frontmatter and inline tags. Nested selection is opt-in for mutations. Wildcards
+match tag names, not filesystem paths. Malformed or ambiguous frontmatter refuses
+the operation instead of being rewritten.
+
+An apply validates all bases and edits, then creates, reads, compares and flushes
+every required before-image before changing any original. It rechecks bases before
+publication and before each file. A later race or I/O failure stops the batch.
+Inspect every `results` row, including `attempted`, `applied`, `durable`,
+`beforeImage` and `preserved`; `complete:false` can accompany completed local
+changes. Basalt does not roll those changes back over other writers.
+
+A move creates and verifies the destination, updates approved backlinks, then
+retires the source last. It is a recoverable copy and deletion, not an atomic
+rename across devices. The destination starts its own history. A failure can
+leave both names, and a crash can leave some backlinks updated; the before-images
+remain available. Short links with multiple possible targets stay unchanged and
+are counted in `ambiguousLinks`. Labels, aliases, titles and fragment syntax are
+preserved. Deleted backlinks stay as they were unless `markBroken:true` requests
+visible strike-through markers. Deletion always keeps its synced before-image.
+
+Plans are bounded to 32 affected paths (including a move destination), 16 KiB of
+JSON-encoded paths and 64 KiB of exact changes. Scans read at most 512 notes or
+8 MiB; unreadable or ambiguous notes refuse the plan rather than authorize an
+incomplete global edit. Narrow `paths` or `folder` when a limit is reached.
 
 ### Inspect and recover
 
@@ -293,7 +340,7 @@ field. This is static bearer authentication, without OAuth discovery or a login
 flow. A client requiring OAuth needs a separate integration. There is no
 credential-management tool or unauthenticated health endpoint.
 
-HTTP starts with read-only tools. Add `--writable` to enable the four mutation
+HTTP starts with read-only tools. Add `--writable` to enable mutation
 tools. It cannot override a saved read-only pairing or `--read-only`; those
 combinations exit 2. HTTP's default only restricts MCP tools: ordinary sync
 still uploads local changes on a writable device. `--read-only` also restricts

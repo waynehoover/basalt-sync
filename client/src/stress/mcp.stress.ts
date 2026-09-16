@@ -554,3 +554,131 @@ it("an admitted MCP edit finishes across server disconnection and reaches a fres
   );
   expect(await readFile(join(fresh, result.beforeImage), "utf8")).toBe(before.content);
 });
+
+it.each(
+  ["delete_note", "move_note", "add_tags"].flatMap((name) =>
+    [false, true].map((http) => ({ name, http })),
+  ),
+)(
+  "namespace $name retains a disconnected phone branch and all local input (HTTP=$http)",
+  async ({ name, http }) => {
+    const { a, b, host, original, baseline } = await setup(false, http);
+    const entered = deferred<void>(),
+      release = deferred<void>();
+    releases.push(() => release.resolve());
+    const put = a.c.transport.putMany.bind(a.c.transport);
+    let intercepted = false;
+    vi.spyOn(a.c.transport, "putMany").mockImplementation(async (...args) => {
+      if (!intercepted) {
+        intercepted = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return put(...args);
+    });
+    const args =
+      name === "move_note"
+        ? { path: "note.md", to: "moved.md" }
+        : name === "delete_note"
+          ? { path: "note.md" }
+          : { paths: ["note.md"], tags: ["AGENT_TAG"] };
+    const preview = await tool(host, name, args);
+    const result = await tool(host, name, { ...args, changes: preview.changes });
+    expect(result.complete).toBe(true);
+    const originalRow = result.results.find((row: { path: string }) => row.path === "note.md");
+    expect(await readFile(join(a.dir, originalRow.beforeImage), "utf8")).toBe(original);
+    await within(entered.promise, "namespace upload before remote edit");
+    await writeFile(join(b.dir, "note.md"), baseline + "PHONE NAMESPACE BRANCH\n");
+    b.c.noteChanged("note.md");
+    await b.c.settle();
+    await b.c.close();
+    await receiveCommitted(a.c.transport);
+    release.resolve();
+    await a.c.settle({ retryFailures: true }, 16);
+    await settle([a], 3);
+    const fresh = await device(server, "namespace-reader", dirs, clients);
+    await settle([fresh], 2);
+    const markers = ["PREEXISTING BRANCH", "UNSENT LOCAL MATERIAL", "PHONE NAMESPACE BRANCH"];
+    if (name === "add_tags") markers.push("AGENT_TAG");
+    for (const d of [a, fresh]) await retained(d, markers);
+    expect(await readFile(join(fresh.dir, originalRow.beforeImage), "utf8")).toBe(original);
+    if (name === "move_note")
+      expect(await readFile(join(fresh.dir, "moved.md"), "utf8")).toBe(original);
+  },
+);
+
+it.each(
+  [
+    { name: "move_note", point: "cli/mcp:durable" },
+    { name: "move_note", point: "cli/vault:trash.parked" },
+    { name: "delete_note", point: "cli/vault:trash.parked" },
+    { name: "add_tags", point: "cli/mcp:published" },
+  ].flatMap((row) => [false, true].map((http) => ({ ...row, http }))),
+)(
+  "namespace crash at $point during $name retains all before-images through restart (HTTP=$http)",
+  async ({ name, point, http }) => {
+    server = new TestServer();
+    await server.start();
+    const dir = await mkdtemp(join(tmpdir(), "basalt-namespace-crash-"));
+    dirs.push(dir);
+    const init = await cli("init", server.setup, "--dir", dir, "--json");
+    expect(init.code, init.err).toBe(0);
+    const key = JSON.parse(init.out).recoveryKey;
+    const token = http ? await cli("mcp-token", "--dir", dir) : undefined;
+    await writeFile(join(dir, "a.md"), "ACKNOWLEDGED A UNSENT SOURCE\n");
+    await writeFile(join(dir, "b.md"), "ACKNOWLEDGED B [[a]]\n");
+    const child = http ? await httpChild(dir, token!.out.trim()) : mcpProcess(bundle, dir);
+    children.push(child);
+    await child.initialize();
+    await child.ready();
+    const args =
+      name === "move_note"
+        ? { path: "a.md", to: "moved.md" }
+        : name === "delete_note"
+          ? { path: "a.md" }
+          : { paths: ["a.md", "b.md"], tags: ["agent"] };
+    const preview = await child.tool(name, args);
+    await child.hold(point);
+    child.send({
+      id: "namespace-crash",
+      method: "tools/call",
+      params: { name, arguments: { ...args, changes: preview.changes } },
+    });
+    const reached = await child.reached(point);
+    expect(reached.path).toBeTypeOf("string");
+    expect(child.responses.has("namespace-crash")).toBe(false);
+    child.child.kill("SIGKILL");
+    expect((await child.exited()).signal).toBe("SIGKILL");
+    const observer = new NodeVault(dir, { observeOnly: true });
+    const files = await observer.list({ forceFull: true, checked: true });
+    const local = (
+      await Promise.all(
+        files.filter((file) => !file.folder).map((file) => readFile(join(dir, file.path), "utf8")),
+      )
+    ).join("\n");
+    expect(local).toContain("ACKNOWLEDGED A UNSENT SOURCE");
+    expect(local).toContain("ACKNOWLEDGED B [[a]]");
+    const restarted = http ? await httpChild(dir, token!.out.trim()) : mcpProcess(bundle, dir);
+    children.push(restarted);
+    await restarted.initialize();
+    await restarted.ready();
+    if (http) restarted.child.kill("SIGTERM");
+    else restarted.child.stdin!.end();
+    expect((await restarted.exited()).code).toBe(0);
+    const fresh = await mkdtemp(join(tmpdir(), "basalt-namespace-crash-reader-"));
+    dirs.push(fresh);
+    expect((await cli("pair", key, "--dir", fresh)).code).toBe(0);
+    const synced = await cli("sync", "--dir", fresh);
+    expect(synced.code, synced.err).toBe(0);
+    const remoteFiles = await new NodeVault(fresh, { observeOnly: true }).list();
+    const remote = (
+      await Promise.all(
+        remoteFiles
+          .filter((file) => !file.folder)
+          .map((file) => readFile(join(fresh, file.path), "utf8")),
+      )
+    ).join("\n");
+    expect(remote).toContain("ACKNOWLEDGED A UNSENT SOURCE");
+    expect(remote).toContain("ACKNOWLEDGED B [[a]]");
+  },
+);

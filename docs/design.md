@@ -106,6 +106,18 @@ remain ordinary synced files, immutable through MCP. Creation and restore publis
 only to absent destinations; restore requires an authenticated version belonging
 to the requested path and an explicit different destination.
 
+Tag and namespace tools first return a bounded preview. Applying requires every
+affected base and exact source edit as input; recomputing a different plan refuses
+the request. A batch validates all inputs and verifies and flushes all required
+before-images before publishing its first change. It then rechecks each source
+and reports per-file results. A later failure retains completed work and all
+recovery copies, without rollback over another author's save.
+
+Moves publish a verified destination, update approved links, then recoverably
+delete the source last. This deliberately uses ordinary sync create/delete
+semantics. It does not promise atomic remote visibility or move history across
+paths. Permanent deletion and mutation of recovery copies remain unavailable.
+
 Success distinguishes a verified, flushed local result from server delivery.
 Cancellation or connection loss cannot roll back an admitted write; unknown
 outcomes require inspection before retry. Checked access refuses existing child

@@ -21,7 +21,9 @@ export type NoteMutation =
   | { kind: "edit"; path: string; base: string; edits: readonly { old: string; new: string }[] }
   | { kind: "append"; path: string; base: string; text: string }
   | { kind: "prepend"; path: string; base: string; text: string }
-  | { kind: "create"; path: string; content: string };
+  | { kind: "create"; path: string; content: string }
+  | { kind: "delete"; path: string; base: string }
+  | { kind: "spans"; path: string; base: string; edits: readonly SourceEdit[] };
 export type Certainty = boolean | "unknown";
 export interface MutationResult {
   applied: Certainty;
@@ -116,6 +118,42 @@ export function noteFailure(error: unknown): { code: string; message: string } {
   };
 }
 
+export interface SourceEdit {
+  start: number;
+  end: number;
+  old: string;
+  text: string;
+}
+export function sourceEdit(source: string, start: number, end: number, text: string): SourceEdit {
+  return { start, end, old: source.slice(start, end), text };
+}
+
+export function applySourceEdits(source: string, edits: readonly SourceEdit[]): string {
+  let at = 0;
+  const out: string[] = [];
+  for (const edit of [...edits].sort((a, b) => a.start - b.start || a.end - b.end)) {
+    if (
+      !Number.isSafeInteger(edit.start) ||
+      !Number.isSafeInteger(edit.end) ||
+      edit.start < at ||
+      edit.end < edit.start ||
+      edit.end > source.length ||
+      source.slice(edit.start, edit.end) !== edit.old
+    ) {
+      throw new NoteError(
+        "invalid_edits",
+        "source edits overlap or differ from the inspected bytes",
+      );
+    }
+    out.push(source.slice(at, edit.start), edit.text);
+    at = edit.end;
+  }
+  out.push(source.slice(at));
+  const result = out.join("");
+  inputText(result, NOTE_BYTES);
+  return result;
+}
+
 function replacement(
   source: string,
   edits: Extract<NoteMutation, { kind: "edit" }>["edits"],
@@ -165,112 +203,168 @@ function sibling(path: string, kind: "backup" | "recovery"): string {
   return `${stem} (MCP ${kind} ${stamp} ${randomBytes(8).toString("hex")})${ext}`;
 }
 
-/** No client or wire calls belong here. The caller owns the serial write slot. */
-export async function mutateNote(
+export interface PreparedNote {
+  readonly request: NoteMutation;
+  readonly before: Awaited<ReturnType<NodeVault["readSnapshot"]>> | undefined;
+  readonly proposed: Uint8Array | undefined;
+  readonly times: { mtime: number; ctime: number };
+  readonly result: MutationResult;
+  consumed: boolean;
+}
+
+export async function verifyNote(
   vault: NodeVault,
-  request: NoteMutation,
+  path: string,
+  expected: Uint8Array,
+): Promise<void> {
+  const found = await vault.readSnapshot(path, NOTE_BYTES, { flush: true });
+  if (
+    found.size !== expected.length ||
+    found.base !== noteDigest(expected) ||
+    !Buffer.from(found.bytes).equals(expected)
+  )
+    throw new NoteError("verification_failed", "the written bytes differ from the intended bytes");
+}
+
+/** No client or wire calls belong here. The caller owns the serial write slot. */
+export async function prepareNote(vault: NodeVault, request: NoteMutation): Promise<PreparedNote> {
+  noteFormat(request.path, true);
+  const result: MutationResult = { applied: false, path: request.path, preserved: [] };
+  let before: PreparedNote["before"];
+  let proposed: Uint8Array | undefined;
+  let times = { mtime: Date.now(), ctime: Date.now() };
+  if (request.kind === "create") {
+    proposed = inputText(request.content, NOTE_BYTES);
+    const destination = await vault.checkPath(request.path, { allowMissing: true });
+    result.path = destination.path;
+    if (destination.exists) throw new NoteError("exists", "the destination is already occupied");
+    result.bytesBefore = 0;
+  } else {
+    if (typeof request.base !== "string" || !/^[a-f0-9]{64}$/u.test(request.base))
+      throw new NoteError("invalid_base", "supply the complete SHA-256 base from read_note");
+    before = await vault.readSnapshot(request.path, NOTE_BYTES);
+    result.path = before.path;
+    noteFormat(result.path, true);
+    if (before.base !== request.base)
+      throw new NoteError("stale", "the note changed; read it and reconsider the edit");
+    const source = noteText(before.bytes);
+    if (request.kind === "append" || request.kind === "prepend") {
+      const inserted = inputText(request.text, INPUT_BYTES);
+      if (!inserted.length) throw new NoteError("invalid_text", "inserted text cannot be empty");
+      if (request.kind === "append") proposed = Buffer.concat([before.bytes, inserted]);
+      else {
+        const bom = source.startsWith("\ufeff") ? 3 : 0;
+        proposed = Buffer.concat([
+          before.bytes.subarray(0, bom),
+          inserted,
+          before.bytes.subarray(bom),
+        ]);
+      }
+    } else if (request.kind === "spans") {
+      proposed = inputText(applySourceEdits(source, request.edits), NOTE_BYTES);
+    } else if (request.kind === "edit") proposed = replacement(source, request.edits);
+    else if (request.kind !== "delete")
+      throw new NoteError("invalid_operation", "unknown note operation");
+    if (proposed && proposed.length > NOTE_BYTES)
+      throw new NoteError("note_too_large", "the resulting note exceeds 1 MiB");
+    result.bytesBefore = before.size;
+    result.bytesAfter = proposed?.length ?? 0;
+    if (proposed && Buffer.from(before.bytes).equals(proposed)) {
+      result.base = before.base;
+      result.noop = true;
+    }
+    times = { mtime: Date.now(), ctime: before.ctime };
+  }
+  return { request, before, proposed, times, result, consumed: false };
+}
+
+async function saveSibling(
+  vault: NodeVault,
+  plan: PreparedNote,
+  bytes: Uint8Array,
+  kind: "backup" | "recovery",
+  changed: (path: string) => void,
+): Promise<string> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const path = sibling(plan.result.path, kind);
+    await vault.checkPath(path, { allowMissing: true });
+    // A failed exclusive-open fallback can leave partial bytes. Report its
+    // attempted name and never delete it merely because verification failed.
+    plan.result.preserved.push(path);
+    changed(path);
+    if (!(await vault.create(path, bytes, plan.times))) {
+      plan.result.preserved.pop();
+      continue;
+    }
+    await verifyNote(vault, path, bytes);
+    if (kind === "backup") await midNoteMutation.backupVerified(plan.result.path);
+    await vault.flush();
+    return path;
+  }
+  throw new NoteError("backup_collision", "could not claim a free recovery name");
+}
+
+export async function preserveNote(
+  vault: NodeVault,
+  plan: PreparedNote,
+  changed: (path: string) => void,
+): Promise<void> {
+  if (!plan.before || plan.result.noop) return;
+  if (plan.result.beforeImage)
+    throw new NoteError("invalid_operation", "this before-image was already prepared");
+  plan.result.durable = false;
+  // Rules 3 and 5: a matching base says nothing about unsent prose the
+  // requested edit removes. Preserve an independent, verified copy first.
+  const backup = await saveSibling(vault, plan, plan.before.bytes, "backup", changed);
+  plan.result.beforeImage = backup;
+  plan.result.preserved = plan.result.preserved.filter((path) => path !== backup);
+  await midNoteMutation.backupDurable(plan.result.path);
+}
+
+export async function checkPrepared(vault: NodeVault, plan: PreparedNote): Promise<void> {
+  if (!plan.before) return;
+  if (!plan.result.noop) {
+    if (!plan.result.beforeImage)
+      throw new NoteError("missing_backup", "the verified before-image is required");
+    await verifyNote(vault, plan.result.beforeImage, plan.before.bytes);
+  }
+  const again = await vault.readSnapshot(plan.result.path, NOTE_BYTES);
+  if (again.base !== plan.before.base)
+    throw new NoteError(
+      "stale",
+      "the note changed while its before-image was saved; read and reconsider",
+    );
+}
+
+export async function applyNote(
+  vault: NodeVault,
+  plan: PreparedNote,
   changed: (path: string) => void,
 ): Promise<MutationResult> {
-  const result: MutationResult = { applied: false, path: request.path, preserved: [] };
-  let proposed: Uint8Array | undefined;
+  const { result, before, proposed, times } = plan;
   let publishing = false;
   let raced = false;
-  let times = { mtime: Date.now(), ctime: Date.now() };
-  const mark = (path: string): void => {
-    changed(path);
-  };
-  const verify = async (path: string, expected: Uint8Array): Promise<void> => {
-    const found = await vault.readSnapshot(path, NOTE_BYTES, { flush: true });
-    if (
-      found.size !== expected.length ||
-      found.base !== noteDigest(expected) ||
-      !Buffer.from(found.bytes).equals(expected)
-    ) {
-      throw new NoteError(
-        "verification_failed",
-        "the written bytes differ from the intended bytes",
-      );
-    }
-  };
-  const saveSibling = async (bytes: Uint8Array, kind: "backup" | "recovery"): Promise<string> => {
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const path = sibling(result.path, kind);
-      await vault.checkPath(path, { allowMissing: true });
-      // A failed exclusive-open fallback can leave partial bytes. Report its
-      // attempted name and never delete it merely because verification failed.
-      result.preserved.push(path);
-      mark(path);
-      if (!(await vault.create(path, bytes, times))) {
-        result.preserved.pop();
-        continue;
-      }
-      await verify(path, bytes);
-      if (kind === "backup") await midNoteMutation.backupVerified(result.path);
-      await vault.flush();
-      return path;
-    }
-    throw new NoteError("backup_collision", "could not claim a free recovery name");
-  };
   try {
-    noteFormat(request.path, true);
-    if (request.kind === "create") {
-      proposed = inputText(request.content, NOTE_BYTES);
-      const destination = await vault.checkPath(request.path, { allowMissing: true });
-      result.path = destination.path;
+    if (plan.consumed)
+      throw new NoteError("invalid_operation", "a prepared operation cannot be repeated");
+    plan.consumed = true;
+    if (result.noop) {
+      await checkPrepared(vault, plan);
+      return result;
+    }
+    if (!before) {
+      const destination = await vault.checkPath(result.path, { allowMissing: true });
       if (destination.exists) throw new NoteError("exists", "the destination is already occupied");
       publishing = true;
       result.applied = "unknown";
-      mark(result.path);
-      if (!(await vault.create(result.path, proposed, times))) {
+      changed(result.path);
+      if (!(await vault.create(result.path, proposed!, times))) {
         publishing = false;
         result.applied = false;
         throw new NoteError("exists", "another writer occupied the destination");
       }
-      result.bytesBefore = 0;
     } else {
-      if (typeof request.base !== "string" || !/^[a-f0-9]{64}$/u.test(request.base))
-        throw new NoteError("invalid_base", "supply the complete SHA-256 base from read_note");
-      const before = await vault.readSnapshot(request.path, NOTE_BYTES);
-      result.path = before.path;
-      noteFormat(result.path, true);
-      if (before.base !== request.base)
-        throw new NoteError("stale", "the note changed; read it and reconsider the edit");
-      const source = noteText(before.bytes);
-      if (request.kind === "append" || request.kind === "prepend") {
-        const suffix = inputText(request.text, INPUT_BYTES);
-        if (suffix.length === 0)
-          throw new NoteError("invalid_text", "inserted text cannot be empty");
-        if (request.kind === "append") proposed = Buffer.concat([before.bytes, suffix]);
-        else {
-          const bom = source.startsWith("\ufeff") ? 3 : 0;
-          proposed = Buffer.concat([
-            before.bytes.subarray(0, bom),
-            suffix,
-            before.bytes.subarray(bom),
-          ]);
-        }
-      } else proposed = replacement(source, request.edits);
-      if (proposed.length > NOTE_BYTES)
-        throw new NoteError("note_too_large", "the resulting note exceeds 1 MiB");
-      result.bytesBefore = before.size;
-      result.bytesAfter = proposed.length;
-      if (Buffer.from(before.bytes).equals(proposed)) {
-        return { ...result, base: before.base, noop: true };
-      }
-      times = { mtime: Date.now(), ctime: before.ctime };
-      result.durable = false;
-      // Rules 3 and 5: a matching base says nothing about unsent prose the
-      // requested edit removes. Preserve an independent, verified copy first.
-      const backup = await saveSibling(before.bytes, "backup");
-      result.beforeImage = backup;
-      result.preserved = result.preserved.filter((path) => path !== backup);
-      await midNoteMutation.backupDurable(result.path);
-      const again = await vault.readSnapshot(result.path, NOTE_BYTES);
-      if (again.base !== before.base)
-        throw new NoteError(
-          "stale",
-          "the note changed while its before-image was saved; read and reconsider",
-        );
+      await checkPrepared(vault, plan);
       const keepAt = await firstFreeName(
         conflictCopyPath(result.path, "MCP", new Date()),
         async (path) => (await vault.checkPath(path, { allowMissing: true })).exists,
@@ -278,50 +372,56 @@ export async function mutateNote(
       await vault.checkPath(result.path);
       publishing = true;
       result.applied = "unknown";
-      mark(result.path);
-      mark(keepAt);
-      const replaced = await vault.replace(
-        result.path,
-        { contentId: before.base, idOf: async (bytes) => noteDigest(bytes) },
-        proposed,
-        times,
-        keepAt,
-      );
+      changed(result.path);
+      changed(keepAt);
+      const expectation = {
+        contentId: before.base,
+        idOf: async (bytes: Uint8Array) => noteDigest(bytes),
+      };
+      const replaced =
+        proposed === undefined
+          ? await vault.removeExpecting(result.path, expectation, keepAt)
+          : await vault.replace(result.path, expectation, proposed, times, keepAt);
       if (replaced.keptAt) {
         result.preserved.push(replaced.keptAt);
-        mark(replaced.keptAt);
+        changed(replaced.keptAt);
         await vault.readSnapshot(replaced.keptAt, NOTE_BYTES, { flush: true });
         raced = true;
       }
       if (!replaced.landed) {
         result.applied = false;
-        await saveSibling(proposed, "recovery");
+        if (proposed) await saveSibling(vault, plan, proposed, "recovery", changed);
         await vault.flush();
         result.durable = true;
         return {
           ...result,
           error: {
             code: "race",
-            message: "another writer took the destination; the proposed edit was saved beside it",
+            message: "another writer took the destination; inspect the reported recovery paths",
           },
         };
       }
     }
     await midNoteMutation.published(result.path);
-    await verify(result.path, proposed);
-    result.applied = true;
+    if (proposed) {
+      await verifyNote(vault, result.path, proposed);
+      result.applied = true;
+      result.bytesAfter = proposed.length;
+      result.base = noteDigest(proposed);
+    } else {
+      result.applied = !(await vault.checkPath(result.path, { allowMissing: true })).exists;
+      if (!result.applied) raced = true;
+    }
     await vault.flush();
     result.durable = true;
     await midNoteMutation.durable(result.path);
-    result.bytesAfter = proposed.length;
-    result.base = noteDigest(proposed);
     if (raced)
       return {
         ...result,
         error: {
           code: "race",
           message:
-            "the edit landed, but a newer local version was displaced and preserved; inspect both",
+            "an independent local save raced with this operation; inspect the current note and recovery paths",
         },
       };
     result.sync = { state: "pending", reason: "ordinary sync scheduled" };
@@ -330,29 +430,55 @@ export async function mutateNote(
     if (error instanceof PreservationError) {
       for (const path of error.preserved) {
         if (!result.preserved.includes(path)) result.preserved.push(path);
-        mark(path);
+        changed(path);
       }
     }
-    if (publishing && proposed) {
+    if (publishing) {
       // Publication can have succeeded even when the adapter threw. Never
       // turn a lost acknowledgement into permission to repeat an append.
-      let matches = false;
-      try {
-        await verify(result.path, proposed);
-        matches = true;
-        result.applied = true;
-      } catch {
-        /* The target may belong to a later writer; never roll it back. */
-      }
-      if (!matches) {
+      if (proposed) {
+        let matches = false;
         try {
-          await saveSibling(proposed, "recovery");
+          await verifyNote(vault, result.path, proposed);
+          matches = true;
+          result.applied = true;
         } catch {
-          /* Its attempted path is retained in preserved. */
+          /* A later writer owns the target; never roll it back. */
+        }
+        if (!matches) {
+          try {
+            await saveSibling(vault, plan, proposed, "recovery", changed);
+          } catch {
+            /* Its attempted path is retained in preserved. */
+          }
+        }
+      } else {
+        try {
+          result.applied = !(await vault.checkPath(result.path, { allowMissing: true })).exists;
+        } catch {
+          /* The removal remains unknown until the path can be inspected. */
         }
       }
       result.durable = false;
     }
     return { ...result, error: noteFailure(error) };
+  }
+}
+
+export async function mutateNote(
+  vault: NodeVault,
+  request: NoteMutation,
+  changed: (path: string) => void,
+): Promise<MutationResult> {
+  let plan: PreparedNote | undefined;
+  try {
+    plan = await prepareNote(vault, request);
+    await preserveNote(vault, plan, changed);
+    return await applyNote(vault, plan, changed);
+  } catch (error) {
+    return {
+      ...(plan?.result ?? { applied: false, path: request.path, preserved: [] }),
+      error: noteFailure(error),
+    };
   }
 }
