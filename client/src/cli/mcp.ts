@@ -7,6 +7,8 @@ import { NodeVault } from "./vault.ts";
 import { McpReader } from "./mcp-read.ts";
 import { startStdio, type ProtocolHandle } from "./mcp-protocol.ts";
 import { createTools, type McpSession } from "./mcp-tools.ts";
+import { startHttp, parseMcpListen } from "./mcp-http.ts";
+import { readMcpToken } from "./mcp-token.ts";
 
 function boundedArrays<T extends object>(value: T): { value: T; truncated: boolean } {
   let remaining = 32768;
@@ -33,7 +35,22 @@ function boundedArrays<T extends object>(value: T): { value: T; truncated: boole
 export async function cmdMcp(args: Args, io: Console, version: string): Promise<number> {
   const config = await loadConfig(args.dir);
   if (!config) throw new Error(`${args.dir} is not paired. Run basalt init or basalt pair first.`);
+  const listen = args.mcpListen === undefined ? undefined : parseMcpListen(args.mcpListen);
+  if (args.mcpWritable && (args.readOnly || config.readOnly)) {
+    io.err("basalt mcp: --writable cannot override a read-only device");
+    return 2;
+  }
+  if (listen) {
+    try {
+      await readMcpToken(args.dir);
+    } catch {
+      throw new Error(
+        "HTTP MCP requires a readable credential. Run basalt mcp-token for this vault.",
+      );
+    }
+  }
   const opts = await clientOptions(config, { ...args, watch: true }, io);
+  const mode = opts.readOnly || (listen && !args.mcpWritable) ? "read-only" : "writable";
   const writer = opts.vault as NodeVault;
   const observed = new NodeVault(args.dir, {
     configDir: args.configDir,
@@ -76,13 +93,13 @@ export async function cmdMcp(args: Args, io: Console, version: string): Promise<
   }
   const summary = () => ({
     connection: state,
-    writeReady: !stopping && !!current?.writeReady,
+    writeReady: mode === "writable" && !stopping && !!current?.writeReady,
     localGeneration,
     scannedGeneration,
     localWritesSincePass: localGeneration - scannedGeneration,
   });
   const session: McpSession = {
-    mode: opts.readOnly ? "read-only" : "writable",
+    mode,
     reader,
     writer,
     client: () =>
@@ -104,7 +121,7 @@ export async function cmdMcp(args: Args, io: Console, version: string): Promise<
         const sampled = boundedArrays({ stranded: observed.stranded, displaced: recovery.waiting });
         return {
           ...summary(),
-          readOnly: opts.readOnly ?? false,
+          readOnly: mode === "read-only",
           mergeEnabled: opts.merge ?? true,
           exclusions: { configDir: args.configDir ?? ".obsidian", ignoredNames: args.ignore },
           engine: current
@@ -188,16 +205,36 @@ export async function cmdMcp(args: Args, io: Console, version: string): Promise<
     },
   ).catch(stop);
   try {
-    protocol = startStdio(
-      () => {
-        const registry = createTools(session, version);
-        registries.push(registry);
-        return registry.server;
-      },
-      process.stdin,
-      process.stdout,
-      stop,
-    );
+    if (listen) {
+      protocol = await startHttp(
+        args.dir,
+        () => createTools(session, version),
+        {
+          host: listen.host,
+          port: listen.port,
+          allowOrigins: args.mcpOrigins ?? [],
+          verbose: args.verbose,
+          log: io.err,
+        },
+        stop,
+      );
+      if (!listen.loopback)
+        io.err(
+          `WARNING: ${args.mcpListen} carries plaintext notes and credentials. Use a trusted network and a TLS proxy.`,
+        );
+      io.err(`basalt mcp: HTTP listening on ${args.mcpListen}, ${mode}`);
+      if (stopping) protocol.stop();
+    } else
+      protocol = startStdio(
+        () => {
+          const registry = createTools(session, version);
+          registries.push(registry);
+          return registry.server;
+        },
+        process.stdin,
+        process.stdout,
+        stop,
+      );
     await finished;
   } finally {
     stop();

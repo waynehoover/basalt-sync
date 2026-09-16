@@ -1,4 +1,5 @@
 import type { Args } from "./cli.ts";
+import { mcpOrigin, parseMcpListen } from "./mcp-http.ts";
 
 /** Accepted positional arguments. Vault paths always use --dir. */
 const POSITIONALS: Record<string, number> = {
@@ -63,7 +64,11 @@ export function validateUsage(args: Args): void {
     "--device": ["init", "pair"],
     "--vault-id": ["init"],
     "--key-file": ["init", "pair", "rotate"],
-    "--key-out": ["init", "rotate"],
+    "--key-out": ["init", "rotate", "mcp-token"],
+    "--revoke": ["mcp-token"],
+    "--listen": ["mcp"],
+    "--writable": ["mcp"],
+    "--allow-origin": ["mcp"],
     "--no-merge": ["sync", "restore", "preview", "mcp"],
     "--read-only": ["init", "pair", "sync", "restore", "preview", "mcp"],
   };
@@ -74,6 +79,14 @@ export function validateUsage(args: Args): void {
         `${flag} is only for ${allowed.join(", ")}; it has no effect on ${args.command}`,
       );
   }
+  if (args.command === "mcp-token" && (args.json || (args.mcpRevoke && args.keyOut !== undefined)))
+    throw new Error("mcp-token does not accept --json or --key-out together with --revoke");
+  if ((args.mcpWritable || args.mcpOrigins?.length) && args.mcpListen === undefined)
+    throw new Error("--writable and --allow-origin require --listen");
+  if (args.mcpWritable && args.readOnly)
+    throw new Error("--writable cannot be combined with --read-only");
+  if (args.mcpListen !== undefined) parseMcpListen(args.mcpListen);
+  for (const origin of args.mcpOrigins ?? []) mcpOrigin(origin);
   if (args.keyFile && args.rest[0] && args.rest[0] !== "-")
     throw new Error("Use a key argument or --key-file, not both");
   if (["pair", "rotate"].includes(args.command ?? "") && !args.rest[0] && !args.keyFile)

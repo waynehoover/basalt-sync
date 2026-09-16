@@ -1,4 +1,5 @@
 import { cmdMcp } from "./mcp.ts";
+import { cmdMcpToken } from "./mcp-token.ts";
 import { clientOptions } from "./client-options.ts";
 import { validateUsage } from "./usage.ts";
 import { previewCounts } from "../core/preview.ts";
@@ -114,6 +115,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt sync                               sync once and exit
   basalt sync --watch                       sync, then keep syncing
   basalt mcp                                serve notes to a local MCP host over stdio
+  basalt mcp-token                          issue or rotate the HTTP MCP credential
   basalt status                             what this device thinks the state is
   basalt preview                            show planned sync changes without writing notes
   basalt devices                            every device that may reach this vault
@@ -222,6 +224,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await locked(args, () => cmdRebase(args, io));
       case "mcp":
         return await locked(args, () => cmdMcp(args, io, VERSION));
+      case "mcp-token":
+        return await cmdMcpToken(args, io, writeKeyOut);
       case "sync":
         return await locked(args, () => cmdSync(args, io));
       case "status":
@@ -2466,6 +2470,10 @@ export interface Args {
   keyFile: string | undefined;
   /** Where to write a newly generated recovery key, at 0600 (I12). */
   keyOut: string | undefined;
+  mcpRevoke?: boolean;
+  mcpListen?: string;
+  mcpWritable?: boolean;
+  mcpOrigins?: string[];
   verbose: boolean;
   help: boolean;
   version: boolean;
@@ -2566,6 +2574,7 @@ export function parseArgs(argv: readonly string[]): Args {
     "--ignore",
     "--ttl",
     "--recovery-key",
+    "--allow-origin",
   ]);
   let onlyPositional = false;
   for (let i = 0; i < argv.length; i++) {
@@ -2593,6 +2602,16 @@ export function parseArgs(argv: readonly string[]): Args {
       if (value === undefined || value.startsWith("--")) throw new Error(`${arg} needs a value`);
     }
     switch (arg) {
+      case "--listen":
+        args.mcpListen =
+          argv[i + 1] && !argv[i + 1]!.startsWith("-") ? argv[++i]! : "127.0.0.1:3010";
+        break;
+      case "--writable":
+        args.mcpWritable = true;
+        break;
+      case "--allow-origin":
+        (args.mcpOrigins ??= []).push(value!);
+        break;
       case "--dir":
         args.dir = resolve(value!);
         break;
@@ -2666,6 +2685,9 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--key-out":
         args.keyOut = value!;
+        break;
+      case "--revoke":
+        args.mcpRevoke = true;
         break;
       case "--before": {
         const before = Number(value);
