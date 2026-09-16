@@ -321,13 +321,14 @@ Serve can publish the loopback listener; its TLS terminator sees plaintext notes
 Every request still needs the token. Rotation uses `mcp-token` again; revocation
 uses `mcp-token --revoke`. Old-key queued work is cancelled when the change is
 observed, while admitted edits finish. The client must support a static bearer
-and reach the endpoint; OAuth is outside this release. Real Tailscale, Collie
-and phone acceptance remain unverified. If the phone just prompts an agent on
-the Mac, configure the Mac's MCP client and use stdio when it supports it.
+and reach the endpoint; OAuth is outside this release. Real Tailscale HTTPS,
+credential rotation and restart were verified with official SDK clients. Collie
+and a specific phone MCP client remain untested. If the phone just prompts an
+agent on the Mac, configure the Mac's MCP client and use stdio when it supports it.
 
 ## Working from development source
 
-This source tree, the Compose image, and released 0.8.x clients use protocol 7.
+This source tree, the Compose image, and released 0.8.x and 0.9.x clients use protocol 7.
 Version 0.7.x uses protocol 6 and cannot connect. For source builds, build the
 server and clients from the same checkout.
 Keep existing data and credentials, and verify the reported protocol after

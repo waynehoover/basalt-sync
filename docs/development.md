@@ -204,13 +204,19 @@ checks still require CI. The HTTP reverse-proxy stand-in rewrites Host and adds
 forwarded headers while preserving mandatory bearer authentication. It exercises
 forwarding, not external TLS, tailnet reachability or proxy identity enforcement.
 
-Real Tailscale Serve, Cloudflare Tunnel, Collie and phone-client acceptance have
-not been exercised. They cannot be established by the CI stand-in. Manual
-acceptance must publish a running listener through the actual proxy, ask the
-daily-note questions from the intended phone client, then rotate the credential
-and prove access fails until the new token is entered. That arrangement remains
-untested for this release; phone access is unverified. If the chosen MCP client
-requires OAuth instead of a static bearer, scope that separately.
+Real Tailscale Serve acceptance passed on 2026-09-15 with a Linux headless client
+and official SDK clients on macOS. Both protocol families negotiated through
+HTTPS; exact edits, verified before-images, stale retries, token rotation,
+revocation and restart were exercised. Mac and Android Obsidian devices received
+the expected edited bytes and original before-image through ordinary Basalt sync.
+Temporary vaults also exercised native/container exclusion and SIGKILL recovery
+on that Linux host. This does not replace CI's mounted-filesystem or systemd checks.
+
+Cloudflare Tunnel, Collie and a specific phone MCP client remain untested. Manual
+acceptance for that client must reach the actual proxy, ask the intended note
+questions, then rotate the credential and prove access fails until the new token
+is entered. If the chosen client requires OAuth instead of a static bearer,
+scope that separately.
 
 ## Plugin testing
 
