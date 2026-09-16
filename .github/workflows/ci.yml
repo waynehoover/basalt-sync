@@ -84,6 +84,11 @@ jobs:
         with:
           go-version-file: server/go.mod
           cache-dependency-path: server/go.sum
+      # The release verifier now delegates its packed CLI check to Bun. This
+      # job lacked it, so the first MCP release passed locally and failed here.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.1
 
       - name: the pinned image is not behind the newest server release
         run: scripts/pin-check.sh
