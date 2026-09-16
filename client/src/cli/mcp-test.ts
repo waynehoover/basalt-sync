@@ -30,7 +30,7 @@ export async function cli(...argv: string[]) {
 export async function openMcp(bundle: string, dir: string, flags: string[] = [], modern = false) {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [bundle, "mcp", "--dir", dir, ...flags],
+    args: [bundle, "mcp", ...(flags.includes("--vault") ? [] : ["--dir", dir]), ...flags],
     stderr: "pipe",
   });
   const client = new Client(

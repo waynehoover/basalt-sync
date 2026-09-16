@@ -67,6 +67,7 @@ export function validateUsage(args: Args): void {
     "--key-out": ["init", "rotate", "mcp-token"],
     "--revoke": ["mcp-token"],
     "--listen": ["mcp"],
+    "--vault": ["mcp"],
     "--writable": ["mcp"],
     "--allow-origin": ["mcp"],
     "--no-merge": ["sync", "restore", "preview", "mcp"],
@@ -79,6 +80,8 @@ export function validateUsage(args: Args): void {
         `${flag} is only for ${allowed.join(", ")}; it has no effect on ${args.command}`,
       );
   }
+  if (args.mcpVaults?.length && args.provided?.has("--dir"))
+    throw new Error("mcp takes --dir or named --vault roots, not both");
   if (args.command === "mcp-token" && (args.json || (args.mcpRevoke && args.keyOut !== undefined)))
     throw new Error("mcp-token does not accept --json or --key-out together with --revoke");
   if ((args.mcpWritable || args.mcpOrigins?.length) && args.mcpListen === undefined)

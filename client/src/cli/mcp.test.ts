@@ -292,8 +292,11 @@ it("omits every mutation in persisted read-only mode and refuses invalid schemas
   await saveConfig(dir, { ...config, readOnly: true });
   const { client } = await host(dir);
   expect((await client.listTools()).tools.map((row) => row.name).sort()).toEqual([
+    "compare_versions",
     "deleted_notes",
+    "delivery_status",
     "list_notes",
+    "list_vaults",
     "note_history",
     "read_note",
     "search_notes",

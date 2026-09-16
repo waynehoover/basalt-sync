@@ -1,250 +1,127 @@
-import { runForever, type Client } from "../core/client.ts";
-import { outcomeOf } from "../core/outcome.ts";
 import type { Args, Console } from "./cli.ts";
-import { clientOptions } from "./client-options.ts";
 import { loadConfig } from "./config.ts";
-import { NodeVault } from "./vault.ts";
-import { McpReader } from "./mcp-read.ts";
 import { startStdio, type ProtocolHandle } from "./mcp-protocol.ts";
-import { createTools, type McpSession } from "./mcp-tools.ts";
+import { createVaultTools } from "./mcp-tools.ts";
 import { startHttp, parseMcpListen } from "./mcp-http.ts";
 import { readMcpToken } from "./mcp-token.ts";
-
-function boundedArrays<T extends object>(value: T): { value: T; truncated: boolean } {
-  let remaining = 32768;
-  let truncated = false;
-  const result = Object.fromEntries(
-    Object.entries(value).map(([key, item]) => {
-      if (!Array.isArray(item)) return [key, item];
-      const rows: unknown[] = [];
-      for (const row of item) {
-        const bytes = Buffer.byteLength(JSON.stringify(row));
-        if (rows.length >= 20 || bytes > remaining) {
-          truncated = true;
-          continue;
-        }
-        remaining -= bytes;
-        rows.push(row);
-      }
-      return [key, rows];
-    }),
-  );
-  return { value: result as T, truncated };
-}
+import { mcpVaultRoots, withMcpLocks } from "./mcp-vaults.ts";
+import { prepareMcpSession } from "./mcp-session.ts";
 
 export async function cmdMcp(args: Args, io: Console, version: string): Promise<number> {
-  const config = await loadConfig(args.dir);
-  if (!config) throw new Error(`${args.dir} is not paired. Run basalt init or basalt pair first.`);
-  const listen = args.mcpListen === undefined ? undefined : parseMcpListen(args.mcpListen);
-  if (args.mcpWritable && (args.readOnly || config.readOnly)) {
-    io.err("basalt mcp: --writable cannot override a read-only device");
-    return 2;
-  }
-  if (listen) {
-    try {
-      await readMcpToken(args.dir);
-    } catch {
-      throw new Error(
-        "HTTP MCP requires a readable credential. Run basalt mcp-token for this vault.",
-      );
+  const roots = await mcpVaultRoots(args);
+  return withMcpLocks(roots, async () => {
+    const configs = await Promise.all(
+      roots.map(async (root) => {
+        const config = await loadConfig(root.dir);
+        if (!config)
+          throw new Error(`${root.id} is not paired. Run basalt init or basalt pair first.`);
+        return config;
+      }),
+    );
+    const listen = args.mcpListen === undefined ? undefined : parseMcpListen(args.mcpListen);
+    if (args.mcpWritable && (args.readOnly || configs.some((config) => config.readOnly))) {
+      io.err("basalt mcp: --writable cannot override a read-only device");
+      return 2;
     }
-  }
-  const opts = await clientOptions(config, { ...args, watch: true }, io);
-  const mode = opts.readOnly || (listen && !args.mcpWritable) ? "read-only" : "writable";
-  const writer = opts.vault as NodeVault;
-  const observed = new NodeVault(args.dir, {
-    configDir: args.configDir,
-    alsoIgnore: args.ignore,
-    observeOnly: true,
-  });
-  await observed.probeCase();
-  const reader = new McpReader(observed);
-  let current: Client | undefined;
-  let stopping = false;
-  let state = "connecting";
-  let wake: (() => void) | undefined;
-  let lastPass: object | null = null;
-  let lastFailure: object | null = null;
-  let localGeneration = 0;
-  let passGeneration = 0;
-  let scannedGeneration = 0;
-  let protocol: ProtocolHandle | undefined;
-  let exitCode = 0;
-  let finish!: () => void;
-  const finished = new Promise<void>((resolve) => {
-    finish = resolve;
-  });
-  function stop(error?: Error): void {
-    if (stopping) return;
-    stopping = true;
-    state = "stopping";
-    if (error) {
-      exitCode = 1;
-      io.err(`basalt mcp: ${error.message.slice(0, 1024)}`);
-    }
-    protocol?.stop();
-    wake?.();
-    // close refuses queued mutations immediately and drains an admitted one.
-    void current?.close().catch((error) => {
-      exitCode = 1;
-      io.err(`basalt mcp: ${String(error).slice(0, 1024)}`);
-    });
-    finish();
-  }
-  const summary = () => ({
-    connection: state,
-    writeReady: mode === "writable" && !stopping && !!current?.writeReady,
-    localGeneration,
-    scannedGeneration,
-    localWritesSincePass: localGeneration - scannedGeneration,
-  });
-  const session: McpSession = {
-    mode,
-    reader,
-    writer,
-    client: () =>
-      state === "ready" && current && !current.transport.isClosed ? current : undefined,
-    stopping: () => stopping,
-    changed: () => {
-      localGeneration++;
-    },
-    summary,
-    async status() {
-      return reader.run(async () => {
-        let scanFailure: string | undefined;
-        try {
-          await observed.list({ forceFull: true, checked: true });
-        } catch {
-          scanFailure = "the recovery inventory could not be completely checked";
-        }
-        const recovery = observed.recovery;
-        const sampled = boundedArrays({ stranded: observed.stranded, displaced: recovery.waiting });
-        return {
-          ...summary(),
-          readOnly: mode === "read-only",
-          mergeEnabled: opts.merge ?? true,
-          exclusions: { configDir: args.configDir ?? ".obsidian", ignoredNames: args.ignore },
-          engine: current
-            ? { ...current.engine.status(), serverCursor: current.serverCursor }
-            : null,
-          lastPass,
-          lastFailure,
-          recovery: {
-            observedAt: scanFailure ? null : Date.now(),
-            complete: !scanFailure && recovery.complete,
-            why: scanFailure ?? recovery.why?.slice(0, 1024) ?? null,
-            ...sampled.value,
-            count: new Set([...observed.stranded, ...recovery.waiting.map((item) => item.at)]).size,
-            truncated: sampled.truncated,
-          },
-          observedAt: Date.now(),
-        };
-      });
-    },
-  };
-  const registries: ReturnType<typeof createTools>[] = [];
-  const onSignal = () => stop();
-  process.on("SIGINT", onSignal);
-  process.on("SIGTERM", onSignal);
-  const loop = runForever(
-    {
-      ...opts,
-      onSyncStart: () => {
-        passGeneration = localGeneration;
-      },
-      onPass: (report) => {
-        scannedGeneration = passGeneration;
-        const sampled = boundedArrays(report);
-        const outcome = boundedArrays(
-          outcomeOf(report, undefined, writer.recovery, writer.stranded),
-        );
-        lastPass = {
-          at: Date.now(),
-          report: sampled.value,
-          outcome: outcome.value,
-          truncated: sampled.truncated || outcome.truncated,
-        };
-      },
-      onSyncFailed: (error) => {
-        lastFailure = { at: Date.now(), message: error.message.slice(0, 1024), retryInMs: null };
-      },
-    },
-    {
-      keepGoing: () => !stopping,
-      onWaiting: (value) => {
-        wake = value;
-      },
-      onConnecting: (client) => {
-        current = client;
-        state = "connecting";
-      },
-      onClient: (client) => {
-        if (client) {
-          current = client;
-          state = "initial-sync";
-        } else {
-          current = undefined;
-          if (!stopping && state !== "fatal") state = "offline";
-        }
-      },
-      onSynced: () => {
-        if (!stopping) state = "ready";
-      },
-      onFatal: (error) => {
-        state = "fatal";
-        lastFailure = { at: Date.now(), message: error.message.slice(0, 1024), retryInMs: null };
-      },
-      onDisconnected: (error, retryInMs) => {
-        if (!stopping) state = "offline";
-        lastFailure = { at: Date.now(), message: error.message.slice(0, 1024), retryInMs };
-      },
-      onUnreachable: (error, retryInMs) => {
-        if (!stopping) state = "offline";
-        lastFailure = { at: Date.now(), message: error.message.slice(0, 1024), retryInMs };
-      },
-    },
-  ).catch(stop);
-  try {
+    const credentialRoot = roots[0]!.dir;
     if (listen) {
-      protocol = await startHttp(
-        args.dir,
-        () => createTools(session, version),
-        {
-          host: listen.host,
-          port: listen.port,
-          allowOrigins: args.mcpOrigins ?? [],
-          verbose: args.verbose,
-          log: io.err,
-        },
-        stop,
-      );
-      if (!listen.loopback)
-        io.err(
-          `WARNING: ${args.mcpListen} carries plaintext notes and credentials. Use a trusted network and a TLS proxy.`,
+      try {
+        await readMcpToken(credentialRoot);
+      } catch {
+        throw new Error(
+          "HTTP MCP requires a readable credential. Run basalt mcp-token for the first configured vault.",
         );
-      io.err(`basalt mcp: HTTP listening on ${args.mcpListen}, ${mode}`);
-      if (stopping) protocol.stop();
-    } else
-      protocol = startStdio(
-        () => {
-          const registry = createTools(session, version);
-          registries.push(registry);
-          return registry.server;
-        },
-        process.stdin,
-        process.stdout,
-        stop,
-      );
-    await finished;
-  } finally {
-    stop();
-    await loop;
-    await Promise.all(registries.map((registry) => registry.drain()));
-    await reader.drain();
-    await protocol?.drain();
-    await protocol?.close();
-    process.removeListener("SIGINT", onSignal);
-    process.removeListener("SIGTERM", onSignal);
-  }
-  return exitCode;
+      }
+    }
+    const sessions: Awaited<ReturnType<typeof prepareMcpSession>>[] = [];
+    const registries: ReturnType<typeof createVaultTools>[] = [];
+    let protocol: ProtocolHandle | undefined;
+    let stopping = false,
+      exitCode = 0;
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    function stop(error?: Error) {
+      if (error) {
+        exitCode = 1;
+        io.err(`basalt mcp: ${error.message.slice(0, 1024)}`);
+      }
+      if (stopping) return;
+      stopping = true;
+      protocol?.stop();
+      for (const session of sessions) session.stop();
+      finish();
+    }
+    const onSignal = () => stop();
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+    try {
+      for (let index = 0; index < roots.length; index++) {
+        if (stopping) break;
+        sessions.push(
+          await prepareMcpSession({ ...args, dir: roots[index]!.dir }, configs[index]!, io, stop),
+        );
+      }
+      if (!stopping) {
+        const vaults = sessions.map((session, index) => ({
+          id: roots[index]!.id,
+          session: session.session,
+        }));
+        for (const session of sessions) session.start();
+        if (listen) {
+          protocol = await startHttp(
+            credentialRoot,
+            () => createVaultTools(vaults, version),
+            {
+              host: listen.host,
+              port: listen.port,
+              allowOrigins: args.mcpOrigins ?? [],
+              verbose: args.verbose,
+              log: io.err,
+            },
+            stop,
+          );
+          if (!listen.loopback)
+            io.err(
+              `WARNING: ${args.mcpListen} carries plaintext notes and credentials. Use a trusted network and a TLS proxy.`,
+            );
+          io.err(
+            `basalt mcp: HTTP listening on ${args.mcpListen}, ${sessions.map((item, index) => `${roots[index]!.id}: ${item.session.mode}`).join(", ")}`,
+          );
+        } else {
+          protocol = startStdio(
+            () => {
+              const registry = createVaultTools(vaults, version);
+              registries.push(registry);
+              return registry.server;
+            },
+            process.stdin,
+            process.stdout,
+            stop,
+          );
+        }
+        if (stopping) protocol.stop();
+        await finished;
+      }
+    } finally {
+      stop();
+      try {
+        // Keep every vault lock until all admitted work has drained. Releasing
+        // the first one early lets another process sync a half-finished batch.
+        const drained = await Promise.allSettled([
+          ...sessions.map((session) => session.drain()),
+          ...registries.map((registry) => registry.drain()),
+          protocol?.drain(),
+        ]);
+        await protocol?.close();
+        const failure = drained.find((result) => result.status === "rejected");
+        if (failure) throw failure.reason;
+      } finally {
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+      }
+    }
+    return exitCode;
+  });
 }

@@ -43,6 +43,7 @@ for the installed version's usage.
 | `--server URL --token TOKEN` | Alternative to the combined setup string for `init`. |
 | `--json` | Structured command output; invalid for `mcp` and `mcp-token`. |
 | `--timeout MS` | Server wait; default `30000`. |
+| `--vault NAME=DIR` | `mcp` only: repeat for up to ten separately paired absolute directories. Cannot combine with `--dir`. |
 | `--listen [ADDR]` | `mcp` over HTTP; default `127.0.0.1:3010`. Requires an issued MCP credential. |
 | `--writable` | Enable HTTP mutation tools; requires `--listen` and a writable device. |
 | `--allow-origin ORIGIN` | Allow an exact HTTP origin; repeatable, requires `--listen`. |
@@ -157,6 +158,35 @@ Stdout contains only MCP messages; diagnostics and verbose logs go to stderr.
 `--read-only`, `--no-merge`, `--timeout`, `--config-dir` and `--ignore` apply.
 `--listen` selects the separate [HTTP transport](#mcp-over-http).
 
+### Several vaults
+
+To expose several separately paired headless directories, name each one explicitly:
+
+```bash
+basalt mcp --vault personal=/srv/personal --vault work=/srv/work
+```
+
+Names begin with a lowercase letter and contain lowercase letters, digits,
+underscores or hyphens, up to 32 characters. Up to ten distinct, non-nested
+roots are allowed. `list_vaults` returns their names, access modes and connection
+readiness, without host paths. With more than one vault, every other tool
+requires `vault`, for example `{"vault":"work","path":"daily.md"}`. There is
+no shared current-vault setting. A single vault keeps the selector optional;
+`--dir` uses the name `default`.
+
+Each vault keeps its own sync connection, keys, history, read queue and mutation
+queue. The process acquires all vault locks before starting and keeps every lock
+until all admitted work drains. Saved read-only settings apply per vault; shared
+launch flags such as `--ignore`, `--no-merge` and `--read-only` apply to every vault.
+
+For HTTP, add `--listen` and issue the credential with `mcp-token --dir` for the
+**first configured vault**. That credential grants access to the entire explicit
+vault set in this process, in its launch mode. Other vaults' tokens do not grant
+access. Rotating or revoking the first vault's token applies to the whole endpoint.
+Store any exported token outside every exposed vault. Use separate endpoints and
+credentials if the clients should have different vault access. `--writable`
+refuses startup if any selected pairing is read-only.
+
 ### Tools and bounds
 
 Arguments below are JSON objects supplied to MCP tools, not shell commands.
@@ -167,10 +197,13 @@ resolve to its canonical local directory.
 
 | Tool | Arguments and behavior |
 |---|---|
+| `list_vaults` | No arguments. Lists only configured aliases, access modes and readiness. |
 | `list_notes` | Optional `folder`, `nameContains`, `after`, `limit` (default 100, max 500), `includeBackups` (default false). Lists notes, attachment metadata and folders. `nameContains` is a case-sensitive filename substring. |
 | `read_note` | Required `path`; optional `uid`, `startLine` (default 1), `maxLines` (default 200, max 1000), `base`. Returns exact text, the complete note's SHA-256 `base`, and `nextLine`. `uid` selects authenticated server history. |
 | `search_notes` | Required `query` (max 1024 bytes); optional `mode` (`content`, `filename`, `both`, `tag`; default `content`), `folder`, `caseSensitive` (default false), `cursor`, `limit` (default 50, max 200), `contextLines` (default 0, max 3), `includeBackups`. Tag mode matches case-insensitive tags and their nested descendants; `includeChildren:false` selects only the exact tag. It reads frontmatter and body text, excluding code, comments and link syntax. Filename rows have line 0. Returns explicit skipped/omitted counts. |
 | `note_history` | Required `path`; optional `before`, `limit` (default 20, max 100). Returns authenticated versions newest first and `nextBefore`. Device names are labels, not proof of authorship. |
+| `compare_versions` | Required `path`, historical `fromUid`; optional historical `toUid` (defaults to current local bytes), `after`, `limit` (default 20, max 100), `fromBase`, `toBase`. Returns bounded line differences and both complete bases. |
+| `delivery_status` | No arguments. Reports live device checkpoints and whether receipt is received, waiting or unconfirmed. Omits device IDs and pairing invitations. |
 | `deleted_notes` | Optional `before`, `limit` (default 50, max 200). Returns deleted notes, their latest recoverable version UID (`restorable`, or 0) and `nextBefore`. |
 | `sync_status` | Optional `preview:true`, then optional `after` and `limit` (default 100, max 500). Basic status includes connection, write readiness, last pass/failure, exclusions and recovery inventory. Preview is an observing estimate. |
 | `edit_note` | Required `path`, current `base`, and 1 to 32 `{old,new}` edits. Each nonempty `old` must occur exactly once. Edits must not overlap and all refer to the original source. Each `old`/`new` is at most 8 KiB; combined input is at most 64 KiB. |
@@ -290,6 +323,24 @@ JSON-encoded paths and 64 KiB of exact changes. Scans read at most 512 notes or
 8 MiB; unreadable or ambiguous notes refuse the plan rather than authorize an
 incomplete global edit. Narrow `paths` or `folder` when a limit is reached.
 
+### Compare versions and inspect delivery
+
+Use `compare_versions` with a UID from `note_history` to see what changed since
+that version. Supply `toUid` to compare two retained versions. Follow `nextAfter`
+with both returned bases; a changed local note refuses continuation. Comparisons
+never modify notes. Each hunk clips old/new text to 2048 characters and reports
+`clipped`; `detailClipped` reports clipping on that page. A deterministic work
+limit may return a broader hunk with `coarse:true`. `complete` means all hunks
+were paginated, not that clipped text was shown. Read complete versions before
+using them for an edit or restore.
+
+`delivery_status` requires a live connection. `received` means an online device
+reported applying at least the observed server checkpoint while the local client
+remained settled. Pending local work, a changing connection, offline devices or
+missing checkpoints produce `unconfirmed`. It is not a receipt for a particular
+tool call. Device names are reported labels. The response includes at most 100
+devices and counts any omitted rows.
+
 ### Inspect and recover
 
 After an edit, pass the returned `beforeImage` path to `read_note`. To find older
@@ -319,7 +370,7 @@ to a free name. `restorable:0` means no content remains available.
 ## MCP over HTTP
 
 Use the same separately paired headless directory, tools and preservation rules
-as stdio. Issue a credential before starting the listener:
+as stdio, including [explicitly named vaults](#several-vaults). Issue a credential before starting the listener:
 
 ```bash
 basalt mcp-token --dir /srv/vault --key-out /private/path/basalt-mcp.key
@@ -378,7 +429,7 @@ listener from starting.
 The pinned SDK supports legacy `2025-11-25` sessions and sessionless `2026-07-28`
 requests. Legacy sessions expire after 30 minutes idle, with at most 16 sessions,
 8 requests and one GET stream per session. Both modes share a 32-request process
-cap and the same reader and mutation queues. Overflow returns 429 with
+cap. Requests selecting the same vault share its reader and mutation queues. Overflow returns 429 with
 `Retry-After`, or a tool-level `busy` refusal. Bodies are limited to 8 MiB before
 parsing; headers time out after 10 seconds and request bodies after 30 seconds.
 Tool responses are bounded to 1 MiB. GET streams have no write timeout.
@@ -387,7 +438,7 @@ inspect any uncertain mutation before deciding whether to retry.
 
 HTTP ignores stdin EOF and keeps stdout empty. SIGINT and SIGTERM close admission,
 cancel queued work and drain admitted transactions before releasing the shared
-vault lock. One process serves all clients and handles ongoing sync. The proxy
+vault locks. One process serves all clients and handles ongoing sync. The proxy
 stand-in and real child have been tested locally; actual Tailscale and phone-client
 acceptance remain unverified.
 
