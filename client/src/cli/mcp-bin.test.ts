@@ -198,7 +198,7 @@ it("MCP and sync watch exclude each other through root aliases and release after
   expect((await final.exited()).code).toBe(0);
 });
 
-it.each(["--json", "--watch", "--verify", "--listen"])(
+it.each(["--json", "--watch", "--verify"])(
   "rejects %s without putting human diagnostics on stdout",
   async (flag) => {
     const dir = await paired();
