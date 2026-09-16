@@ -1,5 +1,9 @@
 import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
-import { Client as Host, InMemoryTransport } from "@modelcontextprotocol/client";
+import {
+  Client as Host,
+  InMemoryTransport,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { mkdtemp, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,14 +18,18 @@ import { McpReader } from "../cli/mcp-read.ts";
 import { createTools } from "../cli/mcp-tools.ts";
 import { buildMcp, cli, tool } from "../cli/mcp-test.ts";
 import { mcpProcess } from "../cli/mcp-process-test.ts";
-import { device, reopen, fingerprint, settle, type Device } from "./harness.ts";
+import { device, reopen, fingerprint, settle, type Device, SUITE_SECRET } from "./harness.ts";
+import { startHttp } from "../cli/mcp-http.ts";
+import { openHttp } from "../cli/mcp-http-test.ts";
+import { saveConfig } from "../cli/config.ts";
 
 let server: TestServer, buildDir: string, bundle: string;
 const dirs: string[] = [],
   clients: Client[] = [],
   hosts: Host[] = [];
 const registries: ReturnType<typeof createTools>[] = [];
-const children: ReturnType<typeof mcpProcess>[] = [];
+const children: { dispose(): Promise<void> }[] = [];
+const httpServers: Awaited<ReturnType<typeof startHttp>>[] = [];
 const releases: (() => void)[] = [];
 beforeAll(async () => {
   buildDir = await mkdtemp(join(tmpdir(), "basalt-mcp-crash-build-"));
@@ -33,6 +41,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   for (const child of children.splice(0)) await child.dispose();
   for (const c of clients.splice(0)) await c.close();
+  for (const http of httpServers.splice(0)) await http.close();
   for (const registry of registries.splice(0)) {
     await registry.drain();
     await registry.server.close();
@@ -41,7 +50,7 @@ afterEach(async () => {
   await server?.cleanup();
   for (const dir of dirs.splice(0)) await removeTree(dir);
 });
-async function setup(singlePut = false) {
+async function setup(singlePut = false, overHttp = false) {
   server = new TestServer();
   if (singlePut) server.extraArgs = ["-max-batch-bytes", "1048576"];
   await server.start();
@@ -58,26 +67,60 @@ async function setup(singlePut = false) {
   const reader = new McpReader(new NodeVault(a.dir, { observeOnly: true }));
   await reader.vault.probeCase();
   const writer = await a.c.mutateLocal(async ({ vault }) => vault);
-  const registry = createTools(
-    {
-      mode: "writable",
-      reader,
-      writer: writer as NodeVault,
-      client: () => a.c,
-      stopping: () => false,
-      changed: () => {},
-      summary: () => ({}),
-      status: async () => ({}),
-    },
-    "test",
-  );
+  const session = {
+    mode: "writable" as const,
+    reader,
+    writer: writer as NodeVault,
+    client: () => a.c,
+    stopping: () => false,
+    changed: () => {},
+    summary: () => ({}),
+    status: async () => ({}),
+  };
+  if (overHttp) {
+    // The harness registers devices directly; token issuance requires the
+    // same local pairing state as the actual CLI owner.
+    await saveConfig(a.dir, {
+      url: server.wsUrl,
+      vaultId: "default",
+      device: "agent",
+      secret: SUITE_SECRET,
+    });
+    const issued = await cli("mcp-token", "--dir", a.dir);
+    expect(issued.code, issued.err).toBe(0);
+    const http = await startHttp(
+      a.dir,
+      () => createTools(session, "test"),
+      { host: "127.0.0.1", port: 0, allowOrigins: [], log: () => {} },
+      (error) => {
+        if (error) throw error;
+      },
+    );
+    httpServers.push(http);
+    const agents: Host[] = [];
+    for (let i = 0; i < 3; i++) {
+      const host = new Host(
+        { name: `http-stress-${i}`, version: "1" },
+        { versionNegotiation: { mode: i === 0 ? "legacy" : { pin: "2026-07-28" } } },
+      );
+      hosts.push(host);
+      agents.push(host);
+      await host.connect(
+        new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${http.port}/mcp`), {
+          authProvider: { token: async () => issued.out.trim() },
+        }),
+      );
+    }
+    return { a, b, host: agents[0]!, agents, original, baseline };
+  }
+  const registry = createTools(session, "test");
   registries.push(registry);
   const [hostWire, serverWire] = InMemoryTransport.createLinkedPair();
   await registry.server.connect(serverWire);
   const host = new Host({ name: "stress", version: "1" });
   await host.connect(hostWire);
   hosts.push(host);
-  return { a, b, host, original, baseline };
+  return { a, b, host, agents: [host], original, baseline };
 }
 async function retained(d: Device, markers: string[]) {
   const bodies = await Promise.all(
@@ -87,10 +130,60 @@ async function retained(d: Device, markers: string[]) {
     expect(bodies.join("\n"), `lost ${marker} on ${d.dir}`).toContain(marker);
 }
 
-it.each(["disjoint", "overlap", "append", "delete", "rename", "lost-reply"])(
-  "MCP %s preserves the local commit and a phone branch after its author exits",
-  async (scenario) => {
-    const { a, b, host, original, baseline } = await setup();
+async function httpChild(dir: string, token: string) {
+  const owner = await openHttp(bundle, dir, token, ["--writable"]);
+  const responses = new Map<string | number, unknown>();
+  return {
+    child: owner.child,
+    responses,
+    initialize: async () => {},
+    async ready() {
+      await within(
+        (async () => {
+          while (!(await tool(owner.client, "sync_status")).writeReady)
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        })(),
+        "HTTP crash child readiness",
+        15000,
+      );
+    },
+    tool: (name: string, args: Record<string, unknown> = {}) => tool(owner.client, name, args),
+    send(message: {
+      id: string | number;
+      method: string;
+      params: { name: string; arguments: Record<string, unknown> };
+    }) {
+      void owner.client.callTool(message.params).then(
+        (result) => responses.set(message.id, result),
+        (error) => responses.set(message.id, error),
+      );
+    },
+    hold: owner.hold,
+    async reached(name: string) {
+      await owner.reached(name);
+      return owner.messages.find(
+        (value) =>
+          value && typeof value === "object" && "reached" in value && value.reached === name,
+      ) as { path: string };
+    },
+    exited: owner.exited,
+    async dispose() {
+      if (owner.child.exitCode === null && owner.child.signalCode === null)
+        owner.child.kill("SIGKILL");
+      await owner.close();
+    },
+  };
+}
+
+it.each(
+  ["disjoint", "overlap", "append", "delete", "rename", "lost-reply"].flatMap((scenario) => [
+    { scenario, http: false },
+    { scenario, http: true },
+  ]),
+)(
+  "MCP $scenario preserves the local commit and a phone branch after its author exits (HTTP=$http)",
+  async ({ scenario, http }) => {
+    const { a, b, host, agents, original, baseline } = await setup(false, http);
     const entered = deferred<void>(),
       release = deferred<void>();
     releases.push(() => release.resolve());
@@ -116,18 +209,20 @@ it.each(["disjoint", "overlap", "append", "delete", "rename", "lost-reply"])(
     const read = await tool(host, "read_note", { path: "note.md" });
     const result =
       scenario === "append"
-        ? await tool(host, "append_note", {
+        ? await tool(agents[1] ?? host, "append_note", {
             path: "note.md",
             base: read.base,
             text: "AGENT COMMIT\n",
           })
-        : await tool(host, "edit_note", {
+        : await tool(agents[1] ?? host, "edit_note", {
             path: "note.md",
             base: read.base,
             edits: [{ old: "Original first line.", new: "AGENT COMMIT" }],
           });
     expect(result).toMatchObject({ applied: true, durable: true });
-    expect((await tool(host, "read_note", { path: result.beforeImage })).content).toBe(original);
+    expect((await tool(agents[2] ?? host, "read_note", { path: result.beforeImage })).content).toBe(
+      original,
+    );
     await within(entered.promise, "prepared MCP upload");
     const markers = ["PREEXISTING BRANCH", "UNSENT LOCAL MATERIAL", "AGENT COMMIT"];
     if (scenario === "delete") {
@@ -156,6 +251,21 @@ it.each(["disjoint", "overlap", "append", "delete", "rename", "lost-reply"])(
     await settle([a], 3);
     if (scenario === "lost-reply") expect(acceptedBeforeLoss).toBe(true);
     else expect(stale).toBe(true);
+    if (http) {
+      const submitted = await Promise.all(
+        agents.map((agent, i) =>
+          tool(agent, "create_note", {
+            path: `session-${i}.md`,
+            content: `HTTP SESSION ${i} COMMIT\n`,
+          }),
+        ),
+      );
+      expect(submitted.every((result) => result.applied === true && result.durable === true)).toBe(
+        true,
+      );
+      markers.push(...agents.map((_, i) => `HTTP SESSION ${i} COMMIT`));
+      await settle([a], 2);
+    }
     const fresh = await device(server, "fresh-reader", dirs, clients);
     await settle([fresh], 2);
     await retained(a, markers);
@@ -186,9 +296,14 @@ it("accounts for every MCP mutation seam in the crash matrix", () => {
       .sort(),
   );
 });
-it.each(CRASH_SEAMS)(
-  "a real MCP process killed at %s leaves acknowledged and preexisting bytes discoverable",
-  async (point) => {
+it.each(
+  CRASH_SEAMS.flatMap((point) => [
+    { point, http: false },
+    { point, http: true },
+  ]),
+)(
+  "a real MCP process killed at $point leaves acknowledged and preexisting bytes discoverable (HTTP=$http)",
+  async ({ point, http }) => {
     server = new TestServer();
     await server.start();
     const dir = await mkdtemp(join(tmpdir(), "basalt-mcp-crash-"));
@@ -196,8 +311,10 @@ it.each(CRASH_SEAMS)(
     const initialized = await cli("init", server.setup, "--dir", dir, "--json");
     expect(initialized.code, initialized.err).toBe(0);
     const key = JSON.parse(initialized.out).recoveryKey;
+    const token = http ? await cli("mcp-token", "--dir", dir) : undefined;
+    if (token) expect(token.code).toBe(0);
     await writeFile(join(dir, "note.md"), "PREEXISTING CRASH BRANCH\n");
-    const child = mcpProcess(bundle, dir);
+    const child = http ? await httpChild(dir, token!.out.trim()) : mcpProcess(bundle, dir);
     children.push(child);
     await child.initialize();
     await child.ready();
@@ -236,11 +353,12 @@ it.each(CRASH_SEAMS)(
     expect(retainedBytes).toContain("ACKNOWLEDGED COMMIT");
     if (point === "cli/mcp:published" || point === "cli/mcp:durable")
       expect(retainedBytes).toContain("PROPOSED SECOND EDIT");
-    const restarted = mcpProcess(bundle, dir);
+    const restarted = http ? await httpChild(dir, token!.out.trim()) : mcpProcess(bundle, dir);
     children.push(restarted);
     await restarted.initialize();
     await restarted.ready();
-    restarted.child.stdin.end();
+    if (http) restarted.child.kill("SIGTERM");
+    else restarted.child.stdin!.end();
     expect((await restarted.exited()).code).toBe(0);
     const fresh = await mkdtemp(join(tmpdir(), "basalt-mcp-crash-reader-"));
     dirs.push(fresh);

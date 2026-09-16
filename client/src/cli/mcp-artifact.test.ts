@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { removeTree } from "../core/test-server.ts";
 import { within } from "../core/test-async.ts";
-import { smokeMcpArtifact } from "./mcp-artifact-test.ts";
+import { smokeMcpArtifact, smokeHttpArtifact } from "./mcp-artifact-test.ts";
 
 it("the actual production configuration builds an isolated single-file MCP and keeps the SDK out of the plugin", async () => {
   const root = await mkdtemp(join(tmpdir(), "basalt-mcp-production-"));
@@ -44,8 +44,10 @@ it("the actual production configuration builds an isolated single-file MCP and k
     await removeTree(join(root, "staging"));
     expect(await readdir(installation)).toEqual(["basalt.mjs"]);
     const measured = await smokeMcpArtifact(artifact, process.execPath, join(source, ".."));
+    const http = await smokeHttpArtifact(artifact, process.execPath, join(source, ".."));
     console.info({
       ...measured,
+      httpInitializationMs: http.initializationMs,
       cliBytes: (await readFile(artifact)).length,
       pluginBytes: Buffer.byteLength(plugin),
     });

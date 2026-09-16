@@ -13,10 +13,13 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { deferred, within } from "../core/test-async.ts";
+import type { Client as SyncClient } from "../core/client.ts";
 
 export async function httpFixture(
   options: {
     status?: () => Promise<object>;
+    mode?: McpSession["mode"];
+    client?: () => SyncClient | undefined;
     now?: () => number;
     allowOrigins?: string[];
   } = {},
@@ -35,10 +38,10 @@ export async function httpFixture(
   const writer = new NodeVault(root);
   const reader = new McpReader(new NodeVault(root, { observeOnly: true }));
   const session: McpSession = {
-    mode: "read-only",
+    mode: options.mode ?? "read-only",
     reader,
     writer,
-    client: () => undefined,
+    client: options.client ?? (() => undefined),
     stopping: () => false,
     changed() {},
     summary: () => ({ connection: "offline" }),
@@ -71,9 +74,9 @@ export async function httpFixture(
     session,
     logs,
     errors,
-    async client(modern = false) {
-      const transport = new StreamableHTTPClientTransport(new URL(url), {
-        authProvider: { token: async () => token },
+    async client(modern = false, key = token, at = url) {
+      const transport = new StreamableHTTPClientTransport(new URL(at), {
+        authProvider: { token: async () => key },
       });
       const client = new Client(
         { name: "basalt-http-test", version: "1" },
@@ -161,13 +164,28 @@ export async function openHttp(
   token: string,
   flags: string[] = [],
   modern = false,
+  launch: { runtime?: string; denyRead?: string; host?: string; bare?: boolean } = {},
 ) {
   const port = await unusedHttpPort();
-  const child = spawn(
-    process.execPath,
-    [bundle, "mcp", "--dir", root, "--listen", `127.0.0.1:${port}`, ...flags],
-    { stdio: ["pipe", "pipe", "pipe", "ipc"] },
-  );
+  const hostname = launch.host ?? "127.0.0.1";
+  const listen = `${launch.bare ? "" : hostname}:${port}`;
+  let command = launch.runtime ?? process.execPath;
+  let argv = [bundle, "mcp", "--dir", root, "--listen", listen, ...flags];
+  if (launch.denyRead && process.platform === "darwin") {
+    const profile = join(root, ".basalt/mcp-test.sb");
+    await writeFile(
+      profile,
+      `(version 1)\n(allow default)\n(deny file-read* (subpath ${JSON.stringify(launch.denyRead)}))\n`,
+    );
+    argv = ["-f", profile, command, ...argv];
+    command = "/usr/bin/sandbox-exec";
+  }
+  const started = performance.now();
+  const child = spawn(command, argv, {
+    cwd: root,
+    env: { ...process.env, NODE_PATH: "" },
+    stdio: ["pipe", "pipe", "pipe", "ipc"],
+  });
   const closed = once(child, "close");
   const listening = deferred<void>();
   const messages: unknown[] = [];
@@ -198,7 +216,7 @@ export async function openHttp(
       })(),
       `${kind}: ${name}`,
     );
-  const url = `http://127.0.0.1:${port}/mcp`;
+  const url = `http://${hostname}:${port}/mcp`;
   async function connect(modern = false, key = token, at = url) {
     const transport = new StreamableHTTPClientTransport(new URL(at), {
       authProvider: { token: async () => key },
@@ -214,10 +232,12 @@ export async function openHttp(
     return { client, transport };
   }
   async function close() {
-    await Promise.all(clients.map((client) => client.close()));
+    const clientsClosed = await Promise.allSettled(clients.map((client) => client.close()));
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     try {
       const [code, signal] = await within(closed, "HTTP child shutdown", 15000);
+      const failed = clientsClosed.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
       return { code, signal, stdout, stderr };
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -238,11 +258,16 @@ export async function openHttp(
     const connected = await connect(modern);
     return {
       ...connected,
+      initializationMs: Math.round((performance.now() - started) * 10) / 10,
       connect,
       child,
       messages,
       url,
       close,
+      exited: async () => {
+        const [code, signal] = await within(closed, "HTTP child exit", 15000);
+        return { code, signal };
+      },
       stdout: () => stdout,
       stderr: () => stderr,
       async hold(name: string) {

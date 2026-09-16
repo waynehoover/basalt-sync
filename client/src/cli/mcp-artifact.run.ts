@@ -1,4 +1,4 @@
-import { smokeMcpArtifact } from "./mcp-artifact-test.ts";
+import { smokeMcpArtifact, smokeHttpArtifact } from "./mcp-artifact-test.ts";
 import { cleanupBinary } from "../core/test-server.ts";
 import { fileURLToPath } from "node:url";
 
@@ -8,6 +8,10 @@ try {
   console.info(
     "Packed MCP initialize/list/read/edit and before-image:",
     await smokeMcpArtifact(artifact, runtime, fileURLToPath(new URL("../../..", import.meta.url))),
+  );
+  console.info(
+    "Packed HTTP MCP initialize/list/read/edit and before-image:",
+    await smokeHttpArtifact(artifact, runtime, fileURLToPath(new URL("../../..", import.meta.url))),
   );
 } finally {
   await cleanupBinary();
