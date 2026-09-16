@@ -183,6 +183,47 @@ it("reaps its HTTP child even when the SDK client fails to close", async () => {
   }
 });
 
+it("cleanup waits for an already signalled HTTP child without sending SIGTERM again", async () => {
+  const { dir, token } = await paired();
+  await writeFile(join(dir, "note.md"), "keep the original\n");
+  const owner = await host(dir, token, ["--writable"]);
+  await ready(owner.client);
+  const read = await tool(owner.client, "read_note", { path: "note.md" });
+  await owner.hold("cli/mcp:durable");
+  const edit = tool(owner.client, "append_note", {
+    path: "note.md",
+    base: read.base,
+    text: "finish the admitted edit\n",
+  }).catch(() => undefined);
+  await owner.reached("cli/mcp:durable");
+  const signals = vi.spyOn(owner.child, "kill");
+  const sdkClosed = deferred<void>();
+  const closeClient = owner.client.close.bind(owner.client);
+  vi.spyOn(owner.client, "close").mockImplementationOnce(async () => {
+    await closeClient();
+    sdkClosed.resolve();
+  });
+  owner.child.kill("SIGTERM");
+  const closing = owner.close();
+  try {
+    await within(sdkClosed.promise, "SDK client cleanup");
+    // Let close's settled-client continuation run while the admitted write
+    // still holds the child alive. Cleanup must not send a second signal.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(signals.mock.calls).toEqual([["SIGTERM"]]);
+    expect(owner.child.exitCode).toBeNull();
+  } finally {
+    owner.release();
+    const closed = await closing;
+    await edit;
+    signals.mockRestore();
+    expect(closed).toMatchObject({ code: 0, signal: null, stdout: "" });
+  }
+  expect(await readFile(join(dir, "note.md"), "utf8")).toBe(
+    "keep the original\nfinish the admitted edit\n",
+  );
+});
+
 it("accepts a bare loopback port without a plaintext warning", async () => {
   const { dir, token } = await paired();
   const local = await openHttp(bundle, dir, token, [], false, { bare: true });
