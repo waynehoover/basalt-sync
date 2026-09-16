@@ -10,11 +10,19 @@ transfer tables remain in `git show 573617c:docs/compared.md`.
 
 The requested tool coverage follows
 [StevenStavrakis/obsidian-mcp at bd90097](https://github.com/StevenStavrakis/obsidian-mcp/tree/bd900974adc6d7451f1f9d0f09d46b14307714f8).
-Its read/create/edit, search, tag, directory and namespace tools informed the
+Its read/create/edit, search, tag, directory, namespace and explicit vault-selection tools informed the
 scope. Basalt retains mandatory revision bases, exact edits and independent
 verified before-images. Whole-file replacement and permanent deletion remain
 outside this contract. Namespace and batch tools expand the original MCP plan's
-deliberately narrower first release.
+deliberately narrower first release. Multi-vault selection also expands that
+plan: it composes separately paired clients without changing one server per
+vault or one writer per local directory.
+
+Basalt adds authenticated history comparison and device checkpoint inspection
+on top of its existing history, deleted-note discovery, safe restore and sync
+preview tools. Comparison uses a deterministic bounded line diff so pagination
+does not change with machine timing. Device checkpoint reports fail closed to
+unconfirmed when local state changes during the query.
 
 Tag parsing uses pinned `yaml` and `mdast-util-from-markdown` packages in the
 CLI only. Markdown parsing supplies code, comment and link boundaries; YAML

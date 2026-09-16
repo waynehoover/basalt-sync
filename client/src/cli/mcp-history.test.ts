@@ -359,3 +359,93 @@ it("reuses checked inventory for preview pages while checking remote-only paths 
   expect(second.nextAfter).toBeNull();
   expect(await snapshot()).toEqual(before);
 });
+
+it("compares authenticated history with local bytes without changing either version", async () => {
+  await save("compare.md", "\ufeffkeep\r\nold task\r\nUNSENT original\r\n");
+  const uid = (await client.history("compare.md"))[0]!.uid;
+  await save("compare.md", "\ufeffkeep\r\nnew task\r\nUNSENT original\r\n");
+  const before = await snapshot();
+  const { host } = await connectedTools();
+  const result = await tool(host, "compare_versions", { path: "compare.md", fromUid: uid });
+  expect(result).toMatchObject({ complete: true, coarse: false, from: { uid }, to: { uid: null } });
+  expect(result.changes).toEqual([
+    {
+      fromLine: 2,
+      toLine: 2,
+      old: "old task\r\n",
+      new: "new task\r\n",
+      oldLines: 1,
+      newLines: 1,
+      clipped: false,
+    },
+  ]);
+  expect(await snapshot()).toEqual(before);
+});
+it("pins comparison pages to both complete bases and refuses another path's version", async () => {
+  await save("compare.md", "old A\nkeep\nold B\n");
+  const uid = (await client.history("compare.md"))[0]!.uid;
+  await save("compare.md", "new A\nkeep\nnew B\n");
+  await save("other.md", "private other");
+  const other = (await client.history("other.md"))[0]!.uid;
+  const { host } = await connectedTools();
+  const page = await tool(host, "compare_versions", { path: "compare.md", fromUid: uid, limit: 1 });
+  expect(page.nextAfter).toBe(1);
+  const next = await tool(host, "compare_versions", {
+    path: "compare.md",
+    fromUid: uid,
+    after: page.nextAfter,
+    fromBase: page.from.base,
+    toBase: page.to.base,
+    limit: 1,
+  });
+  expect(next.changes[0]).toMatchObject({ old: "old B\n", new: "new B\n" });
+  await save("compare.md", "changed between pages");
+  expect(
+    await tool(host, "compare_versions", {
+      path: "compare.md",
+      fromUid: uid,
+      after: page.nextAfter,
+      fromBase: page.from.base,
+      toBase: page.to.base,
+    }),
+  ).toMatchObject({ error: { code: "stale" } });
+  expect(
+    await tool(host, "compare_versions", { path: "compare.md", fromUid: other }),
+  ).toMatchObject({ error: { code: "version_not_found" } });
+});
+it("reports device checkpoints without claiming an offline or unconfirmed device received changes", async () => {
+  const { host } = await connectedTools();
+  const cursor = client.serverCursor;
+  const row = {
+    id: "private id",
+    name: "phone",
+    createdAt: 1,
+    lastSeen: 2,
+    online: true,
+    applied: cursor,
+  };
+  vi.spyOn(client, "devices").mockResolvedValue({
+    devices: [
+      row,
+      { ...row, name: "offline", online: false, applied: null },
+      { ...row, name: "unknown", applied: null },
+    ],
+    maxDevices: 10,
+    invites: [{ id: "private invite", expiresAt: 100 }],
+  });
+  const ready = vi.spyOn(client, "deliveryReady", "get").mockReturnValue(true);
+  const result = await tool(host, "delivery_status");
+  expect(result.localReady).toBe(true);
+  expect(result.devices.map((row: { state: string }) => row.state)).toEqual([
+    "received",
+    "unconfirmed",
+    "unconfirmed",
+  ]);
+  expect(JSON.stringify(result)).not.toContain("private");
+  ready.mockReturnValue(false);
+  expect(
+    (await tool(host, "delivery_status")).devices.every(
+      (row: { state: string }) => row.state === "unconfirmed",
+    ),
+  ).toBe(true);
+});

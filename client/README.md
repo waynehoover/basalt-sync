@@ -126,15 +126,28 @@ reads work during connection setup or outages. They can be stale; a missing loca
 file may simply be waiting to download. Edits require `writeReady:true` after
 initial sync. History and restore need a server connection.
 
+Search by content, filename or tag with `search_notes`. Tag changes, moves and
+recoverable deletion use a preview first, then require the returned exact
+changes and bases to apply. `compare_versions` shows differences from retained
+history; `delivery_status` reports device checkpoints without promising that a
+particular edit reached every device.
+
+To expose several separately paired directories, replace `--dir` with repeated
+`--vault name=/absolute/path` arguments. `list_vaults` discovers those aliases;
+every other tool requires `vault` when several are configured. For HTTP, the
+first configured directory's credential grants access to the whole explicit set.
+See [multiple vaults](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md#several-vaults)
+for credential scope and per-vault permissions.
+
 To change a note, read it and supply its returned `base` with exact `{old,new}`
 spans to `edit_note`. Each old span must be unique; all spans are validated
-against the same original and published as one replacement. `append_note` also
-requires a base and adds exactly the supplied text, including only the newlines
+against the same original and published as one replacement. `append_note` and `prepend_note` also
+require a base and add exactly the supplied text, including only the newlines
 you supply. `create_note` and `restore_note` require free destination paths.
 UTF-8 Markdown and plain text are supported up to 1 MiB; drawings and attachments
 cannot be mutated. There is no whole-file writer.
 
-Every edit or append that changes a note preserves a verified, flushed
+Every mutation of an existing note preserves a verified, flushed
 before-image. Read the returned `beforeImage` to inspect it, or list with
 `includeBackups:true` to find older copies. Backups sync as ordinary notes and
 MCP cannot alter or delete them.

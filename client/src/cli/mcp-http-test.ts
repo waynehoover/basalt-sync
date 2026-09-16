@@ -170,7 +170,14 @@ export async function openHttp(
   const hostname = launch.host ?? "127.0.0.1";
   const listen = `${launch.bare ? "" : hostname}:${port}`;
   let command = launch.runtime ?? process.execPath;
-  let argv = [bundle, "mcp", "--dir", root, "--listen", listen, ...flags];
+  let argv = [
+    bundle,
+    "mcp",
+    ...(flags.includes("--vault") ? [] : ["--dir", root]),
+    "--listen",
+    listen,
+    ...flags,
+  ];
   if (launch.denyRead && process.platform === "darwin") {
     const profile = join(root, ".basalt/mcp-test.sb");
     await writeFile(

@@ -90,7 +90,7 @@ for every phone.
 
 ## Agent edits in the headless client
 
-The stdio MCP process is a local author on its own paired directory. Its writes
+The MCP process is a local author on each explicitly configured paired directory. Its writes
 run in the owning client's serial queue alongside sync, and its vault lock
 remains held until admitted work drains. Offline inspection is allowed; a new
 mutation requires a settled live writable client. Read-only launch omits mutation
@@ -125,6 +125,18 @@ symlinks and ambiguous names. This is not isolation from a hostile local OS user
 continually swapping directories or editing open descriptors. The supported
 storage and cooperating-owner assumptions still apply, and a host receiving
 notes has access to their plaintext.
+
+A multi-vault endpoint exposes only its explicit, non-overlapping root set.
+Every call selects a vault when more than one is configured. Session closures
+keep clients, keys, bases, queues and history separate. All root locks remain
+held until every session drains. The HTTP credential belongs to the first
+configured directory and authorizes the whole configured endpoint, not a
+per-vault subset. Separate access scopes require separate endpoints.
+
+Version comparisons authenticate both historical selections through the chosen
+vault and path. Local comparison pagination pins full content bases. Device
+receipt reports require settled local state before and after reading server
+checkpoints; they cannot establish delivery of a particular tool call.
 
 ## Fast, because it sends less
 

@@ -1,5 +1,6 @@
-import type { CallToolResult } from "@modelcontextprotocol/server";
+import type { CallToolResult, ServerContext, ToolAnnotations } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { compareVersions, deliveryStatus } from "./mcp-inspect.ts";
 import { LocalMutationError, type Client } from "../core/client.ts";
 import { McpHistory, type PreviewInput } from "./mcp-history.ts";
 import { type McpReader } from "./mcp-read.ts";
@@ -206,8 +207,8 @@ export function toolFailure(error: unknown): { code: string; message: string } {
   return noteFailure(error);
 }
 
-export function createTools(session: McpSession, version: string) {
-  const server = new TrackedMcpServer({ name: "basalt", version });
+function sessionTools(session: McpSession, register: RegisterTool) {
+  const server = { registerTool: register };
   const history = new McpHistory(session.reader, () => session.client());
   const pending = new Set<Promise<CallToolResult>>();
   function call(work: () => Promise<object>): Promise<CallToolResult> {
@@ -316,6 +317,37 @@ export function createTools(session: McpSession, version: string) {
       annotations: readAnnotations,
     },
     (input, ctx) => call(() => history.deleted(input, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    "compare_versions",
+    {
+      description:
+        "Compare an authenticated historical version with local bytes or another historical version. Paginate with both returned bases. Inspect detailClipped and coarse; read the full versions before acting on omitted detail.",
+      inputSchema: z
+        .object({
+          path,
+          fromUid: uid,
+          toUid: uid.optional(),
+          fromBase: base.optional(),
+          toBase: base.optional(),
+          after: z.number().int().min(0).max(1_000_000).optional(),
+          limit: limit(100).optional(),
+        })
+        .strict(),
+      annotations: readAnnotations,
+    },
+    (input, ctx) => call(() => compareVersions(history, session.reader, input, ctx.mcpReq.signal)),
+  );
+  server.registerTool(
+    "delivery_status",
+    {
+      description:
+        "Inspect live devices' completed server checkpoints. Offline, unconfirmed or changing local state never proves delivery. This does not confirm a particular edit reached every device.",
+      inputSchema: z.object({}).strict(),
+      annotations: readAnnotations,
+    },
+    () => call(() => deliveryStatus(session.client(), () => session.summary())),
   );
 
   async function localWork(
@@ -612,9 +644,111 @@ export function createTools(session: McpSession, version: string) {
   }
 
   return {
-    server,
     async drain() {
       await Promise.all(pending);
+    },
+  };
+}
+
+export interface NamedMcpSession {
+  readonly id: string;
+  readonly session: McpSession;
+}
+interface ToolConfig<S extends z.ZodType> {
+  description: string;
+  inputSchema: S;
+  annotations: ToolAnnotations;
+}
+type RegisterTool = <S extends z.ZodType>(
+  name: string,
+  config: ToolConfig<S>,
+  handler: (input: z.output<S>, context: ServerContext) => Promise<CallToolResult>,
+) => void;
+
+export function createTools(session: McpSession, version: string) {
+  return createVaultTools([{ id: "default", session }], version);
+}
+
+export function createVaultTools(vaults: readonly NamedMcpSession[], version: string) {
+  if (
+    !vaults.length ||
+    vaults.length > 10 ||
+    new Set(vaults.map((vault) => vault.id)).size !== vaults.length ||
+    vaults.some((vault) => !/^[a-z][a-z0-9_-]{0,31}$/u.test(vault.id))
+  )
+    throw new NoteError("invalid_vaults", "configure between one and ten distinct vault names");
+  const server = new TrackedMcpServer({ name: "basalt", version });
+  const definitions = new Map<
+    string,
+    {
+      config: ToolConfig<z.ZodType>;
+      handlers: Map<string, (input: unknown, context: ServerContext) => Promise<CallToolResult>>;
+    }
+  >();
+  const registries = vaults.map(({ id, session }) =>
+    sessionTools(session, (name, config, handler) => {
+      let definition = definitions.get(name);
+      if (!definition) {
+        definition = { config, handlers: new Map() };
+        definitions.set(name, definition);
+      }
+      definition.handlers.set(id, (input, context) =>
+        handler(config.inputSchema.parse(input), context),
+      );
+    }),
+  );
+  const aliases = z.enum(vaults.map((vault) => vault.id) as [string, ...string[]]);
+  const selector = vaults.length === 1 ? aliases.optional() : aliases;
+  const selectedSchema = (schema: z.core.$ZodType): z.ZodType => {
+    if (schema instanceof z.ZodObject) return schema.safeExtend({ vault: selector });
+    if (schema instanceof z.ZodDiscriminatedUnion)
+      return z.union(schema.options.map((option) => selectedSchema(option)));
+    throw new Error("tool inputs must be strict objects or discriminated objects");
+  };
+  for (const [name, definition] of definitions) {
+    server.registerTool(
+      name,
+      { ...definition.config, inputSchema: selectedSchema(definition.config.inputSchema) },
+      async (input, context) => {
+        const { vault, ...args } = input as Record<string, unknown>;
+        const handler = definition.handlers.get((vault as string | undefined) ?? vaults[0]!.id);
+        if (!handler)
+          return toolResult(
+            {
+              applied: false,
+              error: {
+                code: "read_only",
+                message: "the selected vault does not permit this mutation",
+              },
+            },
+            true,
+          );
+        return handler(args, context);
+      },
+    );
+  }
+  server.registerTool(
+    "list_vaults",
+    {
+      description:
+        "List explicitly configured vault names, access modes and connection readiness. Host paths and credentials are never returned. With multiple vaults, every other tool requires its vault name.",
+      inputSchema: z.object({}).strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () =>
+      toolResult({
+        vaults: vaults.map(({ id, session }) => ({ id, mode: session.mode, ...session.summary() })),
+      }),
+  );
+  return {
+    server,
+    async drain() {
+      await Promise.all(registries.map((registry) => registry.drain()));
     },
   };
 }

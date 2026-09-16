@@ -264,8 +264,11 @@ it("does not expose the credential or administrative tools over authenticated HT
   const host = await fixture();
   const { client } = await host.client();
   expect((await client.listTools()).tools.map((row) => row.name).sort()).toEqual([
+    "compare_versions",
     "deleted_notes",
+    "delivery_status",
     "list_notes",
+    "list_vaults",
     "note_history",
     "read_note",
     "search_notes",

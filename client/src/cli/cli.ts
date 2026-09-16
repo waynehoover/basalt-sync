@@ -133,6 +133,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
 
 Options
   --dir DIR        the vault (default: the current directory)
+  --vault NAME=DIR mcp only: explicitly named absolute vault directory; repeatable, replaces --dir
   --device NAME    what this device calls itself (default: its hostname and four random characters)
   --vault-id ID    which vault on the server (default: default)
   --json           machine-readable output
@@ -229,7 +230,7 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
       case "rebase":
         return await locked(args, () => cmdRebase(args, io));
       case "mcp":
-        return await locked(args, () => cmdMcp(args, io, VERSION));
+        return await cmdMcp(args, io, VERSION);
       case "mcp-token":
         return await cmdMcpToken(args, io, writeKeyOut);
       case "sync":
@@ -2480,6 +2481,7 @@ export interface Args {
   mcpListen?: string;
   mcpWritable?: boolean;
   mcpOrigins?: string[];
+  mcpVaults?: string[];
   verbose: boolean;
   help: boolean;
   version: boolean;
@@ -2565,6 +2567,7 @@ export function parseArgs(argv: readonly string[]): Args {
 
   const takes = new Set([
     "--dir",
+    "--vault",
     "--device",
     "--vault-id",
     "--server",
@@ -2617,6 +2620,9 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--allow-origin":
         (args.mcpOrigins ??= []).push(value!);
+        break;
+      case "--vault":
+        (args.mcpVaults ??= []).push(value!);
         break;
       case "--dir":
         args.dir = resolve(value!);
