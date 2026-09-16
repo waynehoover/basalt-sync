@@ -31,7 +31,11 @@ const cli = {
   // Nothing is external. A self-hosted sync client that needs an npm install
   // before it will run is one more thing to go wrong on the machine you were
   // trying to make reliable.
-  banner: { js: "#!/usr/bin/env node" },
+  // The YAML parser loads Node's process module from CommonJS. The isolated
+  // installation test caught that require has no binding in an ESM bundle.
+  banner: {
+    js: '#!/usr/bin/env node\nimport { createRequire as __basaltRequire } from "node:module"; const require = __basaltRequire(import.meta.url);',
+  },
   define: { __BASALT_VERSION__: JSON.stringify(version) },
 };
 

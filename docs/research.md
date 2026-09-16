@@ -6,6 +6,30 @@ This page records dated measurements and design evaluations. Results describe
 specific fixtures, not a speed ranking against another product. The original
 transfer tables remain in `git show 573617c:docs/compared.md`.
 
+## MCP tool expansion, September 16, 2026
+
+The requested tool coverage follows
+[StevenStavrakis/obsidian-mcp at bd90097](https://github.com/StevenStavrakis/obsidian-mcp/tree/bd900974adc6d7451f1f9d0f09d46b14307714f8).
+Its read/create/edit, search, tag, directory and namespace tools informed the
+scope. Basalt retains mandatory revision bases, exact edits and independent
+verified before-images. Whole-file replacement and permanent deletion remain
+outside this contract. Namespace and batch tools expand the original MCP plan's
+deliberately narrower first release.
+
+Tag parsing uses pinned `yaml` and `mdast-util-from-markdown` packages in the
+CLI only. Markdown parsing supplies code, comment and link boundaries; YAML
+source ranges restrict changes to the tags property. Re-serializing all
+frontmatter would change unrelated properties. Tests retain BOM, CRLF, comments,
+unrelated YAML formatting and note bodies byte-for-byte outside explicit spans.
+Malformed or aliased tag properties are refused. Tag search reports such
+unreadable semantics as skipped, never as a complete negative result.
+
+Review reproduced two parser errors before fixing them: a URL fragment after
+balanced parentheses was mistaken for a tag, and a literal `%%` inside code
+hid later body tags. Regression tests cover inline links, reference definitions,
+autolinks and both inline and fenced code. Source-span tests also exposed a
+Unicode-normalization error that left a combining mark in renamed nested tags.
+
 ## Post-0.8.2 performance work — September 10, 2026
 
 Local changes based on `aba03b4`; Node 22.23.2, Apple M4 Pro, macOS.

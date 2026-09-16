@@ -98,7 +98,8 @@ tools while still allowing incoming synchronization.
 
 A matching content base proves which bytes an edit starts from, not whether a
 model's replacement preserves their meaning. MCP therefore exposes exact unique
-old-to-new edits and exact append, with no whole-file writer. Before changing an
+old-to-new edits, exact append and prepend, with no whole-file writer. Prepend
+retains an existing UTF-8 BOM at the start. Before changing an
 existing note it creates an independent visible before-image, reads and compares
 its bytes, and flushes it. Failure stops before touching the original. Backups
 remain ordinary synced files, immutable through MCP. Creation and restore publish

@@ -50,6 +50,8 @@ const listSchema = z
 const searchSchema = z
   .object({
     query: text(1024).min(1),
+    mode: z.enum(["content", "filename", "both", "tag"]).optional(),
+    includeChildren: z.boolean().optional(),
     folder: text(4096).optional(),
     caseSensitive: z.boolean().optional(),
     cursor: text(8192).optional(),
@@ -185,7 +187,7 @@ export function createTools(session: McpSession, version: string) {
     "search_notes",
     {
       description:
-        "Search literal text in local notes. Follow nextCursor and check skipped and complete.",
+        "Search literal content, filenames, both, or parsed Obsidian tags. Follow nextCursor and check skipped and complete.",
       inputSchema: searchSchema,
       annotations: readAnnotations,
     },
@@ -309,6 +311,16 @@ export function createTools(session: McpSession, version: string) {
         annotations: { ...annotations, destructiveHint: false },
       },
       (input, ctx) => call(() => mutation({ kind: "append", ...input }, ctx.mcpReq.signal)),
+    );
+    server.registerTool(
+      "prepend_note",
+      {
+        description:
+          "Prepend exact text after an existing UTF-8 BOM, using a required base and verified before-image. Supply separators. Inspect uncertain outcomes before retrying.",
+        inputSchema: appendSchema,
+        annotations: { ...annotations, destructiveHint: false },
+      },
+      (input, ctx) => call(() => mutation({ kind: "prepend", ...input }, ctx.mcpReq.signal)),
     );
     server.registerTool(
       "create_note",

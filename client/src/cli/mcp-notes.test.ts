@@ -107,6 +107,21 @@ async function survivors(): Promise<Record<string, string>> {
   }
   return contents;
 }
+it("prepends exact bytes without moving the BOM or losing unsent CRLF content", async () => {
+  const { base, run, vault, bytes } = await seeded("\ufeffUNSENT original\r\n");
+  const result = await run({
+    kind: "prepend",
+    path: "Daily.md",
+    base,
+    text: "Heading\r\n",
+  } as NoteMutation);
+  expect(result).toMatchObject({ applied: true, durable: true });
+  expect(await vault.read("Daily.md")).toEqual(enc.encode("\ufeffHeading\r\nUNSENT original\r\n"));
+  expect(await vault.read(result.beforeImage!)).toEqual(bytes);
+  expect(
+    await run({ kind: "prepend", path: "Daily.md", base, text: "Heading\r\n" } as NoteMutation),
+  ).toMatchObject({ applied: false, error: { code: "stale" } });
+});
 it("changes two exact tasks together while preserving every unrelated byte", async () => {
   const input =
     "\ufeff---\r\ntags: [daily]\r\n---\r\n[[Family]] cafe\u0301 😀\r\n- [ ] Book tickets\r\n- [ ] Pack bags\r\nUNSENT end\r\n";

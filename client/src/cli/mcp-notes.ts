@@ -20,6 +20,7 @@ export const midNoteMutation = composite({
 export type NoteMutation =
   | { kind: "edit"; path: string; base: string; edits: readonly { old: string; new: string }[] }
   | { kind: "append"; path: string; base: string; text: string }
+  | { kind: "prepend"; path: string; base: string; text: string }
   | { kind: "create"; path: string; content: string };
 export type Certainty = boolean | "unknown";
 export interface MutationResult {
@@ -235,10 +236,19 @@ export async function mutateNote(
       if (before.base !== request.base)
         throw new NoteError("stale", "the note changed; read it and reconsider the edit");
       const source = noteText(before.bytes);
-      if (request.kind === "append") {
+      if (request.kind === "append" || request.kind === "prepend") {
         const suffix = inputText(request.text, INPUT_BYTES);
-        if (suffix.length === 0) throw new NoteError("invalid_text", "append text cannot be empty");
-        proposed = Buffer.concat([before.bytes, suffix]);
+        if (suffix.length === 0)
+          throw new NoteError("invalid_text", "inserted text cannot be empty");
+        if (request.kind === "append") proposed = Buffer.concat([before.bytes, suffix]);
+        else {
+          const bom = source.startsWith("\ufeff") ? 3 : 0;
+          proposed = Buffer.concat([
+            before.bytes.subarray(0, bom),
+            suffix,
+            before.bytes.subarray(bom),
+          ]);
+        }
       } else proposed = replacement(source, request.edits);
       if (proposed.length > NOTE_BYTES)
         throw new NoteError("note_too_large", "the resulting note exceeds 1 MiB");
