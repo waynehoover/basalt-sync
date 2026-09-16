@@ -72,6 +72,7 @@ export async function smokeMcpArtifact(artifact: string, runtime: string, denyRe
       original.replace("[ ]", "[x]"),
     );
     assert.equal((await tool(host, "read_note", { path: edited.beforeImage })).content, original);
+    await smokeExpandedTools(host);
     return { initializationMs: Math.round(initializationMs * 10) / 10 };
   } catch (error) {
     throw new Error(`${String(error)}\n${stderr}`);
@@ -123,6 +124,7 @@ export async function smokeHttpArtifact(artifact: string, runtime: string, denyR
       original.replace("[ ]", "[x]"),
     );
     assert.equal((await tool(client, "read_note", { path: edited.beforeImage })).content, original);
+    await smokeExpandedTools(client);
     assert.equal(host.stdout(), "");
     assert(!host.stderr().includes(issued.out.trim()));
     return { initializationMs: host.initializationMs };
@@ -140,4 +142,93 @@ export async function smokeHttpArtifact(artifact: string, runtime: string, denyR
       }
     }
   }
+}
+
+async function smokeExpandedTools(client: Client) {
+  assert.equal((await tool(client, "list_vaults")).vaults[0].id, "default");
+  assert.equal((await tool(client, "create_directory", { path: "Expanded" })).durable, true);
+  const path = "Expanded/source.md";
+  const original = "UNSENT EXPANSION MARKER\r\n#old\r\n";
+  assert.equal((await tool(client, "create_note", { path, content: original })).durable, true);
+  const read = await tool(client, "read_note", { path });
+  const prepend = await tool(client, "prepend_note", {
+    path,
+    base: read.base,
+    text: "# Heading\r\n",
+  });
+  assert.equal(prepend.durable, true);
+  assert.equal((await tool(client, "read_note", { path: prepend.beforeImage })).content, original);
+  const apply = async (name: string, args: Record<string, unknown>) => {
+    const preview = await tool(client, name, args);
+    assert.equal(preview.phase, "preview", JSON.stringify(preview));
+    const result = await tool(client, name, { ...args, changes: preview.changes });
+    assert.equal(result.complete, true, JSON.stringify(result));
+    return result;
+  };
+  await apply("add_tags", { paths: [path], tags: ["yaml"], location: "frontmatter" });
+  await apply("manage_tags", {
+    paths: [path],
+    operation: "add",
+    tags: ["managed"],
+    location: "content",
+  });
+  await apply("remove_tags", { paths: [path], patterns: ["yam*"] });
+  await apply("rename_tag", { oldTag: "old", newTag: "new" });
+  assert(
+    (await tool(client, "search_notes", { query: "new", mode: "tag" })).matches.some(
+      (row: { path: string }) => row.path === path,
+    ),
+  );
+  assert(
+    (await tool(client, "search_notes", { query: "source", mode: "filename" })).matches.some(
+      (row: { path: string }) => row.path === path,
+    ),
+  );
+  assert.equal(
+    (
+      await tool(client, "create_note", {
+        path: "expanded-index.md",
+        content: "[[Expanded/source|label]]\n",
+      })
+    ).durable,
+    true,
+  );
+  const destination = "Expanded/moved.md";
+  await apply("move_note", { path, to: destination });
+  assert.equal(
+    (await tool(client, "read_note", { path: "expanded-index.md" })).content,
+    "[[Expanded/moved|label]]\n",
+  );
+  const moved = await tool(client, "read_note", { path: destination });
+  assert(moved.content.includes("UNSENT EXPANSION MARKER\r\n"));
+  assert(moved.content.includes("#new"));
+  assert(moved.content.includes("#managed"));
+  await within(
+    (async () => {
+      for (;;) {
+        const status = await tool(client, "sync_status");
+        if (!status.localWritesSincePass && !status.engine.syncing && !status.engine.pending)
+          return;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    })(),
+    "expanded artifact sync",
+    15000,
+  );
+  const history = await tool(client, "note_history", { path: destination });
+  assert.equal(
+    (
+      await tool(client, "compare_versions", {
+        path: destination,
+        fromUid: history.versions[0].uid,
+      })
+    ).identical,
+    true,
+  );
+  assert(Array.isArray((await tool(client, "delivery_status")).devices));
+  const deletion = await apply("delete_note", { path: destination });
+  const backup = deletion.results.find(
+    (row: { path: string }) => row.path === destination,
+  ).beforeImage;
+  assert.equal((await tool(client, "read_note", { path: backup })).content, moved.content);
 }
