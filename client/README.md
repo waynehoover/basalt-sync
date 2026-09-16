@@ -232,9 +232,10 @@ access. The stored hash cannot recover a lost token.
 The [HTTP reference](https://github.com/waynehoover/basalt-sync/blob/main/docs/cli-reference.md#mcp-over-http)
 covers origins, limits and reconnect behavior. TLS terminators receive plaintext
 notes; read the [Cloudflare and proxy warning](https://github.com/waynehoover/basalt-sync/blob/main/docs/security.md#http-access-for-an-agent)
-before choosing another proxy. A loopback proxy stand-in was tested. **Real
-Tailscale routing, Cloudflare Tunnel, Collie and phone-client access remain
-unverified**, including phone lockout and re-entry after token rotation.
+before choosing another proxy. Real Tailscale HTTPS was tested with official SDK
+clients, including edits, before-images, credential rotation and restart.
+**Cloudflare Tunnel, Collie and a specific phone MCP client remain unverified**,
+including phone lockout and re-entry after token rotation.
 
 ## A mirror, and turning merging off
 
