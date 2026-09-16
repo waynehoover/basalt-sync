@@ -169,12 +169,13 @@ resolve to its canonical local directory.
 |---|---|
 | `list_notes` | Optional `folder`, `nameContains`, `after`, `limit` (default 100, max 500), `includeBackups` (default false). Lists notes, attachment metadata and folders. `nameContains` is a case-sensitive filename substring. |
 | `read_note` | Required `path`; optional `uid`, `startLine` (default 1), `maxLines` (default 200, max 1000), `base`. Returns exact text, the complete note's SHA-256 `base`, and `nextLine`. `uid` selects authenticated server history. |
-| `search_notes` | Required literal `query` (max 1024 bytes); optional `folder`, `caseSensitive` (default false), `cursor`, `limit` (default 50, max 200), `contextLines` (default 0, max 3), `includeBackups`. Returns matches and explicit skipped/omitted counts. |
+| `search_notes` | Required `query` (max 1024 bytes); optional `mode` (`content`, `filename`, `both`, `tag`; default `content`), `folder`, `caseSensitive` (default false), `cursor`, `limit` (default 50, max 200), `contextLines` (default 0, max 3), `includeBackups`. Tag mode matches case-insensitive tags and their nested descendants; `includeChildren:false` selects only the exact tag. It reads frontmatter and body text, excluding code, comments and link syntax. Filename rows have line 0. Returns explicit skipped/omitted counts. |
 | `note_history` | Required `path`; optional `before`, `limit` (default 20, max 100). Returns authenticated versions newest first and `nextBefore`. Device names are labels, not proof of authorship. |
 | `deleted_notes` | Optional `before`, `limit` (default 50, max 200). Returns deleted notes, their latest recoverable version UID (`restorable`, or 0) and `nextBefore`. |
 | `sync_status` | Optional `preview:true`, then optional `after` and `limit` (default 100, max 500). Basic status includes connection, write readiness, last pass/failure, exclusions and recovery inventory. Preview is an observing estimate. |
 | `edit_note` | Required `path`, current `base`, and 1 to 32 `{old,new}` edits. Each nonempty `old` must occur exactly once. Edits must not overlap and all refer to the original source. Each `old`/`new` is at most 8 KiB; combined input is at most 64 KiB. |
 | `append_note` | Required `path`, current `base`, and nonempty `text` (max 64 KiB). Appends exactly those bytes to an existing note. Include any wanted newline yourself. |
+| `prepend_note` | Same arguments as append. Inserts exact text at the start, after an existing UTF-8 BOM. Include any wanted newline yourself. Preserves a verified before-image and refuses stale retries. |
 | `create_note` | Required `path` and `content` (max 1 MiB). Exclusively creates a note at a free path. |
 | `restore_note` | Required source `path`, inspected version `uid`, and distinct explicit destination `to`. Exclusively creates that destination; an occupied path gives `exists`. Repeating a request never invents another filename. |
 
@@ -213,11 +214,11 @@ Mutations require `writeReady:true`; a queued mutation waits at most five second
 to start and otherwise returns `busy`. An admitted mutation finishes in the
 owning sync client's serial queue even if its connection subsequently drops.
 
-`--read-only`, including a saved read-only pairing, removes all four mutation
+`--read-only`, including a saved read-only pairing, removes all mutation
 tools. It still permits incoming sync to change local files. It is a local
 process policy, not a restricted server credential.
 
-Before an edit or append changes existing bytes, it creates a visible sibling,
+Before an edit, append or prepend changes existing bytes, it creates a visible sibling,
 reads it back, compares every byte and flushes it. Failure stops the edit before
 touching the original. Creation and restore have no before-image because their
 destinations must be absent. An unchanged edit returns `noop:true` without a write.

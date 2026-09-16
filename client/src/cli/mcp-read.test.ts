@@ -39,6 +39,67 @@ async function put(path: string, text: string) {
   await mkdir(join(root, path, ".."), { recursive: true });
   await writeFile(join(root, path), text);
 }
+it("searches parsed tags without matching code, comments, or ordinary prose", async () => {
+  await put("real.md", "---\r\ntags: [Project/Active]\r\n---\r\nbody\r\n");
+  await put("inline.md", "#project/active\n");
+  await put(
+    "prose.md",
+    "project/active\n`#project/active`\n<!-- #project/active -->\n````\n```\n#project/active\n````\n",
+  );
+  const found = await reader.search({ query: "project/active", mode: "tag" } as Parameters<
+    McpReader["search"]
+  >[0]);
+  expect(found.matches.map((row) => row.path)).toEqual(["inline.md", "real.md"]);
+  expect(found.complete).toBe(true);
+});
+it("paginates filename matches independently from content and binds the search mode", async () => {
+  await put("a-needle.md", "no content match");
+  await put("b-needle.md", "no content match");
+  await put("c.md", "needle");
+  const input = { query: "needle", mode: "filename", limit: 1 } as Parameters<
+    McpReader["search"]
+  >[0];
+  const first = await reader.search(input);
+  expect(first.matches.map((row) => row.path)).toEqual(["a-needle.md"]);
+  const second = await reader.search({ ...input, cursor: first.nextCursor! });
+  expect(second.matches.map((row) => row.path)).toEqual(["b-needle.md"]);
+  await expect(
+    reader.search({ ...input, mode: "content", cursor: first.nextCursor! } as Parameters<
+      McpReader["search"]
+    >[0]),
+  ).rejects.toMatchObject({ code: "invalid_cursor" });
+});
+it("finds nested tags by default and can restrict tag search to the exact parent", async () => {
+  await put("child.md", "#project/active\n");
+  await put("parent.md", "#Project\n");
+  await put("prefix.md", "#projectile\n");
+  const input = { query: "project", mode: "tag" } as Parameters<McpReader["search"]>[0];
+  expect((await reader.search(input)).matches.map((row) => row.path)).toEqual([
+    "child.md",
+    "parent.md",
+  ]);
+  expect(
+    (
+      await reader.search({ ...input, includeChildren: false } as Parameters<
+        McpReader["search"]
+      >[0])
+    ).matches.map((row) => row.path),
+  ).toEqual(["parent.md"]);
+});
+it("keeps filename hits when combined search cannot decode the note body", async () => {
+  await writeFile(join(root, "unreadable-needle.md"), Buffer.from([0xff]));
+  const result = await reader.search({ query: "needle", mode: "both" });
+  expect(result.matches.map((row) => row.path)).toEqual(["unreadable-needle.md"]);
+  expect(result.skipped.count).toBe(1);
+  expect(result.complete).toBe(false);
+});
+it("does not return duplicate scalar-tag coordinates that pagination cannot resume", async () => {
+  await put("note.md", "---\ntags: old old\n---\n");
+  const result = await reader.search({ query: "old", mode: "tag", limit: 1 });
+  expect(result.matches).toHaveLength(1);
+  expect(result.nextCursor).toBeNull();
+  expect(result.complete).toBe(true);
+});
 it("reads and lists through a root alias while refusing child links", async () => {
   await put("real/note.md", "inside the aliased root");
   await put("outside/note.md", "outside the aliased root");

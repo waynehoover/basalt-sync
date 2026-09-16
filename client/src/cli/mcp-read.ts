@@ -10,6 +10,7 @@ import {
   noteText,
 } from "./mcp-notes.ts";
 import type { NodeVault } from "./vault.ts";
+import { matchesTag, tagOccurrences, validateTag } from "./mcp-markdown.ts";
 
 export const PAGE_TEXT_BYTES = 64 * 1024;
 const PAGE_ROWS_BYTES = 192 * 1024;
@@ -35,6 +36,8 @@ export interface ReadNoteInput {
 }
 export interface SearchNotesInput {
   query: string;
+  mode?: "content" | "filename" | "both" | "tag" | undefined;
+  includeChildren?: boolean | undefined;
   folder?: string | undefined;
   caseSensitive?: boolean | undefined;
   cursor?: string | undefined;
@@ -289,11 +292,16 @@ export class McpReader {
       const folder = await this.folder(input.folder);
       const query = {
         query: input.query,
+        mode: input.mode ?? "content",
+        includeChildren: input.includeChildren ?? true,
         folder,
         caseSensitive: input.caseSensitive ?? false,
         includeBackups: input.includeBackups ?? false,
         contextLines: context,
       };
+      if (!["content", "filename", "both", "tag"].includes(query.mode))
+        throw new NoteError("invalid_query", "unknown search mode");
+      if (query.mode === "tag") validateTag(input.query);
       const after = position(input.cursor, query);
       const pattern = new RegExp(
         input.query.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"),
@@ -321,6 +329,7 @@ export class McpReader {
         before: string[];
         after: string[];
         clipped: boolean;
+        kind?: "filename" | "tag";
       }[] = [];
       const skipped: { count: number; items: { path: string; why: string }[]; truncated: boolean } =
         { count: 0, items: [], truncated: false };
@@ -346,11 +355,41 @@ export class McpReader {
           break;
         }
         scanned++;
+        pattern.lastIndex = 0;
+        if (
+          (query.mode === "filename" || query.mode === "both") &&
+          pattern.test(file.path.split("/").pop()!) &&
+          !(after?.path === file.path)
+        ) {
+          const row = {
+            path: file.path,
+            line: 0,
+            column: 1,
+            text: file.path,
+            before: [],
+            after: [],
+            clipped: false,
+            kind: "filename" as const,
+          };
+          const size = byteSize(row);
+          if (matches.length >= limit || outputBytes + size > PAGE_TEXT_BYTES) {
+            more = true;
+            break;
+          }
+          matches.push(row);
+          outputBytes += size;
+          last = { path: file.path, line: 0, column: 1 };
+        }
         let source: string;
+        let tags: ReturnType<typeof tagOccurrences> = [];
         try {
-          const snapshot = await this.vault.readSnapshot(file.path, NOTE_BYTES);
-          source = noteText(snapshot.bytes);
-          scannedBytes += snapshot.size;
+          if (query.mode === "filename") source = "";
+          else {
+            const snapshot = await this.vault.readSnapshot(file.path, NOTE_BYTES);
+            source = noteText(snapshot.bytes);
+            scannedBytes += snapshot.size;
+            if (query.mode === "tag") tags = tagOccurrences(source);
+          }
         } catch (error) {
           skip(file.path, noteFailure(error).code);
           last = { path: file.path, line: Number.MAX_SAFE_INTEGER, column: 0 };
@@ -361,8 +400,22 @@ export class McpReader {
         const offsets = [0];
         for (let i = 0; i < lines.length - 1; i++) offsets.push(offsets[i]! + lines[i]!.length + 1);
         pattern.lastIndex = 0;
+        const hits: Iterable<{ index: number }> =
+          query.mode === "tag"
+            ? [
+                ...new Set(
+                  tags
+                    .filter((tag) =>
+                      matchesTag(tag.tag, validateTag(input.query), query.includeChildren),
+                    )
+                    .map((tag) => tag.start),
+                ),
+              ].map((index) => ({ index }))
+            : query.mode === "filename"
+              ? []
+              : source.matchAll(pattern);
         let line = 0;
-        for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
+        for (const match of hits) {
           aborted(signal);
           while (line + 1 < offsets.length && offsets[line + 1]! <= match.index) line++;
           const column = match.index - offsets[line]! + 1;
@@ -395,6 +448,7 @@ export class McpReader {
                 (value, i) => value.length < lines[Math.max(0, line - context) + i]!.length,
               ) ||
               next.some((value, i) => value.length < lines[line + 1 + i]!.length),
+            ...(query.mode === "tag" ? { kind: "tag" as const } : {}),
           };
           const size = byteSize(row);
           if (matches.length >= limit || outputBytes + size > PAGE_TEXT_BYTES) {

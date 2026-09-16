@@ -1,11 +1,10 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { build } from "esbuild";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { buildMcp } from "./mcp-test.ts";
 import { run } from "./cli.ts";
 import { TestServer, removeTree } from "../core/test-server.ts";
 import { within } from "../core/test-async.ts";
@@ -22,16 +21,7 @@ it("the packaged entrypoint flushes a large JSON preview before exiting through 
   vi.spyOn(console, "info").mockImplementation(() => undefined);
   const buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-output-"));
   dirs.push(buildDir);
-  const bundle = join(buildDir, "basalt.mjs");
-  await build({
-    entryPoints: [fileURLToPath(new URL("./bin.ts", import.meta.url))],
-    outfile: bundle,
-    platform: "node",
-    target: "node22",
-    format: "esm",
-    bundle: true,
-    logLevel: "silent",
-  });
+  const bundle = await buildMcp(buildDir);
   server = new TestServer();
   await server.start();
   const vault = await mkdtemp(join(tmpdir(), "basalt-bin-vault-"));
