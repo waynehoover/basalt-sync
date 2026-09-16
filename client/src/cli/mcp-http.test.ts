@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { chmod, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { httpFixture, legacy, initialize, callStatus } from "./mcp-http-test.ts";
 import { cli, tool } from "./mcp-test.ts";
@@ -207,6 +207,29 @@ it("refuses malformed and missing bearer headers before any tool runs, with fixe
   expect(dispatched).toBe(0);
 });
 
+it("an unreadable credential refuses HTTP with 503 before any tool runs", async (context) => {
+  if (process.getuid?.() === 0) {
+    context.skip("root bypasses the filesystem permission refusal");
+    return;
+  }
+  let dispatched = 0;
+  const host = await fixture({ status: async () => ({ dispatched: ++dispatched }) });
+  const headers = await legacy(host);
+  const path = join(host.root, ".basalt/mcp-token.json");
+  await chmod(path, 0);
+  try {
+    await expect(readFile(path)).rejects.toMatchObject({ code: "EACCES" });
+    const response = await host.request(callStatus(1), { headers });
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe("unavailable");
+    expect(dispatched).toBe(0);
+    expect(host.logs.join("\n")).not.toContain(path);
+    expect(host.logs.join("\n")).not.toContain(host.token);
+  } finally {
+    await chmod(path, 0o600);
+  }
+});
+
 it("logs bounded proxy diagnostics without trusting forwarded identity or recording secrets", async () => {
   const host = await fixture();
   const denied = await host.request(initialize(), {
@@ -363,9 +386,11 @@ it("caps sessions, expires idle sessions, and keeps existing clients usable afte
   const host = await fixture({ now: () => now });
   const sessions = [];
   for (let i = 0; i < 16; i++) sessions.push(await legacy(host));
-  const overflow = await host.request(initialize());
-  expect(overflow.status).toBe(429);
-  await overflow.text();
+  for (let i = 16; i < 20; i++) {
+    const overflow = await host.request(initialize());
+    expect(overflow.status).toBe(429);
+    await overflow.text();
+  }
   const existing = await host.request(callStatus(1), { headers: sessions[0]! });
   expect(existing.status).toBe(200);
   await existing.text();

@@ -1,6 +1,6 @@
-import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
+import { mkdtemp, mkdir, readFile, writeFile, symlink } from "node:fs/promises";
+import { tmpdir, networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { buildMcp, cli, tool } from "./mcp-test.ts";
 import { openHttp } from "./mcp-http-test.ts";
@@ -8,6 +8,9 @@ import { TestServer, removeTree } from "../core/test-server.ts";
 import { within } from "../core/test-async.ts";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer as httpServer, request as httpRequest } from "node:http";
+import { loadConfig, saveConfig } from "./config.ts";
+import { deferred } from "../core/test-async.ts";
 
 let buildDir: string, bundle: string, server: TestServer | undefined;
 const roots: string[] = [];
@@ -162,6 +165,165 @@ it("defaults HTTP to read-only, keeps stdin EOF harmless, and denies mutation ca
   ).rejects.toThrow();
   expect(await readFile(join(dir, "note.md"), "utf8")).toBe("original bytes\n");
   expect(owner.child.exitCode).toBeNull();
+});
+
+it("reaps its HTTP child even when the SDK client fails to close", async () => {
+  const { dir, token } = await paired();
+  const owner = await host(dir, token);
+  const close = vi.spyOn(owner.client, "close").mockRejectedValueOnce(new Error("close failed"));
+  try {
+    await expect(owner.close()).rejects.toThrow("close failed");
+    expect(await within(owner.exited(), "child after failed client cleanup", 1000)).toEqual({
+      code: 0,
+      signal: null,
+    });
+  } finally {
+    close.mockRestore();
+    await owner.close();
+  }
+});
+
+it("accepts a bare loopback port without a plaintext warning", async () => {
+  const { dir, token } = await paired();
+  const local = await openHttp(bundle, dir, token, [], false, { bare: true });
+  hosts.push(local);
+  expect((await tool(local.client, "sync_status")).readOnly).toBe(true);
+  expect(local.stderr()).not.toContain("WARNING");
+  expect((await local.close()).code).toBe(0);
+  hosts.splice(hosts.indexOf(local), 1);
+});
+
+it("warns when bound to an available named non-loopback IPv4 interface", async (context) => {
+  const address = Object.values(networkInterfaces())
+    .flat()
+    .find((address) => address?.family === "IPv4" && !address.internal)?.address;
+  if (!address) {
+    context.skip("this host has no non-loopback IPv4 interface");
+    return;
+  }
+  const { dir, token } = await paired();
+  const named = await openHttp(bundle, dir, token, [], false, { host: address });
+  hosts.push(named);
+  expect((await tool(named.client, "sync_status")).readOnly).toBe(true);
+  expect(named.stderr()).toContain("carries plaintext notes and credentials");
+});
+
+it("the proxy may rewrite Host and forwarded headers but cannot grant note access", async () => {
+  const { dir, token } = await paired();
+  await writeFile(join(dir, "note.md"), "before proxy edit\n");
+  const owner = await host(dir, token, ["--writable", "--verbose"]);
+  await ready(owner.client);
+  const proxy = httpServer((incoming, outgoing) => {
+    const request = httpRequest(
+      owner.url,
+      {
+        method: incoming.method,
+        headers: {
+          ...incoming.headers,
+          host: "rewritten.proxy",
+          "x-forwarded-for": "100.64.0.12",
+          "x-forwarded-proto": "https",
+          "x-real-ip": "100.64.0.12",
+        },
+      },
+      (response) => {
+        outgoing.writeHead(response.statusCode!, response.headers);
+        response.pipe(outgoing);
+      },
+    );
+    incoming.once("aborted", () => request.destroy());
+    outgoing.once("close", () => {
+      if (!outgoing.writableFinished) request.destroy();
+    });
+    request.once("error", () => outgoing.destroy());
+    incoming.pipe(request);
+  });
+  await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const address = proxy.address();
+  if (!address || typeof address === "string") throw new Error("missing proxy port");
+  const url = `http://127.0.0.1:${address.port}/mcp`;
+  try {
+    const refused = await fetch(url, { method: "POST", body: "{}" });
+    expect(refused.status).toBe(401);
+    expect(await refused.text()).toBe("unauthorized");
+    const connection = await owner.connect(true, token, url);
+    const read = await tool(connection.client, "read_note", { path: "note.md" });
+    const result = await tool(connection.client, "append_note", {
+      path: "note.md",
+      base: read.base,
+      text: "through the proxy\n",
+    });
+    expect(result).toMatchObject({ applied: true, durable: true });
+    expect((await tool(connection.client, "read_note", { path: result.beforeImage })).content).toBe(
+      read.content,
+    );
+    expect((await tool(connection.client, "read_note", { path: "note.md" })).content).toBe(
+      read.content + "through the proxy\n",
+    );
+    expect(owner.stderr()).not.toContain(token);
+    expect(owner.stderr()).toContain('"forwardedFor":"100.64.0.12"');
+    await connection.client.close();
+  } finally {
+    proxy.closeAllConnections();
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+  }
+});
+
+it("HTTP and sync watch exclude each other through root aliases, with kernel release after a kill", async () => {
+  const { dir, token } = await paired();
+  const alias = dir + "-alias";
+  roots.push(alias);
+  await symlink(dir, alias);
+  const owner = await host(dir, token);
+  const refused = await command("sync", "--watch", "--dir", alias);
+  expect(refused.code).not.toBe(0);
+  expect(refused.err).toMatch(/lock|held|running|another/i);
+  owner.child.kill("SIGKILL");
+  expect((await owner.close()).signal).toBe("SIGKILL");
+  hosts.splice(hosts.indexOf(owner), 1);
+  const watcher = spawn(process.execPath, [bundle, "sync", "--watch", "--dir", alias], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const closed = once(watcher, "close"),
+    started = deferred<void>();
+  watcher.stdout.on("data", () => started.resolve());
+  watcher.stderr.on("data", () => started.resolve());
+  try {
+    await within(started.promise, "watcher startup");
+    const denied = await command("mcp", "--listen", "--dir", dir);
+    expect(denied.code).not.toBe(0);
+    expect(denied.err).toMatch(/lock|held|running|another/i);
+    expect(denied.out).toBe("");
+  } finally {
+    watcher.kill("SIGTERM");
+    await within(closed, "watcher shutdown");
+  }
+  const final = await host(dir, token);
+  expect((await tool(final.client, "sync_status")).readOnly).toBe(true);
+});
+
+it("SIGTERM wakes HTTP reconnect sleep while local reads remain available", async () => {
+  const { dir, token } = await paired();
+  const config = (await loadConfig(dir))!;
+  await saveConfig(dir, { ...config, url: "ws://127.0.0.1:1" });
+  await writeFile(join(dir, "offline.md"), "offline bytes\n");
+  const owner = await host(dir, token, ["--writable"]);
+  await within(
+    (async () => {
+      while ((await tool(owner.client, "sync_status")).connection !== "offline")
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    })(),
+    "HTTP reconnect sleep",
+  );
+  expect((await tool(owner.client, "read_note", { path: "offline.md" })).content).toBe(
+    "offline bytes\n",
+  );
+  expect(
+    await tool(owner.client, "create_note", { path: "must-not-exist.md", content: "no" }),
+  ).toMatchObject({ applied: false, error: { code: "not_ready" } });
+  owner.child.kill("SIGTERM");
+  expect((await owner.close()).code).toBe(0);
+  hosts.splice(hosts.indexOf(owner), 1);
 });
 
 it("serializes edits from separate HTTP sessions against the same base", async () => {
