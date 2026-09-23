@@ -306,13 +306,23 @@ func TestHealthSaysOkAndNothingElse(t *testing.T) {
 // must produce the same frame, byte for byte. Anything that later starts
 // answering differently for a vault that exists shows up here, whatever code
 // it chooses.
+//
+// And with the server told which vault it serves, as every basaltd is, because
+// that is one more thing it could leak: the name. It did, twice. The refusal
+// for an unserved vault said "this server serves %q", and on the invite route
+// the check ran before the request's own shape was judged, so a malformed
+// redemption was `badname` or `badentry` for the served vault and `auth` for
+// any other. A rig that never called Serves could see neither.
 func TestNoPreAuthRefusalDependsOnWhetherTheVaultExists(t *testing.T) {
 	// One vault that is real in every way a vault can be: claimed, with
 	// devices on it, entries in it and an outstanding invite. If any of those
 	// can be sensed from outside, this is the rig that would show it.
-	furnished := func(t *testing.T) *rig {
+	furnished := func(t *testing.T, serving bool) *rig {
 		t.Helper()
 		r := newRig(t)
+		if serving {
+			r.srv.Serves(testVault)
+		}
 		r.device("laptop")
 		r.device("phone")
 		r.seed("note.md", "hello")
@@ -358,6 +368,20 @@ func TestNoPreAuthRefusalDependsOnWhetherTheVaultExists(t *testing.T) {
 				Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"),
 				Auth: strings.Repeat("k", MinClaimLength)}
 		}},
+		{"a redemption with a malformed device id", wire.CodeBadName, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: "not base64url!",
+				Auth: strings.Repeat("k", MinClaimLength)}
+		}},
+		{"a redemption with a short auth key", wire.CodeBadEntry, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"), Auth: "short"}
+		}},
+		{"a redemption with a malformed name", wire.CodeBadName, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"),
+				Auth: strings.Repeat("k", MinClaimLength), Name: "a\nb"}
+		}},
 		{"an over-long device name", wire.CodeBadName, func(v string) wire.In {
 			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: long}
 		}},
@@ -376,26 +400,36 @@ func TestNoPreAuthRefusalDependsOnWhetherTheVaultExists(t *testing.T) {
 				Token: testToken, Invite: "jjjjjjjjjjjjjjjjjjjjjj"}
 		}},
 	} {
-		t.Run(tc.what, func(t *testing.T) {
-			real := furnished(t)
-			cl := real.dial("prober")
-			cl.sendJSON(tc.probe(testVault))
-			present := cl.recvFrame()
+		for _, serving := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, serving=%v", tc.what, serving), func(t *testing.T) {
+				real := furnished(t, serving)
+				cl := real.dial("prober")
+				cl.sendJSON(tc.probe(testVault))
+				present := cl.recvFrame()
 
-			absent := furnished(t)
-			cl = absent.dial("prober")
-			cl.sendJSON(tc.probe("no-such-vault"))
-			missing := cl.recvFrame()
+				absent := furnished(t, serving)
+				cl = absent.dial("prober")
+				cl.sendJSON(tc.probe("no-such-vault"))
+				missing := cl.recvFrame()
 
-			if string(present) != string(missing) {
-				t.Fatalf("the refusal differs by whether the vault exists:\n  served: %s\n  unknown: %s",
-					present, missing)
-			}
-			if !strings.Contains(string(present), `"code":"`+tc.code+`"`) {
-				t.Fatalf("this probe never reached the check it is about: wanted %s, got %s",
-					tc.code, present)
-			}
-		})
+				if string(present) != string(missing) {
+					t.Fatalf("the refusal differs by whether the vault exists:\n  served: %s\n  unknown: %s",
+						present, missing)
+				}
+				if !strings.Contains(string(present), `"code":"`+tc.code+`"`) {
+					t.Fatalf("this probe never reached the check it is about: wanted %s, got %s",
+						tc.code, present)
+				}
+				// Neither name, in either refusal. Identical frames already rule
+				// out naming the vault that was asked for; this also rules out
+				// naming the served one to everybody alike.
+				for _, name := range []string{testVault, "no-such-vault"} {
+					if msg, _ := rawFields(t, string(missing))["msg"].(string); strings.Contains(msg, name) {
+						t.Fatalf("a refusal before authentication names the vault %q: %s", name, missing)
+					}
+				}
+			})
+		}
 	}
 }
 

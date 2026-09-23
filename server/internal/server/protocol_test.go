@@ -1071,12 +1071,15 @@ func TestADeviceOfAnUnservedVaultIsRefused(t *testing.T) {
 		t.Fatalf("register a device on the other vault: %v", err)
 	}
 
+	// Refused as a wrong credential is, naming neither vault. This asserted
+	// once that the refusal named the vault it refused, and the text it
+	// matched said which vault this server serves to anybody on the port;
+	// the log names both instead.
 	cl := r.dial("stranger")
 	cl.sendJSON(wire.In{Op: "hello", Proto: wire.Proto, Crypto: wire.Crypto,
 		Vault: other, DeviceID: deviceID, Token: key, Device: "stranger"})
-	msg := cl.expectErr(wire.CodeAuth)
-	if !strings.Contains(msg, other) {
-		t.Fatalf("the refusal does not name the vault it refused: %s", msg)
+	if msg := cl.expectErr(wire.CodeAuth); msg != errNotAuthorised.Error() {
+		t.Fatalf("the refusal is not the one a wrong credential gets: %q", msg)
 	}
 
 	// And the served vault still works from the same server.
@@ -1095,10 +1098,16 @@ func TestAnInviteForAnUnservedVaultIsRefusedWithoutBeingSpent(t *testing.T) {
 		t.Fatalf("add an invite on the other vault: %v", err)
 	}
 
+	// A redemption well formed in every way but the vault, so that it reaches
+	// the served-vault check: the request's own shape is judged first, for
+	// every vault alike, and a malformed one is refused for that instead.
 	cl := r.dial("stranger")
 	cl.sendJSON(wire.In{Op: "hello", Proto: wire.Proto, Crypto: wire.Crypto,
-		Vault: other, DeviceID: "BBBBBBBBBBBBBBBBBBBBBB", Invite: invite, Device: "stranger"})
-	cl.expectErr(wire.CodeAuth)
+		Vault: other, DeviceID: "BBBBBBBBBBBBBBBBBBBBBB", Invite: invite, Device: "stranger",
+		Auth: strings.Repeat("k", MinClaimLength)})
+	if msg := cl.expectErr(wire.CodeAuth); msg != errNotAuthorised.Error() {
+		t.Fatalf("the refusal is not the one a wrong credential gets: %q", msg)
+	}
 
 	// Unspent: a refusal for the wrong vault must not burn somebody's invite.
 	left, err := r.st.Invites(other, r.srv.now().UnixMilli())
