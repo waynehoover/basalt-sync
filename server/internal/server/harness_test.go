@@ -268,6 +268,19 @@ func (c *client) sendRaw(v any) {
 	}
 }
 
+// sendFrame writes one text frame exactly as given, bytes json.Marshal would
+// never write included, and records id, when there is one, as a request
+// awaiting its reply.
+func (c *client) sendFrame(id int64, frame []byte) {
+	c.t.Helper()
+	if id != 0 {
+		c.pending = append(c.pending, id)
+	}
+	if err := c.conn.Write(c.ctx, websocket.MessageText, frame); err != nil {
+		c.t.Fatalf("%s: write: %v", c.name, err)
+	}
+}
+
 // check is the client-side half of request ids, run on every reply. It is the
 // rule docs/protocol.md gives a client: a reply whose id it does not recognise
 // ends the session, an error with no id is the reason the connection is about

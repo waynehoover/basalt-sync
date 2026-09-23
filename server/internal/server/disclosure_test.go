@@ -162,6 +162,10 @@ func TestNoPreAuthSurfaceNamesTheServerVersion(t *testing.T) {
 					c.t.Fatalf("write: %v", err)
 				}
 			}},
+			{"hello is not well-formed text", wire.CodeProtoState, func(r *rig, c *client) {
+				c.sendFrame(1, framed(c.t, wire.In{Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto,
+					Vault: testVault, Device: "name-goes-here"}, "prober"+wireBytes(0xff)))
+			}},
 			{"first frame is binary", wire.CodeProtoState, func(r *rig, c *client) {
 				c.sendBinary([]byte("not a hello"))
 			}},
