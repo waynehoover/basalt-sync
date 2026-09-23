@@ -93,6 +93,31 @@ func OpenMode(dbPath, chunkDir string, mode Mode, sync SyncMode) (*Store, error)
 
 	// SQLite and its driver parse URI parameters. Escape the filesystem path
 	// first so a literal '?' cannot truncate it or inject connection options.
+	//
+	// The pragmas every connection needs are here rather than in the schema,
+	// because a pragma run as a statement applies to the one connection that
+	// ran it and database/sql keeps a pool; the driver runs these on every
+	// connection it opens.
+	//
+	// temp_store = MEMORY (2) is the one that has cost something. SQLite writes
+	// a statement journal when a statement inside a transaction may have to be
+	// rolled back on its own, which is what a SAVEPOINT is for, and puts it in
+	// a temp directory. The shipped image is FROM scratch, and its container
+	// mounts only /data and sets read_only, so there is no temp directory: the
+	// batched commit added in 0.8.4 asked for one and got
+	// SQLITE_IOERR_GETTEMPPATH (6410) on every batch large enough to need it,
+	// twenty-two thousand times in a day on the author's own server, because a
+	// single put never takes that path and a failed batch just looks like a
+	// client retrying. MEMORY is the right answer rather than a workaround:
+	// these transactions hold one batch, which the protocol already bounds, so
+	// the journal they would spill is small, and the disk it would spill to is
+	// one this server is deliberately not given.
+	//
+	// It went in as a statement in the schema, so it reached the connection
+	// that ran the schema and no other. Every other connection the pool opened
+	// reported 0, the default, which is the temp directory again, and a
+	// read-only open never ran the schema at all.
+	// TestEveryConnectionKeepsItsTemporaryFilesInMemory.
 	absPath, err := filepath.Abs(dbPath)
 	if err != nil {
 		return nil, err
@@ -100,7 +125,8 @@ func OpenMode(dbPath, chunkDir string, mode Mode, sync SyncMode) (*Store, error)
 	dbURL := &url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}
 	dsn := dbURL.String() + "?_pragma=busy_timeout(5000)" +
 		"&_pragma=synchronous(" + string(sync) + ")" +
-		"&_pragma=foreign_keys(1)"
+		"&_pragma=foreign_keys(1)" +
+		"&_pragma=temp_store(2)"
 	if mode == ReadOnly {
 		// The driver's own read-only open, so this is enforced below the code
 		// rather than by the code remembering. A write through this handle is
