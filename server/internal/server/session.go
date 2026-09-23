@@ -958,6 +958,34 @@ func (s *Session) handleHello(m wire.In) error {
 	return s.helloAsRegistrar(m)
 }
 
+// errNotAuthorised is the one refusal every credential failure at hello gets: a
+// wrong vault credential, a device with no row or the wrong key, an invite that
+// is unknown, expired, used or malformed, and a vault this server does not
+// serve. Saying which would tell a caller which half to keep guessing. The log
+// says which, for the operator.
+var errNotAuthorised = errors.New("not authorised for this vault")
+
+// refuseUnserved is the served-vault check (F19) on the two routes that look a
+// vault up by the name the caller sent, a device connecting and an invite
+// being redeemed. The registrar's route has it inside DerivedAuth.
+//
+// It runs once the request's own shape has been judged, and it refuses with
+// errNotAuthorised. It used to name the served vault in its refusal, and on
+// the invite route it ran before the shape checks, so a malformed redemption
+// was `badname` or `badentry` for the served vault and `auth` for any other:
+// either way anybody on the port could learn the one vault name worth aiming
+// at. Now every answer before authentication is a function of the request
+// alone, and the name is in the log. It still runs before anything is looked
+// up, so an invite for an unserved vault is refused without being spent.
+// TestNoPreAuthRefusalDependsOnWhetherTheVaultExists.
+func (s *Session) refuseUnserved(m wire.In) error {
+	if err := s.srv.refuseUnservedVault(m.Vault); err != nil {
+		s.srv.log.Warn("hello for a vault this server does not serve", "remote", s.remote, "vault", m.Vault, "err", err)
+		return s.fatal(wire.CodeAuth, errNotAuthorised)
+	}
+	return nil
+}
+
 // helloAsDevice finishes a hello that named a device: the sync path, and the
 // only one there is.
 //
@@ -969,12 +997,13 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	// The served vault, before this looks one up by the name the caller sent
 	// (F19). `DerivedAuth` enforces it on the registrar's route and only
 	// there, so a device of another vault in the same store connected to a
-	// server that had logged that vault as "not served" at startup.
+	// server that had logged that vault as "not served" at startup. The
+	// request's shape was judged in handleHello, before this route was chosen.
 	//
 	// The same refusal a wrong key gets, and for the same reason: which half
 	// is wrong is not the caller's business.
-	if err := s.srv.refuseUnservedVault(m.Vault); err != nil {
-		return s.fatal(wire.CodeAuth, err)
+	if err := s.refuseUnserved(m); err != nil {
+		return err
 	}
 	_, stored, ok, err := s.srv.st.DeviceByID(m.Vault, m.DeviceID)
 	if err != nil {
@@ -998,7 +1027,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	if subtle.ConstantTimeCompare(offered[:], want) != 1 || !ok {
 		s.srv.log.Warn("device auth failed", "remote", s.remote, "vault", m.Vault,
 			"deviceId", m.DeviceID, "registered", ok)
-		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+		return s.fatal(wire.CodeAuth, errNotAuthorised)
 	}
 
 	// The vault's key material. A device that has converted holds the data key
@@ -1079,7 +1108,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 		if errors.Is(err, store.ErrUnknownDevice) || errors.Is(err, errSessionRevoked) {
 			s.srv.log.Warn("device revoked mid-handshake", "remote", s.remote,
 				"vault", m.Vault, "deviceId", m.DeviceID)
-			return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+			return s.fatal(wire.CodeAuth, errNotAuthorised)
 		}
 		return s.fatal(wire.CodeInternal, err)
 	}
@@ -1136,21 +1165,19 @@ func (s *Session) helloAsDevice(m wire.In) error {
 // proof, and helloAsDevice stays the only place a syncing session is built.
 //
 // Refusals. An invite that is unknown, expired, already used or malformed is
-// `auth` and says none of the four, exactly as a wrong token does. A device id
-// or an auth key the server will not write is the request's own fault and is
-// named: `badname` and `badentry`. Every refusal
-// leaves the invite unspent, because the store rolls the spend back with the
-// registration; see store.RedeemInviteFor.
+// `auth` and says none of the four, exactly as a wrong token does, and so is
+// an invite for a vault this server does not serve. A device id or an auth key
+// the server will not write is the request's own fault and is named: `badname`
+// and `badentry`, for any vault alike. Every refusal leaves the invite unspent,
+// because the store rolls the spend back with the registration; see
+// store.RedeemInviteFor.
 func (s *Session) helloAsInvite(m wire.In) error {
 	// Shape before the invite is touched, so a malformed request cannot burn
 	// one. `badname` and `badentry` rather than `auth`, because these are
 	// facts about the frame and not about the vault: the same rule the device
-	// id shape check on an ordinary hello follows.
-	// Before the invite is looked up, so an invite for an unserved vault is
-	// refused without being spent (F19).
-	if err := s.srv.refuseUnservedVault(m.Vault); err != nil {
-		return s.fatal(wire.CodeAuth, err)
-	}
+	// id shape check on an ordinary hello follows. The served vault comes
+	// after them, below, so that none of them depends on which vault was
+	// named.
 	if !store.ValidDeviceID(m.DeviceID) {
 		return s.fatal(wire.CodeBadName, fmt.Errorf(
 			"redeeming an invite registers the device redeeming it, so this hello must carry the "+
@@ -1172,6 +1199,11 @@ func (s *Session) helloAsInvite(m wire.In) error {
 	if err := checkName("device", name, store.MaxDeviceLen); err != nil {
 		return s.fatal(wire.CodeBadName, err)
 	}
+	// Before the invite is looked up, so an invite for an unserved vault is
+	// refused without being spent (F19).
+	if err := s.refuseUnserved(m); err != nil {
+		return err
+	}
 
 	sum := sha256.Sum256([]byte(m.Auth))
 	sealed, err := s.srv.st.RedeemInviteFor(m.Vault, m.Invite, m.DeviceID, name,
@@ -1184,7 +1216,7 @@ func (s *Session) helloAsInvite(m wire.In) error {
 		// this server serves.
 		s.srv.log.Warn("invite refused", "remote", s.remote, "vault", m.Vault,
 			"deviceId", m.DeviceID, "err", err)
-		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+		return s.fatal(wire.CodeAuth, errNotAuthorised)
 	case errors.Is(err, store.ErrDeviceExists):
 		return s.fatal(wire.CodeBadEntry, fmt.Errorf(
 			"this vault already has a device registered under id %q, so this invite was not spent; "+
@@ -1221,7 +1253,7 @@ func (s *Session) helloAsRegistrar(m wire.In) error {
 		// Logged in full, reported as one word. Telling a caller whether the
 		// vault or the token was wrong tells them which half to keep guessing.
 		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)
-		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+		return s.fatal(wire.CodeAuth, errNotAuthorised)
 	}
 	// The vault's key material, one read for both columns, used by both paths
 	// below. After auth and never before it: a first device's claim writes both

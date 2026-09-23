@@ -572,7 +572,9 @@ func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {
 func (s *Server) Serves(vaultID string) { s.servedVault = vaultID }
 
 // refuseUnservedVault is the check every hello route makes before it looks a
-// vault up by the name the caller sent.
+// vault up by the name the caller sent. Its error names both vaults and is for
+// the log: the caller is told only what a wrong credential is told, see
+// Session.refuseUnserved.
 func (s *Server) refuseUnservedVault(vaultID string) error {
 	if s.servedVault == "" || vaultID == s.servedVault {
 		return nil
