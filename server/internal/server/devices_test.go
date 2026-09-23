@@ -3,7 +3,9 @@ package server
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
@@ -459,6 +461,171 @@ func TestRevokingClosesTheRevokedDevicesLiveSession(t *testing.T) {
 	waitFor(t, "the revoked session to leave", func() bool { return r.srv.Peers(testVault) == 1 })
 }
 
+// A note another device commits after a revoke has deleted a device's row, and
+// before that device's connections are closed, is not sent to them.
+//
+// A device holds the vault's data key, so a batch reaching a revoked device's
+// socket is a note it can read, sent after the revoke committed. The row was
+// deleted under commitMu and the sessions to close were looked up only after
+// the lock was released, so a commit landing between the two was broadcast to
+// a connection whose device no longer existed. afterRevoke parks the revoke in
+// exactly that gap while another device commits, and the commit's ack means
+// its broadcast has already happened when the revoke moves on.
+//
+// Both ways a device is revoked: by another device, which evicts it, and by
+// itself, which is what unlinking is, and which it hears as its own reply.
+func TestNothingCommittedAfterARevokeReachesTheRevokedDevice(t *testing.T) {
+	for _, tc := range []struct {
+		what    string
+		revoker string
+		// last checks the one frame the revoked connection may still hear.
+		last func(t *testing.T, frame map[string]any)
+	}{
+		{"revoked by another device", "owner", revocationNotice},
+		{"revoking itself", "victim", func(t *testing.T, f map[string]any) {
+			if f["res"] != "revoked" || f["self"] != true {
+				t.Fatalf("the device that revoked itself heard %v, want its own reply", f)
+			}
+		}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			r := newRig(t)
+			victim := r.dial("victim")
+			victim.hello(0)
+			owner := r.dial("owner")
+			owner.hello(0)
+			writer := r.dial("writer")
+			writer.hello(0)
+			revoker := owner
+			if tc.revoker == "victim" {
+				revoker = victim
+			}
+
+			parked, resume := make(chan struct{}), make(chan struct{})
+			var park, release sync.Once
+			r.srv.afterRevoke = func() { park.Do(func() { close(parked); <-resume }) }
+			t.Cleanup(func() { release.Do(func() { close(resume) }) })
+
+			revoker.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("victim")})
+			awaitClosed(t, parked, "the revoke to reach the gap between its commit and its evictions")
+			uid := writer.put("after-the-revoke.md", "not for the revoked device")
+			release.Do(func() { close(resume) })
+
+			// The commit reached the fan-out while the revoke was parked: a
+			// device that was not revoked was sent it. Without this the test
+			// would pass for a commit that never broadcast at all.
+			if revoker == owner {
+				owner.recvInto("revoked", &wire.Revoked{})
+			}
+			if got := owner.nextBatch(); got.To != uid || len(got.Entries) != 1 {
+				t.Fatalf("the device that was not revoked was sent %+v, want uid %d", got, uid)
+			}
+			heardOnly(t, victim.rest(), tc.last)
+		})
+	}
+}
+
+// A revoked device still catching up is sent nothing more either, including a
+// note committed after the revoke that its catch-up would otherwise reach.
+//
+// A catch-up is read from the store and not from the fan-out, so taking the
+// device out of the hub does not stop one that is under way: it goes on
+// reading, and the backlog it reads grows with every commit after the revoke.
+// What stops it is the writer, because the revoke marks the session in the
+// same hold on commitMu as the delete and a marked session is sent nothing but
+// its notice. Here the catch-up is parked after its first batch, a note is
+// committed after the revoke, and the catch-up then runs to its caught-up
+// before the eviction is let go ahead, so everything it read reached the queue
+// while the connection was open.
+func TestARevokedDeviceStillCatchingUpIsSentNothingMore(t *testing.T) {
+	r := newRig(t)
+	r.srv.batchSize = 1
+	r.seed("one.md", "first")
+	r.seed("two.md", "second")
+
+	// Every hook is in place before any session exists and acts only once
+	// armed, so the sessions set up first pass through them untouched.
+	var armed atomic.Bool
+	parked, resume, flushed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	inGap, goOn := make(chan struct{}), make(chan struct{})
+	var park, release, flush, gap, proceed sync.Once
+	r.srv.afterReplayBatch = func(n int) {
+		if n == 1 && armed.Load() {
+			park.Do(func() { close(parked); <-resume })
+		}
+	}
+	r.srv.afterFlush = func() {
+		if armed.Load() {
+			flush.Do(func() { close(flushed) })
+		}
+	}
+	r.srv.afterRevoke = func() { gap.Do(func() { close(inGap); <-goOn }) }
+	t.Cleanup(func() {
+		release.Do(func() { close(resume) })
+		proceed.Do(func() { close(goOn) })
+	})
+
+	owner := r.dial("owner")
+	owner.hello(0)
+	writer := r.dial("writer")
+	writer.hello(0)
+
+	armed.Store(true)
+	victim := r.dial("victim")
+	victim.sendJSON(victim.deviceHello(0))
+	victim.recvInto("ready", &wire.Ready{})
+	if got := victim.nextBatch(); got.To != 1 {
+		t.Fatalf("the catch-up began with %+v, want uid 1", got)
+	}
+	awaitClosed(t, parked, "the catch-up to park after its first batch")
+
+	owner.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("victim")})
+	awaitClosed(t, inGap, "the revoke to reach the gap between its commit and its evictions")
+	writer.put("after-the-revoke.md", "not for the revoked device")
+	release.Do(func() { close(resume) })
+	awaitClosed(t, flushed, "the revoked device's catch-up to finish")
+	proceed.Do(func() { close(goOn) })
+	owner.recvInto("revoked", &wire.Revoked{})
+
+	heardOnly(t, victim.rest(), revocationNotice)
+}
+
+// heardOnly fails unless frames, everything a revoked device's connection was
+// sent after the revoke, is a single frame and no batch, and hands that frame
+// to check.
+func heardOnly(t *testing.T, frames []string, check func(t *testing.T, frame map[string]any)) {
+	t.Helper()
+	for _, f := range frames {
+		if rawFields(t, f)["op"] == "batch" {
+			t.Fatalf("the revoked device was sent a batch after its revocation committed: %s", f)
+		}
+	}
+	if len(frames) != 1 {
+		t.Fatalf("the revoked device heard %d frames after the revoke, want one: %v", len(frames), frames)
+	}
+	check(t, rawFields(t, frames[0]))
+}
+
+// revocationNotice fails unless frame is the notice an evicted device is sent:
+// an unsolicited `auth` saying that it was revoked.
+func revocationNotice(t *testing.T, f map[string]any) {
+	t.Helper()
+	msg, _ := f["msg"].(string)
+	if f["res"] != "err" || f["code"] != wire.CodeAuth || f["id"] != nil || !strings.Contains(msg, "revoked") {
+		t.Fatalf("the revoked device heard %v, want the unsolicited notice", f)
+	}
+}
+
+// awaitClosed waits for a test hook to report that the server reached it.
+func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
 // Revoking one device disturbs no other device's session or sync. Spec test 2:
 // the whole point of the feature is that the answer to a stolen laptop is not
 // re-pairing the phone, the desktop and the NAS.
@@ -575,7 +742,14 @@ func TestADeviceMayNotEmptyTheVault(t *testing.T) {
 		t.Fatalf("%d devices after the recovery key emptied the vault", len(ds))
 	}
 	// And the device it emptied is closed, the same as any other revocation.
-	waitFor(t, "the emptied device to leave", func() bool { return r.srv.Peers(testVault) == 0 })
+	// Asked of the connection: the fan-out lets it go as the revoke commits,
+	// before anything has closed it.
+	if r.srv.Peers(testVault) != 0 {
+		t.Fatalf("%d sessions still in the fan-out after the vault was emptied", r.srv.Peers(testVault))
+	}
+	if !a.closed() {
+		t.Fatal("the device the recovery key emptied kept its connection")
+	}
 }
 
 // A revoke under a root the vault no longer knows is refused, so a rotation

@@ -311,6 +311,13 @@ type Server struct {
 	// peer is reading, which a test cannot arrange honestly.
 	beforeEvict func()
 
+	// afterRevoke runs once a revoke has committed and released commitMu, and
+	// before any of the revoked device's sessions is evicted, and is nil in
+	// every non-test build. A test parks the revoke here while another device
+	// commits, which is the one moment a revoked connection could still have
+	// been sent a note.
+	afterRevoke func()
+
 	// beforeAppend runs just before an entry is committed, and is nil in every
 	// non-test build. An error from it stands in for the database failing the
 	// commit, which no test can arrange honestly on a working disk, so that the

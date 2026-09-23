@@ -82,26 +82,39 @@ func (h *Hub) broadcast(vaultID string, e store.Entry, origin *Session) {
 	}
 }
 
-// sessionsOf returns every session on the vault belonging to one device,
-// except origin, for a revoke to close.
+// detach takes every session on the vault belonging to one device, except
+// origin, out of the fan-out and returns them, for a revoke to close.
 //
 // Deleting the row is not enough on its own. A live stream does not check the
 // credential again for each notification, so it would go on receiving every
 // note pushed to the vault for as long as it stayed up: a revocation the revoked
 // device never notices.
 //
+// Nor is closing the sessions afterwards, which is what this used to leave to
+// the caller: it only found them, after the revoke had released commitMu, and
+// a commit landing in between was broadcast to a device that no longer had a
+// row and still held the key to read what it was sent. The revoke calls this
+// in the same hold on commitMu as the delete, and every broadcast runs under
+// that lock, so none after the revoke can find them.
+// TestNothingCommittedAfterARevokeReachesTheRevokedDevice.
+//
 // A device may have more than one session, so this is a list rather than a
 // lookup, and origin is left out because the caller is about to answer it.
 // Reading deviceID here is safe without any lock of its own: it is written
 // before the session joins, and joining takes the same mutex this holds.
-func (h *Hub) sessionsOf(vaultID, deviceID string, origin *Session) []*Session {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+func (h *Hub) detach(vaultID, deviceID string, origin *Session) []*Session {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	m := h.byVault[vaultID]
 	var out []*Session
-	for s := range h.byVault[vaultID] {
+	for s := range m {
 		if s != origin && s.deviceID == deviceID {
 			out = append(out, s)
+			delete(m, s)
 		}
+	}
+	if m != nil && len(m) == 0 {
+		delete(h.byVault, vaultID)
 	}
 	return out
 }
