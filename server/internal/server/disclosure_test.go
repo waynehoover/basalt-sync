@@ -299,11 +299,10 @@ func TestHealthSaysOkAndNothingElse(t *testing.T) {
 // plugin, and one that cannot tell `badname` from `auth` sends somebody
 // hunting a credential bug over a 65-character device name.
 //
-// The third, `full`, is not reachable here at all: it comes from the device
-// limit, which is checked inside the transaction that registers a row, after
-// the invite has been spent, so anybody without a live invite gets `auth` from
-// the spend and never reaches the count. That ordering is the property, and it
-// is asserted below rather than read.
+// The third is gone. `full` came from a device limit, and there has been no
+// limit and no such code since the limit was removed: maxDevices is sent as 0,
+// which means no cap, so nothing about how many devices a vault has is left
+// for a refusal to reveal.
 //
 // So the test is the boundary rather than a list of codes: the same probe
 // against a vault this server serves, and against one it has never heard of,

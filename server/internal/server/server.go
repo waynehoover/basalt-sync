@@ -304,8 +304,8 @@ type Server struct {
 	// test-only race reaches CI and stays.
 	beforePing atomic.Pointer[func()]
 
-	// beforeEvict runs at the top of each eviction a rotation causes, and is
-	// nil in every non-test build. A test uses it to see that the evictions
+	// beforeEvict runs at the top of each eviction, a rotation's or a
+	// revoke's, and is nil in every non-test build. A test uses it to see that the evictions
 	// overlap, which is the whole of what parallelising them buys and is not
 	// otherwise observable: how long an eviction takes depends on whether the
 	// peer is reading, which a test cannot arrange honestly.
@@ -571,10 +571,11 @@ func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {
 // which is what a test that builds a server directly gets.
 func (s *Server) Serves(vaultID string) { s.servedVault = vaultID }
 
-// refuseUnservedVault is the check every hello route makes before it looks a
-// vault up by the name the caller sent. Its error names both vaults and is for
-// the log: the caller is told only what a wrong credential is told, see
-// Session.refuseUnserved.
+// refuseUnservedVault is the check the device and invite routes make, through
+// Session.refuseUnserved, before they look a vault up by the name the caller
+// sent; the registrar's route makes the same check inside DerivedAuth. Its
+// error names both vaults and is for the log: the caller is told only what a
+// wrong credential is told.
 func (s *Server) refuseUnservedVault(vaultID string) error {
 	if s.servedVault == "" || vaultID == s.servedVault {
 		return nil
