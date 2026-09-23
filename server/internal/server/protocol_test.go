@@ -1133,3 +1133,115 @@ func claimOtherVault(t *testing.T, r *rig) (string, string) {
 	}
 	return other, hash
 }
+
+/* ---------------------------------------------------------------- *
+ * Text frames the decoder would repair
+ * ---------------------------------------------------------------- */
+
+// unitEscape is a JSON string escape for one UTF-16 code unit. It is built
+// rather than written out, so each case says which unit it means without
+// depending on anything between this file and the compiler leaving that
+// sequence alone.
+func unitEscape(unit string) string { return string(rune(0x5c)) + "u" + unit }
+
+// wireBytes is bytes as they would arrive, which need not be UTF-8.
+func wireBytes(b ...byte) string { return string(b) }
+
+// framed marshals in and puts name, exactly as given, where in carries the
+// placeholder. Marshal repairs invalid UTF-8 the way the decoder does, so a
+// frame carrying some can only be built by hand.
+func framed(t *testing.T, in wire.In, name string) []byte {
+	t.Helper()
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const slot = `"name-goes-here"`
+	if strings.Count(string(b), slot) != 1 {
+		t.Fatalf("the frame has no single place for the name: %s", b)
+	}
+	return []byte(strings.Replace(string(b), slot, `"`+name+`"`, 1))
+}
+
+// A text frame that JSON decoding would quietly change is refused, in a hello
+// and after one, and a frame that is only unusual is not.
+//
+// Go's decoder turns invalid UTF-8, and an escape naming one half of a
+// surrogate pair without the other, into U+FFFD without a word. So a device
+// that sent either one was connected, or renamed, under a name it never sent:
+// stamped on every entry it wrote and shown in every device list, while it was
+// told that everything had worked. Each kind goes out twice here, as the
+// device name in a hello and as a rename, and has to be refused as
+// `protostate` with nothing recorded. A character outside the Basic
+// Multilingual Plane, escaped as a pair or sent as UTF-8, is renamed to
+// exactly itself, and so are the two that only look like the refused ones.
+func TestATextFrameTheDecoderWouldRepairIsRefused(t *testing.T) {
+	for _, tc := range []struct{ what, name string }{
+		{"an invalid UTF-8 byte", "laptop" + wireBytes(0xff)},
+		{"a surrogate encoded as UTF-8", "laptop" + wireBytes(0xed, 0xa0, 0x80)},
+		{"a high surrogate escaped alone", "laptop" + unitEscape("d83d")},
+		{"a low surrogate escaped alone", "laptop" + unitEscape("de00")},
+		{"a high surrogate escaped before something else", "laptop" + unitEscape("d83d") + unitEscape("0041")},
+	} {
+		t.Run(tc.what+", in a hello", func(t *testing.T) {
+			r := newRig(t)
+			cl := r.dial("laptop")
+			hello := cl.deviceHello(0)
+			hello.ID, hello.Proto, hello.Device = 1, wire.Proto, "name-goes-here"
+			cl.sendFrame(hello.ID, framed(t, hello, tc.name))
+			cl.expectErr(wire.CodeProtoState)
+			if !cl.closed() {
+				t.Fatal("the session went on after a hello it could not read as sent")
+			}
+			if d, _, _, _ := r.st.DeviceByID(testVault, deviceID("laptop")); d.LastSeen != 0 {
+				t.Fatal("the hello was accepted: the device is marked as having connected")
+			}
+		})
+		t.Run(tc.what+", in a rename", func(t *testing.T) {
+			r := newRig(t)
+			cl := r.dial("laptop")
+			cl.hello(0)
+			cl.sendFrame(7, framed(t, wire.In{Op: "rename", ID: 7, Name: "name-goes-here"}, tc.name))
+			cl.expectErr(wire.CodeProtoState)
+			if !cl.closed() {
+				t.Fatal("the session went on after a request it could not read as sent")
+			}
+			if d, _, _, _ := r.st.DeviceByID(testVault, deviceID("laptop")); d.Name != "laptop" {
+				t.Fatalf("the device was renamed %q from a frame it never sent", d.Name)
+			}
+		})
+	}
+
+	bs := string(rune(0x5c)) // one backslash
+	face := string(rune(0x1f600))
+	for _, tc := range []struct{ what, sent, stored string }{
+		{"a character outside the BMP, escaped as a pair",
+			"laptop " + unitEscape("d83d") + unitEscape("de00"), "laptop " + face},
+		{"the same character as UTF-8", "laptop " + wireBytes(0xf0, 0x9f, 0x98, 0x80), "laptop " + face},
+		{"U+FFFD itself, sent on purpose", "laptop " + wireBytes(0xef, 0xbf, 0xbd), "laptop " + string(rune(0xfffd))},
+		{"an escaped backslash before the letters ud800", "laptop " + bs + bs + "ud800", "laptop " + bs + "ud800"},
+	} {
+		t.Run(tc.what+", in a hello, is not refused", func(t *testing.T) {
+			r := newRig(t)
+			cl := r.dial("laptop")
+			hello := cl.deviceHello(0)
+			hello.ID, hello.Proto, hello.Device = 1, wire.Proto, "name-goes-here"
+			cl.sendFrame(hello.ID, framed(t, hello, tc.sent))
+			cl.recvInto("ready", &wire.Ready{})
+		})
+		t.Run(tc.what+", in a rename, is not refused", func(t *testing.T) {
+			r := newRig(t)
+			cl := r.dial("laptop")
+			cl.hello(0)
+			cl.sendFrame(7, framed(t, wire.In{Op: "rename", ID: 7, Name: "name-goes-here"}, tc.sent))
+			var done wire.Renamed
+			cl.recvInto("renamed", &done)
+			if done.Name != tc.stored {
+				t.Fatalf("renamed to %q, want %q", done.Name, tc.stored)
+			}
+			if d, _, _, _ := r.st.DeviceByID(testVault, deviceID("laptop")); d.Name != tc.stored {
+				t.Fatalf("the row says %q, want %q", d.Name, tc.stored)
+			}
+		})
+	}
+}

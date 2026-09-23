@@ -636,6 +636,12 @@ func (s *Session) run() error {
 		return s.fatal(wire.CodeProtoState,
 			fmt.Errorf("first frame must be text hello, got %v", typ))
 	}
+	// Before decoding, because decoding would quietly repair what this
+	// refuses, and a device name repaired on the way in is a name the device
+	// never sent. See wire.ValidText.
+	if err := wire.ValidText(data); err != nil {
+		return s.fatal(wire.CodeProtoState, fmt.Errorf("hello: %w", err))
+	}
 	var m wire.In
 	if err := json.Unmarshal(data, &m); err != nil {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("hello parse: %w", err))
@@ -667,6 +673,11 @@ func (s *Session) run() error {
 			// would mean guessing what it was.
 			return s.fatal(wire.CodeProtoState,
 				fmt.Errorf("unexpected binary frame (%d bytes)", len(data)))
+		}
+		// The same check the hello had, for the same reason: every string in
+		// the frame is either exactly what was sent or the frame is refused.
+		if err := wire.ValidText(data); err != nil {
+			return s.fatal(wire.CodeProtoState, err)
 		}
 		var m wire.In
 		if err := json.Unmarshal(data, &m); err != nil {

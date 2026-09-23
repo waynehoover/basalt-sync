@@ -12,7 +12,14 @@
 // no `ok` here.
 package wire
 
-import "github.com/waynehoover/basalt-sync/server/internal/store"
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"unicode/utf8"
+
+	"github.com/waynehoover/basalt-sync/server/internal/store"
+)
 
 // Proto is the newest protocol version this server implements, and MinProto the
 // oldest it still answers. A version outside that range is refused at hello
@@ -752,4 +759,97 @@ func Retryable(code string) bool {
 		return true
 	}
 	return false
+}
+
+// ErrNotText is a text frame that is not well-formed text: invalid UTF-8, or a
+// JSON string escape naming half of a surrogate pair without the other half.
+var ErrNotText = errors.New("the frame is not well-formed text")
+
+// ValidText refuses a text frame that JSON decoding would quietly change.
+//
+// Go's decoder refuses neither invalid UTF-8 nor an escape naming one half of a
+// surrogate pair, D800 to DFFF, without the other: it substitutes U+FFFD and
+// carries on, so a field arrives as a different string from the one that was
+// sent. A device name repaired on the way in is stored, stamped on every entry
+// that device writes and shown to every other device, as a name its owner
+// never typed, and the device that sent it is told it worked. So a frame that
+// is not well-formed text is refused before it is decoded, as `protostate`,
+// since the two ends no longer agree on what was said.
+//
+// Nothing a correct client sends is refused. RFC 6455 requires a text frame to
+// be valid UTF-8, and the standard WebSocket both Basalt shells send through
+// encodes every string as UTF-8; RFC 8259 leaves an unpaired surrogate's
+// meaning undefined, and JSON.stringify writes that escape only for a string
+// that already held one.
+//
+// The escapes are found by jumping from one backslash to the next, without
+// following which bytes are inside a string, because in JSON a backslash can
+// only be inside one: a frame with a backslash anywhere else is not JSON, and
+// the decoder refuses it whatever this says. Walking the escapes left to right
+// is what the decoder does, so an escaped backslash is never mistaken for the
+// start of an escape. The jump matters: a batch frame is up to 16 MiB, nearly
+// all of it base64url and hex, which holds no backslash, and following string
+// state byte by byte cost nearly as much as decoding the frame. A malformed
+// escape, or one cut off by the end of the frame, is left for the decoder to
+// refuse, which it does.
+func ValidText(data []byte) error {
+	if !utf8.Valid(data) {
+		return fmt.Errorf("%w: it is not valid UTF-8", ErrNotText)
+	}
+	for i := 0; i < len(data); i++ {
+		next := bytes.IndexByte(data[i:], '\\')
+		if next < 0 {
+			return nil
+		}
+		i += next
+		if i+1 >= len(data) {
+			return nil // cut off: the decoder's to refuse
+		}
+		if data[i+1] != 'u' {
+			i++ // a one-character escape, which may be an escaped backslash
+			continue
+		}
+		unit, ok := hex4(data, i+2)
+		if !ok {
+			return nil // malformed: the decoder's to refuse
+		}
+		i += 5 // the last of the four digits
+		switch {
+		case unit >= 0xdc00 && unit <= 0xdfff:
+			return fmt.Errorf("%w: it escapes a low surrogate with no high surrogate before it", ErrNotText)
+		case unit >= 0xd800 && unit <= 0xdbff:
+			low, ok := uint16(0), false
+			if i+6 < len(data) && data[i+1] == '\\' && data[i+2] == 'u' {
+				low, ok = hex4(data, i+3)
+			}
+			if !ok || low < 0xdc00 || low > 0xdfff {
+				return fmt.Errorf("%w: it escapes a high surrogate with no low surrogate after it", ErrNotText)
+			}
+			i += 6 // the last digit of the low half
+		}
+	}
+	return nil
+}
+
+// hex4 reads the four hex digits a JSON string escape carries, at data[at:].
+func hex4(data []byte, at int) (uint16, bool) {
+	if at+4 > len(data) {
+		return 0, false
+	}
+	var v uint16
+	for _, c := range data[at : at+4] {
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | uint16(d)
+	}
+	return v, true
 }
