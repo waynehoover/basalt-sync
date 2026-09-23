@@ -62,13 +62,23 @@ type Session struct {
 	// authenticated as, and is empty on a registrar session, which is not a
 	// device. It is written before the session joins the fan-out and read
 	// afterwards by whoever is revoking that device, so the hub's lock is what
-	// publishes it; see Hub.sessionsOf.
+	// publishes it; see Hub.detach.
 	deviceID string
 	// Captured at hello, so reusing a revoked ID with a new key cannot grant
 	// its old session permission to mutate the vault.
 	deviceHash string
 	// Zero is unknown; otherwise the last applied cursor plus one.
 	applied atomic.Int64
+
+	// revoked is set by the revoke that deleted this session's device row,
+	// under commitMu and in the same critical section that takes the session
+	// out of the fan-out. From then on the writer sends nothing but the notice
+	// saying so (see writeLoop), which makes "a revoked device is sent nothing
+	// more" true of what was already queued, of a catch-up still being read
+	// from the store, and of replies to requests already being served, and not
+	// only of commits that come later. currentCredential refuses on it too, so
+	// the row coming back under the same key does not revive this session.
+	revoked atomic.Bool
 
 	// registrar is true when this session authenticated with the *vault's*
 	// credential rather than a device's. Such a session may register a device
@@ -147,6 +157,9 @@ type Session struct {
 type outFrame struct {
 	typ  websocket.MessageType
 	data []byte
+	// final marks the one frame a revoked session is still sent: the notice
+	// that it was revoked. See writeLoop.
+	final bool
 }
 
 // pendingChange is a live batch held back during catch-up, already marshalled.
@@ -208,9 +221,18 @@ func (s *Session) writeLoop() {
 		case <-s.dead:
 			return
 		case f := <-s.out:
-			ctx, cancel := context.WithTimeout(s.ctx, s.srv.writeWait)
-			err := s.conn.Write(ctx, f.typ, f.data)
-			cancel()
+			// A revoked device's connection hears one thing after the revoke:
+			// that it was revoked. Anything else still queued, a live batch, a
+			// catch-up page, the reply to a request sent a moment before, is
+			// dropped here, the last point before the socket, because the
+			// revoke has already been answered as done. It is still counted
+			// out below, so a drain waiting on it is not left waiting.
+			var err error
+			if f.final || !s.revoked.Load() {
+				ctx, cancel := context.WithTimeout(s.ctx, s.srv.writeWait)
+				err = s.conn.Write(ctx, f.typ, f.data)
+				cancel()
+			}
 			// Released only now, after the write returned, so a zero on either
 			// counter means the frame has reached the socket rather than merely
 			// left the channel. drain relies on that (S10).
@@ -288,14 +310,20 @@ func (s *Session) drain(timeout time.Duration) {
 // The bytes are reserved before the frame is offered and given back if it is
 // refused, so the counter is never below what the writer will subtract.
 func (s *Session) enqueue(typ websocket.MessageType, data []byte) bool {
-	n := int64(len(data))
+	return s.enqueueFrame(outFrame{typ: typ, data: data})
+}
+
+// enqueueFrame is enqueue for a frame already built, which is how the one
+// frame marked final reaches the queue.
+func (s *Session) enqueueFrame(f outFrame) bool {
+	n := int64(len(f.data))
 	if after := s.queued.Add(n); after > SendQueueBytes && after != n {
 		s.queued.Add(-n)
 		return false
 	}
 	s.inflight.Add(1)
 	select {
-	case s.out <- outFrame{typ, data}:
+	case s.out <- f:
 		return true
 	default:
 		s.queued.Add(-n)
@@ -332,12 +360,17 @@ func (s *Session) send(typ websocket.MessageType, data []byte) error {
 // dropped peer receives everything it missed as catch-up on reconnect. Dropping
 // the frame instead would leave a live peer permanently short one file.
 func (s *Session) trySend(typ websocket.MessageType, data []byte) bool {
+	return s.trySendFrame(outFrame{typ: typ, data: data})
+}
+
+// trySendFrame is trySend for a frame already built.
+func (s *Session) trySendFrame(f outFrame) bool {
 	select {
 	case <-s.dead:
 		return false
 	default:
 	}
-	if !s.enqueue(typ, data) {
+	if !s.enqueueFrame(f) {
 		s.kill(errors.New("send queue overflow, peer too slow"))
 		return false
 	}
@@ -560,12 +593,17 @@ func (s *Session) shutdown() {
 // The notice is unsolicited `auth` in both cases, with a message that says
 // which. `auth` is the code a client already stops on, and the two causes want
 // the same thing from it: stop, and do not reconnect with what you have.
+//
+// It is marked final, so it is the one frame the writer still sends to a
+// session a revoke has marked; everything queued ahead of it is dropped (see
+// writeLoop). A registrar a rotation closes is never marked, and hears
+// everything queued ahead of its notice exactly as before.
 func (s *Session) evict(msg string, cause error) {
 	if s.srv.beforeEvict != nil {
 		s.srv.beforeEvict()
 	}
 	if b, err := json.Marshal(s.errFrame(0, wire.CodeAuth, msg, 0)); err == nil {
-		s.trySend(websocket.MessageText, b)
+		s.trySendFrame(outFrame{typ: websocket.MessageText, data: b, final: true})
 	}
 	s.drain(time.Second)
 	s.kill(cause)
@@ -1033,7 +1071,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	// Recheck the credential and stamp it as seen after joining, under the
 	// same lock as revocation. A prior revoke is refused even if its device ID
 	// has since been reused with another key. A later revoke finds this joined
-	// session when it collects sockets to close.
+	// session and takes it out of the fan-out, under that same lock.
 	seenAt := s.srv.now().UnixMilli()
 	if err := s.authorizedMutation(func() error {
 		return s.srv.st.SawDevice(m.Vault, m.DeviceID, seenAt)
@@ -2690,14 +2728,18 @@ func (s *Session) handleRename(m wire.In) error {
 // key, so the person doing this correctly is holding it either way.
 //
 // Deleting the row blocks subsequent persistent mutations, but the open
-// connection must also be closed to stop reads and live deliveries. The reply
-// follows that eviction so it never reports a device removed while its socket
-// is still receiving notes.
+// connection must also be closed to stop reads and live deliveries, and it has
+// to stop receiving when the row goes rather than when the socket closes. So
+// the delete and taking the device's sessions out of the fan-out are one hold
+// on commitMu, the lock every broadcast runs under, and those sessions are
+// marked so that their writer sends nothing but the notice. The eviction
+// follows outside the lock, and the reply follows the eviction, so it never
+// reports a device removed while its socket is still receiving notes.
 //
 // The order is the guarantee, not luck. The delete lands first, so a connect
 // racing this either does its SawDevice after the delete and is refused, or was
-// already in the hub when the list below is taken and is closed here. See
-// helloAsDevice for the other half.
+// already in the hub when this takes the device's sessions out of it and is
+// closed here. See helloAsDevice for the other half.
 func (s *Session) handleRevoke(m wire.In) error {
 	if !store.ValidDeviceID(m.DeviceID) {
 		return s.reject(wire.CodeBadName, fmt.Errorf(
@@ -2732,8 +2774,28 @@ func (s *Session) handleRevoke(m wire.In) error {
 		}
 		vaultHash = s.authHash
 	}
+	// The row and the fan-out in one critical section. Every session that
+	// device has open except this one leaves the hub and is marked before the
+	// lock is released, so no commit after the delete can be broadcast to it,
+	// and it is closed afterwards, where waiting on a socket belongs. This one
+	// is left out because it is about to be told what happened, and evicting it
+	// would close the socket before the reply reached it; when it revoked its
+	// own device it leaves the fan-out too, unmarked, so that the reply is the
+	// last thing it hears.
+	self := m.DeviceID == s.deviceID
+	var victims []*Session
 	if err := s.authorizedMutation(func() error {
-		return s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, vaultHash, m.AllowLast)
+		if err := s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, vaultHash, m.AllowLast); err != nil {
+			return err
+		}
+		victims = s.srv.hub.detach(s.vaultID, m.DeviceID, s)
+		for _, peer := range victims {
+			peer.revoked.Store(true)
+		}
+		if self {
+			s.srv.hub.leave(s.vaultID, s)
+		}
+		return nil
 	}); err != nil {
 		switch {
 		case errors.Is(err, errSessionRevoked):
@@ -2767,11 +2829,12 @@ func (s *Session) handleRevoke(m wire.In) error {
 		s.srv.log.Error("revoke failed", "vault", s.vaultID, "deviceId", m.DeviceID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("the device could not be revoked: "+err.Error()))
 	}
+	if s.srv.afterRevoke != nil {
+		s.srv.afterRevoke()
+	}
 
-	// Every session that device has open except this one. This one is left
-	// out because it is about to be told what happened, and evicting it here
-	// would close the socket before the reply reached it.
-	victims := s.srv.hub.sessionsOf(s.vaultID, m.DeviceID, s)
+	// In parallel, because each peer is given up to a second to read its
+	// notice before it is closed, as a rotation's evictions are.
 	var wg sync.WaitGroup
 	for _, peer := range victims {
 		wg.Add(1)
@@ -2784,7 +2847,6 @@ func (s *Session) handleRevoke(m wire.In) error {
 	}
 	wg.Wait()
 
-	self := m.DeviceID == s.deviceID
 	s.srv.log.Info("device revoked", "vault", s.vaultID, "deviceId", m.DeviceID,
 		"by", s.device, "closed", len(victims), "self", self)
 	if err := s.writeJSON(wire.Revoked{

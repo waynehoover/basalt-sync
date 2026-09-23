@@ -690,6 +690,33 @@ func (c *client) closed() bool {
 	}
 }
 
+// rest reads every frame the server sends until it hangs up, and returns them:
+// a text frame as it arrived, a body as a note of its length. Like closed, it
+// must be the last thing a test does with this client, and for the same
+// reason a connection still open after five quiet seconds fails the test
+// rather than being reported as having said everything.
+func (c *client) rest() []string {
+	c.t.Helper()
+	var out []string
+	for {
+		ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+		typ, data, err := c.conn.Read(ctx)
+		timedOut := ctx.Err() != nil
+		cancel()
+		if err != nil {
+			if timedOut {
+				c.t.Fatalf("%s: the connection stayed open after %d frames: %v", c.name, len(out), out)
+			}
+			return out
+		}
+		if typ == websocket.MessageBinary {
+			out = append(out, fmt.Sprintf("<a %d byte body>", len(data)))
+			continue
+		}
+		out = append(out, string(data))
+	}
+}
+
 // onlyPeer is the one session joined to the test vault, for tests that drive
 // the queue from the server side. It waits, because a client's hello has
 // returned before the server has necessarily finished joining it.

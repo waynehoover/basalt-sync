@@ -23,7 +23,15 @@ func (s *Session) authorizedMutation(fn func() error) error {
 
 // currentCredential is called while commitMu is held. Compare the key as well
 // as the ID: a newly registered device can reuse an ID from an older session.
+//
+// A session a revoke has marked is refused before the row is read, so a row
+// registered again under the same id and the same key, which the device list
+// cannot tell apart from the one revoked, does not revive a connection the
+// revoke has already answered for as closed.
 func (s *Session) currentCredential() error {
+	if s.revoked.Load() {
+		return errSessionRevoked
+	}
 	if s.registrar {
 		hash, err := s.srv.st.AuthHash(s.vaultID)
 		if err != nil {

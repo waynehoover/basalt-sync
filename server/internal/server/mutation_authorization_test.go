@@ -20,7 +20,9 @@ func TestRevokedDeviceCannotFinishMintingAnInvite(t *testing.T) {
 		owner.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("victim")})
 		owner.recvInto("revoked", &wire.Revoked{})
 	})
-	waitFor(t, "revoked handler to unwind", func() bool { return r.srv.Peers(testVault) == 1 })
+	// The session count and not the fan-out, which a revoke leaves as it
+	// commits, well before the handler it interrupted has unwound.
+	waitFor(t, "revoked handler to unwind", func() bool { return r.srv.Sessions() == 1 })
 	if got := redeem(t, r, testInvite, "replacement"); got["res"] == "redeemed" {
 		t.Fatalf("revoked device minted an invite after revocation was acknowledged and regained access: %v", got)
 	}
@@ -41,7 +43,7 @@ func TestRevokedWriterCannotCommitAfterTheRevocationReply(t *testing.T) {
 		owner.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("victim")})
 		owner.recvInto("revoked", &wire.Revoked{})
 	})
-	waitFor(t, "revoked writer to unwind", func() bool { return r.srv.Peers(testVault) == 1 })
+	waitFor(t, "revoked writer to unwind", func() bool { return r.srv.Sessions() == 1 })
 	history, err := r.st.HistoryForPath(testVault, old.Path, 0, 10)
 	if err != nil || len(history) != 1 || history[0].UID != old.UID {
 		t.Fatalf("revoked writer changed note history after the successful revocation: %+v %v", history, err)
