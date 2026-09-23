@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -245,5 +247,61 @@ func TestInspectionDoesNotRecreateMissingChunkStorage(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("inspection accepted missing chunk storage")
+	}
+}
+
+// Every connection the pool opens keeps SQLite's temporary files in memory,
+// not only the connection that happened to run the schema, and in every mode.
+//
+// temp_store is a property of a connection, and it was a statement in the
+// schema, so it reached one pooled connection and no other. The rest of the
+// pool kept SQLite's default, a temporary directory, and the shipped image has
+// none: that is SQLITE_IOERR_GETTEMPPATH, the error the batched commit met
+// twenty-two thousand times in a day on 0.8.4. A read-only open never runs the
+// schema, so inspection had it on no connection at all. The connections are
+// held at once, so the pool has to open distinct ones rather than hand the
+// same one back each time.
+func TestEveryConnectionKeepsItsTemporaryFilesInMemory(t *testing.T) {
+	dbPath, chunkDir := newStore(t)
+	for _, tc := range []struct {
+		what string
+		mode Mode
+	}{
+		{"serving", Create},
+		{"an existing store", Existing},
+		{"inspection", ReadOnly},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			st, err := OpenMode(dbPath, chunkDir, tc.mode, SyncFull)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			defer func() { _ = st.Close() }()
+
+			ctx := context.Background()
+			const held = 4
+			conns := make([]*sql.Conn, 0, held)
+			defer func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			}()
+			for i := 0; i < held; i++ {
+				c, err := st.db.Conn(ctx)
+				if err != nil {
+					t.Fatalf("connection %d: %v", i+1, err)
+				}
+				conns = append(conns, c)
+			}
+			for i, c := range conns {
+				var mode int
+				if err := c.QueryRowContext(ctx, `PRAGMA temp_store`).Scan(&mode); err != nil {
+					t.Fatalf("connection %d: %v", i+1, err)
+				}
+				if mode != 2 {
+					t.Errorf("connection %d of %d has temp_store %d, want 2 (MEMORY)", i+1, held, mode)
+				}
+			}
+		})
 	}
 }
